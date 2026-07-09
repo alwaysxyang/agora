@@ -1,0 +1,9 @@
+[package]
+name = "agora-node"
+version = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+agora-core = { path = "../agora-core" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
