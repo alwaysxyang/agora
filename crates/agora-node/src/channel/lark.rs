@@ -677,7 +677,7 @@ impl LarkApi {
             .json(&ReplyCardRequest {
                 msg_type: "interactive",
                 content: serde_json::to_string(card)?,
-                reply_in_thread: false,
+                reply_in_thread: true,
             })
             .send()
             .await?

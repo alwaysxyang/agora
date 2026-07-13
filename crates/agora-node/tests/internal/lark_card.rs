@@ -49,7 +49,17 @@ fn lark_card_separates_thinking_progress_and_final_answer() {
     assert!(rendered.contains("**Done**  Run `cargo test`"));
     assert!(rendered.contains("**Final answer**"));
     assert!(rendered.contains("The Lark path is ready."));
+    assert!(!rendered.contains("正在等待 Agent 输出"));
     assert_eq!(rendered.matches("Run `cargo test`").count(), 1);
+}
+
+#[test]
+fn lark_card_shows_a_placeholder_before_agent_output() {
+    let content = LarkCardContent::new("codex-dev".to_string());
+
+    let rendered = serde_json::to_string(&content.build_card()).unwrap();
+
+    assert!(rendered.contains("> 正在等待 Agent 输出..."));
 }
 
 #[test]
@@ -123,7 +133,7 @@ async fn lark_card_coalesces_intermediate_updates_and_flushes_completion() {
     assert_eq!(patches.len(), 2);
 
     let reply_body: serde_json::Value = serde_json::from_str(&replies[0].body).unwrap();
-    assert_eq!(reply_body["reply_in_thread"], false);
+    assert_eq!(reply_body["reply_in_thread"], true);
     let final_body: serde_json::Value = serde_json::from_str(&patches[1].body).unwrap();
     let final_card: serde_json::Value =
         serde_json::from_str(final_body["content"].as_str().unwrap()).unwrap();

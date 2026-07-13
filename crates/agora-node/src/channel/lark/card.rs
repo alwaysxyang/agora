@@ -166,6 +166,13 @@ impl LarkCardContent {
             }));
         }
 
+        if elements.is_empty() && !self.finished {
+            elements.push(json!({
+                "tag": "markdown",
+                "content": "> 正在等待 Agent 输出..."
+            }));
+        }
+
         let mut card = json!({
             "config": {
                 "update_multi": true,
