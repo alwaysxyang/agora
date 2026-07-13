@@ -1,0 +1,72 @@
+use agora_node::store::{SessionKey, SessionStore};
+
+#[test]
+fn store_schema_is_embedded_from_a_sql_file() {
+    let store_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("store");
+    let schema = std::fs::read_to_string(store_dir.join("schema.sql")).unwrap();
+    let source = std::fs::read_to_string(store_dir.join("mod.rs")).unwrap();
+
+    assert!(schema.contains("CREATE TABLE IF NOT EXISTS channel_agent_sessions"));
+    assert!(source.contains("include_str!(\"schema.sql\")"));
+}
+
+#[test]
+fn session_store_round_trips_and_updates_a_mapping() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("store.db");
+    let store = SessionStore::open(&path).unwrap();
+    let key = SessionKey::new("lark1", "chat-1", "codex-dev");
+
+    assert_eq!(store.get(&key).unwrap(), None);
+
+    store.save(&key, "thread-1").unwrap();
+    drop(store);
+
+    let reopened = SessionStore::open(path).unwrap();
+    assert_eq!(reopened.get(&key).unwrap().as_deref(), Some("thread-1"));
+
+    reopened.save(&key, "thread-2").unwrap();
+    assert_eq!(reopened.get(&key).unwrap().as_deref(), Some("thread-2"));
+}
+
+#[test]
+fn session_store_allows_many_sessions_per_agent_without_reusing_one_backend_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(temp.path().join("store.db")).unwrap();
+    let first = SessionKey::new("lark1", "chat-1", "codex-dev");
+    let second = SessionKey::new("lark1", "chat-2", "codex-dev");
+    let third = SessionKey::new("lark1", "chat-3", "codex-dev");
+
+    store.save(&first, "thread-1").unwrap();
+    store.save(&second, "thread-2").unwrap();
+
+    assert_eq!(store.get(&second).unwrap().as_deref(), Some("thread-2"));
+    assert!(store.save(&third, "thread-1").is_err());
+    assert_eq!(store.get(&third).unwrap(), None);
+}
+
+#[test]
+fn session_store_only_removes_the_expected_mapping() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(temp.path().join("store.db")).unwrap();
+    let key = SessionKey::new("lark1", "chat-1", "codex-dev");
+    store.save(&key, "thread-2").unwrap();
+
+    assert!(!store.remove_if_matches(&key, "thread-1").unwrap());
+    assert!(store.remove_if_matches(&key, "thread-2").unwrap());
+    assert_eq!(store.get(&key).unwrap(), None);
+}
+
+#[test]
+fn default_store_path_is_under_agora_home() {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+
+    assert_eq!(
+        SessionStore::default_path().unwrap(),
+        home.join(".agora").join("db").join("store.db")
+    );
+}

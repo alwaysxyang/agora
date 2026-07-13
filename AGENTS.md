@@ -9,6 +9,8 @@
 - Prefer incremental improvement over large rewrites.
 - Keep module boundaries clear.
 - Respect existing layering and ownership rules.
+- Treat every agent and every channel as an autonomous component. Agents and channels must not depend on each other; the daemon composes them through neutral task, output, and outcome boundaries.
+- Keep agent execution, protocol parsing, and session state inside the agent. Keep connection management, message delivery, acknowledgement, reconnection, and reply rendering inside the channel.
 - If the existing architecture is poor, improve only the part directly touched by the task.
 - Follow `spec/` documents when they exist.
 - Keep code and `spec/` documents consistent after every code change.

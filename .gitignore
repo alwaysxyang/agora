@@ -3,3 +3,4 @@
 !.gitignore
 Cargo.lock
 spec
+config.json

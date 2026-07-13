@@ -1,1 +1,190 @@
+use anyhow::{Context, Result, anyhow, bail};
+use rusqlite::{Connection, OptionalExtension, params};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+const SCHEMA_VERSION: i64 = 1;
+const CREATE_SCHEMA: &str = include_str!("schema.sql");
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SessionKey {
+    channel_name: String,
+    channel_session_id: String,
+    agent_name: String,
+}
+
+impl SessionKey {
+    pub fn new(
+        channel_name: impl Into<String>,
+        channel_session_id: impl Into<String>,
+        agent_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            channel_name: channel_name.into(),
+            channel_session_id: channel_session_id.into(),
+            agent_name: agent_name.into(),
+        }
+    }
+
+    pub fn channel_name(&self) -> &str {
+        &self.channel_name
+    }
+
+    pub fn channel_session_id(&self) -> &str {
+        &self.channel_session_id
+    }
+
+    pub fn agent_name(&self) -> &str {
+        &self.agent_name
+    }
+}
+
+#[derive(Clone)]
+pub struct SessionStore {
+    connection: Arc<Mutex<Connection>>,
+}
+
+impl SessionStore {
+    pub fn open_default() -> Result<Self> {
+        Self::open(Self::default_path()?)
+    }
+
+    pub fn default_path() -> Result<PathBuf> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .context("HOME is not set; cannot resolve agora store path")?;
+        Ok(home.join(".agora").join("db").join("store.db"))
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("store path has no parent: {}", path.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create store directory failed: {}", parent.display()))?;
+
+        let connection = Connection::open(path)
+            .with_context(|| format!("open sqlite store failed: {}", path.display()))?;
+        Self::initialize(&connection)?;
+        Ok(Self {
+            connection: Arc::new(Mutex::new(connection)),
+        })
+    }
+
+    pub fn get(&self, key: &SessionKey) -> Result<Option<String>> {
+        let connection = self.lock_connection();
+        connection
+            .query_row(
+                "SELECT agent_session_id
+                 FROM channel_agent_sessions
+                 WHERE channel_name = ?1
+                   AND channel_session_id = ?2
+                   AND agent_name = ?3",
+                params![
+                    key.channel_name(),
+                    key.channel_session_id(),
+                    key.agent_name()
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("query channel-agent session mapping failed")
+    }
+
+    pub fn save(&self, key: &SessionKey, agent_session_id: &str) -> Result<()> {
+        if agent_session_id.is_empty() {
+            bail!("agent session id must not be empty");
+        }
+        let now = Self::now_millis()?;
+        let connection = self.lock_connection();
+        connection
+            .execute(
+                "INSERT INTO channel_agent_sessions (
+                     channel_name,
+                     channel_session_id,
+                     agent_name,
+                     agent_session_id,
+                     created_at,
+                     updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                 ON CONFLICT (channel_name, channel_session_id, agent_name)
+                 DO UPDATE SET
+                     agent_session_id = excluded.agent_session_id,
+                     updated_at = excluded.updated_at",
+                params![
+                    key.channel_name(),
+                    key.channel_session_id(),
+                    key.agent_name(),
+                    agent_session_id,
+                    now
+                ],
+            )
+            .context("save channel-agent session mapping failed")?;
+        Ok(())
+    }
+
+    pub fn remove_if_matches(&self, key: &SessionKey, agent_session_id: &str) -> Result<bool> {
+        let connection = self.lock_connection();
+        let removed = connection
+            .execute(
+                "DELETE FROM channel_agent_sessions
+                 WHERE channel_name = ?1
+                   AND channel_session_id = ?2
+                   AND agent_name = ?3
+                   AND agent_session_id = ?4",
+                params![
+                    key.channel_name(),
+                    key.channel_session_id(),
+                    key.agent_name(),
+                    agent_session_id
+                ],
+            )
+            .context("remove channel-agent session mapping failed")?;
+        Ok(removed > 0)
+    }
+
+    fn initialize(connection: &Connection) -> Result<()> {
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA busy_timeout = 5000;",
+            )
+            .context("configure sqlite store failed")?;
+        let version = connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .context("read sqlite store schema version failed")?;
+        match version {
+            0 => {
+                connection
+                    .execute_batch(CREATE_SCHEMA)
+                    .context("create sqlite store schema failed")?;
+                connection
+                    .pragma_update(None, "user_version", SCHEMA_VERSION)
+                    .context("write sqlite store schema version failed")?;
+            }
+            SCHEMA_VERSION => {
+                connection
+                    .execute_batch(CREATE_SCHEMA)
+                    .context("verify sqlite store schema failed")?;
+            }
+            version => bail!("unsupported sqlite store schema version: {version}"),
+        }
+        Ok(())
+    }
+
+    fn lock_connection(&self) -> MutexGuard<'_, Connection> {
+        self.connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn now_millis() -> Result<i64> {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system time is before unix epoch")?
+            .as_millis();
+        i64::try_from(millis).context("current timestamp does not fit in sqlite integer")
+    }
+}
