@@ -1,5 +1,6 @@
 use super::command::{Command, CommandOutput};
 use super::{Agent, AgentOutcome, AgentOutput, AgentRequest, AgentSessionUpdate};
+use crate::output::OutputEvent;
 use anyhow::Result;
 
 #[derive(Clone)]
@@ -45,13 +46,17 @@ where
 {
     async fn stdout(&mut self, chunk: &[u8]) -> Result<()> {
         self.output
-            .write(String::from_utf8_lossy(chunk).into_owned())
+            .write(OutputEvent::Answer {
+                text: String::from_utf8_lossy(chunk).into_owned(),
+            })
             .await
     }
 
     async fn stderr(&mut self, chunk: &[u8]) -> Result<()> {
         self.output
-            .write(String::from_utf8_lossy(chunk).into_owned())
+            .write(OutputEvent::Answer {
+                text: String::from_utf8_lossy(chunk).into_owned(),
+            })
             .await
     }
 }

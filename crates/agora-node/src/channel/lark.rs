@@ -1,4 +1,5 @@
 use crate::channel::{Channel, ChannelRun, ChannelRunContext, ChannelTask, RunEvent};
+use crate::output::OutputEvent;
 use agora_core::logger;
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
@@ -860,9 +861,15 @@ impl LarkAgentCard {
 
         match event {
             RunEvent::Started { .. } => {}
-            RunEvent::OutputChunk { text } => {
-                state.output.push_str(&text);
-            }
+            RunEvent::Output(event) => match event {
+                OutputEvent::Thinking { text } | OutputEvent::Answer { text } => {
+                    state.output.push_str(&text);
+                }
+                OutputEvent::Progress { text, .. } => {
+                    state.output.push_str(&text);
+                    state.output.push('\n');
+                }
+            },
             RunEvent::Completed { .. } => {
                 state.finished = true;
             }

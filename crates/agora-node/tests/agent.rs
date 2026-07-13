@@ -1,16 +1,29 @@
 use agora_node::agent::{AgentOutput, AgentSessionUpdate, AgentTask, ConfiguredAgent};
 use agora_node::config::{AgentCard, AgentConfig, AgentType, IsolateMode};
+use agora_node::output::OutputEvent;
 use anyhow::Result;
 
 #[derive(Default)]
 struct VecAgentOutput {
-    chunks: Vec<String>,
+    events: Vec<OutputEvent>,
 }
 
 impl AgentOutput for VecAgentOutput {
-    async fn write(&mut self, chunk: String) -> Result<()> {
-        self.chunks.push(chunk);
+    async fn write(&mut self, event: OutputEvent) -> Result<()> {
+        self.events.push(event);
         Ok(())
+    }
+}
+
+impl VecAgentOutput {
+    fn answer_text(&self) -> String {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                OutputEvent::Answer { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -79,17 +92,14 @@ async fn codex_agent_uses_the_session_supplied_by_its_caller() {
             "exec resume --json --model gpt-5.4 --config model_reasoning_effort=xhigh thread-123 -",
         ]
     );
+    assert!(first_output.events.iter().any(
+        |event| matches!(event, OutputEvent::Answer { text } if text.contains("hello from codex"))
+    ));
     assert!(
         first_output
-            .chunks
+            .events
             .iter()
-            .any(|chunk| chunk.contains("hello from codex"))
-    );
-    assert!(
-        first_output
-            .chunks
-            .iter()
-            .all(|chunk| !chunk.contains("thread.started"))
+            .all(|event| !format!("{event:?}").contains("thread.started"))
     );
 }
 
@@ -129,7 +139,7 @@ async fn codex_agent_reports_a_missing_session_without_persisting_it() {
         .unwrap();
 
     assert_eq!(outcome.session_update(), &AgentSessionUpdate::NotFound);
-    assert!(output.chunks.is_empty());
+    assert!(output.events.is_empty());
 }
 
 #[cfg(unix)]
@@ -170,7 +180,7 @@ async fn codex_agent_does_not_publish_backend_stderr() {
         .await
         .unwrap();
 
-    let output = output.chunks.concat();
+    let output = output.answer_text();
     assert!(output.contains("visible response"));
     assert!(!output.contains("codex_core::tools::router"));
 }
@@ -193,7 +203,7 @@ async fn custom_agent_streams_raw_command_output() {
 
     assert_eq!(outcome.exit_code(), 0);
     assert_eq!(outcome.session_update(), &AgentSessionUpdate::Unchanged);
-    assert_eq!(output.chunks.concat(), "hello from custom");
+    assert_eq!(output.answer_text(), "hello from custom");
     assert!(temp.path().exists());
 }
 

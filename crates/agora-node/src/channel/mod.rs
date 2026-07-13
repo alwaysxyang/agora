@@ -1,5 +1,6 @@
 use crate::channel::lark::{LarkAgentCard, LarkChannel, LarkMessageEvent};
 use crate::config::ChannelConfig;
+use crate::output::OutputEvent;
 use anyhow::Result;
 use std::future::Future;
 
@@ -123,7 +124,7 @@ impl Channel for ConfiguredChannel {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunEvent {
     Started { run_id: String },
-    OutputChunk { text: String },
+    Output(OutputEvent),
     Completed { exit_code: i32 },
     Failed { message: String },
 }

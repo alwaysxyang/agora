@@ -7,6 +7,7 @@ use agora_node::config::{
     AgentCard, AgentConfig, AgentSubscription, AgentType, ChannelConfig, IsolateMode, NodeConfig,
 };
 use agora_node::daemon::AgentDispatcher;
+use agora_node::output::OutputEvent;
 use agora_node::store::{SessionKey, SessionStore};
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
@@ -50,6 +51,7 @@ async fn opens_one_channel_run_for_each_agent() {
     let contexts = Arc::new(Mutex::new(Vec::new()));
     let channel = RecordingChannel {
         contexts: Arc::clone(&contexts),
+        events: Arc::new(Mutex::new(Vec::new())),
     };
     let dispatcher =
         AgentDispatcher::new(SessionStore::open(temp.path().join("store.db")).unwrap());
@@ -99,6 +101,7 @@ async fn persists_and_serializes_session_by_channel_and_agent() {
 
     let channel = RecordingChannel {
         contexts: Arc::new(Mutex::new(Vec::new())),
+        events: Arc::new(Mutex::new(Vec::new())),
     };
     let store = SessionStore::open(temp.path().join("store.db")).unwrap();
     let dispatcher = AgentDispatcher::new(store.clone());
@@ -175,6 +178,7 @@ async fn replaces_a_missing_agent_session_with_a_new_session() {
     let dispatcher = AgentDispatcher::new(store.clone());
     let channel = RecordingChannel {
         contexts: Arc::new(Mutex::new(Vec::new())),
+        events: Arc::new(Mutex::new(Vec::new())),
     };
     let agent = ConfiguredAgent::from_config(AgentConfig {
         name: "codex-dev".to_string(),
@@ -203,6 +207,36 @@ async fn replaces_a_missing_agent_session_with_a_new_session() {
         ]
     );
     assert_eq!(store.get(&key).unwrap().as_deref(), Some("thread-new"));
+}
+
+#[tokio::test]
+async fn forwards_structured_agent_output_to_the_channel_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let channel = RecordingChannel {
+        contexts: Arc::new(Mutex::new(Vec::new())),
+        events: Arc::clone(&events),
+    };
+    let dispatcher =
+        AgentDispatcher::new(SessionStore::open(temp.path().join("store.db")).unwrap());
+
+    dispatcher
+        .dispatch_channel_task(
+            &channel,
+            vec![ConfiguredAgent::from_config(custom_agent("custom")).unwrap()],
+            TestTask,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .contains(&RunEvent::Output(OutputEvent::Answer {
+                text: "hello".to_string(),
+            }))
+    );
 }
 
 fn agent(name: &str, channel: &str) -> AgentConfig {
@@ -254,16 +288,20 @@ impl ChannelTask for TestTask {
 }
 
 #[derive(Clone)]
-struct RecordingRun;
+struct RecordingRun {
+    events: Arc<Mutex<Vec<RunEvent>>>,
+}
 
 impl ChannelRun for RecordingRun {
-    async fn publish(&self, _event: RunEvent) -> Result<()> {
+    async fn publish(&self, event: RunEvent) -> Result<()> {
+        self.events.lock().unwrap().push(event);
         Ok(())
     }
 }
 
 struct RecordingChannel {
     contexts: Arc<Mutex<Vec<ChannelRunContext>>>,
+    events: Arc<Mutex<Vec<RunEvent>>>,
 }
 
 impl Channel for RecordingChannel {
@@ -280,6 +318,8 @@ impl Channel for RecordingChannel {
 
     async fn open_run(&self, _task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
         self.contexts.lock().unwrap().push(context);
-        Ok(RecordingRun)
+        Ok(RecordingRun {
+            events: Arc::clone(&self.events),
+        })
     }
 }

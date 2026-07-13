@@ -1,5 +1,6 @@
 use super::command::{Command, CommandOutput};
 use super::{Agent, AgentOutcome, AgentOutput, AgentRequest, AgentSessionUpdate};
+use crate::output::OutputEvent;
 use agora_core::logger;
 use anyhow::Result;
 use serde_json::Value;
@@ -174,7 +175,14 @@ where
     async fn handle_line(&mut self, line: &str) -> Result<()> {
         let event = match serde_json::from_str::<Value>(line) {
             Ok(event) => event,
-            Err(_) => return self.output.write(format!("{line}\n")).await,
+            Err(_) => {
+                return self
+                    .output
+                    .write(OutputEvent::Answer {
+                        text: format!("{line}\n"),
+                    })
+                    .await;
+            }
         };
 
         match event.get("type").and_then(Value::as_str) {
@@ -187,7 +195,11 @@ where
                 if event.pointer("/item/type").and_then(Value::as_str) == Some("agent_message") =>
             {
                 if let Some(text) = event.pointer("/item/text").and_then(Value::as_str) {
-                    self.output.write(format!("{text}\n")).await?;
+                    self.output
+                        .write(OutputEvent::Answer {
+                            text: format!("{text}\n"),
+                        })
+                        .await?;
                 }
             }
             Some("error") | Some("turn.failed") => {
@@ -196,7 +208,11 @@ where
                     .or_else(|| event.pointer("/error/message"))
                     .and_then(Value::as_str)
                     .unwrap_or("codex execution failed");
-                self.output.write(format!("{message}\n")).await?;
+                self.output
+                    .write(OutputEvent::Answer {
+                        text: format!("{message}\n"),
+                    })
+                    .await?;
             }
             _ => {}
         }

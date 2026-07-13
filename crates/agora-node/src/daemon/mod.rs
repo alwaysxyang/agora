@@ -5,6 +5,7 @@ use crate::channel::{
     Channel, ChannelAgent, ChannelRun, ChannelRunContext, ChannelTask, ConfiguredChannel, RunEvent,
 };
 use crate::config::NodeConfig;
+use crate::output::OutputEvent;
 use crate::store::{SessionKey, SessionStore};
 use agora_core::logger;
 use anyhow::{Result, bail};
@@ -249,9 +250,7 @@ impl<R> AgentOutput for AgentRunOutput<R>
 where
     R: ChannelRun + Send + Sync,
 {
-    async fn write(&mut self, chunk: String) -> Result<()> {
-        self.run
-            .publish(RunEvent::OutputChunk { text: chunk })
-            .await
+    async fn write(&mut self, event: OutputEvent) -> Result<()> {
+        self.run.publish(RunEvent::Output(event)).await
     }
 }

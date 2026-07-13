@@ -1,4 +1,5 @@
 use crate::config::{AgentConfig, AgentType};
+use crate::output::OutputEvent;
 use anyhow::{Result, anyhow};
 use std::future::Future;
 use std::path::PathBuf;
@@ -12,7 +13,7 @@ use codex::CodexAgent;
 use custom::CustomAgent;
 
 pub trait AgentOutput {
-    fn write(&mut self, chunk: String) -> impl Future<Output = Result<()>> + Send;
+    fn write(&mut self, event: OutputEvent) -> impl Future<Output = Result<()>> + Send;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
