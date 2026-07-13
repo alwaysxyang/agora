@@ -128,8 +128,8 @@ async fn persists_and_serializes_session_by_channel_and_agent() {
     assert_eq!(
         invocations.lines().collect::<Vec<_>>(),
         vec![
-            "exec --json --color never -",
-            "exec resume --json thread-123 -",
+            "exec --json --color never --config model_reasoning_summary=concise -",
+            "exec resume --json --config model_reasoning_summary=concise thread-123 -",
         ]
     );
     assert_eq!(
@@ -202,8 +202,8 @@ async fn replaces_a_missing_agent_session_with_a_new_session() {
     assert_eq!(
         invocations.lines().collect::<Vec<_>>(),
         vec![
-            "exec resume --json missing -",
-            "exec --json --color never -",
+            "exec resume --json --config model_reasoning_summary=concise missing -",
+            "exec --json --color never --config model_reasoning_summary=concise -",
         ]
     );
     assert_eq!(store.get(&key).unwrap().as_deref(), Some("thread-new"));

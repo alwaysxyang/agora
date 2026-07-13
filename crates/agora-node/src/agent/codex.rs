@@ -1,6 +1,6 @@
 use super::command::{Command, CommandOutput};
 use super::{Agent, AgentOutcome, AgentOutput, AgentRequest, AgentSessionUpdate};
-use crate::output::OutputEvent;
+use crate::output::{OutputEvent, ProgressStatus};
 use agora_core::logger;
 use anyhow::Result;
 use serde_json::Value;
@@ -67,6 +67,8 @@ impl CodexAgent {
             args.push("--config".to_string());
             args.push(format!("model_reasoning_effort={effort}"));
         }
+        args.push("--config".to_string());
+        args.push("model_reasoning_summary=concise".to_string());
     }
 }
 
@@ -100,6 +102,7 @@ struct CodexCommandOutput<'a, O> {
     stdout_buffer: Vec<u8>,
     stderr_buffer: Vec<u8>,
     session_id: Option<String>,
+    pending_message: Option<PendingAgentMessage>,
     resume_requested: bool,
     session_not_found: bool,
 }
@@ -115,6 +118,7 @@ where
             stdout_buffer: Vec::new(),
             stderr_buffer: Vec::new(),
             session_id: None,
+            pending_message: None,
             resume_requested,
             session_not_found: false,
         }
@@ -172,6 +176,165 @@ where
             || message.contains("thread not found")
     }
 
+    async fn publish_pending_message(&mut self, final_answer: bool) -> Result<()> {
+        let Some(message) = self.pending_message.take() else {
+            return Ok(());
+        };
+        let event = if final_answer {
+            OutputEvent::Answer { text: message.text }
+        } else {
+            OutputEvent::Progress {
+                id: message.id,
+                text: Self::concise(&message.text, 240),
+                status: ProgressStatus::Completed,
+            }
+        };
+        self.output.write(event).await
+    }
+
+    async fn handle_item(&mut self, event_type: &str, item: &Value) -> Result<()> {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if item_type == "agent_message" && event_type == "item.completed" {
+            self.publish_pending_message(false).await?;
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                self.pending_message = Some(PendingAgentMessage {
+                    id: item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("agent-message")
+                        .to_string(),
+                    text: text.to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        self.publish_pending_message(false).await?;
+        match item_type {
+            "reasoning" if event_type == "item.completed" => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    let text = Self::concise(text, 600);
+                    if !text.is_empty() {
+                        self.output.write(OutputEvent::Thinking { text }).await?;
+                    }
+                }
+            }
+            "command_execution" => {
+                let command = item
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("command");
+                self.publish_progress(
+                    item,
+                    format!("Run `{}`", Self::concise(&command.replace('`', "'"), 160)),
+                    Self::progress_status(event_type, item),
+                )
+                .await?;
+            }
+            "file_change" => {
+                let count = item
+                    .get("changes")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                self.publish_progress(
+                    item,
+                    format!("Changed {count} file(s)"),
+                    Self::progress_status(event_type, item),
+                )
+                .await?;
+            }
+            "todo_list" => {
+                let items = item
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let completed = items
+                    .iter()
+                    .filter(|item| {
+                        item.get("completed")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                    .count();
+                self.publish_progress(
+                    item,
+                    format!("Plan progress: {completed}/{}", items.len()),
+                    Self::progress_status(event_type, item),
+                )
+                .await?;
+            }
+            "mcp_tool_call" => {
+                let server = item.get("server").and_then(Value::as_str).unwrap_or("mcp");
+                let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                self.publish_progress(
+                    item,
+                    format!("Call `{server}/{tool}`"),
+                    Self::progress_status(event_type, item),
+                )
+                .await?;
+            }
+            "web_search" => {
+                let query = item
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or("web search");
+                self.publish_progress(
+                    item,
+                    format!("Search `{}`", Self::concise(&query.replace('`', "'"), 160)),
+                    Self::progress_status(event_type, item),
+                )
+                .await?;
+            }
+            "error" => {
+                let message = item
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("codex item failed");
+                self.publish_progress(item, message.to_string(), ProgressStatus::Failed)
+                    .await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn publish_progress(
+        &mut self,
+        item: &Value,
+        text: String,
+        status: ProgressStatus,
+    ) -> Result<()> {
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("codex-progress")
+            .to_string();
+        self.output
+            .write(OutputEvent::Progress { id, text, status })
+            .await
+    }
+
+    fn progress_status(event_type: &str, item: &Value) -> ProgressStatus {
+        match item.get("status").and_then(Value::as_str) {
+            Some("completed") => ProgressStatus::Completed,
+            Some("failed" | "declined") => ProgressStatus::Failed,
+            Some("in_progress") => ProgressStatus::Running,
+            _ if event_type == "item.completed" => ProgressStatus::Completed,
+            _ => ProgressStatus::Running,
+        }
+    }
+
+    fn concise(text: &str, max_chars: usize) -> String {
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.chars().count() <= max_chars {
+            return normalized;
+        }
+        let mut result = normalized.chars().take(max_chars).collect::<String>();
+        result.push_str("...");
+        result
+    }
+
     async fn handle_line(&mut self, line: &str) -> Result<()> {
         let event = match serde_json::from_str::<Value>(line) {
             Ok(event) => event,
@@ -191,18 +354,16 @@ where
                     self.session_id = Some(thread_id.to_string());
                 }
             }
-            Some("item.completed")
-                if event.pointer("/item/type").and_then(Value::as_str) == Some("agent_message") =>
-            {
-                if let Some(text) = event.pointer("/item/text").and_then(Value::as_str) {
-                    self.output
-                        .write(OutputEvent::Answer {
-                            text: format!("{text}\n"),
-                        })
-                        .await?;
+            Some(event_type @ ("item.started" | "item.updated" | "item.completed")) => {
+                if let Some(item) = event.get("item") {
+                    self.handle_item(event_type, item).await?;
                 }
             }
+            Some("turn.completed") => {
+                self.publish_pending_message(true).await?;
+            }
             Some("error") | Some("turn.failed") => {
+                self.publish_pending_message(false).await?;
                 let message = event
                     .get("message")
                     .or_else(|| event.pointer("/error/message"))
@@ -210,7 +371,7 @@ where
                     .unwrap_or("codex execution failed");
                 self.output
                     .write(OutputEvent::Answer {
-                        text: format!("{message}\n"),
+                        text: message.to_string(),
                     })
                     .await?;
             }
@@ -218,6 +379,11 @@ where
         }
         Ok(())
     }
+}
+
+struct PendingAgentMessage {
+    id: String,
+    text: String,
 }
 
 impl<O> CommandOutput for CodexCommandOutput<'_, O>
@@ -235,6 +401,7 @@ where
 
     async fn finish(&mut self) -> Result<()> {
         self.flush_stdout().await?;
+        self.publish_pending_message(true).await?;
         self.flush_stderr().await
     }
 }

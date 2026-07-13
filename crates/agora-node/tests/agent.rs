@@ -1,6 +1,6 @@
 use agora_node::agent::{AgentOutput, AgentSessionUpdate, AgentTask, ConfiguredAgent};
 use agora_node::config::{AgentCard, AgentConfig, AgentType, IsolateMode};
-use agora_node::output::OutputEvent;
+use agora_node::output::{OutputEvent, ProgressStatus};
 use anyhow::Result;
 
 #[derive(Default)]
@@ -88,8 +88,8 @@ async fn codex_agent_uses_the_session_supplied_by_its_caller() {
     assert_eq!(
         invocations.lines().collect::<Vec<_>>(),
         vec![
-            "exec --json --color never --model gpt-5.4 --config model_reasoning_effort=xhigh -",
-            "exec resume --json --model gpt-5.4 --config model_reasoning_effort=xhigh thread-123 -",
+            "exec --json --color never --model gpt-5.4 --config model_reasoning_effort=xhigh --config model_reasoning_summary=concise -",
+            "exec resume --json --model gpt-5.4 --config model_reasoning_effort=xhigh --config model_reasoning_summary=concise thread-123 -",
         ]
     );
     assert!(first_output.events.iter().any(
@@ -100,6 +100,80 @@ async fn codex_agent_uses_the_session_supplied_by_its_caller() {
             .events
             .iter()
             .all(|event| !format!("{event:?}").contains("thread.started"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_agent_classifies_thinking_progress_and_final_answer() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("codex");
+    std::fs::write(
+        &script,
+        concat!(
+            "#!/bin/sh\n",
+            "cat >/dev/null\n",
+            "printf '%s\\n' ",
+            "'{\"type\":\"thread.started\",\"thread_id\":\"thread-123\"}'\n",
+            "printf '%s\\n' ",
+            "'{\"type\":\"item.completed\",\"item\":{\"id\":\"msg-0\",\"type\":\"agent_message\",\"text\":\"I will inspect the channel path\"}}'\n",
+            "printf '%s\\n' ",
+            "'{\"type\":\"item.completed\",\"item\":{\"id\":\"reason-1\",\"type\":\"reasoning\",\"text\":\"Inspecting the channel path\"}}'\n",
+            "printf '%s\\n' ",
+            "'{\"type\":\"item.started\",\"item\":{\"id\":\"cmd-1\",\"type\":\"command_execution\",\"command\":\"cargo test\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}}'\n",
+            "printf '%s\\n' ",
+            "'{\"type\":\"item.completed\",\"item\":{\"id\":\"cmd-1\",\"type\":\"command_execution\",\"command\":\"cargo test\",\"aggregated_output\":\"ok\",\"exit_code\":0,\"status\":\"completed\"}}'\n",
+            "printf '%s\\n' ",
+            "'{\"type\":\"item.completed\",\"item\":{\"id\":\"msg-1\",\"type\":\"agent_message\",\"text\":\"All checks passed\"}}'\n",
+            "printf '%s\\n' ",
+            "'{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"cached_input_tokens\":0,\"output_tokens\":1,\"reasoning_output_tokens\":1}}'\n",
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let agent =
+        ConfiguredAgent::from_config(agent(AgentType::Codex, &script, temp.path())).unwrap();
+    let mut output = VecAgentOutput::default();
+
+    agent
+        .run(
+            AgentTask::new("task-1", "session-1", "hello"),
+            None,
+            &mut output,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        output.events,
+        vec![
+            OutputEvent::Progress {
+                id: "msg-0".to_string(),
+                text: "I will inspect the channel path".to_string(),
+                status: ProgressStatus::Completed,
+            },
+            OutputEvent::Thinking {
+                text: "Inspecting the channel path".to_string(),
+            },
+            OutputEvent::Progress {
+                id: "cmd-1".to_string(),
+                text: "Run `cargo test`".to_string(),
+                status: ProgressStatus::Running,
+            },
+            OutputEvent::Progress {
+                id: "cmd-1".to_string(),
+                text: "Run `cargo test`".to_string(),
+                status: ProgressStatus::Completed,
+            },
+            OutputEvent::Answer {
+                text: "All checks passed".to_string(),
+            },
+        ]
     );
 }
 
