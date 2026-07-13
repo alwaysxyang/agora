@@ -41,8 +41,7 @@ fn parses_lark_message_receive_event_payload() {
     assert_eq!(event.message_id, "om_123");
     assert_eq!(event.session_id(), "oc_123");
     assert_eq!(event.input(), "run tests");
-    assert_eq!(event.reply_target().receive_id_type, "chat_id");
-    assert_eq!(event.reply_target().receive_id, "oc_123");
+    assert_eq!(event.reply_target().message_id, "om_123");
 }
 
 #[test]
@@ -161,4 +160,14 @@ fn lark_card_body_does_not_repeat_run_status() {
     assert!(!source.contains("Run `{}` started."));
     assert!(!source.contains("Completed with exit code"));
     assert!(!source.contains("Waiting for output."));
+}
+
+#[test]
+fn lark_card_uses_the_message_reply_api() {
+    let source =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/channel/lark.rs"))
+            .unwrap();
+
+    assert!(source.contains("/open-apis/im/v1/messages/{}/reply"));
+    assert!(!source.contains("receive_id_type"));
 }

@@ -1,5 +1,4 @@
-use crate::channel::{Channel, ChannelRun, ChannelRunContext, ChannelTask, RunEvent};
-use crate::output::OutputEvent;
+use crate::channel::{Channel, ChannelRunContext, ChannelTask};
 use agora_core::logger;
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
@@ -8,16 +7,14 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 
 const LARK_OPENAPI: &str = "https://open.feishu.cn";
 const LARK_WS_ENDPOINT_PATH: &str = "/callback/ws/endpoint";
-const MAX_CARD_CONTENT_BYTES: usize = 24 * 1024;
 const LARK_FRAME_TYPE_CONTROL: i32 = 0;
 const LARK_FRAME_TYPE_DATA: i32 = 1;
 const LARK_MESSAGE_TYPE_EVENT: &str = "event";
@@ -30,6 +27,10 @@ const LARK_HTTP_IDLE_TIMEOUT_SECONDS: u64 = 300;
 const LARK_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 10;
 const LARK_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 60;
 
+pub(crate) mod card;
+
+pub use card::LarkAgentCard;
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct LarkChannelConfig {
     pub name: String,
@@ -39,8 +40,7 @@ pub struct LarkChannelConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LarkReplyTarget {
-    pub receive_id_type: String,
-    pub receive_id: String,
+    pub message_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -120,8 +120,7 @@ impl LarkMessageEvent {
 
     pub fn reply_target(&self) -> LarkReplyTarget {
         LarkReplyTarget {
-            receive_id_type: "chat_id".to_string(),
-            receive_id: self.chat_id.clone(),
+            message_id: self.message_id.clone(),
         }
     }
 
@@ -658,7 +657,7 @@ impl LarkApi {
         response.into_result()
     }
 
-    async fn send_card(
+    async fn reply_card(
         &self,
         token: &str,
         target: &LarkReplyTarget,
@@ -666,13 +665,15 @@ impl LarkApi {
     ) -> Result<String> {
         let response = self
             .client
-            .post(format!("{}/open-apis/im/v1/messages", self.base_url))
+            .post(format!(
+                "{}/open-apis/im/v1/messages/{}/reply",
+                self.base_url, target.message_id
+            ))
             .bearer_auth(token)
-            .query(&[("receive_id_type", target.receive_id_type.as_str())])
-            .json(&SendCardRequest {
-                receive_id: target.receive_id.as_str(),
+            .json(&ReplyCardRequest {
                 msg_type: "interactive",
                 content: serde_json::to_string(card)?,
+                reply_in_thread: false,
             })
             .send()
             .await?
@@ -719,10 +720,10 @@ impl TenantTokenResponse {
 }
 
 #[derive(Serialize)]
-struct SendCardRequest<'a> {
-    receive_id: &'a str,
+struct ReplyCardRequest<'a> {
     msg_type: &'a str,
     content: String,
+    reply_in_thread: bool,
 }
 
 #[derive(Deserialize)]
@@ -744,7 +745,7 @@ impl SendCardResponse {
                 .map(|data| data.message_id)
                 .ok_or_else(|| anyhow!("lark response missing message_id"))
         } else {
-            Err(anyhow!("lark send card failed: {}", self.msg))
+            Err(anyhow!("lark reply card failed: {}", self.msg))
         }
     }
 }
@@ -767,149 +768,5 @@ impl LarkEmptyResponse {
         } else {
             Err(anyhow!("lark patch card failed: {}", self.msg))
         }
-    }
-}
-
-pub struct LarkAgentCard {
-    inner: Arc<LarkAgentCardInner>,
-}
-
-impl Clone for LarkAgentCard {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-struct LarkAgentCardInner {
-    target: LarkReplyTarget,
-    api: LarkApi,
-    state: Mutex<LarkAgentCardState>,
-}
-
-struct LarkAgentCardState {
-    token: Option<String>,
-    message_id: Option<String>,
-    agent_name: String,
-    output: String,
-    finished: bool,
-    failed: bool,
-}
-
-impl LarkAgentCardState {
-    fn build_card(&self) -> Value {
-        let mut card = json!({
-            "config": { "update_multi": true },
-            "header": {
-                "template": if self.failed { "red" } else if self.finished { "green" } else { "blue" },
-                "title": {
-                    "tag": "plain_text",
-                    "content": if self.finished {
-                        format!("{} completed", self.agent_name)
-                    } else {
-                        format!("{} is running", self.agent_name)
-                    }
-                }
-            }
-        });
-        if !self.output.is_empty() {
-            card["elements"] = json!([{
-                "tag": "markdown",
-                "content": Self::truncate_output(&self.output)
-            }]);
-        }
-        card
-    }
-
-    fn truncate_output(output: &str) -> String {
-        if output.len() <= MAX_CARD_CONTENT_BYTES {
-            return output.to_string();
-        }
-        let marker = "[output truncated]\n\n";
-        let budget = MAX_CARD_CONTENT_BYTES.saturating_sub(marker.len());
-        let mut start = output.len().saturating_sub(budget);
-        while !output.is_char_boundary(start) {
-            start += 1;
-        }
-        format!("{}{}", marker, &output[start..])
-    }
-}
-
-impl LarkAgentCard {
-    pub fn new(target: LarkReplyTarget, agent_name: String, api: LarkApi) -> Self {
-        Self {
-            inner: Arc::new(LarkAgentCardInner {
-                target,
-                api,
-                state: Mutex::new(LarkAgentCardState {
-                    token: None,
-                    message_id: None,
-                    agent_name,
-                    output: String::new(),
-                    finished: false,
-                    failed: false,
-                }),
-            }),
-        }
-    }
-}
-
-impl LarkAgentCard {
-    async fn publish_event(&self, event: RunEvent) -> Result<()> {
-        let mut state = self.inner.state.lock().await;
-
-        match event {
-            RunEvent::Started { .. } => {}
-            RunEvent::Output(event) => match event {
-                OutputEvent::Thinking { text } | OutputEvent::Answer { text } => {
-                    state.output.push_str(&text);
-                }
-                OutputEvent::Progress { text, .. } => {
-                    state.output.push_str(&text);
-                    state.output.push('\n');
-                }
-            },
-            RunEvent::Completed { .. } => {
-                state.finished = true;
-            }
-            RunEvent::Failed { message } => {
-                state.finished = true;
-                state.failed = true;
-                if !state.output.is_empty() {
-                    state.output.push_str("\n\n");
-                }
-                state
-                    .output
-                    .push_str(format!("Failed: `{}`.", message).as_str());
-            }
-        }
-
-        if state.token.is_none() {
-            state.token = Some(self.inner.api.tenant_access_token().await?);
-        }
-        let token = state
-            .token
-            .as_deref()
-            .ok_or_else(|| anyhow!("lark tenant token initialization failed"))?;
-        let card = state.build_card();
-
-        if let Some(message_id) = state.message_id.as_deref() {
-            self.inner.api.patch_card(token, message_id, &card).await
-        } else {
-            state.message_id = Some(
-                self.inner
-                    .api
-                    .send_card(token, &self.inner.target, &card)
-                    .await?,
-            );
-            Ok(())
-        }
-    }
-}
-
-impl ChannelRun for LarkAgentCard {
-    async fn publish(&self, event: RunEvent) -> Result<()> {
-        self.publish_event(event).await
     }
 }
