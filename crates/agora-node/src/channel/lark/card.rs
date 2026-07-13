@@ -1,15 +1,18 @@
 use super::{LarkApi, LarkReplyTarget};
 use crate::channel::{ChannelRun, RunEvent};
 use crate::output::{OutputEvent, ProgressStatus};
+use agora_core::logger;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 const MAX_THINKING_ENTRIES: usize = 3;
 const MAX_PROGRESS_ENTRIES: usize = 5;
 const MAX_ANSWER_BYTES: usize = 20 * 1024;
+const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 
 pub struct LarkAgentCard {
     inner: Arc<LarkAgentCardInner>,
@@ -33,6 +36,10 @@ struct LarkAgentCardState {
     token: Option<String>,
     message_id: Option<String>,
     content: LarkCardContent,
+    version: u64,
+    sent_version: u64,
+    last_update: Option<Instant>,
+    flush_scheduled: bool,
 }
 
 pub(crate) struct LarkCardContent {
@@ -204,7 +211,7 @@ impl LarkCardContent {
 }
 
 impl LarkAgentCard {
-    pub(super) fn new(target: LarkReplyTarget, agent_name: String, api: LarkApi) -> Self {
+    pub(crate) fn new(target: LarkReplyTarget, agent_name: String, api: LarkApi) -> Self {
         Self {
             inner: Arc::new(LarkAgentCardInner {
                 target,
@@ -213,39 +220,100 @@ impl LarkAgentCard {
                     token: None,
                     message_id: None,
                     content: LarkCardContent::new(agent_name),
+                    version: 0,
+                    sent_version: 0,
+                    last_update: None,
+                    flush_scheduled: false,
                 }),
             }),
         }
     }
 
     async fn publish_event(&self, event: RunEvent) -> Result<()> {
-        let mut state = self.inner.state.lock().await;
-        match event {
-            RunEvent::Started { .. } => {}
-            RunEvent::Output(event) => state.content.apply_output(event),
-            RunEvent::Completed { .. } => state.content.complete(),
-            RunEvent::Failed { message } => state.content.fail(message),
-        }
+        let flush_now = {
+            let mut state = self.inner.state.lock().await;
+            let flush_now = match event {
+                RunEvent::Started { .. } => true,
+                RunEvent::Output(event) => {
+                    state.content.apply_output(event);
+                    false
+                }
+                RunEvent::Completed { .. } => {
+                    state.content.complete();
+                    true
+                }
+                RunEvent::Failed { message } => {
+                    state.content.fail(message);
+                    true
+                }
+            };
+            state.version = state.version.saturating_add(1);
+            if !flush_now && !state.flush_scheduled {
+                state.flush_scheduled = true;
+                let delay = state
+                    .last_update
+                    .map(|last_update| CARD_UPDATE_INTERVAL.saturating_sub(last_update.elapsed()))
+                    .unwrap_or_default();
+                self.schedule_flush(delay);
+            }
+            flush_now
+        };
 
+        if flush_now {
+            self.flush_latest().await
+        } else {
+            Ok(())
+        }
+    }
+
+    fn schedule_flush(&self, delay: Duration) {
+        let card = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            {
+                let mut state = card.inner.state.lock().await;
+                state.flush_scheduled = false;
+            }
+            if let Err(err) = card.flush_latest().await {
+                logger::error!(
+                    "lark card update failed source_message_id={} error={}",
+                    card.inner.target.message_id,
+                    err
+                );
+            }
+        });
+    }
+
+    async fn flush_latest(&self) -> Result<()> {
+        let mut state = self.inner.state.lock().await;
+        if state.version == state.sent_version {
+            return Ok(());
+        }
         if state.token.is_none() {
             state.token = Some(self.inner.api.tenant_access_token().await?);
         }
         let token = state
             .token
-            .as_deref()
+            .clone()
             .ok_or_else(|| anyhow!("lark tenant token initialization failed"))?;
         let card = state.content.build_card();
-        if let Some(message_id) = state.message_id.as_deref() {
-            self.inner.api.patch_card(token, message_id, &card).await
+        let version = state.version;
+        if let Some(message_id) = state.message_id.clone() {
+            self.inner
+                .api
+                .patch_card(&token, &message_id, &card)
+                .await?;
         } else {
             state.message_id = Some(
                 self.inner
                     .api
-                    .reply_card(token, &self.inner.target, &card)
+                    .reply_card(&token, &self.inner.target, &card)
                     .await?,
             );
-            Ok(())
         }
+        state.sent_version = version;
+        state.last_update = Some(Instant::now());
+        Ok(())
     }
 }
 

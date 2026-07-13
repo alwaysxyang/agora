@@ -630,12 +630,16 @@ pub struct LarkApi {
 
 impl LarkApi {
     pub fn new(config: LarkChannelConfig) -> Result<Self> {
+        Self::with_base_url(config, LARK_OPENAPI.to_string())
+    }
+
+    pub(crate) fn with_base_url(config: LarkChannelConfig, base_url: String) -> Result<Self> {
         Ok(Self {
             name: config.name,
             appid: config.appid,
             secret: config.secret,
             client: Self::http_client()?,
-            base_url: LARK_OPENAPI.to_string(),
+            base_url,
         })
     }
 
