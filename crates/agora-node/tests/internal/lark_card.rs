@@ -1,13 +1,183 @@
-use crate::channel::lark::card::{LarkAgentCard, LarkCardContent};
-use crate::channel::lark::{LarkApi, LarkChannelConfig, LarkReplyTarget};
+use super::LarkReplyTarget;
+use super::card::{LarkAgentCard, LarkCardContent};
+use super::lark_api::LarkApi;
 use crate::channel::{ChannelRun, RunEvent};
-use crate::output::{OutputEvent, ProgressStatus};
+use crate::config::LarkChannelConfig;
+use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
+
+#[test]
+fn lark_card_uses_json_v2_for_standard_markdown() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.apply_output(OutputEvent::Thinking {
+        text: "Inspecting the channel".to_string(),
+    });
+
+    let card = content.build_card();
+
+    assert_eq!(
+        card.pointer("/schema").and_then(|v| v.as_str()),
+        Some("2.0")
+    );
+    assert!(card.get("elements").is_none());
+    assert!(card.pointer("/config/wide_screen_mode").is_none());
+    assert_eq!(
+        card.pointer("/body/elements/0/tag").unwrap(),
+        "collapsible_panel"
+    );
+    assert_eq!(
+        card.pointer("/body/elements/0/elements/0/content")
+            .and_then(|v| v.as_str()),
+        Some("> • Inspecting the channel")
+    );
+}
+
+#[test]
+fn lark_card_collapses_thinking_and_expands_running_progress() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.apply_output(OutputEvent::Thinking {
+        text: "Inspecting the channel".to_string(),
+    });
+    content.apply_output(OutputEvent::Progress {
+        id: "command-1".to_string(),
+        text: "Run `cargo test`".to_string(),
+        status: ProgressStatus::Running,
+    });
+
+    let card = content.build_card();
+    let thinking = card.pointer("/body/elements/0").unwrap();
+    let progress = card.pointer("/body/elements/1").unwrap();
+
+    assert_eq!(thinking["tag"], "collapsible_panel");
+    assert_eq!(thinking["expanded"], false);
+    assert_eq!(thinking["background_color"], "grey-50");
+    assert_eq!(thinking.pointer("/border/color").unwrap(), "grey-200");
+    assert_eq!(thinking.pointer("/border/corner_radius").unwrap(), "8px");
+    assert!(thinking.pointer("/header/background_color").is_none());
+    assert_eq!(thinking["padding"], "2px 12px 10px 12px");
+    assert_eq!(
+        thinking.pointer("/header/padding").unwrap(),
+        "8px 12px 8px 12px"
+    );
+    assert_eq!(
+        thinking.pointer("/header/title/content").unwrap(),
+        "**Thinking**  <font color='grey'>· 1 update</font>"
+    );
+    assert_eq!(progress["tag"], "collapsible_panel");
+    assert_eq!(progress["expanded"], true);
+    assert_eq!(progress["background_color"], "grey-50");
+    assert_eq!(progress.pointer("/border/color").unwrap(), "grey-200");
+    assert_eq!(progress.pointer("/border/corner_radius").unwrap(), "8px");
+    assert_eq!(
+        progress.pointer("/elements/0/content").unwrap(),
+        "<font color='blue'>●</font>  Run `cargo test`"
+    );
+    assert_eq!(
+        progress.pointer("/header/title/content").unwrap(),
+        "**Progress**  <font color='grey'>·</font> <font color='blue'>●</font> <font color='grey'>1 running</font>"
+    );
+}
+
+#[test]
+fn lark_card_collapses_progress_after_completion() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.apply_output(OutputEvent::Progress {
+        id: "command-1".to_string(),
+        text: "Run `cargo test`".to_string(),
+        status: ProgressStatus::Completed,
+    });
+    content.complete();
+
+    let card = content.build_card();
+    let progress = card.pointer("/body/elements/0").unwrap();
+
+    assert_eq!(progress["tag"], "collapsible_panel");
+    assert_eq!(progress["expanded"], false);
+    assert_eq!(
+        progress.pointer("/header/title/content").unwrap(),
+        "**Progress**  <font color='grey'>·</font> <font color='green'>✓</font> <font color='grey'>1 completed</font>"
+    );
+}
+
+#[test]
+fn lark_card_progress_summary_shows_completed_and_failed_statuses() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    for index in 0..2 {
+        content.apply_output(OutputEvent::Progress {
+            id: format!("completed-{index}"),
+            text: format!("Completed {index}"),
+            status: ProgressStatus::Completed,
+        });
+    }
+    content.apply_output(OutputEvent::Progress {
+        id: "failed-1".to_string(),
+        text: "Failed 1".to_string(),
+        status: ProgressStatus::Failed,
+    });
+    content.complete();
+
+    let card = content.build_card();
+    let progress = card.pointer("/body/elements/0").unwrap();
+
+    assert_eq!(
+        progress.pointer("/header/title/content").unwrap(),
+        "**Progress**  <font color='grey'>·</font> <font color='green'>✓</font> <font color='grey'>2 completed</font> · <font color='red'>×</font> <font color='grey'>1 failed</font>"
+    );
+}
+
+#[test]
+fn lark_card_failure_shows_safe_summary_and_collapsed_details() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.fail("agent process exited with code 1; Authorization: Bearer top-secret".to_string());
+
+    let card = content.build_card();
+    let rendered = serde_json::to_string(&card).unwrap();
+    let details = card.pointer("/body/elements/1").unwrap();
+
+    assert_eq!(
+        card.pointer("/header/text_tag_list/0/text/content")
+            .and_then(serde_json::Value::as_str),
+        Some("Failed")
+    );
+    assert!(rendered.contains("<font color='red'>▌</font> **Run failed**"));
+    assert!(rendered.contains("Agent 进程在完成任务前退出。"));
+    assert!(rendered.contains("建议：请重试"));
+    assert!(!rendered.contains("Authorization"));
+    assert!(!rendered.contains("top-secret"));
+    assert_eq!(details["tag"], "collapsible_panel");
+    assert_eq!(details["expanded"], false);
+    assert_eq!(
+        details.pointer("/header/title/content").unwrap(),
+        "**Technical details**  <font color='grey'>· Process exit</font>"
+    );
+    assert_eq!(
+        details.pointer("/elements/0/content").unwrap(),
+        "完整错误已写入 daemon 日志。"
+    );
+}
+
+#[test]
+fn lark_card_labels_an_answer_as_partial_when_the_run_fails() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.apply_output(OutputEvent::Answer {
+        text: "Work completed before the error.".to_string(),
+    });
+    content.fail("agent process exited with code 1".to_string());
+
+    let rendered = serde_json::to_string(&content.build_card()).unwrap();
+    let failure_index = rendered.find("**Run failed**").unwrap();
+    let answer_index = rendered.find("**Partial answer**").unwrap();
+
+    assert!(failure_index < answer_index);
+    assert!(rendered.contains("<font color='blue'>▌</font> **Partial answer**"));
+    assert!(!rendered.contains("**Final answer**"));
+    assert!(rendered.contains("Work completed before the error."));
+}
 
 #[test]
 fn lark_card_separates_thinking_progress_and_final_answer() {
@@ -43,11 +213,11 @@ fn lark_card_separates_thinking_progress_and_final_answer() {
     );
     let rendered = serde_json::to_string(&card).unwrap();
     assert!(rendered.contains("**Thinking**"));
-    assert!(rendered.contains("> Inspecting the channel"));
-    assert!(rendered.contains("> Checking reply delivery"));
+    assert!(rendered.contains("> • Inspecting the channel"));
+    assert!(rendered.contains("> • Checking reply delivery"));
     assert!(rendered.contains("**Progress**"));
-    assert!(rendered.contains("**Done**  Run `cargo test`"));
-    assert!(rendered.contains("**Final answer**"));
+    assert!(rendered.contains("<font color='green'>✓</font>  Run `cargo test`"));
+    assert!(rendered.contains("<font color='blue'>▌</font> **Final answer**"));
     assert!(rendered.contains("The Lark path is ready."));
     assert!(!rendered.contains("正在等待 Agent 输出"));
     assert_eq!(rendered.matches("Run `cargo test`").count(), 1);
@@ -63,7 +233,27 @@ fn lark_card_shows_a_placeholder_before_agent_output() {
 }
 
 #[test]
-fn lark_card_keeps_only_the_five_latest_progress_entries() {
+fn lark_card_keeps_all_thinking_updates_with_latest_first() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    for index in 0..5 {
+        content.apply_output(OutputEvent::Thinking {
+            text: format!("Thinking {index}"),
+        });
+    }
+
+    let card = content.build_card();
+    let rendered = card
+        .pointer("/body/elements/0/elements/0/content")
+        .and_then(|value| value.as_str())
+        .unwrap();
+    assert_eq!(
+        rendered,
+        "> • Thinking 4\n> • Thinking 3\n> • Thinking 2\n> • Thinking 1\n> • Thinking 0"
+    );
+}
+
+#[test]
+fn lark_card_keeps_all_progress_entries_with_latest_first() {
     let mut content = LarkCardContent::new("codex-dev".to_string());
     for index in 0..6 {
         content.apply_output(OutputEvent::Progress {
@@ -73,11 +263,60 @@ fn lark_card_keeps_only_the_five_latest_progress_entries() {
         });
     }
 
-    let rendered = serde_json::to_string(&content.build_card()).unwrap();
-    assert!(!rendered.contains("Progress 0"));
-    for index in 1..6 {
-        assert!(rendered.contains(format!("Progress {index}").as_str()));
-    }
+    let card = content.build_card();
+    let rendered = card
+        .pointer("/body/elements/0/elements/0/content")
+        .and_then(|value| value.as_str())
+        .unwrap();
+    assert_eq!(
+        rendered,
+        "<font color='green'>✓</font>  Progress 5\n<font color='green'>✓</font>  Progress 4\n<font color='green'>✓</font>  Progress 3\n<font color='green'>✓</font>  Progress 2\n<font color='green'>✓</font>  Progress 1\n<font color='green'>✓</font>  Progress 0"
+    );
+}
+
+#[test]
+fn lark_card_renders_token_usage_without_a_heading() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.apply_output(OutputEvent::Answer {
+        text: "All checks passed.".to_string(),
+    });
+    content.apply_output(OutputEvent::Usage(TokenUsage {
+        input_tokens: 42_800,
+        cached_input_tokens: 31_600,
+        output_tokens: 3_200,
+        reasoning_output_tokens: 1_900,
+    }));
+
+    content.complete();
+    let card = content.build_card();
+    let rendered = serde_json::to_string(&card).unwrap();
+    assert!(rendered.contains("All checks passed."));
+    assert!(!rendered.contains("Usage"));
+    let elements = card
+        .pointer("/body/elements")
+        .and_then(|value| value.as_array())
+        .unwrap();
+    assert_eq!(elements[elements.len() - 2]["tag"], "hr");
+    let usage = elements.last().unwrap();
+    assert_eq!(usage["tag"], "column_set");
+    let columns = usage["columns"].as_array().unwrap();
+    assert_eq!(columns.len(), 4);
+    assert_eq!(
+        columns[0].pointer("/elements/0/content").unwrap(),
+        "<font color='grey'>Total</font>\n**46.0K**\n<font color='grey'>tokens</font>"
+    );
+    assert_eq!(
+        columns[1].pointer("/elements/0/content").unwrap(),
+        "<font color='grey'>Input</font>\n**42.8K**\n<font color='grey'>31.6K cached</font>"
+    );
+    assert_eq!(
+        columns[2].pointer("/elements/0/content").unwrap(),
+        "<font color='grey'>Output</font>\n**3.2K**\n<font color='grey'>tokens</font>"
+    );
+    assert_eq!(
+        columns[3].pointer("/elements/0/content").unwrap(),
+        "<font color='grey'>Reasoning</font>\n**1.9K**\n<font color='grey'>of output</font>"
+    );
 }
 
 #[tokio::test]
@@ -86,7 +325,7 @@ async fn lark_card_coalesces_intermediate_updates_and_flushes_completion() {
     let api = LarkApi::with_base_url(
         LarkChannelConfig {
             name: "lark-test".to_string(),
-            appid: "app-id".to_string(),
+            app_id: "app-id".to_string(),
             secret: "secret".to_string(),
         },
         server.base_url(),

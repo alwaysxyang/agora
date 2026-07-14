@@ -18,7 +18,7 @@ const CONFIG_HELP: &str = r#"CONFIGURATION FILE (JSON)
   Lark channel fields:
     type                     Channel type; use "lark".
     name                     Unique channel name referenced by subscriptions.
-    appid                    Lark application ID.
+    app_id                   Lark application ID.
     secret                   Lark application secret; do not commit it.
 
   Reserved channel types:
@@ -33,42 +33,16 @@ const CONFIG_HELP: &str = r#"CONFIGURATION FILE (JSON)
     path                     Backend executable path.
     model                    Optional Codex model override.
     effort                   Optional Codex reasoning effort override.
-    card                     A2A-compatible public agent description.
+    agent_sandbox            Optional backend sandbox: "read-only", "workspace-write",
+                             or "danger-full-access". This is separate from Agora isolation.
     subscribe                Channel subscriptions for this agent.
     subscribe[].channel      Name of a configured channel.
     subscribe[].filter       Optional reserved channel filter; currently ignored.
 
-  Agent card fields:
-    name                     Display name.
-    description              Public description of what the agent does.
-    supportedInterfaces      A2A protocol endpoints advertised by the agent.
-    provider                 Optional provider URL and organization.
-    version                  Agent version.
-    documentationUrl         Optional documentation URL.
-    capabilities             Streaming, push notification, and extension metadata.
-    securitySchemes          Optional named security scheme definitions.
-    securityRequirements     Optional security requirements.
-    defaultInputModes        Supported input media types.
-    defaultOutputModes       Supported output media types.
-    skills                   A2A skill declarations.
-    signatures               Optional agent card signatures.
-    iconUrl                  Optional icon URL.
-
-  Nested agent card fields:
-    supportedInterfaces[]    url, protocolBinding, optional tenant, and protocolVersion.
-    provider                 url and organization.
-    capabilities             Optional streaming, pushNotifications, extensions, and
-                             extendedAgentCard values.
-    capabilities.extensions[]
-                             Optional uri, description, required, and params values.
-    skills[]                 id, name, description, tags, optional examples,
-                             inputModes, outputModes, and securityRequirements.
-    signatures[]             protected, signature, and optional header values.
-
   Example:
-    {"channels":[{"type":"lark","name":"lark1","appid":"xxx","secret":"xxx"}],
+    {"channels":[{"type":"lark","name":"lark1","app_id":"xxx","secret":"xxx"}],
      "agents":[{"name":"codex","isolate":"none","type":"codex",
-     "path":"/opt/homebrew/bin/codex","card":{...},
+     "path":"/opt/homebrew/bin/codex","agent_sandbox":"danger-full-access",
      "subscribe":[{"channel":"lark1","filter":{}}]}]}
 "#;
 

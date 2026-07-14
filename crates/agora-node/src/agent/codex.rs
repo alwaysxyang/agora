@@ -1,9 +1,12 @@
 use super::command::{Command, CommandOutput};
 use super::{Agent, AgentOutcome, AgentOutput, AgentRequest, AgentSessionUpdate};
-use crate::output::{OutputEvent, ProgressStatus};
+use crate::config::AgentSandbox;
+use crate::task::{OutputEvent, ProgressStatus, TaskAttachment, TaskAttachmentKind, TokenUsage};
 use agora_core::logger;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
 
 #[derive(Clone)]
 pub(super) struct CodexAgent {
@@ -11,6 +14,7 @@ pub(super) struct CodexAgent {
     path: String,
     model: Option<String>,
     effort: Option<String>,
+    agent_sandbox: Option<AgentSandbox>,
 }
 
 impl CodexAgent {
@@ -19,17 +23,21 @@ impl CodexAgent {
         path: String,
         model: Option<String>,
         effort: Option<String>,
+        agent_sandbox: Option<AgentSandbox>,
     ) -> Self {
         Self {
             name,
             path,
             model,
             effort,
+            agent_sandbox,
         }
     }
 
-    fn command(&self, request: AgentRequest) -> (Command, bool) {
-        let (workdir, input, session_id) = request.into_parts();
+    fn command(&self, request: AgentRequest) -> Result<PreparedCommand> {
+        let (workdir, content, session_id) = request.into_parts();
+        let (input, attachments) = content.into_parts();
+        let (attachment_dir, image_paths) = Self::materialize_images(&workdir, &attachments)?;
         let resume_requested = session_id.is_some();
         let mut args = match &session_id {
             Some(_) => vec![
@@ -45,17 +53,60 @@ impl CodexAgent {
             ],
         };
         self.append_options(&mut args);
+        for path in image_paths {
+            args.push("--image".to_string());
+            args.push(path.to_string_lossy().into_owned());
+        }
         if let Some(session_id) = session_id {
             args.push(session_id);
         }
         args.push("-".to_string());
-        (
-            Command::new(&self.path)
+        Ok(PreparedCommand {
+            command: Command::new(&self.path)
                 .args(args)
                 .current_dir(workdir)
                 .input(input),
             resume_requested,
-        )
+            _attachment_dir: attachment_dir,
+        })
+    }
+
+    fn materialize_images(
+        workdir: &Path,
+        attachments: &[TaskAttachment],
+    ) -> Result<(Option<TempDir>, Vec<PathBuf>)> {
+        let images = attachments
+            .iter()
+            .filter(|attachment| attachment.kind() == TaskAttachmentKind::Image)
+            .collect::<Vec<_>>();
+        if images.is_empty() {
+            return Ok((None, Vec::new()));
+        }
+
+        let directory = tempfile::Builder::new()
+            .prefix(".agora-attachments-")
+            .tempdir_in(workdir)
+            .context("create temporary agent attachment directory failed")?;
+        let mut paths = Vec::with_capacity(images.len());
+        for (index, image) in images.into_iter().enumerate() {
+            let extension = Path::new(image.file_name())
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .filter(|extension| {
+                    !extension.is_empty()
+                        && extension.len() <= 10
+                        && extension.chars().all(|ch| ch.is_ascii_alphanumeric())
+                })
+                .unwrap_or("img");
+            let path = directory
+                .path()
+                .join(format!("image-{}.{}", index + 1, extension));
+            std::fs::write(&path, image.data()).with_context(|| {
+                format!("write agent image attachment failed: {}", path.display())
+            })?;
+            paths.push(path);
+        }
+        Ok((Some(directory), paths))
     }
 
     fn append_options(&self, args: &mut Vec<String>) {
@@ -67,6 +118,12 @@ impl CodexAgent {
             args.push("--config".to_string());
             args.push(format!("model_reasoning_effort={effort}"));
         }
+        if let Some(agent_sandbox) = self.agent_sandbox {
+            args.push("--config".to_string());
+            args.push(format!("sandbox_mode=\"{}\"", agent_sandbox.as_str()));
+            args.push("--config".to_string());
+            args.push("approval_policy=\"never\"".to_string());
+        }
         args.push("--config".to_string());
         args.push("model_reasoning_summary=concise".to_string());
     }
@@ -77,7 +134,11 @@ impl Agent for CodexAgent {
     where
         O: AgentOutput + Send,
     {
-        let (command, resume_requested) = self.command(request);
+        let PreparedCommand {
+            command,
+            resume_requested,
+            _attachment_dir,
+        } = self.command(request)?;
         let mut command_output = CodexCommandOutput::new(&self.name, output, resume_requested);
         let outcome = command.run(&mut command_output).await?;
         let session_update = if command_output.session_not_found() {
@@ -94,6 +155,12 @@ impl Agent for CodexAgent {
         };
         Ok(AgentOutcome::new(outcome.exit_code(), session_update))
     }
+}
+
+struct PreparedCommand {
+    command: Command,
+    resume_requested: bool,
+    _attachment_dir: Option<TempDir>,
 }
 
 struct CodexCommandOutput<'a, O> {
@@ -335,6 +402,22 @@ where
         result
     }
 
+    fn token_usage(event: &Value) -> Option<TokenUsage> {
+        let usage = event.get("usage")?;
+        Some(TokenUsage {
+            input_tokens: usage.get("input_tokens")?.as_u64()?,
+            cached_input_tokens: usage
+                .get("cached_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            output_tokens: usage.get("output_tokens")?.as_u64()?,
+            reasoning_output_tokens: usage
+                .get("reasoning_output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        })
+    }
+
     async fn handle_line(&mut self, line: &str) -> Result<()> {
         let event = match serde_json::from_str::<Value>(line) {
             Ok(event) => event,
@@ -361,6 +444,9 @@ where
             }
             Some("turn.completed") => {
                 self.publish_pending_message(true).await?;
+                if let Some(usage) = Self::token_usage(&event) {
+                    self.output.write(OutputEvent::Usage(usage)).await?;
+                }
             }
             Some("error") | Some("turn.failed") => {
                 self.publish_pending_message(false).await?;

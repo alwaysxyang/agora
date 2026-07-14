@@ -1,6 +1,6 @@
 use agora_node::agent::{AgentOutput, AgentSessionUpdate, AgentTask, ConfiguredAgent};
-use agora_node::config::{AgentCard, AgentConfig, AgentType, IsolateMode};
-use agora_node::output::{OutputEvent, ProgressStatus};
+use agora_node::config::{AgentConfig, AgentSandbox, AgentType, IsolateMode};
+use agora_node::task::{OutputEvent, ProgressStatus, TaskAttachment, TaskContent, TokenUsage};
 use anyhow::Result;
 
 #[derive(Default)]
@@ -54,6 +54,7 @@ async fn codex_agent_uses_the_session_supplied_by_its_caller() {
     let mut config = agent(AgentType::Codex, &script, temp.path());
     config.model = Some("gpt-5.4".to_string());
     config.effort = Some("xhigh".to_string());
+    config.agent_sandbox = Some(AgentSandbox::DangerFullAccess);
     let agent = ConfiguredAgent::from_config(config).unwrap();
     let mut first_output = VecAgentOutput::default();
     let mut second_output = VecAgentOutput::default();
@@ -88,8 +89,8 @@ async fn codex_agent_uses_the_session_supplied_by_its_caller() {
     assert_eq!(
         invocations.lines().collect::<Vec<_>>(),
         vec![
-            "exec --json --color never --model gpt-5.4 --config model_reasoning_effort=xhigh --config model_reasoning_summary=concise -",
-            "exec resume --json --model gpt-5.4 --config model_reasoning_effort=xhigh --config model_reasoning_summary=concise thread-123 -",
+            "exec --json --color never --model gpt-5.4 --config model_reasoning_effort=xhigh --config sandbox_mode=\"danger-full-access\" --config approval_policy=\"never\" --config model_reasoning_summary=concise -",
+            "exec resume --json --model gpt-5.4 --config model_reasoning_effort=xhigh --config sandbox_mode=\"danger-full-access\" --config approval_policy=\"never\" --config model_reasoning_summary=concise thread-123 -",
         ]
     );
     assert!(first_output.events.iter().any(
@@ -173,6 +174,12 @@ async fn codex_agent_classifies_thinking_progress_and_final_answer() {
             OutputEvent::Answer {
                 text: "All checks passed".to_string(),
             },
+            OutputEvent::Usage(TokenUsage {
+                input_tokens: 1,
+                cached_input_tokens: 0,
+                output_tokens: 1,
+                reasoning_output_tokens: 1,
+            }),
         ]
     );
 }
@@ -259,6 +266,72 @@ async fn codex_agent_does_not_publish_backend_stderr() {
     assert!(!output.contains("codex_core::tools::router"));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_agent_passes_image_attachments_to_a_resumed_turn() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("codex");
+    std::fs::write(
+        &script,
+        concat!(
+            "#!/bin/sh\n",
+            "printf '%s\\n' \"$@\" > invocation-args\n",
+            "while [ \"$#\" -gt 0 ]; do\n",
+            "  if [ \"$1\" = \"--image\" ]; then\n",
+            "    shift\n",
+            "    cp \"$1\" received-image\n",
+            "  fi\n",
+            "  shift\n",
+            "done\n",
+            "cat > received-prompt\n",
+            "printf '%s\\n' ",
+            "'{\"type\":\"thread.started\",\"thread_id\":\"thread-123\"}'\n",
+            "printf '%s\\n' ",
+            "'{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"image received\"}}'\n",
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let agent =
+        ConfiguredAgent::from_config(agent(AgentType::Codex, &script, temp.path())).unwrap();
+    let content = TaskContent::new("analyze this image").with_attachment(TaskAttachment::image(
+        "trace.png",
+        "image/png",
+        b"image-bytes".to_vec(),
+    ));
+    let mut output = VecAgentOutput::default();
+
+    agent
+        .run(
+            AgentTask::new("task-1", "session-1", content),
+            Some("thread-123".to_string()),
+            &mut output,
+        )
+        .await
+        .unwrap();
+
+    let args = std::fs::read_to_string(temp.path().join("invocation-args")).unwrap();
+    let args = args.lines().collect::<Vec<_>>();
+    assert_eq!(&args[..3], ["exec", "resume", "--json"]);
+    let image = args.iter().position(|arg| *arg == "--image").unwrap();
+    let session = args.iter().position(|arg| *arg == "thread-123").unwrap();
+    assert!(image < session);
+    assert_eq!(args.last(), Some(&"-"));
+    assert_eq!(
+        std::fs::read(temp.path().join("received-image")).unwrap(),
+        b"image-bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("received-prompt")).unwrap(),
+        "analyze this image"
+    );
+}
+
 #[tokio::test]
 async fn custom_agent_streams_raw_command_output() {
     let temp = tempfile::tempdir().unwrap();
@@ -281,6 +354,33 @@ async fn custom_agent_streams_raw_command_output() {
     assert!(temp.path().exists());
 }
 
+#[tokio::test]
+async fn custom_agent_rejects_attachments_without_a_backend_contract() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent =
+        ConfiguredAgent::from_config(agent(AgentType::Custom, "/bin/cat", temp.path())).unwrap();
+    let content = TaskContent::new("analyze this image").with_attachment(TaskAttachment::image(
+        "trace.png",
+        "image/png",
+        b"image-bytes".to_vec(),
+    ));
+    let mut output = VecAgentOutput::default();
+
+    let error = agent
+        .run(
+            AgentTask::new("task-1", "session-1", content),
+            None,
+            &mut output,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "custom agent does not support task attachments"
+    );
+}
+
 fn agent(
     agent_type: AgentType,
     path: impl AsRef<std::path::Path>,
@@ -294,7 +394,7 @@ fn agent(
         path: path.as_ref().to_string_lossy().into_owned(),
         model: None,
         effort: None,
-        card: AgentCard::default(),
+        agent_sandbox: None,
         subscribe: Vec::new(),
     }
 }

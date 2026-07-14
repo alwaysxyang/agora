@@ -1,5 +1,5 @@
 use crate::config::{AgentConfig, AgentType};
-use crate::output::OutputEvent;
+use crate::task::{OutputEvent, TaskContent};
 use anyhow::{Result, anyhow};
 use std::future::Future;
 use std::path::PathBuf;
@@ -20,19 +20,19 @@ pub trait AgentOutput {
 pub struct AgentTask {
     task_id: String,
     session_id: String,
-    input: String,
+    content: TaskContent,
 }
 
 impl AgentTask {
     pub fn new(
         task_id: impl Into<String>,
         session_id: impl Into<String>,
-        input: impl Into<String>,
+        content: impl Into<TaskContent>,
     ) -> Self {
         Self {
             task_id: task_id.into(),
             session_id: session_id.into(),
-            input: input.into(),
+            content: content.into(),
         }
     }
 
@@ -48,7 +48,7 @@ impl AgentTask {
         std::fs::create_dir_all(&workdir)?;
         Ok(AgentRequest {
             workdir,
-            input: self.input,
+            content: self.content,
             session_id: agent_session_id,
         })
     }
@@ -75,13 +75,13 @@ impl AgentTask {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentRequest {
     workdir: PathBuf,
-    input: String,
+    content: TaskContent,
     session_id: Option<String>,
 }
 
 impl AgentRequest {
-    pub(crate) fn into_parts(self) -> (PathBuf, String, Option<String>) {
-        (self.workdir, self.input, self.session_id)
+    pub(crate) fn into_parts(self) -> (PathBuf, TaskContent, Option<String>) {
+        (self.workdir, self.content, self.session_id)
     }
 }
 
@@ -157,6 +157,7 @@ impl ConfiguredAgent {
                 config.path.clone(),
                 config.model.clone(),
                 config.effort.clone(),
+                config.agent_sandbox,
             )),
             AgentType::Custom => AgentBackend::Custom(CustomAgent::new(config.path.clone())),
             AgentType::Coco => {

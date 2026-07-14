@@ -1,6 +1,7 @@
-use super::{LarkApi, LarkReplyTarget};
+use super::LarkReplyTarget;
+use super::lark_api::LarkApi;
 use crate::channel::{ChannelRun, RunEvent};
-use crate::output::{OutputEvent, ProgressStatus};
+use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
 use agora_core::logger;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
@@ -9,12 +10,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-const MAX_THINKING_ENTRIES: usize = 3;
-const MAX_PROGRESS_ENTRIES: usize = 5;
 const MAX_ANSWER_BYTES: usize = 20 * 1024;
 const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 
-pub struct LarkAgentCard {
+pub(super) struct LarkAgentCard {
     inner: Arc<LarkAgentCardInner>,
 }
 
@@ -42,11 +41,12 @@ struct LarkAgentCardState {
     flush_scheduled: bool,
 }
 
-pub(crate) struct LarkCardContent {
+pub(super) struct LarkCardContent {
     agent_name: String,
     thinking: VecDeque<String>,
     progress: VecDeque<LarkProgressEntry>,
     answer: String,
+    usage: Option<TokenUsage>,
     failure: Option<String>,
     finished: bool,
 }
@@ -58,25 +58,23 @@ struct LarkProgressEntry {
 }
 
 impl LarkCardContent {
-    pub(crate) fn new(agent_name: String) -> Self {
+    pub(super) fn new(agent_name: String) -> Self {
         Self {
             agent_name,
             thinking: VecDeque::new(),
             progress: VecDeque::new(),
             answer: String::new(),
+            usage: None,
             failure: None,
             finished: false,
         }
     }
 
-    pub(crate) fn apply_output(&mut self, event: OutputEvent) {
+    pub(super) fn apply_output(&mut self, event: OutputEvent) {
         match event {
             OutputEvent::Thinking { text } => {
                 if !text.trim().is_empty() {
-                    self.thinking.push_back(text);
-                    while self.thinking.len() > MAX_THINKING_ENTRIES {
-                        self.thinking.pop_front();
-                    }
+                    self.thinking.push_front(text);
                 }
             }
             OutputEvent::Progress { id, text, status } => {
@@ -84,25 +82,23 @@ impl LarkCardContent {
                     self.progress.remove(index);
                 }
                 self.progress
-                    .push_back(LarkProgressEntry { id, text, status });
-                while self.progress.len() > MAX_PROGRESS_ENTRIES {
-                    self.progress.pop_front();
-                }
+                    .push_front(LarkProgressEntry { id, text, status });
             }
             OutputEvent::Answer { text } => self.answer.push_str(&text),
+            OutputEvent::Usage(usage) => self.usage = Some(usage),
         }
     }
 
-    pub(crate) fn complete(&mut self) {
+    pub(super) fn complete(&mut self) {
         self.finished = true;
     }
 
-    pub(crate) fn fail(&mut self, message: String) {
+    pub(super) fn fail(&mut self, message: String) {
         self.finished = true;
         self.failure = Some(message);
     }
 
-    pub(crate) fn build_card(&self) -> Value {
+    pub(super) fn build_card(&self) -> Value {
         let (template, status, status_color) = if self.failure.is_some() {
             ("red", "Failed", "red")
         } else if self.finished {
@@ -110,6 +106,7 @@ impl LarkCardContent {
         } else {
             ("blue", "Running", "blue")
         };
+        let failure_view = self.failure.as_deref().map(Self::failure_view);
         let mut elements = Vec::new();
 
         if !self.thinking.is_empty() {
@@ -117,13 +114,16 @@ impl LarkCardContent {
                 .thinking
                 .iter()
                 .flat_map(|entry| entry.lines())
-                .map(|line| format!("> {}", line.trim()))
+                .map(|line| format!("> • {}", line.trim()))
                 .collect::<Vec<_>>()
                 .join("\n");
-            elements.push(json!({
-                "tag": "markdown",
-                "content": format!("**Thinking**\n{thinking}")
-            }));
+            let count = self.thinking.len();
+            let suffix = if count == 1 { "update" } else { "updates" };
+            elements.push(Self::collapsible_panel(
+                format!("**Thinking**  <font color='grey'>· {count} {suffix}</font>"),
+                false,
+                thinking,
+            ));
         }
 
         if !self.progress.is_empty() {
@@ -131,39 +131,67 @@ impl LarkCardContent {
                 .progress
                 .iter()
                 .map(|entry| {
-                    let status = match entry.status {
-                        ProgressStatus::Running => "Running",
-                        ProgressStatus::Completed => "Done",
-                        ProgressStatus::Failed => "Failed",
+                    let marker = match entry.status {
+                        ProgressStatus::Running => "<font color='blue'>●</font>",
+                        ProgressStatus::Completed => "<font color='green'>✓</font>",
+                        ProgressStatus::Failed => "<font color='red'>×</font>",
                     };
-                    format!("- **{status}**  {}", entry.text)
+                    format!("{marker}  {}", entry.text)
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
+            elements.push(Self::collapsible_panel(
+                format!(
+                    "**Progress**  <font color='grey'>·</font> {}",
+                    self.progress_summary()
+                ),
+                !self.finished,
+                progress,
+            ));
+        }
+
+        if let Some((category, summary)) = failure_view {
+            if !elements.is_empty() {
+                elements.push(json!({ "tag": "hr" }));
+            }
             elements.push(json!({
                 "tag": "markdown",
-                "content": format!("**Progress**\n{progress}")
+                "content": format!(
+                    "<font color='red'>▌</font> **Run failed**\nAgent 未能完成本次任务。\n\n<font color='grey'>{summary}</font>\n<font color='grey'>建议：请重试；如果仍然失败，请查看 Technical details 和 daemon 日志。</font>"
+                )
             }));
+            elements.push(Self::collapsible_panel(
+                format!("**Technical details**  <font color='grey'>· {category}</font>"),
+                false,
+                "完整错误已写入 daemon 日志。".to_string(),
+            ));
         }
 
         if !self.answer.is_empty() {
             if !elements.is_empty() {
                 elements.push(json!({ "tag": "hr" }));
             }
+            let title = if self.failure.is_some() {
+                "Partial answer"
+            } else {
+                "Final answer"
+            };
             elements.push(json!({
                 "tag": "markdown",
-                "content": format!("**Final answer**\n{}", Self::truncate_answer(&self.answer))
+                "content": format!(
+                    "<font color='blue'>▌</font> **{title}**\n{}",
+                    Self::truncate_answer(&self.answer)
+                )
             }));
         }
 
-        if let Some(message) = &self.failure {
+        if self.finished
+            && let Some(usage) = self.usage
+        {
             if !elements.is_empty() {
                 elements.push(json!({ "tag": "hr" }));
             }
-            elements.push(json!({
-                "tag": "markdown",
-                "content": format!("**Failure**\n{}", message)
-            }));
+            elements.push(Self::usage_element(usage));
         }
 
         if elements.is_empty() && !self.finished {
@@ -174,9 +202,9 @@ impl LarkCardContent {
         }
 
         let mut card = json!({
+            "schema": "2.0",
             "config": {
                 "update_multi": true,
-                "wide_screen_mode": true,
                 "summary": {
                     "content": format!("{}: {}", self.agent_name, status)
                 }
@@ -198,9 +226,150 @@ impl LarkCardContent {
             }
         });
         if !elements.is_empty() {
-            card["elements"] = Value::Array(elements);
+            card["body"] = json!({ "elements": elements });
         }
         card
+    }
+
+    fn collapsible_panel(title: String, expanded: bool, content: String) -> Value {
+        json!({
+            "tag": "collapsible_panel",
+            "expanded": expanded,
+            "background_color": "grey-50",
+            "header": {
+                "title": {
+                    "tag": "markdown",
+                    "content": title
+                },
+                "vertical_align": "center",
+                "padding": "8px 12px 8px 12px",
+                "icon": {
+                    "tag": "standard_icon",
+                    "token": "down-small-ccm_outlined",
+                    "size": "16px 16px"
+                },
+                "icon_position": "right",
+                "icon_expanded_angle": -180
+            },
+            "border": {
+                "color": "grey-200",
+                "corner_radius": "8px"
+            },
+            "vertical_spacing": "6px",
+            "padding": "2px 12px 10px 12px",
+            "elements": [{
+                "tag": "markdown",
+                "content": content
+            }]
+        })
+    }
+
+    fn progress_summary(&self) -> String {
+        let completed = self
+            .progress
+            .iter()
+            .filter(|entry| entry.status == ProgressStatus::Completed)
+            .count();
+        let running = self
+            .progress
+            .iter()
+            .filter(|entry| entry.status == ProgressStatus::Running)
+            .count();
+        let failed = self
+            .progress
+            .iter()
+            .filter(|entry| entry.status == ProgressStatus::Failed)
+            .count();
+
+        let mut parts = Vec::new();
+        if completed > 0 {
+            parts.push(format!(
+                "<font color='green'>✓</font> <font color='grey'>{completed} completed</font>"
+            ));
+        }
+        if running > 0 {
+            parts.push(format!(
+                "<font color='blue'>●</font> <font color='grey'>{running} running</font>"
+            ));
+        }
+        if failed > 0 {
+            parts.push(format!(
+                "<font color='red'>×</font> <font color='grey'>{failed} failed</font>"
+            ));
+        }
+        parts.join(" · ")
+    }
+
+    fn failure_view(message: &str) -> (&'static str, &'static str) {
+        let message = message.to_ascii_lowercase();
+        if message.contains("timed out") || message.contains("timeout") {
+            ("Execution timeout", "Agent 执行超时。")
+        } else if message.contains("session")
+            && (message.contains("not found")
+                || message.contains("missing")
+                || message.contains("unavailable"))
+        {
+            ("Session unavailable", "Agent 会话不可用。")
+        } else if message.contains("attachment") {
+            ("Attachment error", "Agent 无法处理附件。")
+        } else if message.contains("exit") {
+            ("Process exit", "Agent 进程在完成任务前退出。")
+        } else {
+            ("Agent error", "Agent 执行失败。")
+        }
+    }
+
+    fn usage_element(usage: TokenUsage) -> Value {
+        let total_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+        json!({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "horizontal_spacing": "small",
+            "horizontal_align": "left",
+            "columns": [
+                Self::usage_column("Total", total_tokens, "tokens"),
+                Self::usage_column(
+                    "Input",
+                    usage.input_tokens,
+                    &format!("{} cached", Self::format_tokens(usage.cached_input_tokens)),
+                ),
+                Self::usage_column("Output", usage.output_tokens, "tokens"),
+                Self::usage_column(
+                    "Reasoning",
+                    usage.reasoning_output_tokens,
+                    "of output",
+                ),
+            ]
+        })
+    }
+
+    fn usage_column(label: &str, tokens: u64, detail: &str) -> Value {
+        json!({
+            "tag": "column",
+            "width": "weighted",
+            "weight": 1,
+            "vertical_align": "top",
+            "vertical_spacing": "0px",
+            "elements": [{
+                "tag": "markdown",
+                "content": format!(
+                    "<font color='grey'>{label}</font>\n**{}**\n<font color='grey'>{detail}</font>",
+                    Self::format_tokens(tokens),
+                ),
+                "text_align": "center",
+                "text_size": "notation",
+            }]
+        })
+    }
+
+    fn format_tokens(tokens: u64) -> String {
+        if tokens < 1_000 {
+            tokens.to_string()
+        } else if tokens < 1_000_000 {
+            format!("{:.1}K", tokens as f64 / 1_000.0)
+        } else {
+            format!("{:.1}M", tokens as f64 / 1_000_000.0)
+        }
     }
 
     fn truncate_answer(answer: &str) -> String {
@@ -218,7 +387,7 @@ impl LarkCardContent {
 }
 
 impl LarkAgentCard {
-    pub(crate) fn new(target: LarkReplyTarget, agent_name: String, api: LarkApi) -> Self {
+    pub(super) fn new(target: LarkReplyTarget, agent_name: String, api: LarkApi) -> Self {
         Self {
             inner: Arc::new(LarkAgentCardInner {
                 target,

@@ -13,8 +13,6 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "q
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = "3.27.0"
 tokio = { workspace = true }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-
-[dev-dependencies]
-tempfile = "3.27.0"

@@ -1,6 +1,6 @@
-use crate::channel::lark::{LarkAgentCard, LarkChannel, LarkMessageEvent};
+use crate::channel::lark::{LarkChannel, LarkRun, LarkTask};
 use crate::config::ChannelConfig;
-use crate::output::OutputEvent;
+use crate::task::{OutputEvent, TaskContent};
 use anyhow::Result;
 use std::future::Future;
 
@@ -26,7 +26,7 @@ pub trait ChannelTask: Clone {
 
     fn session_id(&self) -> &str;
 
-    fn input(&self) -> &str;
+    fn content(&self) -> &TaskContent;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,7 +45,7 @@ pub trait ChannelRun: Clone {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfiguredTask {
-    Lark(LarkMessageEvent),
+    Lark(LarkTask),
 }
 
 impl ChannelTask for ConfiguredTask {
@@ -61,16 +61,16 @@ impl ChannelTask for ConfiguredTask {
         }
     }
 
-    fn input(&self) -> &str {
+    fn content(&self) -> &TaskContent {
         match self {
-            ConfiguredTask::Lark(task) => task.input(),
+            ConfiguredTask::Lark(task) => task.content(),
         }
     }
 }
 
 #[derive(Clone)]
 pub enum ConfiguredRun {
-    Lark(LarkAgentCard),
+    Lark(LarkRun),
 }
 
 impl ChannelRun for ConfiguredRun {

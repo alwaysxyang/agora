@@ -9,6 +9,7 @@
 - Prefer incremental improvement over large rewrites.
 - Keep module boundaries clear.
 - Respect existing layering and ownership rules.
+- Do not start, dispatch, or delegate work to multiple agents or subagents. Complete all work with the current agent only.
 - Treat every agent and every channel as an autonomous component. Agents and channels must not depend on each other; the daemon composes them through neutral task, output, and outcome boundaries.
 - Keep agent execution, protocol parsing, and session state inside the agent. Keep connection management, message delivery, acknowledgement, reconnection, and reply rendering inside the channel.
 - If the existing architecture is poor, improve only the part directly touched by the task.
@@ -120,3 +121,11 @@ If available, run the project spec check before finishing:
 
 ```bash
 just spec-check
+```
+
+## Git Operations
+
+- Leave changes uncommitted by default.
+- Create or amend a Git commit only when the user explicitly requests a commit in the current request.
+- Do not infer permission to commit from a request to implement, fix, verify, merge, or finish work.
+- Do not push commits or tags unless the user explicitly requests it.

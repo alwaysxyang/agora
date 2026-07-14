@@ -1,4 +1,4 @@
-use agora_node::config::{AgentCard, AgentConfig, AgentType, IsolateMode, NodeConfig};
+use agora_node::config::{AgentConfig, AgentSandbox, AgentType, IsolateMode, NodeConfig};
 
 #[test]
 fn parses_channels_and_agents_config() {
@@ -7,7 +7,7 @@ fn parses_channels_and_agents_config() {
             {
                 "type": "lark",
                 "name": "lark1",
-                "appid": "cli_xxx",
+                "app_id": "cli_xxx",
                 "secret": "sec_xxx"
             }
         ],
@@ -20,31 +20,7 @@ fn parses_channels_and_agents_config() {
                 "path": "/opt/homebrew/bin/codex",
                 "model": "gpt-5.4",
                 "effort": "high",
-                "card": {
-                    "name": "Codex Dev Agent",
-                    "description": "Local coding agent",
-                    "supportedInterfaces": [
-                        {
-                            "url": "https://agora.local/a2a/codex-dev",
-                            "protocolBinding": "HTTP+JSON",
-                            "protocolVersion": "1.0"
-                        }
-                    ],
-                    "version": "0.1.0",
-                    "capabilities": {
-                        "streaming": true
-                    },
-                    "defaultInputModes": ["text/plain"],
-                    "defaultOutputModes": ["text/plain"],
-                    "skills": [
-                        {
-                            "id": "workspace-coding",
-                            "name": "Workspace coding",
-                            "description": "Read and modify source code in the configured workspace",
-                            "tags": ["coding", "workspace"]
-                        }
-                    ]
-                },
+                "agent_sandbox": "danger-full-access",
                 "subscribe": [
                     {
                         "channel": "lark1",
@@ -65,31 +41,15 @@ fn parses_channels_and_agents_config() {
     assert_eq!(config.agents[0].path, "/opt/homebrew/bin/codex");
     assert_eq!(config.agents[0].model.as_deref(), Some("gpt-5.4"));
     assert_eq!(config.agents[0].effort.as_deref(), Some("high"));
+    assert_eq!(
+        config.agents[0].agent_sandbox,
+        Some(AgentSandbox::DangerFullAccess)
+    );
     assert_eq!(config.agents[0].subscribe.len(), 1);
     assert_eq!(config.agents[0].subscribe[0].channel, "lark1");
     assert_eq!(
         config.agents[0].subscribe[0].filter,
         Some(serde_json::json!({}))
-    );
-    assert_eq!(config.agents[0].card.version, "0.1.0");
-    assert_eq!(config.agents[0].card.supported_interfaces.len(), 1);
-    assert_eq!(
-        config.agents[0].card.supported_interfaces[0].protocol_binding,
-        "HTTP+JSON"
-    );
-    assert_eq!(config.agents[0].card.capabilities.streaming, Some(true));
-    assert_eq!(
-        config.agents[0].card.default_input_modes,
-        vec!["text/plain".to_string()]
-    );
-    assert_eq!(
-        config.agents[0].card.default_output_modes,
-        vec!["text/plain".to_string()]
-    );
-    assert_eq!(config.agents[0].card.skills.len(), 1);
-    assert_eq!(
-        config.agents[0].card.skills[0].id,
-        "workspace-coding".to_string()
     );
 }
 
@@ -127,16 +87,6 @@ fn defaults_workspace_to_agora_directory_under_home() {
                 "isolate": "none",
                 "type": "codex",
                 "path": "/opt/homebrew/bin/codex",
-                "card": {
-                    "name": "Agent",
-                    "description": "Local coding agent",
-                    "supportedInterfaces": [],
-                    "version": "0.1.0",
-                    "capabilities": {},
-                    "defaultInputModes": ["text/plain"],
-                    "defaultOutputModes": ["text/plain"],
-                    "skills": []
-                },
                 "subscribe": []
             }
         ]
@@ -154,6 +104,7 @@ fn defaults_workspace_to_agora_directory_under_home() {
     );
     assert_eq!(config.agents[0].model, None);
     assert_eq!(config.agents[0].effort, None);
+    assert_eq!(config.agents[0].agent_sandbox, None);
 }
 
 fn example_config() -> AgentConfig {
@@ -165,17 +116,7 @@ fn example_config() -> AgentConfig {
         path: "/opt/homebrew/bin/codex".to_string(),
         model: None,
         effort: None,
-        card: AgentCard {
-            name: "Agent".to_string(),
-            description: "Local coding agent".to_string(),
-            supported_interfaces: Vec::new(),
-            version: "0.1.0".to_string(),
-            capabilities: Default::default(),
-            default_input_modes: vec!["text/plain".to_string()],
-            default_output_modes: vec!["text/plain".to_string()],
-            skills: Vec::new(),
-            ..AgentCard::default()
-        },
+        agent_sandbox: None,
         subscribe: vec![agora_node::config::AgentSubscription {
             channel: "lark1".to_string(),
             filter: None,

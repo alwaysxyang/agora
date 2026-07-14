@@ -5,8 +5,8 @@ use crate::channel::{
     Channel, ChannelAgent, ChannelRun, ChannelRunContext, ChannelTask, ConfiguredChannel, RunEvent,
 };
 use crate::config::NodeConfig;
-use crate::output::OutputEvent;
 use crate::store::{SessionKey, SessionStore};
+use crate::task::OutputEvent;
 use agora_core::logger;
 use anyhow::{Result, bail};
 use std::collections::HashMap;
@@ -78,7 +78,8 @@ impl AgentDispatcher {
                 )
                 .await?;
             let mut output = AgentRunOutput::new(run);
-            let agent_task = AgentTask::new(task.task_id(), task.session_id(), task.input());
+            let agent_task =
+                AgentTask::new(task.task_id(), task.session_id(), task.content().clone());
             let key = SessionKey::new(channel.name(), task.session_id(), agent.name());
             let dispatcher = self.clone();
             runs.spawn(async move {

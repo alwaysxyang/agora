@@ -1,7 +1,7 @@
 use super::command::{Command, CommandOutput};
 use super::{Agent, AgentOutcome, AgentOutput, AgentRequest, AgentSessionUpdate};
-use crate::output::OutputEvent;
-use anyhow::Result;
+use crate::task::OutputEvent;
+use anyhow::{Result, bail};
 
 #[derive(Clone)]
 pub(super) struct CustomAgent {
@@ -19,7 +19,11 @@ impl Agent for CustomAgent {
     where
         O: AgentOutput + Send,
     {
-        let (workdir, input, _) = request.into_parts();
+        let (workdir, content, _) = request.into_parts();
+        let (input, attachments) = content.into_parts();
+        if !attachments.is_empty() {
+            bail!("custom agent does not support task attachments");
+        }
         let command = Command::new(&self.path).current_dir(workdir).input(input);
         let mut command_output = RawCommandOutput::new(output);
         let outcome = command.run(&mut command_output).await?;

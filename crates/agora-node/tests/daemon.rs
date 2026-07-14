@@ -1,14 +1,14 @@
 use agora_node::agent::{AgentRegistry, ConfiguredAgent};
-use agora_node::channel::lark::LarkChannelConfig;
 use agora_node::channel::{
     Channel, ChannelRun, ChannelRunContext, ChannelTask, ConfiguredChannel, RunEvent,
 };
 use agora_node::config::{
-    AgentCard, AgentConfig, AgentSubscription, AgentType, ChannelConfig, IsolateMode, NodeConfig,
+    AgentConfig, AgentSubscription, AgentType, ChannelConfig, IsolateMode, LarkChannelConfig,
+    NodeConfig,
 };
 use agora_node::daemon::AgentDispatcher;
-use agora_node::output::OutputEvent;
 use agora_node::store::{SessionKey, SessionStore};
+use agora_node::task::{OutputEvent, TaskContent};
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 
@@ -36,7 +36,7 @@ fn selects_all_agents_subscribed_to_channel() {
 fn wraps_configured_channel_behind_channel_trait() {
     let channel = ConfiguredChannel::from_config(ChannelConfig::Lark(LarkChannelConfig {
         name: "lark1".to_string(),
-        appid: "cli_xxx".to_string(),
+        app_id: "cli_xxx".to_string(),
         secret: "sec_xxx".to_string(),
     }))
     .unwrap()
@@ -113,7 +113,7 @@ async fn persists_and_serializes_session_by_channel_and_agent() {
         path: script.to_string_lossy().into_owned(),
         model: None,
         effort: None,
-        card: AgentCard::default(),
+        agent_sandbox: None,
         subscribe: Vec::new(),
     };
     let agent = ConfiguredAgent::from_config(agent).unwrap();
@@ -188,7 +188,7 @@ async fn replaces_a_missing_agent_session_with_a_new_session() {
         path: script.to_string_lossy().into_owned(),
         model: None,
         effort: None,
-        card: AgentCard::default(),
+        agent_sandbox: None,
         subscribe: Vec::new(),
     })
     .unwrap();
@@ -248,7 +248,7 @@ fn agent(name: &str, channel: &str) -> AgentConfig {
         path: "/bin/cat".to_string(),
         model: None,
         effort: None,
-        card: AgentCard::default(),
+        agent_sandbox: None,
         subscribe: vec![AgentSubscription {
             channel: channel.to_string(),
             filter: None,
@@ -265,7 +265,7 @@ fn custom_agent(name: &str) -> AgentConfig {
         path: "/bin/cat".to_string(),
         model: None,
         effort: None,
-        card: AgentCard::default(),
+        agent_sandbox: None,
         subscribe: Vec::new(),
     }
 }
@@ -282,8 +282,9 @@ impl ChannelTask for TestTask {
         "session-1"
     }
 
-    fn input(&self) -> &str {
-        "hello"
+    fn content(&self) -> &TaskContent {
+        static CONTENT: std::sync::OnceLock<TaskContent> = std::sync::OnceLock::new();
+        CONTENT.get_or_init(|| TaskContent::new("hello"))
     }
 }
 

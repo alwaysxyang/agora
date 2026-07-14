@@ -1,15 +1,17 @@
-use crate::channel::{Channel, ChannelRunContext, ChannelTask};
+use super::LarkReplyTarget;
+use super::channel::{LarkEvent, LarkMessageEvent};
+use crate::config::LarkChannelConfig;
 use agora_core::logger;
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use reqwest::Client;
+use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 
@@ -27,248 +29,40 @@ const LARK_HTTP_IDLE_TIMEOUT_SECONDS: u64 = 300;
 const LARK_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 10;
 const LARK_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 60;
 
-pub(crate) mod card;
-
-pub use card::LarkAgentCard;
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct LarkChannelConfig {
-    pub name: String,
-    pub appid: String,
-    pub secret: String,
+#[derive(Clone)]
+pub(super) struct LarkApi {
+    name: String,
+    app_id: String,
+    secret: String,
+    client: Client,
+    base_url: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LarkReplyTarget {
-    pub message_id: String,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct LarkMessageEvent {
-    #[serde(rename = "event_id")]
-    pub id: String,
-    pub message_id: String,
-    pub chat_id: String,
-    pub chat_type: String,
-    pub sender_id: String,
-    pub message_type: String,
-    pub content: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LarkEvent {
-    Message(LarkMessageEvent),
-    Ignore { event_type: String },
-}
-
-impl LarkEvent {
-    pub fn from_lark_event_payload(payload: impl AsRef<[u8]>) -> Result<Self> {
-        let value: Value = serde_json::from_slice(payload.as_ref())
-            .context("lark event payload is not valid json")?;
-        let event_type = value
-            .pointer("/header/event_type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("lark message event missing header.event_type"))?;
-        match event_type {
-            "im.message.receive_v1" => {
-                LarkMessageEvent::from_lark_event_value(&value).map(Self::Message)
-            }
-            _ => Ok(Self::Ignore {
-                event_type: event_type.to_string(),
-            }),
-        }
-    }
-}
-
-impl LarkMessageEvent {
-    fn from_lark_event_value(value: &Value) -> Result<Self> {
-        let id = value
-            .pointer("/header/event_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("lark message event missing header.event_id"))?
-            .to_string();
-        let message = value
-            .pointer("/event/message")
-            .ok_or_else(|| anyhow!("lark message event missing event.message"))?;
-        let sender_id = value
-            .pointer("/event/sender/sender_id/open_id")
-            .or_else(|| value.pointer("/event/sender/sender_id/user_id"))
-            .or_else(|| value.pointer("/event/sender/sender_id/union_id"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let message_type = Self::required_str(message, "message_type")?.to_string();
-        let raw_content = Self::required_str(message, "content")?;
-        Ok(Self {
-            id,
-            message_id: Self::required_str(message, "message_id")?.to_string(),
-            chat_id: Self::required_str(message, "chat_id")?.to_string(),
-            chat_type: Self::required_str(message, "chat_type")?.to_string(),
-            sender_id,
-            content: Self::normalize_content(&message_type, raw_content),
-            message_type,
-        })
-    }
-
-    pub fn session_id(&self) -> &str {
-        &self.chat_id
-    }
-
-    pub fn input(&self) -> &str {
-        &self.content
-    }
-
-    pub fn reply_target(&self) -> LarkReplyTarget {
-        LarkReplyTarget {
-            message_id: self.message_id.clone(),
-        }
-    }
-
-    pub fn is_supported_message(&self) -> bool {
-        matches!(self.message_type.as_str(), "text" | "post")
-    }
-
-    fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
-        value
-            .get(field)
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("lark message event missing event.message.{field}"))
-    }
-
-    fn normalize_content(message_type: &str, raw_content: &str) -> String {
-        match message_type {
-            "text" => serde_json::from_str::<Value>(raw_content)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| raw_content.to_string()),
-            "post" => serde_json::from_str::<Value>(raw_content)
-                .ok()
-                .map(|value| Self::flatten_post_content(&value))
-                .filter(|content| !content.is_empty())
-                .unwrap_or_else(|| raw_content.to_string()),
-            _ => raw_content.to_string(),
-        }
-    }
-
-    fn flatten_post_content(value: &Value) -> String {
-        value
-            .get("content")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_array)
-            .flat_map(|line| line.iter())
-            .filter_map(|item| item.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("")
-    }
-}
-
-impl ChannelTask for LarkMessageEvent {
-    fn task_id(&self) -> &str {
-        &self.message_id
-    }
-
-    fn session_id(&self) -> &str {
-        &self.chat_id
-    }
-
-    fn input(&self) -> &str {
-        &self.content
-    }
-}
-
-pub struct LarkChannel {
-    api: LarkApi,
-    receiver: Option<LarkWebSocketReceiver>,
-}
-
-impl LarkChannel {
-    pub fn new(config: LarkChannelConfig) -> Result<Self> {
-        Ok(Self {
-            api: LarkApi::new(config)?,
-            receiver: None,
-        })
-    }
-
-    fn receiver(&mut self) -> &mut LarkWebSocketReceiver {
-        self.receiver
-            .get_or_insert_with(|| LarkWebSocketReceiver::spawn(self.api.clone()))
-    }
-}
-
-impl Channel for LarkChannel {
-    type Task = LarkMessageEvent;
-    type Run = LarkAgentCard;
-
-    fn name(&self) -> &str {
-        &self.api.name
-    }
-
-    async fn recv(&mut self) -> Result<Option<Self::Task>> {
-        loop {
-            let Some(event) = self.receiver().next_event().await? else {
-                return Ok(None);
-            };
-            if event.is_supported_message() {
-                logger::info!(
-                    "lark message received channel={} session={} sender={} message_id={} input={}",
-                    self.name(),
-                    event.session_id(),
-                    event.sender_id,
-                    event.message_id,
-                    event.input()
-                );
-                return Ok(Some(event));
-            }
-        }
-    }
-
-    async fn open_run(&self, task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
-        Ok(LarkAgentCard::new(
-            task.reply_target(),
-            context.agent.name,
-            self.api.clone(),
-        ))
-    }
-}
-
-pub struct LarkWebSocketReceiver {
-    events: mpsc::UnboundedReceiver<Result<LarkMessageEvent>>,
-    task: Option<JoinHandle<Result<()>>>,
-}
-
-impl LarkWebSocketReceiver {
-    pub fn spawn(api: LarkApi) -> Self {
-        let (sender, events) = mpsc::unbounded_channel();
-        let task = tokio::spawn(async move { api.run_websocket_loop(sender).await });
-        Self {
-            events,
-            task: Some(task),
-        }
-    }
-
-    pub async fn next_event(&mut self) -> Result<Option<LarkMessageEvent>> {
-        match self.events.recv().await {
-            Some(event) => event.map(Some),
-            None => {
-                if let Some(task) = self.task.take() {
-                    task.await
-                        .map_err(|err| anyhow!("lark websocket receiver task failed: {err}"))??;
-                }
-                Ok(None)
-            }
-        }
-    }
+pub(super) struct LarkImageResource {
+    pub(super) media_type: String,
+    pub(super) data: Vec<u8>,
 }
 
 impl LarkApi {
-    async fn run_websocket_loop(
+    pub(super) fn new(config: LarkChannelConfig) -> Result<Self> {
+        Self::with_base_url(config, LARK_OPENAPI.to_string())
+    }
+
+    pub(super) fn with_base_url(config: LarkChannelConfig, base_url: String) -> Result<Self> {
+        Ok(Self {
+            name: config.name,
+            app_id: config.app_id,
+            secret: config.secret,
+            client: Self::http_client()?,
+            base_url,
+        })
+    }
+
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(super) async fn run_websocket_loop(
         &self,
         events: mpsc::UnboundedSender<Result<LarkMessageEvent>>,
     ) -> Result<()> {
@@ -343,7 +137,7 @@ impl LarkApi {
                     };
                     match message.context("read lark websocket message failed")? {
                         WebSocketMessage::Binary(payload) => {
-                        if let Some(ack) = self.handle_websocket_binary(&payload, &events)? {
+                            if let Some(ack) = self.handle_websocket_binary(&payload, &events)? {
                                 socket
                                     .send(WebSocketMessage::Binary(ack.encode_to_vec().into()))
                                     .await
@@ -378,7 +172,7 @@ impl LarkApi {
             .post(url)
             .header("locale", "zh")
             .json(&json!({
-                "AppID": self.appid,
+                "AppID": self.app_id,
                 "AppSecret": self.secret,
             }))
             .send()
@@ -471,40 +265,142 @@ impl LarkApi {
             .send(Ok(event))
             .map_err(|_| anyhow!("agora lark receiver closed"))
     }
+
+    pub(super) async fn tenant_access_token(&self) -> Result<String> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/open-apis/auth/v3/tenant_access_token/internal",
+                self.base_url
+            ))
+            .json(&json!({
+                "app_id": self.app_id,
+                "app_secret": self.secret,
+            }))
+            .send()
+            .await?
+            .json::<TenantTokenResponse>()
+            .await?;
+        response.into_result()
+    }
+
+    pub(super) async fn download_message_image(
+        &self,
+        token: &str,
+        message_id: &str,
+        image_key: &str,
+    ) -> Result<LarkImageResource> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/open-apis/im/v1/messages/{}/resources/{}",
+                self.base_url, message_id, image_key
+            ))
+            .query(&[("type", "image")])
+            .bearer_auth(token)
+            .send()
+            .await
+            .context("download lark message image failed")?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow!("download lark message image http failed: {status}"));
+        }
+        let media_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let data = response
+            .bytes()
+            .await
+            .context("read lark message image failed")?
+            .to_vec();
+        Ok(LarkImageResource { media_type, data })
+    }
+
+    pub(super) async fn reply_card(
+        &self,
+        token: &str,
+        target: &LarkReplyTarget,
+        card: &Value,
+    ) -> Result<String> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/open-apis/im/v1/messages/{}/reply",
+                self.base_url, target.message_id
+            ))
+            .bearer_auth(token)
+            .json(&ReplyCardRequest {
+                msg_type: "interactive",
+                content: serde_json::to_string(card)?,
+                reply_in_thread: true,
+            })
+            .send()
+            .await?
+            .json::<SendCardResponse>()
+            .await?;
+        response.into_result()
+    }
+
+    pub(super) async fn patch_card(
+        &self,
+        token: &str,
+        message_id: &str,
+        card: &Value,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .patch(format!(
+                "{}/open-apis/im/v1/messages/{}",
+                self.base_url, message_id
+            ))
+            .bearer_auth(token)
+            .json(&PatchCardRequest {
+                content: serde_json::to_string(card)?,
+            })
+            .send()
+            .await?
+            .json::<LarkEmptyResponse>()
+            .await?;
+        response.into_result()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct LarkWebSocketEndpointResponse {
-    pub code: i32,
+pub(super) struct LarkWebSocketEndpointResponse {
+    pub(super) code: i32,
     #[serde(default)]
-    pub msg: String,
-    pub data: Option<LarkWebSocketEndpoint>,
+    pub(super) msg: String,
+    pub(super) data: Option<LarkWebSocketEndpoint>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
-pub struct LarkWebSocketEndpoint {
+pub(super) struct LarkWebSocketEndpoint {
     #[serde(rename = "URL")]
-    pub url: String,
+    pub(super) url: String,
     #[serde(default)]
-    pub client_config: Option<LarkWebSocketClientConfig>,
+    pub(super) client_config: Option<LarkWebSocketClientConfig>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
-pub struct LarkWebSocketClientConfig {
+pub(super) struct LarkWebSocketClientConfig {
     #[serde(default)]
-    pub reconnect_count: i32,
+    pub(super) reconnect_count: i32,
     #[serde(default)]
-    pub reconnect_interval: i32,
+    pub(super) reconnect_interval: i32,
     #[serde(default)]
-    pub reconnect_nonce: i32,
+    pub(super) reconnect_nonce: i32,
     #[serde(default)]
-    pub ping_interval: i32,
+    pub(super) ping_interval: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LarkReconnectBackoff {
+pub(super) struct LarkReconnectBackoff {
     next_delay: Duration,
 }
 
@@ -517,7 +413,7 @@ impl Default for LarkReconnectBackoff {
 }
 
 impl LarkReconnectBackoff {
-    pub fn next_delay(&mut self) -> Duration {
+    pub(super) fn next_delay(&mut self) -> Duration {
         let delay = self.next_delay;
         self.next_delay = self
             .next_delay
@@ -526,21 +422,21 @@ impl LarkReconnectBackoff {
         delay
     }
 
-    pub fn reset(&mut self) {
+    pub(super) fn reset(&mut self) {
         self.next_delay = Duration::from_secs(LARK_RECONNECT_INITIAL_DELAY_SECONDS);
     }
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct LarkFrameHeader {
+pub(super) struct LarkFrameHeader {
     #[prost(string, tag = "1")]
-    pub key: String,
+    pub(super) key: String,
     #[prost(string, tag = "2")]
-    pub value: String,
+    pub(super) value: String,
 }
 
 impl LarkFrameHeader {
-    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+    pub(super) fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
             key: key.into(),
             value: value.into(),
@@ -549,36 +445,36 @@ impl LarkFrameHeader {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct LarkFrame {
+pub(super) struct LarkFrame {
     #[prost(uint64, tag = "1")]
-    pub seq_id: u64,
+    pub(super) seq_id: u64,
     #[prost(uint64, tag = "2")]
-    pub log_id: u64,
+    pub(super) log_id: u64,
     #[prost(int32, tag = "3")]
-    pub service: i32,
+    pub(super) service: i32,
     #[prost(int32, tag = "4")]
-    pub method: i32,
+    pub(super) method: i32,
     #[prost(message, repeated, tag = "5")]
-    pub headers: Vec<LarkFrameHeader>,
+    pub(super) headers: Vec<LarkFrameHeader>,
     #[prost(string, tag = "6")]
-    pub payload_encoding: String,
+    pub(super) payload_encoding: String,
     #[prost(string, tag = "7")]
-    pub payload_type: String,
+    pub(super) payload_type: String,
     #[prost(bytes, tag = "8")]
-    pub payload: Vec<u8>,
+    pub(super) payload: Vec<u8>,
     #[prost(string, tag = "9")]
-    pub log_id_new: String,
+    pub(super) log_id_new: String,
 }
 
 impl LarkFrame {
-    pub fn header(&self, key: &str) -> Option<&str> {
+    pub(super) fn header(&self, key: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|header| header.key == key)
             .map(|header| header.value.as_str())
     }
 
-    pub fn into_ack(mut self, status_code: u16, biz_rt_ms: u128) -> Result<Self> {
+    pub(super) fn into_ack(mut self, status_code: u16, biz_rt_ms: u128) -> Result<Self> {
         self.upsert_header("biz_rt", biz_rt_ms.to_string());
         self.payload = serde_json::to_vec(&LarkWebSocketAck {
             code: status_code,
@@ -617,92 +513,6 @@ struct LarkWebSocketAck {
     code: u16,
     headers: Option<BTreeMap<String, String>>,
     data: Option<Value>,
-}
-
-#[derive(Clone)]
-pub struct LarkApi {
-    name: String,
-    appid: String,
-    secret: String,
-    client: Client,
-    base_url: String,
-}
-
-impl LarkApi {
-    pub fn new(config: LarkChannelConfig) -> Result<Self> {
-        Self::with_base_url(config, LARK_OPENAPI.to_string())
-    }
-
-    pub(crate) fn with_base_url(config: LarkChannelConfig, base_url: String) -> Result<Self> {
-        Ok(Self {
-            name: config.name,
-            appid: config.appid,
-            secret: config.secret,
-            client: Self::http_client()?,
-            base_url,
-        })
-    }
-
-    async fn tenant_access_token(&self) -> Result<String> {
-        let response = self
-            .client
-            .post(format!(
-                "{}/open-apis/auth/v3/tenant_access_token/internal",
-                self.base_url
-            ))
-            .json(&json!({
-                "app_id": self.appid,
-                "app_secret": self.secret,
-            }))
-            .send()
-            .await?
-            .json::<TenantTokenResponse>()
-            .await?;
-        response.into_result()
-    }
-
-    async fn reply_card(
-        &self,
-        token: &str,
-        target: &LarkReplyTarget,
-        card: &Value,
-    ) -> Result<String> {
-        let response = self
-            .client
-            .post(format!(
-                "{}/open-apis/im/v1/messages/{}/reply",
-                self.base_url, target.message_id
-            ))
-            .bearer_auth(token)
-            .json(&ReplyCardRequest {
-                msg_type: "interactive",
-                content: serde_json::to_string(card)?,
-                reply_in_thread: true,
-            })
-            .send()
-            .await?
-            .json::<SendCardResponse>()
-            .await?;
-        response.into_result()
-    }
-
-    async fn patch_card(&self, token: &str, message_id: &str, card: &Value) -> Result<()> {
-        let response = self
-            .client
-            .patch(format!(
-                "{}/open-apis/im/v1/messages/{}",
-                self.base_url, message_id
-            ))
-            .bearer_auth(token)
-            .json(&PatchCardRequest {
-                content: serde_json::to_string(card)?,
-            })
-            .send()
-            .await?
-            .json::<LarkEmptyResponse>()
-            .await?;
-        response.into_result()
-    }
 }
 
 #[derive(Deserialize)]

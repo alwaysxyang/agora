@@ -63,7 +63,7 @@ fn node_help_describes_the_config_fields() {
     for expected in [
         "CONFIGURATION FILE",
         "channels",
-        "appid",
+        "app_id",
         "secret",
         "agents",
         "isolate",
@@ -71,10 +71,11 @@ fn node_help_describes_the_config_fields() {
         "~/.agora/workspace",
         "model",
         "effort",
-        "card",
+        "agent_sandbox",
         "subscribe",
         "filter",
     ] {
         assert!(stdout.contains(expected), "help is missing {expected:?}");
     }
+    assert!(!stdout.contains("Agent card fields"));
 }

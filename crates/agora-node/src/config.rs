@@ -1,7 +1,5 @@
-use crate::channel::lark::LarkChannelConfig;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -23,7 +21,8 @@ pub struct AgentConfig {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
-    pub card: AgentCard,
+    #[serde(default)]
+    pub agent_sandbox: Option<AgentSandbox>,
     pub subscribe: Vec<AgentSubscription>,
 }
 
@@ -64,6 +63,13 @@ pub enum ChannelConfig {
     Telegram(NamedChannelConfig),
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct LarkChannelConfig {
+    pub name: String,
+    pub app_id: String,
+    pub secret: String,
+}
+
 impl ChannelConfig {
     pub fn name(&self) -> &str {
         match self {
@@ -97,93 +103,20 @@ pub enum AgentType {
     Custom,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentCard {
-    pub name: String,
-    pub description: String,
-    pub supported_interfaces: Vec<AgentInterface>,
-    #[serde(default)]
-    pub provider: Option<AgentProvider>,
-    pub version: String,
-    #[serde(default)]
-    pub documentation_url: Option<String>,
-    pub capabilities: AgentCapabilities,
-    #[serde(default)]
-    pub security_schemes: BTreeMap<String, Value>,
-    #[serde(default, alias = "security")]
-    pub security_requirements: Vec<Value>,
-    pub default_input_modes: Vec<String>,
-    pub default_output_modes: Vec<String>,
-    pub skills: Vec<AgentSkill>,
-    #[serde(default)]
-    pub signatures: Vec<AgentCardSignature>,
-    #[serde(default)]
-    pub icon_url: Option<String>,
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentSandbox {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentInterface {
-    pub url: String,
-    pub protocol_binding: String,
-    #[serde(default)]
-    pub tenant: Option<String>,
-    pub protocol_version: String,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct AgentProvider {
-    pub url: String,
-    pub organization: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentCapabilities {
-    #[serde(default)]
-    pub streaming: Option<bool>,
-    #[serde(default)]
-    pub push_notifications: Option<bool>,
-    #[serde(default)]
-    pub extensions: Vec<AgentExtension>,
-    #[serde(default)]
-    pub extended_agent_card: Option<bool>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-pub struct AgentExtension {
-    #[serde(default)]
-    pub uri: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub required: Option<bool>,
-    #[serde(default)]
-    pub params: Option<Value>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentSkill {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub examples: Vec<String>,
-    #[serde(default)]
-    pub input_modes: Vec<String>,
-    #[serde(default)]
-    pub output_modes: Vec<String>,
-    #[serde(default, alias = "security")]
-    pub security_requirements: Vec<Value>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct AgentCardSignature {
-    pub protected: String,
-    pub signature: String,
-    #[serde(default)]
-    pub header: Option<Value>,
+impl AgentSandbox {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::DangerFullAccess => "danger-full-access",
+        }
+    }
 }
