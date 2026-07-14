@@ -19,6 +19,12 @@ pub trait Channel {
         task: &Self::Task,
         context: ChannelRunContext,
     ) -> impl Future<Output = Result<Self::Run>> + Send;
+
+    fn reply(
+        &self,
+        task: &Self::Task,
+        reply: ChannelReply,
+    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 pub trait ChannelTask: Clone {
@@ -37,6 +43,21 @@ pub struct ChannelRunContext {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelAgent {
     pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelReply {
+    text: String,
+}
+
+impl ChannelReply {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
 }
 
 pub trait ChannelRun: Clone {
@@ -119,6 +140,14 @@ impl Channel for ConfiguredChannel {
             }
         }
     }
+
+    async fn reply(&self, task: &Self::Task, reply: ChannelReply) -> Result<()> {
+        match (self, task) {
+            (ConfiguredChannel::Lark(channel), ConfiguredTask::Lark(task)) => {
+                channel.reply(task, reply).await
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,4 +156,5 @@ pub enum RunEvent {
     Output(OutputEvent),
     Completed { exit_code: i32 },
     Failed { message: String },
+    Stopped,
 }

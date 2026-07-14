@@ -47,8 +47,14 @@ pub(super) struct LarkCardContent {
     progress: VecDeque<LarkProgressEntry>,
     answer: String,
     usage: Option<TokenUsage>,
-    failure: Option<String>,
-    finished: bool,
+    state: LarkRunState,
+}
+
+enum LarkRunState {
+    Running,
+    Completed,
+    Failed(String),
+    Stopped,
 }
 
 struct LarkProgressEntry {
@@ -65,8 +71,7 @@ impl LarkCardContent {
             progress: VecDeque::new(),
             answer: String::new(),
             usage: None,
-            failure: None,
-            finished: false,
+            state: LarkRunState::Running,
         }
     }
 
@@ -90,23 +95,34 @@ impl LarkCardContent {
     }
 
     pub(super) fn complete(&mut self) {
-        self.finished = true;
+        self.state = LarkRunState::Completed;
     }
 
     pub(super) fn fail(&mut self, message: String) {
-        self.finished = true;
-        self.failure = Some(message);
+        self.state = LarkRunState::Failed(message);
+    }
+
+    pub(super) fn stop(&mut self) {
+        for entry in &mut self.progress {
+            if entry.status == ProgressStatus::Running {
+                entry.status = ProgressStatus::Stopped;
+            }
+        }
+        self.state = LarkRunState::Stopped;
     }
 
     pub(super) fn build_card(&self) -> Value {
-        let (template, status, status_color) = if self.failure.is_some() {
-            ("red", "Failed", "red")
-        } else if self.finished {
-            ("green", "Completed", "green")
-        } else {
-            ("blue", "Running", "blue")
+        let (template, status, status_color) = match &self.state {
+            LarkRunState::Running => ("blue", "Running", "blue"),
+            LarkRunState::Completed => ("green", "Completed", "green"),
+            LarkRunState::Failed(_) => ("red", "Failed", "red"),
+            LarkRunState::Stopped => ("grey", "Stopped", "grey"),
         };
-        let failure_view = self.failure.as_deref().map(Self::failure_view);
+        let failure_view = match &self.state {
+            LarkRunState::Failed(message) => Some(Self::failure_view(message)),
+            _ => None,
+        };
+        let finished = !matches!(&self.state, LarkRunState::Running);
         let mut elements = Vec::new();
 
         if !self.thinking.is_empty() {
@@ -135,6 +151,7 @@ impl LarkCardContent {
                         ProgressStatus::Running => "<font color='blue'>●</font>",
                         ProgressStatus::Completed => "<font color='green'>✓</font>",
                         ProgressStatus::Failed => "<font color='red'>×</font>",
+                        ProgressStatus::Stopped => "<font color='grey'>■</font>",
                     };
                     format!("{marker}  {}", entry.text)
                 })
@@ -145,7 +162,7 @@ impl LarkCardContent {
                     "**Progress**  <font color='grey'>·</font> {}",
                     self.progress_summary()
                 ),
-                !self.finished,
+                !finished,
                 progress,
             ));
         }
@@ -167,11 +184,21 @@ impl LarkCardContent {
             ));
         }
 
+        if matches!(&self.state, LarkRunState::Stopped) {
+            if !elements.is_empty() {
+                elements.push(json!({ "tag": "hr" }));
+            }
+            elements.push(json!({
+                "tag": "markdown",
+                "content": "<font color='grey'>▌</font> **Run stopped**\nStopped by `/stop`. Existing output is retained."
+            }));
+        }
+
         if !self.answer.is_empty() {
             if !elements.is_empty() {
                 elements.push(json!({ "tag": "hr" }));
             }
-            let title = if self.failure.is_some() {
+            let title = if matches!(&self.state, LarkRunState::Failed(_) | LarkRunState::Stopped) {
                 "Partial answer"
             } else {
                 "Final answer"
@@ -185,16 +212,14 @@ impl LarkCardContent {
             }));
         }
 
-        if self.finished
-            && let Some(usage) = self.usage
-        {
+        if finished && let Some(usage) = self.usage {
             if !elements.is_empty() {
                 elements.push(json!({ "tag": "hr" }));
             }
             elements.push(Self::usage_element(usage));
         }
 
-        if elements.is_empty() && !self.finished {
+        if elements.is_empty() && !finished {
             elements.push(json!({
                 "tag": "markdown",
                 "content": "> 正在等待 Agent 输出..."
@@ -280,6 +305,11 @@ impl LarkCardContent {
             .iter()
             .filter(|entry| entry.status == ProgressStatus::Failed)
             .count();
+        let stopped = self
+            .progress
+            .iter()
+            .filter(|entry| entry.status == ProgressStatus::Stopped)
+            .count();
 
         let mut parts = Vec::new();
         if completed > 0 {
@@ -295,6 +325,11 @@ impl LarkCardContent {
         if failed > 0 {
             parts.push(format!(
                 "<font color='red'>×</font> <font color='grey'>{failed} failed</font>"
+            ));
+        }
+        if stopped > 0 {
+            parts.push(format!(
+                "<font color='grey'>■</font> <font color='grey'>{stopped} stopped</font>"
             ));
         }
         parts.join(" · ")
@@ -420,6 +455,10 @@ impl LarkAgentCard {
                 }
                 RunEvent::Failed { message } => {
                     state.content.fail(message);
+                    true
+                }
+                RunEvent::Stopped => {
+                    state.content.stop();
                     true
                 }
             };

@@ -326,6 +326,33 @@ impl LarkApi {
         target: &LarkReplyTarget,
         card: &Value,
     ) -> Result<String> {
+        self.reply_message(token, target, "interactive", serde_json::to_string(card)?)
+            .await
+    }
+
+    pub(super) async fn reply_text(
+        &self,
+        token: &str,
+        target: &LarkReplyTarget,
+        text: &str,
+    ) -> Result<()> {
+        self.reply_message(
+            token,
+            target,
+            "text",
+            serde_json::to_string(&json!({ "text": text }))?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn reply_message(
+        &self,
+        token: &str,
+        target: &LarkReplyTarget,
+        msg_type: &str,
+        content: String,
+    ) -> Result<String> {
         let response = self
             .client
             .post(format!(
@@ -333,9 +360,9 @@ impl LarkApi {
                 self.base_url, target.message_id
             ))
             .bearer_auth(token)
-            .json(&ReplyCardRequest {
-                msg_type: "interactive",
-                content: serde_json::to_string(card)?,
+            .json(&ReplyMessageRequest {
+                msg_type,
+                content,
                 reply_in_thread: true,
             })
             .send()
@@ -534,7 +561,7 @@ impl TenantTokenResponse {
 }
 
 #[derive(Serialize)]
-struct ReplyCardRequest<'a> {
+struct ReplyMessageRequest<'a> {
     msg_type: &'a str,
     content: String,
     reply_in_thread: bool,
@@ -559,7 +586,7 @@ impl SendCardResponse {
                 .map(|data| data.message_id)
                 .ok_or_else(|| anyhow!("lark response missing message_id"))
         } else {
-            Err(anyhow!("lark reply card failed: {}", self.msg))
+            Err(anyhow!("lark reply message failed: {}", self.msg))
         }
     }
 }

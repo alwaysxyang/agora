@@ -1,7 +1,7 @@
 use super::LarkReplyTarget;
 use super::card::LarkAgentCard;
 use super::lark_api::LarkApi;
-use crate::channel::{Channel, ChannelRun, ChannelRunContext, ChannelTask, RunEvent};
+use crate::channel::{Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, RunEvent};
 use crate::config::LarkChannelConfig;
 use crate::task::{TaskAttachment, TaskContent};
 use agora_core::logger;
@@ -311,6 +311,13 @@ impl Channel for LarkChannel {
         Ok(LarkRun {
             card: LarkAgentCard::new(task.reply_target(), context.agent.name, self.api.clone()),
         })
+    }
+
+    async fn reply(&self, task: &Self::Task, reply: ChannelReply) -> Result<()> {
+        let token = self.api.tenant_access_token().await?;
+        self.api
+            .reply_text(&token, &task.reply_target(), reply.text())
+            .await
     }
 }
 

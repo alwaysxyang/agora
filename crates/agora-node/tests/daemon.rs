@@ -1,6 +1,6 @@
 use agora_node::agent::{AgentRegistry, ConfiguredAgent};
 use agora_node::channel::{
-    Channel, ChannelRun, ChannelRunContext, ChannelTask, ConfiguredChannel, RunEvent,
+    Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, ConfiguredChannel, RunEvent,
 };
 use agora_node::config::{
     AgentConfig, AgentSubscription, AgentType, ChannelConfig, IsolateMode, LarkChannelConfig,
@@ -322,5 +322,9 @@ impl Channel for RecordingChannel {
         Ok(RecordingRun {
             events: Arc::clone(&self.events),
         })
+    }
+
+    async fn reply(&self, _task: &Self::Task, _reply: ChannelReply) -> Result<()> {
+        Ok(())
     }
 }

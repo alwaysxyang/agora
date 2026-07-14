@@ -180,6 +180,43 @@ fn lark_card_labels_an_answer_as_partial_when_the_run_fails() {
 }
 
 #[test]
+fn lark_card_preserves_output_and_marks_the_run_as_stopped() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.apply_output(OutputEvent::Thinking {
+        text: "Inspecting the project".to_string(),
+    });
+    content.apply_output(OutputEvent::Progress {
+        id: "command-1".to_string(),
+        text: "Run `cargo test`".to_string(),
+        status: ProgressStatus::Running,
+    });
+    content.apply_output(OutputEvent::Answer {
+        text: "Work completed before the stop.".to_string(),
+    });
+    content.stop();
+
+    let card = content.build_card();
+    let rendered = serde_json::to_string(&card).unwrap();
+
+    assert_eq!(
+        card.pointer("/header/text_tag_list/0/text/content")
+            .and_then(serde_json::Value::as_str),
+        Some("Stopped")
+    );
+    assert_eq!(
+        card.pointer("/header/template")
+            .and_then(serde_json::Value::as_str),
+        Some("grey")
+    );
+    assert!(rendered.contains("<font color='grey'>■</font>  Run `cargo test`"));
+    assert!(rendered.contains("<font color='grey'>1 stopped</font>"));
+    assert!(rendered.contains("<font color='grey'>▌</font> **Run stopped**"));
+    assert!(rendered.contains("Stopped by `/stop`. Existing output is retained."));
+    assert!(rendered.contains("<font color='blue'>▌</font> **Partial answer**"));
+    assert!(rendered.contains("Work completed before the stop."));
+}
+
+#[test]
 fn lark_card_separates_thinking_progress_and_final_answer() {
     let mut content = LarkCardContent::new("codex-dev".to_string());
     content.apply_output(OutputEvent::Thinking {
@@ -382,6 +419,45 @@ async fn lark_card_coalesces_intermediate_updates_and_flushes_completion() {
             .and_then(serde_json::Value::as_str),
         Some("Completed")
     );
+}
+
+#[tokio::test]
+async fn lark_api_replies_to_commands_with_threaded_text() {
+    let server = TestHttpServer::start().await;
+    let api = LarkApi::with_base_url(
+        LarkChannelConfig {
+            name: "lark-test".to_string(),
+            app_id: "app-id".to_string(),
+            secret: "secret".to_string(),
+        },
+        server.base_url(),
+    )
+    .unwrap();
+    let token = api.tenant_access_token().await.unwrap();
+
+    api.reply_text(
+        &token,
+        &LarkReplyTarget {
+            message_id: "om_source".to_string(),
+        },
+        "Stopped 1 agent: codex-dev.",
+    )
+    .await
+    .unwrap();
+
+    let requests = server.requests().await;
+    let request = requests
+        .iter()
+        .find(|request| request.path == "/open-apis/im/v1/messages/om_source/reply")
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+    let content: serde_json::Value =
+        serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
+
+    assert_eq!(request.method, "POST");
+    assert_eq!(body["msg_type"], "text");
+    assert_eq!(body["reply_in_thread"], true);
+    assert_eq!(content["text"], "Stopped 1 agent: codex-dev.");
 }
 
 #[derive(Clone, Debug)]

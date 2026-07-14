@@ -27,4 +27,5 @@ pub enum ProgressStatus {
     Running,
     Completed,
     Failed,
+    Stopped,
 }
