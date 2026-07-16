@@ -76,7 +76,12 @@ async fn async_main(opts: Opts) -> anyhow::Result<()> {
     let guard = ShutdownGuard::get();
     let signals = shutdown_signals(&guard)?;
     let daemon = Daemon::new(config)?;
-    guard.run(daemon.run(), signals).await
+    let shutdown = daemon.shutdown_handle();
+    guard
+        .run_with_shutdown(daemon.run(), signals, move |_reason| async move {
+            shutdown.interrupt().await;
+        })
+        .await
 }
 
 #[cfg(unix)]

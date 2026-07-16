@@ -152,9 +152,11 @@ impl Channel for ConfiguredChannel {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunEvent {
+    Queued { ahead: usize },
     Started { run_id: String },
     Output(OutputEvent),
     Completed { exit_code: i32 },
     Failed { message: String },
     Stopped,
+    Interrupted,
 }

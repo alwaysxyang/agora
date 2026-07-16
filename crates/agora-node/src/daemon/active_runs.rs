@@ -26,12 +26,27 @@ impl ActiveRunScope {
 
 struct ActiveRunEntry {
     scope: ActiveRunScope,
-    stop: watch::Sender<bool>,
+    control: watch::Sender<RunControl>,
 }
 
 struct ActiveRunsInner {
     next_id: AtomicU64,
     entries: Mutex<HashMap<u64, ActiveRunEntry>>,
+    active_count: watch::Sender<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RunControl {
+    #[default]
+    Running,
+    Stop,
+    Interrupt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RunCancellation {
+    Stopped,
+    Interrupted,
 }
 
 #[derive(Clone)]
@@ -41,10 +56,12 @@ pub(super) struct ActiveRuns {
 
 impl Default for ActiveRuns {
     fn default() -> Self {
+        let (active_count, _) = watch::channel(0);
         Self {
             inner: Arc::new(ActiveRunsInner {
                 next_id: AtomicU64::new(1),
                 entries: Mutex::new(HashMap::new()),
+                active_count,
             }),
         }
     }
@@ -53,8 +70,11 @@ impl Default for ActiveRuns {
 impl ActiveRuns {
     pub(super) fn register(&self, scope: ActiveRunScope) -> ActiveRun {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let (stop, receiver) = watch::channel(false);
-        self.entries().insert(id, ActiveRunEntry { scope, stop });
+        let (control, receiver) = watch::channel(RunControl::Running);
+        let mut entries = self.entries();
+        entries.insert(id, ActiveRunEntry { scope, control });
+        self.inner.active_count.send_replace(entries.len());
+        drop(entries);
         ActiveRun {
             id,
             receiver,
@@ -76,7 +96,7 @@ impl ActiveRuns {
             if entry.scope.channel_name == channel_name
                 && entry.scope.session_id == session_id
                 && matches_agent
-                && entry.stop.send(true).is_ok()
+                && entry.control.send(RunControl::Stop).is_ok()
             {
                 stopped.insert(entry.scope.agent_name.clone());
             }
@@ -84,8 +104,26 @@ impl ActiveRuns {
         stopped.into_iter().collect()
     }
 
+    pub(super) fn interrupt_all(&self) -> usize {
+        self.entries()
+            .values()
+            .filter(|entry| entry.control.send(RunControl::Interrupt).is_ok())
+            .count()
+    }
+
+    pub(super) async fn wait_until_empty(&self) {
+        let mut active_count = self.inner.active_count.subscribe();
+        while *active_count.borrow() > 0 {
+            if active_count.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     fn remove(&self, id: u64) {
-        self.entries().remove(&id);
+        let mut entries = self.entries();
+        entries.remove(&id);
+        self.inner.active_count.send_replace(entries.len());
     }
 
     fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<u64, ActiveRunEntry>> {
@@ -98,15 +136,20 @@ impl ActiveRuns {
 
 pub(super) struct ActiveRun {
     id: u64,
-    receiver: watch::Receiver<bool>,
+    receiver: watch::Receiver<RunControl>,
     runs: ActiveRuns,
 }
 
 impl ActiveRun {
-    pub(super) async fn cancelled(&mut self) {
-        while !*self.receiver.borrow() {
+    pub(super) async fn cancelled(&mut self) -> RunCancellation {
+        loop {
+            match *self.receiver.borrow() {
+                RunControl::Running => {}
+                RunControl::Stop => return RunCancellation::Stopped,
+                RunControl::Interrupt => return RunCancellation::Interrupted,
+            }
             if self.receiver.changed().await.is_err() {
-                return;
+                return RunCancellation::Interrupted;
             }
         }
     }

@@ -1,4 +1,4 @@
-use super::active_runs::{ActiveRunScope, ActiveRuns};
+use super::active_runs::{ActiveRunScope, ActiveRuns, RunCancellation};
 use super::command::{CommandParser, CommandRoute, NodeCommand};
 use super::{AgentDispatcher, Daemon};
 use crate::agent::ConfiguredAgent;
@@ -88,6 +88,17 @@ async fn active_runs_stop_only_the_named_agent() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn active_runs_interrupt_every_run_during_process_shutdown() {
+    let runs = ActiveRuns::default();
+    let mut codex = runs.register(ActiveRunScope::new("lark", "chat-1", "codex"));
+    let mut reviewer = runs.register(ActiveRunScope::new("lark", "chat-2", "reviewer"));
+
+    assert_eq!(runs.interrupt_all(), 2);
+    assert_eq!(codex.cancelled().await, RunCancellation::Interrupted);
+    assert_eq!(reviewer.cancelled().await, RunCancellation::Interrupted);
 }
 
 #[cfg(unix)]

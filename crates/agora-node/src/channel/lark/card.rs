@@ -51,10 +51,12 @@ pub(super) struct LarkCardContent {
 }
 
 enum LarkRunState {
+    Queued { ahead: usize },
     Running,
     Completed,
     Failed(String),
     Stopped,
+    Interrupted,
 }
 
 struct LarkProgressEntry {
@@ -98,6 +100,14 @@ impl LarkCardContent {
         self.state = LarkRunState::Completed;
     }
 
+    pub(super) fn queue(&mut self, ahead: usize) {
+        self.state = LarkRunState::Queued { ahead };
+    }
+
+    pub(super) fn start(&mut self) {
+        self.state = LarkRunState::Running;
+    }
+
     pub(super) fn fail(&mut self, message: String) {
         self.state = LarkRunState::Failed(message);
     }
@@ -111,18 +121,32 @@ impl LarkCardContent {
         self.state = LarkRunState::Stopped;
     }
 
+    pub(super) fn interrupt(&mut self) {
+        for entry in &mut self.progress {
+            if entry.status == ProgressStatus::Running {
+                entry.status = ProgressStatus::Stopped;
+            }
+        }
+        self.state = LarkRunState::Interrupted;
+    }
+
     pub(super) fn build_card(&self) -> Value {
         let (template, status, status_color) = match &self.state {
+            LarkRunState::Queued { .. } => ("grey", "Queued", "grey"),
             LarkRunState::Running => ("blue", "Running", "blue"),
             LarkRunState::Completed => ("green", "Completed", "green"),
             LarkRunState::Failed(_) => ("red", "Failed", "red"),
             LarkRunState::Stopped => ("grey", "Stopped", "grey"),
+            LarkRunState::Interrupted => ("orange", "Interrupted", "orange"),
         };
         let failure_view = match &self.state {
             LarkRunState::Failed(message) => Some(Self::failure_view(message)),
             _ => None,
         };
-        let finished = !matches!(&self.state, LarkRunState::Running);
+        let finished = !matches!(
+            &self.state,
+            LarkRunState::Queued { .. } | LarkRunState::Running
+        );
         let mut elements = Vec::new();
 
         if !self.thinking.is_empty() {
@@ -194,11 +218,24 @@ impl LarkCardContent {
             }));
         }
 
+        if matches!(&self.state, LarkRunState::Interrupted) {
+            if !elements.is_empty() {
+                elements.push(json!({ "tag": "hr" }));
+            }
+            elements.push(json!({
+                "tag": "markdown",
+                "content": "<font color='orange'>▌</font> **Run interrupted**\nAgora Node 即将退出，本次任务已中断，当前输出已保留。\nNode 恢复后，请重新发送消息继续。"
+            }));
+        }
+
         if !self.answer.is_empty() {
             if !elements.is_empty() {
                 elements.push(json!({ "tag": "hr" }));
             }
-            let title = if matches!(&self.state, LarkRunState::Failed(_) | LarkRunState::Stopped) {
+            let title = if matches!(
+                &self.state,
+                LarkRunState::Failed(_) | LarkRunState::Stopped | LarkRunState::Interrupted
+            ) {
                 "Partial answer"
             } else {
                 "Final answer"
@@ -222,7 +259,12 @@ impl LarkCardContent {
         if elements.is_empty() && !finished {
             elements.push(json!({
                 "tag": "markdown",
-                "content": "> 正在等待 Agent 输出..."
+                "content": match &self.state {
+                    LarkRunState::Queued { ahead } => {
+                        format!("> 正在排队，前面还有 {ahead} 个任务...")
+                    }
+                    _ => "> 正在等待 Agent 输出...".to_string(),
+                }
             }));
         }
 
@@ -444,7 +486,14 @@ impl LarkAgentCard {
         let flush_now = {
             let mut state = self.inner.state.lock().await;
             let flush_now = match event {
-                RunEvent::Started { .. } => true,
+                RunEvent::Queued { ahead } => {
+                    state.content.queue(ahead);
+                    true
+                }
+                RunEvent::Started { .. } => {
+                    state.content.start();
+                    true
+                }
                 RunEvent::Output(event) => {
                     state.content.apply_output(event);
                     false
@@ -459,6 +508,10 @@ impl LarkAgentCard {
                 }
                 RunEvent::Stopped => {
                     state.content.stop();
+                    true
+                }
+                RunEvent::Interrupted => {
+                    state.content.interrupt();
                     true
                 }
             };

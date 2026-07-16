@@ -10,51 +10,28 @@ use crate::store::{SessionKey, SessionStore};
 use crate::task::OutputEvent;
 use agora_core::logger;
 use anyhow::{Result, bail};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::{JoinError, JoinSet};
 
 mod active_runs;
 mod command;
+mod session_queue;
 
-use active_runs::{ActiveRunScope, ActiveRuns};
+use active_runs::{ActiveRunScope, ActiveRuns, RunCancellation};
 use command::{CommandParser, CommandRoute, NodeCommand};
+use session_queue::SessionQueues;
 
 #[cfg(test)]
 #[path = "../../tests/internal/daemon_command.rs"]
 mod command_tests;
 
 const CHANNEL_RETRY_DELAY: Duration = Duration::from_secs(1);
-
-type SessionLock = Arc<AsyncMutex<()>>;
-
-#[derive(Clone, Default)]
-struct SessionLocks {
-    locks: Arc<StdMutex<HashMap<SessionKey, Weak<AsyncMutex<()>>>>>,
-}
-
-impl SessionLocks {
-    fn for_key(&self, key: &SessionKey) -> SessionLock {
-        let mut locks = self
-            .locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        locks.retain(|_, lock| lock.strong_count() > 0);
-        if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
-            return lock;
-        }
-        let lock = Arc::new(AsyncMutex::new(()));
-        locks.insert(key.clone(), Arc::downgrade(&lock));
-        lock
-    }
-}
+const SHUTDOWN_RUN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct AgentDispatcher {
     store: SessionStore,
-    locks: SessionLocks,
+    queues: SessionQueues,
     active_runs: ActiveRuns,
 }
 
@@ -62,7 +39,7 @@ impl AgentDispatcher {
     pub fn new(store: SessionStore) -> Self {
         Self {
             store,
-            locks: SessionLocks::default(),
+            queues: SessionQueues::default(),
             active_runs: ActiveRuns::default(),
         }
     }
@@ -115,6 +92,7 @@ impl AgentDispatcher {
             let agent_task =
                 AgentTask::new(task.task_id(), task.session_id(), task.content().clone());
             let key = SessionKey::new(channel.name(), task.session_id(), agent.name());
+            let mut queue_ticket = self.queues.enqueue(&key);
             let mut active_run = self.active_runs.register(ActiveRunScope::new(
                 channel.name(),
                 task.session_id(),
@@ -122,20 +100,29 @@ impl AgentDispatcher {
             ));
             let dispatcher = self.clone();
             runs.spawn(async move {
+                let mut ahead = queue_ticket.ahead();
+                while ahead > 0 {
+                    output.queued(ahead).await?;
+                    ahead = tokio::select! {
+                        ahead = queue_ticket.changed() => ahead?,
+                        cancellation = active_run.cancelled() => {
+                            return output.cancelled(cancellation).await;
+                        }
+                    };
+                }
                 output.started().await?;
                 let result = tokio::select! {
-                    result = dispatcher.execute_agent(&key, &agent, agent_task, &mut output) => {
-                        Some(result)
+                    result = dispatcher.execute_agent(&key, &agent, agent_task, &mut output) => result,
+                    cancellation = active_run.cancelled() => {
+                        return output.cancelled(cancellation).await;
                     }
-                    _ = active_run.cancelled() => None,
                 };
                 match result {
-                    Some(Ok(outcome)) => output.completed(outcome.exit_code()).await,
-                    Some(Err(err)) => {
+                    Ok(outcome) => output.completed(outcome.exit_code()).await,
+                    Err(err) => {
                         output.failed(err.to_string()).await?;
                         Err(err)
                     }
-                    None => output.stopped().await,
                 }
             });
         }
@@ -169,8 +156,6 @@ impl AgentDispatcher {
     where
         O: AgentOutput + Send,
     {
-        let lock = self.locks.for_key(key);
-        let _guard = lock.lock().await;
         let session_id = self.store.get(key)?;
         let mut outcome = agent.run(task.clone(), session_id.clone(), output).await?;
 
@@ -203,6 +188,30 @@ pub struct Daemon {
     dispatcher: AgentDispatcher,
 }
 
+#[derive(Clone)]
+pub struct DaemonShutdown {
+    active_runs: ActiveRuns,
+}
+
+impl DaemonShutdown {
+    pub async fn interrupt(&self) {
+        let interrupted = self.active_runs.interrupt_all();
+        if interrupted == 0 {
+            return;
+        }
+        logger::info!("interrupting {} agent runs before shutdown", interrupted);
+        if tokio::time::timeout(SHUTDOWN_RUN_TIMEOUT, self.active_runs.wait_until_empty())
+            .await
+            .is_err()
+        {
+            logger::error!(
+                "timed out waiting for agent interruption notifications after {} seconds",
+                SHUTDOWN_RUN_TIMEOUT.as_secs()
+            );
+        }
+    }
+}
+
 impl Daemon {
     pub fn new(config: NodeConfig) -> Result<Self> {
         Ok(Self {
@@ -211,11 +220,20 @@ impl Daemon {
         })
     }
 
+    pub fn shutdown_handle(&self) -> DaemonShutdown {
+        DaemonShutdown {
+            active_runs: self.dispatcher.active_runs.clone(),
+        }
+    }
+
     pub async fn run(self) -> Result<()> {
         let Self { config, dispatcher } = self;
         let NodeConfig { channels, agents } = config;
         let agents = AgentRegistry::from_configs(agents)?;
-        let mut tasks = JoinSet::new();
+        let shutdown = DaemonShutdown {
+            active_runs: dispatcher.active_runs.clone(),
+        };
+        let mut configured_channels = Vec::new();
 
         for channel_config in channels {
             let Some(channel) = ConfiguredChannel::from_config(channel_config)? else {
@@ -225,6 +243,11 @@ impl Daemon {
             if subscribed_agents.is_empty() {
                 continue;
             }
+            configured_channels.push((channel, subscribed_agents));
+        }
+
+        let mut tasks = JoinSet::new();
+        for (channel, subscribed_agents) in configured_channels {
             let dispatcher = dispatcher.clone();
             tasks.spawn(
                 async move { Self::run_channel(channel, subscribed_agents, dispatcher).await },
@@ -232,7 +255,17 @@ impl Daemon {
         }
 
         while let Some(result) = tasks.join_next().await {
-            result??;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    shutdown.interrupt().await;
+                    return Err(err);
+                }
+                Err(err) => {
+                    shutdown.interrupt().await;
+                    return Err(err.into());
+                }
+            }
         }
         Ok(())
     }
@@ -356,6 +389,10 @@ where
             .await
     }
 
+    async fn queued(&self, ahead: usize) -> Result<()> {
+        self.run.publish(RunEvent::Queued { ahead }).await
+    }
+
     async fn completed(&self, exit_code: i32) -> Result<()> {
         self.run.publish(RunEvent::Completed { exit_code }).await
     }
@@ -366,6 +403,21 @@ where
 
     async fn stopped(&self) -> Result<()> {
         self.run.publish(RunEvent::Stopped).await
+    }
+
+    async fn interrupted(&self) -> Result<()> {
+        let result = self.run.publish(RunEvent::Interrupted).await;
+        if let Err(err) = &result {
+            logger::error!("failed to publish interrupted agent run: {}", err);
+        }
+        result
+    }
+
+    async fn cancelled(&self, cancellation: RunCancellation) -> Result<()> {
+        match cancellation {
+            RunCancellation::Stopped => self.stopped().await,
+            RunCancellation::Interrupted => self.interrupted().await,
+        }
     }
 }
 

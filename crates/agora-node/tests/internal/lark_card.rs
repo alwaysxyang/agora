@@ -217,6 +217,40 @@ fn lark_card_preserves_output_and_marks_the_run_as_stopped() {
 }
 
 #[test]
+fn lark_card_preserves_output_and_marks_the_run_as_interrupted() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.apply_output(OutputEvent::Progress {
+        id: "command-1".to_string(),
+        text: "Run `cargo test`".to_string(),
+        status: ProgressStatus::Running,
+    });
+    content.apply_output(OutputEvent::Answer {
+        text: "Work completed before shutdown.".to_string(),
+    });
+
+    content.interrupt();
+
+    let card = content.build_card();
+    let rendered = serde_json::to_string(&card).unwrap();
+    assert_eq!(
+        card.pointer("/header/text_tag_list/0/text/content")
+            .and_then(serde_json::Value::as_str),
+        Some("Interrupted")
+    );
+    assert_eq!(
+        card.pointer("/header/template")
+            .and_then(serde_json::Value::as_str),
+        Some("orange")
+    );
+    assert!(rendered.contains("<font color='grey'>■</font>  Run `cargo test`"));
+    assert!(rendered.contains("<font color='orange'>▌</font> **Run interrupted**"));
+    assert!(rendered.contains("Agora Node 即将退出，本次任务已中断，当前输出已保留。"));
+    assert!(rendered.contains("Node 恢复后，请重新发送消息继续。"));
+    assert!(rendered.contains("<font color='blue'>▌</font> **Partial answer**"));
+    assert!(rendered.contains("Work completed before shutdown."));
+}
+
+#[test]
 fn lark_card_separates_thinking_progress_and_final_answer() {
     let mut content = LarkCardContent::new("codex-dev".to_string());
     content.apply_output(OutputEvent::Thinking {
@@ -267,6 +301,57 @@ fn lark_card_shows_a_placeholder_before_agent_output() {
     let rendered = serde_json::to_string(&content.build_card()).unwrap();
 
     assert!(rendered.contains("> 正在等待 Agent 输出..."));
+}
+
+#[test]
+fn lark_card_shows_queued_state_until_the_agent_starts() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.queue(2);
+
+    let queued = content.build_card();
+    assert_eq!(
+        queued
+            .pointer("/header/text_tag_list/0/text/content")
+            .and_then(serde_json::Value::as_str),
+        Some("Queued")
+    );
+    assert_eq!(
+        queued
+            .pointer("/header/template")
+            .and_then(serde_json::Value::as_str),
+        Some("grey")
+    );
+    assert_eq!(
+        queued
+            .pointer("/body/elements/0/content")
+            .and_then(serde_json::Value::as_str),
+        Some("> 正在排队，前面还有 2 个任务...")
+    );
+
+    content.queue(1);
+    assert_eq!(
+        content
+            .build_card()
+            .pointer("/body/elements/0/content")
+            .and_then(serde_json::Value::as_str),
+        Some("> 正在排队，前面还有 1 个任务...")
+    );
+
+    content.start();
+
+    let running = content.build_card();
+    assert_eq!(
+        running
+            .pointer("/header/text_tag_list/0/text/content")
+            .and_then(serde_json::Value::as_str),
+        Some("Running")
+    );
+    assert_eq!(
+        running
+            .pointer("/body/elements/0/content")
+            .and_then(serde_json::Value::as_str),
+        Some("> 正在等待 Agent 输出...")
+    );
 }
 
 #[test]
