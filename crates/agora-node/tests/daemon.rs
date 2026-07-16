@@ -114,6 +114,7 @@ async fn persists_and_serializes_session_by_channel_and_agent() {
         model: None,
         effort: None,
         agent_sandbox: None,
+        env: Default::default(),
         subscribe: Vec::new(),
     };
     let agent = ConfiguredAgent::from_config(agent).unwrap();
@@ -180,6 +181,7 @@ async fn updates_queue_depth_before_starting_serialized_agent_runs() {
         model: None,
         effort: None,
         agent_sandbox: None,
+        env: Default::default(),
         subscribe: Vec::new(),
     })
     .unwrap();
@@ -348,6 +350,7 @@ async fn replaces_a_missing_agent_session_with_a_new_session() {
         model: None,
         effort: None,
         agent_sandbox: None,
+        env: Default::default(),
         subscribe: Vec::new(),
     })
     .unwrap();
@@ -408,6 +411,7 @@ fn agent(name: &str, channel: &str) -> AgentConfig {
         model: None,
         effort: None,
         agent_sandbox: None,
+        env: Default::default(),
         subscribe: vec![AgentSubscription {
             channel: channel.to_string(),
             filter: None,
@@ -425,6 +429,7 @@ fn custom_agent(name: &str) -> AgentConfig {
         model: None,
         effort: None,
         agent_sandbox: None,
+        env: Default::default(),
         subscribe: Vec::new(),
     }
 }

@@ -72,6 +72,7 @@ fn node_help_describes_the_config_fields() {
         "model",
         "effort",
         "agent_sandbox",
+        "env",
         "subscribe",
         "filter",
     ] {

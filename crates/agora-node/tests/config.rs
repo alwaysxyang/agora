@@ -21,6 +21,9 @@ fn parses_channels_and_agents_config() {
                 "model": "gpt-5.4",
                 "effort": "high",
                 "agent_sandbox": "danger-full-access",
+                "env": {
+                    "AGORA_AGENT_ENV": "configured"
+                },
                 "subscribe": [
                     {
                         "channel": "lark1",
@@ -44,6 +47,13 @@ fn parses_channels_and_agents_config() {
     assert_eq!(
         config.agents[0].agent_sandbox,
         Some(AgentSandbox::DangerFullAccess)
+    );
+    assert_eq!(
+        config.agents[0]
+            .env
+            .get("AGORA_AGENT_ENV")
+            .map(String::as_str),
+        Some("configured")
     );
     assert_eq!(config.agents[0].subscribe.len(), 1);
     assert_eq!(config.agents[0].subscribe[0].channel, "lark1");
@@ -105,6 +115,7 @@ fn defaults_workspace_to_agora_directory_under_home() {
     assert_eq!(config.agents[0].model, None);
     assert_eq!(config.agents[0].effort, None);
     assert_eq!(config.agents[0].agent_sandbox, None);
+    assert!(config.agents[0].env.is_empty());
 }
 
 fn example_config() -> AgentConfig {
@@ -117,6 +128,7 @@ fn example_config() -> AgentConfig {
         model: None,
         effort: None,
         agent_sandbox: None,
+        env: Default::default(),
         subscribe: vec![agora_node::config::AgentSubscription {
             channel: "lark1".to_string(),
             filter: None,

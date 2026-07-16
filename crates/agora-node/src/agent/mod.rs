@@ -158,8 +158,11 @@ impl ConfiguredAgent {
                 config.model.clone(),
                 config.effort.clone(),
                 config.agent_sandbox,
+                config.env.clone(),
             )),
-            AgentType::Custom => AgentBackend::Custom(CustomAgent::new(config.path.clone())),
+            AgentType::Custom => {
+                AgentBackend::Custom(CustomAgent::new(config.path.clone(), config.env.clone()))
+            }
             AgentType::Coco => {
                 return Err(anyhow!("one-shot coco agent execution is not implemented"));
             }

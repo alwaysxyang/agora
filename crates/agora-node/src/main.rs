@@ -35,6 +35,8 @@ const CONFIG_HELP: &str = r#"CONFIGURATION FILE (JSON)
     effort                   Optional Codex reasoning effort override.
     agent_sandbox            Optional backend sandbox: "read-only", "workspace-write",
                              or "danger-full-access". This is separate from Agora isolation.
+    env                      Optional string environment variables for the agent process.
+                             Configured keys override inherited daemon environment values.
     subscribe                Channel subscriptions for this agent.
     subscribe[].channel      Name of a configured channel.
     subscribe[].filter       Optional reserved channel filter; currently ignored.
@@ -43,6 +45,7 @@ const CONFIG_HELP: &str = r#"CONFIGURATION FILE (JSON)
     {"channels":[{"type":"lark","name":"lark1","app_id":"xxx","secret":"xxx"}],
      "agents":[{"name":"codex","isolate":"none","type":"codex",
      "path":"/opt/homebrew/bin/codex","agent_sandbox":"danger-full-access",
+     "env":{"HTTP_PROXY":"http://127.0.0.1:7890"},
      "subscribe":[{"channel":"lark1","filter":{}}]}]}
 "#;
 

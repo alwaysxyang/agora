@@ -2,15 +2,17 @@ use super::command::{Command, CommandOutput};
 use super::{Agent, AgentOutcome, AgentOutput, AgentRequest, AgentSessionUpdate};
 use crate::task::OutputEvent;
 use anyhow::{Result, bail};
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub(super) struct CustomAgent {
     path: String,
+    env: HashMap<String, String>,
 }
 
 impl CustomAgent {
-    pub(super) fn new(path: String) -> Self {
-        Self { path }
+    pub(super) fn new(path: String, env: HashMap<String, String>) -> Self {
+        Self { path, env }
     }
 }
 
@@ -24,7 +26,10 @@ impl Agent for CustomAgent {
         if !attachments.is_empty() {
             bail!("custom agent does not support task attachments");
         }
-        let command = Command::new(&self.path).current_dir(workdir).input(input);
+        let command = Command::new(&self.path)
+            .envs(self.env.clone())
+            .current_dir(workdir)
+            .input(input);
         let mut command_output = RawCommandOutput::new(output);
         let outcome = command.run(&mut command_output).await?;
         Ok(AgentOutcome::new(

@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -23,6 +24,8 @@ pub struct AgentConfig {
     pub effort: Option<String>,
     #[serde(default)]
     pub agent_sandbox: Option<AgentSandbox>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
     pub subscribe: Vec<AgentSubscription>,
 }
 

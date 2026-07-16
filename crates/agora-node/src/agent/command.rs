@@ -29,6 +29,7 @@ impl CommandOutcome {
 pub struct Command {
     program: String,
     args: Vec<String>,
+    env: Vec<(String, String)>,
     current_dir: Option<PathBuf>,
     input: String,
 }
@@ -38,6 +39,7 @@ impl Command {
         Self {
             program: program.into(),
             args: Vec::new(),
+            env: Vec::new(),
             current_dir: None,
             input: String::new(),
         }
@@ -49,6 +51,19 @@ impl Command {
         S: Into<String>,
     {
         self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn envs<I, K, V>(mut self, env: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.env = env
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
         self
     }
 
@@ -69,6 +84,7 @@ impl Command {
         let mut command = TokioCommand::new(&self.program);
         command
             .args(&self.args)
+            .envs(self.env.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

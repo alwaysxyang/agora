@@ -39,6 +39,7 @@ async fn codex_agent_uses_the_session_supplied_by_its_caller() {
         concat!(
             "#!/bin/sh\n",
             "printf '%s\\n' \"$*\" >> invocations\n",
+            "printf '%s' \"$AGORA_AGENT_ENV\" > configured-env\n",
             "cat >/dev/null\n",
             "printf '%s\\n' ",
             "'{\"type\":\"thread.started\",\"thread_id\":\"thread-123\"}'\n",
@@ -55,6 +56,9 @@ async fn codex_agent_uses_the_session_supplied_by_its_caller() {
     config.model = Some("gpt-5.4".to_string());
     config.effort = Some("xhigh".to_string());
     config.agent_sandbox = Some(AgentSandbox::DangerFullAccess);
+    config
+        .env
+        .insert("AGORA_AGENT_ENV".to_string(), "configured".to_string());
     let agent = ConfiguredAgent::from_config(config).unwrap();
     let mut first_output = VecAgentOutput::default();
     let mut second_output = VecAgentOutput::default();
@@ -92,6 +96,10 @@ async fn codex_agent_uses_the_session_supplied_by_its_caller() {
             "exec --json --color never --model gpt-5.4 --config model_reasoning_effort=xhigh --config sandbox_mode=\"danger-full-access\" --config approval_policy=\"never\" --config model_reasoning_summary=concise -",
             "exec resume --json --model gpt-5.4 --config model_reasoning_effort=xhigh --config sandbox_mode=\"danger-full-access\" --config approval_policy=\"never\" --config model_reasoning_summary=concise thread-123 -",
         ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("configured-env")).unwrap(),
+        "configured"
     );
     assert!(first_output.events.iter().any(
         |event| matches!(event, OutputEvent::Answer { text } if text.contains("hello from codex"))
@@ -395,6 +403,7 @@ fn agent(
         model: None,
         effort: None,
         agent_sandbox: None,
+        env: Default::default(),
         subscribe: Vec::new(),
     }
 }

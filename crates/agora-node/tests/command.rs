@@ -47,3 +47,16 @@ async fn command_handles_process_io_without_agent_protocol_knowledge() {
     assert_eq!(String::from_utf8(output.stderr).unwrap(), "stderr:done");
     assert!(output.finished);
 }
+
+#[tokio::test]
+async fn command_injects_configured_environment_variables() {
+    let mut output = RecordingOutput::default();
+    let command = Command::new("/bin/bash")
+        .args(["-c", "printf '%s' \"$AGORA_AGENT_ENV\""])
+        .envs([("AGORA_AGENT_ENV", "configured")]);
+
+    let outcome = command.run(&mut output).await.unwrap();
+
+    assert_eq!(outcome.exit_code(), 0);
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "configured");
+}

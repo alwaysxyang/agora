@@ -5,6 +5,7 @@ use crate::task::{OutputEvent, ProgressStatus, TaskAttachment, TaskAttachmentKin
 use agora_core::logger;
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -15,6 +16,7 @@ pub(super) struct CodexAgent {
     model: Option<String>,
     effort: Option<String>,
     agent_sandbox: Option<AgentSandbox>,
+    env: HashMap<String, String>,
 }
 
 impl CodexAgent {
@@ -24,6 +26,7 @@ impl CodexAgent {
         model: Option<String>,
         effort: Option<String>,
         agent_sandbox: Option<AgentSandbox>,
+        env: HashMap<String, String>,
     ) -> Self {
         Self {
             name,
@@ -31,6 +34,7 @@ impl CodexAgent {
             model,
             effort,
             agent_sandbox,
+            env,
         }
     }
 
@@ -64,6 +68,7 @@ impl CodexAgent {
         Ok(PreparedCommand {
             command: Command::new(&self.path)
                 .args(args)
+                .envs(self.env.clone())
                 .current_dir(workdir)
                 .input(input),
             resume_requested,
