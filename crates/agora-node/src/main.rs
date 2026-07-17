@@ -21,8 +21,13 @@ const CONFIG_HELP: &str = r#"CONFIGURATION FILE (JSON)
     app_id                   Lark application ID.
     secret                   Lark application secret; do not commit it.
 
+  Telegram channel fields:
+    type                     Channel type; use "telegram".
+    name                     Unique channel name referenced by subscriptions.
+    token                    Telegram bot token; do not commit it.
+
   Reserved channel types:
-    type                     "local", "http", or "telegram"; not active yet.
+    type                     "local" or "http"; not active yet.
     name                     Unique channel name.
 
   Agent fields:
@@ -42,11 +47,13 @@ const CONFIG_HELP: &str = r#"CONFIGURATION FILE (JSON)
     subscribe[].filter       Optional reserved channel filter; currently ignored.
 
   Example:
-    {"channels":[{"type":"lark","name":"lark1","app_id":"xxx","secret":"xxx"}],
+    {"channels":[{"type":"lark","name":"lark1","app_id":"xxx","secret":"xxx"},
+     {"type":"telegram","name":"telegram1","token":"xxx"}],
      "agents":[{"name":"codex","isolate":"none","type":"codex",
      "path":"/opt/homebrew/bin/codex","agent_sandbox":"danger-full-access",
      "env":{"HTTP_PROXY":"http://127.0.0.1:7890"},
-     "subscribe":[{"channel":"lark1","filter":{}}]}]}
+     "subscribe":[{"channel":"lark1","filter":{}},
+     {"channel":"telegram1","filter":{}}]}]}
 "#;
 
 #[derive(Parser)]

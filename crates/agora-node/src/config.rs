@@ -69,7 +69,7 @@ pub enum ChannelConfig {
     Lark(LarkChannelConfig),
     Local(NamedChannelConfig),
     Http(NamedChannelConfig),
-    Telegram(NamedChannelConfig),
+    Telegram(TelegramChannelConfig),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -79,13 +79,18 @@ pub struct LarkChannelConfig {
     pub secret: String,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct TelegramChannelConfig {
+    pub name: String,
+    pub token: String,
+}
+
 impl ChannelConfig {
     pub fn name(&self) -> &str {
         match self {
             ChannelConfig::Lark(config) => &config.name,
-            ChannelConfig::Local(config)
-            | ChannelConfig::Http(config)
-            | ChannelConfig::Telegram(config) => &config.name,
+            ChannelConfig::Telegram(config) => &config.name,
+            ChannelConfig::Local(config) | ChannelConfig::Http(config) => &config.name,
         }
     }
 }

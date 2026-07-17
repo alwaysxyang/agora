@@ -1,10 +1,12 @@
 use crate::channel::lark::{LarkChannel, LarkRun, LarkTask};
+use crate::channel::telegram::{TelegramChannel, TelegramRun, TelegramTask};
 use crate::config::ChannelConfig;
 use crate::task::{OutputEvent, TaskContent};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::future::Future;
 
 pub mod lark;
+mod telegram;
 
 pub trait Channel {
     type Task: ChannelTask;
@@ -67,24 +69,28 @@ pub trait ChannelRun: Clone {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfiguredTask {
     Lark(LarkTask),
+    Telegram(TelegramTask),
 }
 
 impl ChannelTask for ConfiguredTask {
     fn task_id(&self) -> &str {
         match self {
             ConfiguredTask::Lark(task) => task.task_id(),
+            ConfiguredTask::Telegram(task) => task.task_id(),
         }
     }
 
     fn session_id(&self) -> &str {
         match self {
             ConfiguredTask::Lark(task) => task.session_id(),
+            ConfiguredTask::Telegram(task) => task.session_id(),
         }
     }
 
     fn content(&self) -> &TaskContent {
         match self {
             ConfiguredTask::Lark(task) => task.content(),
+            ConfiguredTask::Telegram(task) => task.content(),
         }
     }
 }
@@ -92,27 +98,31 @@ impl ChannelTask for ConfiguredTask {
 #[derive(Clone)]
 pub enum ConfiguredRun {
     Lark(LarkRun),
+    Telegram(TelegramRun),
 }
 
 impl ChannelRun for ConfiguredRun {
     async fn publish(&self, event: RunEvent) -> Result<()> {
         match self {
             ConfiguredRun::Lark(run) => run.publish(event).await,
+            ConfiguredRun::Telegram(run) => run.publish(event).await,
         }
     }
 }
 
 pub enum ConfiguredChannel {
     Lark(LarkChannel),
+    Telegram(TelegramChannel),
 }
 
 impl ConfiguredChannel {
     pub fn from_config(config: ChannelConfig) -> Result<Option<Self>> {
         match config {
             ChannelConfig::Lark(config) => Ok(Some(Self::Lark(LarkChannel::new(config)?))),
-            ChannelConfig::Local(_) | ChannelConfig::Http(_) | ChannelConfig::Telegram(_) => {
-                Ok(None)
+            ChannelConfig::Telegram(config) => {
+                Ok(Some(Self::Telegram(TelegramChannel::new(config)?)))
             }
+            ChannelConfig::Local(_) | ChannelConfig::Http(_) => Ok(None),
         }
     }
 }
@@ -124,12 +134,16 @@ impl Channel for ConfiguredChannel {
     fn name(&self) -> &str {
         match self {
             ConfiguredChannel::Lark(channel) => channel.name(),
+            ConfiguredChannel::Telegram(channel) => channel.name(),
         }
     }
 
     async fn recv(&mut self) -> Result<Option<Self::Task>> {
         match self {
             ConfiguredChannel::Lark(channel) => Ok(channel.recv().await?.map(ConfiguredTask::Lark)),
+            ConfiguredChannel::Telegram(channel) => {
+                Ok(channel.recv().await?.map(ConfiguredTask::Telegram))
+            }
         }
     }
 
@@ -138,6 +152,10 @@ impl Channel for ConfiguredChannel {
             (ConfiguredChannel::Lark(channel), ConfiguredTask::Lark(task)) => {
                 Ok(ConfiguredRun::Lark(channel.open_run(task, context).await?))
             }
+            (ConfiguredChannel::Telegram(channel), ConfiguredTask::Telegram(task)) => Ok(
+                ConfiguredRun::Telegram(channel.open_run(task, context).await?),
+            ),
+            _ => bail!("configured channel and task types do not match"),
         }
     }
 
@@ -146,6 +164,10 @@ impl Channel for ConfiguredChannel {
             (ConfiguredChannel::Lark(channel), ConfiguredTask::Lark(task)) => {
                 channel.reply(task, reply).await
             }
+            (ConfiguredChannel::Telegram(channel), ConfiguredTask::Telegram(task)) => {
+                channel.reply(task, reply).await
+            }
+            _ => bail!("configured channel and task types do not match"),
         }
     }
 }

@@ -1,4 +1,6 @@
-use agora_node::config::{AgentConfig, AgentSandbox, AgentType, IsolateMode, NodeConfig};
+use agora_node::config::{
+    AgentConfig, AgentSandbox, AgentType, ChannelConfig, IsolateMode, NodeConfig,
+};
 
 #[test]
 fn parses_channels_and_agents_config() {
@@ -105,6 +107,35 @@ fn rejects_removed_task_isolation_mode() {
     }"#;
 
     assert!(serde_json::from_str::<NodeConfig>(content).is_err());
+}
+
+#[test]
+fn telegram_channel_requires_a_token() {
+    let content = r#"{
+        "channels": [{"type": "telegram", "name": "telegram1"}],
+        "agents": []
+    }"#;
+
+    assert!(serde_json::from_str::<NodeConfig>(content).is_err());
+}
+
+#[test]
+fn parses_telegram_channel_token() {
+    let content = r#"{
+        "channels": [{
+            "type": "telegram",
+            "name": "telegram1",
+            "token": "123456:bot-token"
+        }],
+        "agents": []
+    }"#;
+
+    let config = serde_json::from_str::<NodeConfig>(content).unwrap();
+    let ChannelConfig::Telegram(telegram) = &config.channels[0] else {
+        panic!("channel should be telegram");
+    };
+    assert_eq!(telegram.name, "telegram1");
+    assert_eq!(telegram.token, "123456:bot-token");
 }
 
 #[test]

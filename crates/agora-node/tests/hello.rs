@@ -65,6 +65,8 @@ fn node_help_describes_the_config_fields() {
         "channels",
         "app_id",
         "secret",
+        "telegram",
+        "token",
         "agents",
         "isolate",
         "workspace",
