@@ -1,6 +1,7 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum NodeCommand {
     Stop { agent_name: Option<String> },
+    Reset,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +29,13 @@ impl CommandParser {
                     CommandRoute::Invalid("Usage: /stop [agent_name]".to_string())
                 } else {
                     CommandRoute::Command(NodeCommand::Stop { agent_name })
+                }
+            }
+            "/reset" => {
+                if parts.next().is_some() {
+                    CommandRoute::Invalid("Usage: /reset".to_string())
+                } else {
+                    CommandRoute::Command(NodeCommand::Reset)
                 }
             }
             _ => CommandRoute::Invalid(format!("Unknown command: {command}")),

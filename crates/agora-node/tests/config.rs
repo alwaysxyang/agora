@@ -64,27 +64,47 @@ fn parses_channels_and_agents_config() {
 }
 
 #[test]
-fn derives_workdir_from_isolation_mode() {
+fn isolation_mode_does_not_change_workdir() {
     let mut config = example_config();
     config.workspace = "/tmp/agora-agent".to_string();
 
     config.isolate = IsolateMode::None;
+    let isolation_scope = config.isolation_scope("lark1", "session-a");
     assert_eq!(
-        config.workdir("task-1", "session-a"),
+        isolation_scope,
+        config.isolation_scope("telegram1", "session-b")
+    );
+    assert_eq!(
+        config.workdir(),
         std::path::PathBuf::from("/tmp/agora-agent")
     );
 
     config.isolate = IsolateMode::Session;
-    assert_eq!(
-        config.workdir("task-1", "session-a"),
-        std::path::PathBuf::from("/tmp/agora-agent/agent-1/session-a")
+    let isolation_scope = config.isolation_scope("lark1", "session-a");
+    assert_ne!(
+        isolation_scope,
+        config.isolation_scope("telegram1", "session-b")
     );
+    assert_eq!(
+        config.workdir(),
+        std::path::PathBuf::from("/tmp/agora-agent")
+    );
+}
 
-    config.isolate = IsolateMode::Task;
-    assert_eq!(
-        config.workdir("task-1", "session-a"),
-        std::path::PathBuf::from("/tmp/agora-agent/agent-1/task-1")
-    );
+#[test]
+fn rejects_removed_task_isolation_mode() {
+    let content = r#"{
+        "channels": [],
+        "agents": [{
+            "name": "agent-1",
+            "isolate": "task",
+            "type": "codex",
+            "path": "/opt/homebrew/bin/codex",
+            "subscribe": []
+        }]
+    }"#;
+
+    assert!(serde_json::from_str::<NodeConfig>(content).is_err());
 }
 
 #[test]

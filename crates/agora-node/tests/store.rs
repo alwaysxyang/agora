@@ -1,3 +1,4 @@
+use agora_node::config::IsolationScope;
 use agora_node::store::{SessionKey, SessionStore};
 
 #[test]
@@ -8,7 +9,9 @@ fn store_schema_is_embedded_from_a_sql_file() {
     let schema = std::fs::read_to_string(store_dir.join("schema.sql")).unwrap();
     let source = std::fs::read_to_string(store_dir.join("mod.rs")).unwrap();
 
-    assert!(schema.contains("CREATE TABLE IF NOT EXISTS channel_agent_sessions"));
+    assert!(schema.contains("CREATE TABLE IF NOT EXISTS agent_sessions"));
+    assert!(schema.contains("isolation_scope"));
+    assert!(!schema.contains("scope_type"));
     assert!(source.contains("include_str!(\"schema.sql\")"));
 }
 
@@ -17,7 +20,7 @@ fn session_store_round_trips_and_updates_a_mapping() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("store.db");
     let store = SessionStore::open(&path).unwrap();
-    let key = SessionKey::new("lark1", "chat-1", "codex-dev");
+    let key = SessionKey::new("codex-dev", IsolationScope::session("lark1", "chat-1"));
 
     assert_eq!(store.get(&key).unwrap(), None);
 
@@ -35,9 +38,9 @@ fn session_store_round_trips_and_updates_a_mapping() {
 fn session_store_allows_many_sessions_per_agent_without_reusing_one_backend_session() {
     let temp = tempfile::tempdir().unwrap();
     let store = SessionStore::open(temp.path().join("store.db")).unwrap();
-    let first = SessionKey::new("lark1", "chat-1", "codex-dev");
-    let second = SessionKey::new("lark1", "chat-2", "codex-dev");
-    let third = SessionKey::new("lark1", "chat-3", "codex-dev");
+    let first = SessionKey::new("codex-dev", IsolationScope::session("lark1", "chat-1"));
+    let second = SessionKey::new("codex-dev", IsolationScope::session("lark1", "chat-2"));
+    let third = SessionKey::new("codex-dev", IsolationScope::session("lark1", "chat-3"));
 
     store.save(&first, "thread-1").unwrap();
     store.save(&second, "thread-2").unwrap();
@@ -51,7 +54,7 @@ fn session_store_allows_many_sessions_per_agent_without_reusing_one_backend_sess
 fn session_store_only_removes_the_expected_mapping() {
     let temp = tempfile::tempdir().unwrap();
     let store = SessionStore::open(temp.path().join("store.db")).unwrap();
-    let key = SessionKey::new("lark1", "chat-1", "codex-dev");
+    let key = SessionKey::new("codex-dev", IsolationScope::Shared);
     store.save(&key, "thread-2").unwrap();
 
     assert!(!store.remove_if_matches(&key, "thread-1").unwrap());

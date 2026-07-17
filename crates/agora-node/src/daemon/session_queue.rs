@@ -77,6 +77,13 @@ impl SessionQueueTicket {
             .map_err(|_| anyhow!("session queue position channel closed"))?;
         Ok(*self.ahead.borrow())
     }
+
+    pub(super) async fn wait_until_front(&mut self) -> Result<()> {
+        while self.ahead() > 0 {
+            self.changed().await?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for SessionQueueTicket {

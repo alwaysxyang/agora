@@ -1,38 +1,37 @@
+use crate::config::IsolationScope;
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const CREATE_SCHEMA: &str = include_str!("schema.sql");
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SessionKey {
-    channel_name: String,
-    channel_session_id: String,
     agent_name: String,
+    isolation_scope: IsolationScope,
 }
 
 impl SessionKey {
-    pub fn new(
-        channel_name: impl Into<String>,
-        channel_session_id: impl Into<String>,
-        agent_name: impl Into<String>,
-    ) -> Self {
+    pub fn new(agent_name: impl Into<String>, isolation_scope: IsolationScope) -> Self {
         Self {
-            channel_name: channel_name.into(),
-            channel_session_id: channel_session_id.into(),
             agent_name: agent_name.into(),
+            isolation_scope,
         }
     }
 
-    pub fn channel_name(&self) -> &str {
-        &self.channel_name
+    pub fn isolation_scope(&self) -> &IsolationScope {
+        &self.isolation_scope
     }
 
-    pub fn channel_session_id(&self) -> &str {
-        &self.channel_session_id
+    pub fn channel_name(&self) -> Option<&str> {
+        self.isolation_scope.channel_name()
+    }
+
+    pub fn channel_session_id(&self) -> Option<&str> {
+        self.isolation_scope.session_id()
     }
 
     pub fn agent_name(&self) -> &str {
@@ -78,11 +77,13 @@ impl SessionStore {
         connection
             .query_row(
                 "SELECT agent_session_id
-                 FROM channel_agent_sessions
-                 WHERE channel_name = ?1
-                   AND channel_session_id = ?2
-                   AND agent_name = ?3",
+                 FROM agent_sessions
+                 WHERE isolation_scope = ?1
+                   AND channel_name IS ?2
+                   AND channel_session_id IS ?3
+                   AND agent_name = ?4",
                 params![
+                    key.isolation_scope().as_str(),
                     key.channel_name(),
                     key.channel_session_id(),
                     key.agent_name()
@@ -99,21 +100,17 @@ impl SessionStore {
         }
         let now = Self::now_millis()?;
         let connection = self.lock_connection();
-        connection
+        let updated = connection
             .execute(
-                "INSERT INTO channel_agent_sessions (
-                     channel_name,
-                     channel_session_id,
-                     agent_name,
-                     agent_session_id,
-                     created_at,
-                     updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
-                 ON CONFLICT (channel_name, channel_session_id, agent_name)
-                 DO UPDATE SET
-                     agent_session_id = excluded.agent_session_id,
-                     updated_at = excluded.updated_at",
+                "UPDATE agent_sessions
+                 SET agent_session_id = ?5,
+                     updated_at = ?6
+                 WHERE isolation_scope = ?1
+                   AND channel_name IS ?2
+                   AND channel_session_id IS ?3
+                   AND agent_name = ?4",
                 params![
+                    key.isolation_scope().as_str(),
                     key.channel_name(),
                     key.channel_session_id(),
                     key.agent_name(),
@@ -121,7 +118,30 @@ impl SessionStore {
                     now
                 ],
             )
-            .context("save channel-agent session mapping failed")?;
+            .context("update agent session mapping failed")?;
+        if updated == 0 {
+            connection
+                .execute(
+                    "INSERT INTO agent_sessions (
+                     isolation_scope,
+                     channel_name,
+                     channel_session_id,
+                     agent_name,
+                     agent_session_id,
+                     created_at,
+                     updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                    params![
+                        key.isolation_scope().as_str(),
+                        key.channel_name(),
+                        key.channel_session_id(),
+                        key.agent_name(),
+                        agent_session_id,
+                        now
+                    ],
+                )
+                .context("insert agent session mapping failed")?;
+        }
         Ok(())
     }
 
@@ -129,12 +149,14 @@ impl SessionStore {
         let connection = self.lock_connection();
         let removed = connection
             .execute(
-                "DELETE FROM channel_agent_sessions
-                 WHERE channel_name = ?1
-                   AND channel_session_id = ?2
-                   AND agent_name = ?3
-                   AND agent_session_id = ?4",
+                "DELETE FROM agent_sessions
+                 WHERE isolation_scope = ?1
+                   AND channel_name IS ?2
+                   AND channel_session_id IS ?3
+                   AND agent_name = ?4
+                   AND agent_session_id = ?5",
                 params![
+                    key.isolation_scope().as_str(),
                     key.channel_name(),
                     key.channel_session_id(),
                     key.agent_name(),

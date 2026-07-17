@@ -26,15 +26,15 @@ const CONFIG_HELP: &str = r#"CONFIGURATION FILE (JSON)
     name                     Unique channel name.
 
   Agent fields:
-    name                     Unique local agent name and isolated path segment.
-    isolate                  Workdir isolation: "none", "session", or "task".
-    workspace                Optional base workdir. Defaults to ~/.agora/workspace.
+    name                     Unique local agent name.
+    isolate                  Backend session and queue isolation: "none" or "session".
+    workspace                Optional agent workdir. Defaults to ~/.agora/workspace.
     type                     Backend type: "codex", "coco", "claude_code", or "custom".
     path                     Backend executable path.
     model                    Optional Codex model override.
     effort                   Optional Codex reasoning effort override.
     agent_sandbox            Optional backend sandbox: "read-only", "workspace-write",
-                             or "danger-full-access". This is separate from Agora isolation.
+                             or "danger-full-access". This is separate from session isolation.
     env                      Optional string environment variables for the agent process.
                              Configured keys override inherited daemon environment values.
     subscribe                Channel subscriptions for this agent.

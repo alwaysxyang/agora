@@ -1,5 +1,7 @@
 use super::command::{Command, CommandOutput};
-use super::{Agent, AgentOutcome, AgentOutput, AgentRequest, AgentSessionUpdate};
+use super::{
+    Agent, AgentOutcome, AgentOutput, AgentRequest, AgentSessionUpdate, DeleteSessionOutcome,
+};
 use crate::task::OutputEvent;
 use anyhow::{Result, bail};
 use std::collections::HashMap;
@@ -36,6 +38,10 @@ impl Agent for CustomAgent {
             outcome.exit_code(),
             AgentSessionUpdate::Unchanged,
         ))
+    }
+
+    async fn delete_session(&self, _session_id: &str) -> Result<DeleteSessionOutcome> {
+        Ok(DeleteSessionOutcome::Unsupported)
     }
 }
 

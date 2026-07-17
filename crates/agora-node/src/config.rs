@@ -40,13 +40,19 @@ fn default_workspace() -> String {
 }
 
 impl AgentConfig {
-    pub fn workdir(&self, task_id: &str, session_key: &str) -> PathBuf {
-        let workspace = PathBuf::from(&self.workspace);
+    pub fn isolation_scope(
+        &self,
+        channel_name: impl Into<String>,
+        session_id: impl Into<String>,
+    ) -> IsolationScope {
         match self.isolate {
-            IsolateMode::None => workspace,
-            IsolateMode::Session => workspace.join(&self.name).join(session_key),
-            IsolateMode::Task => workspace.join(&self.name).join(task_id),
+            IsolateMode::None => IsolationScope::Shared,
+            IsolateMode::Session => IsolationScope::session(channel_name, session_id),
         }
+    }
+
+    pub fn workdir(&self) -> PathBuf {
+        PathBuf::from(&self.workspace)
     }
 }
 
@@ -94,7 +100,45 @@ pub struct NamedChannelConfig {
 pub enum IsolateMode {
     None,
     Session,
-    Task,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum IsolationScope {
+    Shared,
+    Session {
+        channel_name: String,
+        session_id: String,
+    },
+}
+
+impl IsolationScope {
+    pub fn session(channel_name: impl Into<String>, session_id: impl Into<String>) -> Self {
+        Self::Session {
+            channel_name: channel_name.into(),
+            session_id: session_id.into(),
+        }
+    }
+
+    pub fn channel_name(&self) -> Option<&str> {
+        match self {
+            Self::Shared => None,
+            Self::Session { channel_name, .. } => Some(channel_name),
+        }
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::Shared => None,
+            Self::Session { session_id, .. } => Some(session_id),
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Session { .. } => "session",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]

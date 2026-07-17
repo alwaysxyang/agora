@@ -1,9 +1,11 @@
 use super::command::{Command, CommandOutput};
-use super::{Agent, AgentOutcome, AgentOutput, AgentRequest, AgentSessionUpdate};
+use super::{
+    Agent, AgentOutcome, AgentOutput, AgentRequest, AgentSessionUpdate, DeleteSessionOutcome,
+};
 use crate::config::AgentSandbox;
 use crate::task::{OutputEvent, ProgressStatus, TaskAttachment, TaskAttachmentKind, TokenUsage};
 use agora_core::logger;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -159,6 +161,45 @@ impl Agent for CodexAgent {
             AgentSessionUpdate::Unchanged
         };
         Ok(AgentOutcome::new(outcome.exit_code(), session_update))
+    }
+
+    async fn delete_session(&self, session_id: &str) -> Result<DeleteSessionOutcome> {
+        let command = Command::new(&self.path)
+            .args(["delete", "--force", session_id])
+            .envs(self.env.clone());
+        let mut command_output = DeleteSessionCommandOutput::default();
+        let outcome = command.run(&mut command_output).await?;
+        if outcome.exit_code() != 0 {
+            bail!(
+                "codex delete session failed exit_code={} output={}",
+                outcome.exit_code(),
+                command_output.message()
+            );
+        }
+        Ok(DeleteSessionOutcome::Deleted)
+    }
+}
+
+#[derive(Default)]
+struct DeleteSessionCommandOutput {
+    output: Vec<u8>,
+}
+
+impl DeleteSessionCommandOutput {
+    fn message(&self) -> String {
+        String::from_utf8_lossy(&self.output).trim().to_string()
+    }
+}
+
+impl CommandOutput for DeleteSessionCommandOutput {
+    async fn stdout(&mut self, chunk: &[u8]) -> Result<()> {
+        self.output.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    async fn stderr(&mut self, chunk: &[u8]) -> Result<()> {
+        self.output.extend_from_slice(chunk);
+        Ok(())
     }
 }
 

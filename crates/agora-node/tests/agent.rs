@@ -1,4 +1,6 @@
-use agora_node::agent::{AgentOutput, AgentSessionUpdate, AgentTask, ConfiguredAgent};
+use agora_node::agent::{
+    AgentOutput, AgentSessionUpdate, AgentTask, ConfiguredAgent, DeleteSessionOutcome,
+};
 use agora_node::config::{AgentConfig, AgentSandbox, AgentType, IsolateMode};
 use agora_node::task::{OutputEvent, ProgressStatus, TaskAttachment, TaskContent, TokenUsage};
 use anyhow::Result;
@@ -64,11 +66,7 @@ async fn codex_agent_uses_the_session_supplied_by_its_caller() {
     let mut second_output = VecAgentOutput::default();
 
     let first_outcome = agent
-        .run(
-            AgentTask::new("task-1", "session-1", "first"),
-            None,
-            &mut first_output,
-        )
+        .run(AgentTask::new("first"), None, &mut first_output)
         .await
         .unwrap();
     assert_eq!(
@@ -78,7 +76,7 @@ async fn codex_agent_uses_the_session_supplied_by_its_caller() {
 
     let second_outcome = agent
         .run(
-            AgentTask::new("task-2", "session-2", "second"),
+            AgentTask::new("second"),
             Some("thread-123".to_string()),
             &mut second_output,
         )
@@ -150,11 +148,7 @@ async fn codex_agent_classifies_thinking_progress_and_final_answer() {
     let mut output = VecAgentOutput::default();
 
     agent
-        .run(
-            AgentTask::new("task-1", "session-1", "hello"),
-            None,
-            &mut output,
-        )
+        .run(AgentTask::new("hello"), None, &mut output)
         .await
         .unwrap();
 
@@ -220,7 +214,7 @@ async fn codex_agent_reports_a_missing_session_without_persisting_it() {
 
     let outcome = agent
         .run(
-            AgentTask::new("task-1", "session-1", "hello"),
+            AgentTask::new("hello"),
             Some("missing".to_string()),
             &mut output,
         )
@@ -261,11 +255,7 @@ async fn codex_agent_does_not_publish_backend_stderr() {
     let mut output = VecAgentOutput::default();
 
     agent
-        .run(
-            AgentTask::new("task-1", "session-1", "hello"),
-            None,
-            &mut output,
-        )
+        .run(AgentTask::new("hello"), None, &mut output)
         .await
         .unwrap();
 
@@ -316,7 +306,7 @@ async fn codex_agent_passes_image_attachments_to_a_resumed_turn() {
 
     agent
         .run(
-            AgentTask::new("task-1", "session-1", content),
+            AgentTask::new(content),
             Some("thread-123".to_string()),
             &mut output,
         )
@@ -348,11 +338,7 @@ async fn custom_agent_streams_raw_command_output() {
     let mut output = VecAgentOutput::default();
 
     let outcome = agent
-        .run(
-            AgentTask::new("task-1", "session-1", "hello from custom"),
-            None,
-            &mut output,
-        )
+        .run(AgentTask::new("hello from custom"), None, &mut output)
         .await
         .unwrap();
 
@@ -375,17 +361,82 @@ async fn custom_agent_rejects_attachments_without_a_backend_contract() {
     let mut output = VecAgentOutput::default();
 
     let error = agent
-        .run(
-            AgentTask::new("task-1", "session-1", content),
-            None,
-            &mut output,
-        )
+        .run(AgentTask::new(content), None, &mut output)
         .await
         .unwrap_err();
 
     assert_eq!(
         error.to_string(),
         "custom agent does not support task attachments"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_agent_deletes_its_backend_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("codex");
+    std::fs::write(
+        &script,
+        concat!(
+            "#!/bin/sh\n",
+            "printf '%s\\n' \"$*\" > \"$DELETE_INVOCATION\"\n",
+            "printf '%s' \"$AGORA_AGENT_ENV\" > \"$DELETE_ENV\"\n",
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let mut config = agent(AgentType::Codex, &script, temp.path());
+    config
+        .env
+        .insert("AGORA_AGENT_ENV".to_string(), "configured".to_string());
+    config.env.insert(
+        "DELETE_INVOCATION".to_string(),
+        temp.path()
+            .join("delete-invocation")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    config.env.insert(
+        "DELETE_ENV".to_string(),
+        temp.path()
+            .join("delete-env")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let agent = ConfiguredAgent::from_config(config).unwrap();
+
+    assert_eq!(
+        agent
+            .delete_session("019f5eb1-cf97-7c71-bf16-b7cff731724a")
+            .await
+            .unwrap(),
+        DeleteSessionOutcome::Deleted
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("delete-invocation")).unwrap(),
+        "delete --force 019f5eb1-cf97-7c71-bf16-b7cff731724a\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("delete-env")).unwrap(),
+        "configured"
+    );
+}
+
+#[tokio::test]
+async fn custom_agent_reports_backend_session_deletion_as_unsupported() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent =
+        ConfiguredAgent::from_config(agent(AgentType::Custom, "/bin/cat", temp.path())).unwrap();
+
+    assert_eq!(
+        agent.delete_session("custom-session").await.unwrap(),
+        DeleteSessionOutcome::Unsupported
     );
 }
 

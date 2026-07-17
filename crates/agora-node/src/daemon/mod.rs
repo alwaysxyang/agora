@@ -1,5 +1,6 @@
 use crate::agent::{
     AgentOutcome, AgentOutput, AgentRegistry, AgentSessionUpdate, AgentTask, ConfiguredAgent,
+    DeleteSessionOutcome,
 };
 use crate::channel::{
     Channel, ChannelAgent, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask,
@@ -10,6 +11,7 @@ use crate::store::{SessionKey, SessionStore};
 use crate::task::OutputEvent;
 use agora_core::logger;
 use anyhow::{Result, bail};
+use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::task::{JoinError, JoinSet};
 
@@ -89,15 +91,15 @@ impl AgentDispatcher {
                 )
                 .await?;
             let mut output = AgentRunOutput::new(run);
-            let agent_task =
-                AgentTask::new(task.task_id(), task.session_id(), task.content().clone());
-            let key = SessionKey::new(channel.name(), task.session_id(), agent.name());
-            let mut queue_ticket = self.queues.enqueue(&key);
+            let agent_task = AgentTask::new(task.content().clone());
+            let isolation_scope = agent.isolation_scope(channel.name(), task.session_id());
+            let key = SessionKey::new(agent.name(), isolation_scope.clone());
             let mut active_run = self.active_runs.register(ActiveRunScope::new(
                 channel.name(),
                 task.session_id(),
-                agent.name(),
+                key.clone(),
             ));
+            let mut queue_ticket = self.queues.enqueue(&key);
             let dispatcher = self.clone();
             runs.spawn(async move {
                 let mut ahead = queue_ticket.ahead();
@@ -112,7 +114,12 @@ impl AgentDispatcher {
                 }
                 output.started().await?;
                 let result = tokio::select! {
-                    result = dispatcher.execute_agent(&key, &agent, agent_task, &mut output) => result,
+                    result = dispatcher.execute_agent(
+                        &key,
+                        &agent,
+                        agent_task,
+                        &mut output,
+                    ) => result,
                     cancellation = active_run.cancelled() => {
                         return output.cancelled(cancellation).await;
                     }
@@ -136,6 +143,73 @@ impl AgentDispatcher {
         agent_name: Option<&str>,
     ) -> Vec<String> {
         self.active_runs.stop(channel_name, session_id, agent_name)
+    }
+
+    async fn reset_sessions(
+        &self,
+        channel_name: &str,
+        session_id: &str,
+        agents: &[ConfiguredAgent],
+    ) -> Vec<String> {
+        let mut resets = agents
+            .iter()
+            .map(|agent| {
+                let key = SessionKey::new(
+                    agent.name(),
+                    agent.isolation_scope(channel_name, session_id),
+                );
+                let barrier = self.queues.enqueue(&key);
+                (agent.clone(), key, barrier)
+            })
+            .collect::<VecDeque<_>>();
+        let keys = resets
+            .iter()
+            .map(|(_, key, _)| key.clone())
+            .collect::<Vec<_>>();
+        self.active_runs.stop_session_keys(&keys);
+
+        let mut failed = Vec::new();
+        while let Some((agent, key, mut barrier)) = resets.pop_front() {
+            let result = async {
+                barrier.wait_until_front().await?;
+                self.reset_agent_session(&key, &agent).await
+            }
+            .await;
+            if let Err(err) = result {
+                logger::error!(
+                    "agent session reset failed agent={} isolation={}: {}",
+                    key.agent_name(),
+                    key.isolation_scope().as_str(),
+                    err
+                );
+                failed.push(key.agent_name().to_string());
+            }
+        }
+        failed
+    }
+
+    async fn reset_agent_session(&self, key: &SessionKey, agent: &ConfiguredAgent) -> Result<()> {
+        let Some(session_id) = self.store.get(key)? else {
+            return Ok(());
+        };
+
+        match agent.delete_session(&session_id).await? {
+            DeleteSessionOutcome::Deleted => {}
+            DeleteSessionOutcome::Unsupported => logger::info!(
+                "agent does not support backend session deletion agent={} isolation={}",
+                key.agent_name(),
+                key.isolation_scope().as_str()
+            ),
+        }
+        if !self.store.remove_if_matches(key, &session_id)? {
+            bail!("agent session mapping changed while reset was in progress");
+        }
+        logger::info!(
+            "agent session reset agent={} isolation={}",
+            key.agent_name(),
+            key.isolation_scope().as_str()
+        );
+        Ok(())
     }
 
     fn log_run_result(result: std::result::Result<Result<()>, JoinError>) {
@@ -165,10 +239,9 @@ impl AgentDispatcher {
             };
             self.store.remove_if_matches(key, &stale_session_id)?;
             logger::info!(
-                "agent session missing; starting a new session channel={} channel_session={} agent={}",
-                key.channel_name(),
-                key.channel_session_id(),
-                key.agent_name()
+                "agent session missing; starting a new session agent={} isolation={}",
+                key.agent_name(),
+                key.isolation_scope().as_str()
             );
             outcome = agent.run(task, None, output).await?;
             if outcome.session_update() == &AgentSessionUpdate::NotFound {
@@ -340,6 +413,12 @@ impl Daemon {
                     .reply(&task, Self::stop_reply(agent_name.as_deref(), &stopped))
                     .await
             }
+            CommandRoute::Command(NodeCommand::Reset) => {
+                let failed = dispatcher
+                    .reset_sessions(channel.name(), task.session_id(), agents)
+                    .await;
+                channel.reply(&task, Self::reset_reply(&failed)).await
+            }
             CommandRoute::Invalid(message) => {
                 channel.reply(&task, ChannelReply::new(message)).await
             }
@@ -366,6 +445,14 @@ impl Daemon {
             stopped.len(),
             stopped.join(", ")
         ))
+    }
+
+    fn reset_reply(failed: &[String]) -> ChannelReply {
+        if failed.is_empty() {
+            ChannelReply::new("Reset successful.")
+        } else {
+            ChannelReply::new(format!("Reset failed for agents: {}.", failed.join(", ")))
+        }
     }
 }
 

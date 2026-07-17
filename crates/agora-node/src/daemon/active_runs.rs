@@ -1,3 +1,4 @@
+use crate::store::SessionKey;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -7,19 +8,19 @@ use tokio::sync::watch;
 pub(super) struct ActiveRunScope {
     channel_name: String,
     session_id: String,
-    agent_name: String,
+    session_key: SessionKey,
 }
 
 impl ActiveRunScope {
     pub(super) fn new(
         channel_name: impl Into<String>,
         session_id: impl Into<String>,
-        agent_name: impl Into<String>,
+        session_key: SessionKey,
     ) -> Self {
         Self {
             channel_name: channel_name.into(),
             session_id: session_id.into(),
-            agent_name: agent_name.into(),
+            session_key,
         }
     }
 }
@@ -91,14 +92,26 @@ impl ActiveRuns {
         let mut stopped = BTreeSet::new();
         for entry in self.entries().values() {
             let matches_agent = agent_name
-                .map(|name| name == entry.scope.agent_name)
+                .map(|name| name == entry.scope.session_key.agent_name())
                 .unwrap_or(true);
             if entry.scope.channel_name == channel_name
                 && entry.scope.session_id == session_id
                 && matches_agent
                 && entry.control.send(RunControl::Stop).is_ok()
             {
-                stopped.insert(entry.scope.agent_name.clone());
+                stopped.insert(entry.scope.session_key.agent_name().to_string());
+            }
+        }
+        stopped.into_iter().collect()
+    }
+
+    pub(super) fn stop_session_keys(&self, session_keys: &[SessionKey]) -> Vec<String> {
+        let mut stopped = BTreeSet::new();
+        for entry in self.entries().values() {
+            if session_keys.contains(&entry.scope.session_key)
+                && entry.control.send(RunControl::Stop).is_ok()
+            {
+                stopped.insert(entry.scope.session_key.agent_name().to_string());
             }
         }
         stopped.into_iter().collect()

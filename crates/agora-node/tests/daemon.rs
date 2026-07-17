@@ -3,8 +3,8 @@ use agora_node::channel::{
     Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, ConfiguredChannel, RunEvent,
 };
 use agora_node::config::{
-    AgentConfig, AgentSubscription, AgentType, ChannelConfig, IsolateMode, LarkChannelConfig,
-    NodeConfig,
+    AgentConfig, AgentSubscription, AgentType, ChannelConfig, IsolateMode, IsolationScope,
+    LarkChannelConfig, NodeConfig,
 };
 use agora_node::daemon::AgentDispatcher;
 use agora_node::store::{SessionKey, SessionStore};
@@ -135,10 +135,223 @@ async fn persists_and_serializes_session_by_channel_and_agent() {
     );
     assert_eq!(
         store
-            .get(&SessionKey::new("test", "session-1", "codex-dev"))
+            .get(&SessionKey::new("codex-dev", IsolationScope::Shared))
             .unwrap()
             .as_deref(),
         Some("thread-123")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn none_isolation_queues_and_resumes_across_channels() {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::time::{Duration, timeout};
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("codex");
+    std::fs::write(
+        &script,
+        concat!(
+            "#!/bin/sh\n",
+            "printf '%s\\n' \"$*\" >> invocations\n",
+            "cat >/dev/null\n",
+            "sleep 0.2\n",
+            "printf '%s\\n' ",
+            "'{\"type\":\"thread.started\",\"thread_id\":\"thread-shared\"}'\n",
+            "printf '%s\\n' ",
+            "'{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}'\n",
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let store = SessionStore::open(temp.path().join("store.db")).unwrap();
+    let dispatcher = AgentDispatcher::new(store.clone());
+    let agent = ConfiguredAgent::from_config(AgentConfig {
+        name: "codex-dev".to_string(),
+        isolate: IsolateMode::None,
+        workspace: temp.path().to_string_lossy().into_owned(),
+        agent_type: AgentType::Codex,
+        path: script.to_string_lossy().into_owned(),
+        model: None,
+        effort: None,
+        agent_sandbox: None,
+        env: Default::default(),
+        subscribe: Vec::new(),
+    })
+    .unwrap();
+    let second_events = Arc::new(Mutex::new(Vec::new()));
+
+    let first = tokio::spawn({
+        let dispatcher = dispatcher.clone();
+        let agent = agent.clone();
+        async move {
+            dispatcher
+                .dispatch_channel_task(
+                    &ScopedChannel::new("lark1"),
+                    vec![agent],
+                    ScopedTask::new("task-1", "chat-1"),
+                )
+                .await
+        }
+    });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if std::fs::read_to_string(temp.path().join("invocations"))
+                .map(|content| content.lines().count() == 1)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let second = tokio::spawn({
+        let dispatcher = dispatcher.clone();
+        let events = Arc::clone(&second_events);
+        async move {
+            dispatcher
+                .dispatch_channel_task(
+                    &ScopedChannel::with_events("telegram1", events),
+                    vec![agent],
+                    ScopedTask::new("task-2", "chat-2"),
+                )
+                .await
+        }
+    });
+
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+
+    let invocations = std::fs::read_to_string(temp.path().join("invocations")).unwrap();
+    assert_eq!(
+        invocations.lines().collect::<Vec<_>>(),
+        vec![
+            "exec --json --color never --config model_reasoning_summary=concise -",
+            "exec resume --json --config model_reasoning_summary=concise thread-shared -",
+        ]
+    );
+    assert!(
+        second_events
+            .lock()
+            .unwrap()
+            .contains(&RunEvent::Queued { ahead: 1 })
+    );
+    assert_eq!(
+        store
+            .get(&SessionKey::new("codex-dev", IsolationScope::Shared))
+            .unwrap()
+            .as_deref(),
+        Some("thread-shared")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_isolation_separates_backend_sessions_and_reuses_workspace() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("codex");
+    std::fs::write(
+        &script,
+        concat!(
+            "#!/bin/sh\n",
+            "printf '%s\\n' \"$*\" >> \"$INVOCATIONS\"\n",
+            "pwd >> \"$WORKDIRS\"\n",
+            "count=$(wc -l < \"$INVOCATIONS\" | tr -d ' ')\n",
+            "cat >/dev/null\n",
+            "printf '{\"type\":\"thread.started\",\"thread_id\":\"thread-%s\"}\\n' \"$count\"\n",
+            "printf '%s\\n' ",
+            "'{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}'\n",
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let invocations = temp.path().join("invocations");
+    let workdirs = temp.path().join("workdirs");
+    let store = SessionStore::open(temp.path().join("store.db")).unwrap();
+    let dispatcher = AgentDispatcher::new(store.clone());
+    let mut env = std::collections::HashMap::new();
+    env.insert(
+        "INVOCATIONS".to_string(),
+        invocations.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "WORKDIRS".to_string(),
+        workdirs.to_string_lossy().into_owned(),
+    );
+    let agent = ConfiguredAgent::from_config(AgentConfig {
+        name: "codex-dev".to_string(),
+        isolate: IsolateMode::Session,
+        workspace: temp.path().to_string_lossy().into_owned(),
+        agent_type: AgentType::Codex,
+        path: script.to_string_lossy().into_owned(),
+        model: None,
+        effort: None,
+        agent_sandbox: None,
+        env,
+        subscribe: Vec::new(),
+    })
+    .unwrap();
+    let channel = ScopedChannel::new("lark1");
+
+    dispatcher
+        .dispatch_channel_task(
+            &channel,
+            vec![agent.clone()],
+            ScopedTask::new("task-1", "chat-1"),
+        )
+        .await
+        .unwrap();
+    dispatcher
+        .dispatch_channel_task(&channel, vec![agent], ScopedTask::new("task-2", "chat-2"))
+        .await
+        .unwrap();
+
+    let invocations = std::fs::read_to_string(invocations).unwrap();
+    assert_eq!(
+        invocations.lines().collect::<Vec<_>>(),
+        vec![
+            "exec --json --color never --config model_reasoning_summary=concise -",
+            "exec --json --color never --config model_reasoning_summary=concise -",
+        ]
+    );
+    assert_eq!(
+        store
+            .get(&SessionKey::new(
+                "codex-dev",
+                IsolationScope::session("lark1", "chat-1"),
+            ))
+            .unwrap()
+            .as_deref(),
+        Some("thread-1")
+    );
+    assert_eq!(
+        store
+            .get(&SessionKey::new(
+                "codex-dev",
+                IsolationScope::session("lark1", "chat-2"),
+            ))
+            .unwrap()
+            .as_deref(),
+        Some("thread-2")
+    );
+    let workdirs = std::fs::read_to_string(workdirs).unwrap();
+    let expected_workdir = std::fs::canonicalize(temp.path()).unwrap();
+    let expected_workdir = expected_workdir.to_string_lossy();
+    assert_eq!(
+        workdirs.lines().collect::<Vec<_>>(),
+        vec![expected_workdir.as_ref(), expected_workdir.as_ref()]
     );
 }
 
@@ -333,7 +546,7 @@ async fn replaces_a_missing_agent_session_with_a_new_session() {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script, permissions).unwrap();
 
-    let key = SessionKey::new("test", "session-1", "codex-dev");
+    let key = SessionKey::new("codex-dev", IsolationScope::Shared);
     let store = SessionStore::open(temp.path().join("store.db")).unwrap();
     store.save(&key, "missing").unwrap();
     let dispatcher = AgentDispatcher::new(store.clone());
@@ -483,6 +696,78 @@ impl Channel for RecordingChannel {
 
     async fn open_run(&self, _task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
         self.contexts.lock().unwrap().push(context);
+        Ok(RecordingRun {
+            events: Arc::clone(&self.events),
+        })
+    }
+
+    async fn reply(&self, _task: &Self::Task, _reply: ChannelReply) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct ScopedTask {
+    task_id: String,
+    session_id: String,
+    content: TaskContent,
+}
+
+impl ScopedTask {
+    fn new(task_id: &str, session_id: &str) -> Self {
+        Self {
+            task_id: task_id.to_string(),
+            session_id: session_id.to_string(),
+            content: TaskContent::new("hello"),
+        }
+    }
+}
+
+impl ChannelTask for ScopedTask {
+    fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    fn content(&self) -> &TaskContent {
+        &self.content
+    }
+}
+
+struct ScopedChannel {
+    name: String,
+    events: Arc<Mutex<Vec<RunEvent>>>,
+}
+
+impl ScopedChannel {
+    fn new(name: &str) -> Self {
+        Self::with_events(name, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    fn with_events(name: &str, events: Arc<Mutex<Vec<RunEvent>>>) -> Self {
+        Self {
+            name: name.to_string(),
+            events,
+        }
+    }
+}
+
+impl Channel for ScopedChannel {
+    type Task = ScopedTask;
+    type Run = RecordingRun;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn recv(&mut self) -> Result<Option<Self::Task>> {
+        Ok(None)
+    }
+
+    async fn open_run(&self, _task: &Self::Task, _context: ChannelRunContext) -> Result<Self::Run> {
         Ok(RecordingRun {
             events: Arc::clone(&self.events),
         })

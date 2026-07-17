@@ -79,4 +79,5 @@ fn node_help_describes_the_config_fields() {
         assert!(stdout.contains(expected), "help is missing {expected:?}");
     }
     assert!(!stdout.contains("Agent card fields"));
+    assert!(!stdout.contains("\"task\""));
 }

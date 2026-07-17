@@ -1,4 +1,4 @@
-use crate::config::{AgentConfig, AgentType};
+use crate::config::{AgentConfig, AgentType, IsolationScope};
 use crate::task::{OutputEvent, TaskContent};
 use anyhow::{Result, anyhow};
 use std::future::Future;
@@ -18,20 +18,12 @@ pub trait AgentOutput {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentTask {
-    task_id: String,
-    session_id: String,
     content: TaskContent,
 }
 
 impl AgentTask {
-    pub fn new(
-        task_id: impl Into<String>,
-        session_id: impl Into<String>,
-        content: impl Into<TaskContent>,
-    ) -> Self {
+    pub fn new(content: impl Into<TaskContent>) -> Self {
         Self {
-            task_id: task_id.into(),
-            session_id: session_id.into(),
             content: content.into(),
         }
     }
@@ -41,34 +33,13 @@ impl AgentTask {
         config: &AgentConfig,
         agent_session_id: Option<String>,
     ) -> Result<AgentRequest> {
-        let workdir = config.workdir(
-            &Self::safe_segment(&self.task_id),
-            &Self::safe_segment(&self.session_id),
-        );
+        let workdir = config.workdir();
         std::fs::create_dir_all(&workdir)?;
         Ok(AgentRequest {
             workdir,
             content: self.content,
             session_id: agent_session_id,
         })
-    }
-
-    fn safe_segment(value: &str) -> String {
-        let segment = value
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                    ch
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
-        if segment.is_empty() {
-            "unknown".to_string()
-        } else {
-            segment
-        }
     }
 }
 
@@ -90,6 +61,12 @@ pub enum AgentSessionUpdate {
     Unchanged,
     Set(String),
     NotFound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteSessionOutcome {
+    Deleted,
+    Unsupported,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +100,11 @@ pub trait Agent {
     ) -> impl Future<Output = Result<AgentOutcome>> + Send
     where
         O: AgentOutput + Send;
+
+    fn delete_session(
+        &self,
+        session_id: &str,
+    ) -> impl Future<Output = Result<DeleteSessionOutcome>> + Send;
 }
 
 #[derive(Clone)]
@@ -139,6 +121,13 @@ impl Agent for AgentBackend {
         match self {
             AgentBackend::Codex(agent) => agent.run(request, output).await,
             AgentBackend::Custom(agent) => agent.run(request, output).await,
+        }
+    }
+
+    async fn delete_session(&self, session_id: &str) -> Result<DeleteSessionOutcome> {
+        match self {
+            AgentBackend::Codex(agent) => agent.delete_session(session_id).await,
+            AgentBackend::Custom(agent) => agent.delete_session(session_id).await,
         }
     }
 }
@@ -186,6 +175,10 @@ impl ConfiguredAgent {
             .any(|subscription| subscription.channel == channel_name)
     }
 
+    pub fn isolation_scope(&self, channel_name: &str, session_id: &str) -> IsolationScope {
+        self.config.isolation_scope(channel_name, session_id)
+    }
+
     pub async fn run<O>(
         &self,
         task: AgentTask,
@@ -198,6 +191,10 @@ impl ConfiguredAgent {
         self.backend
             .run(task.into_request(&self.config, session_id)?, output)
             .await
+    }
+
+    pub async fn delete_session(&self, session_id: &str) -> Result<DeleteSessionOutcome> {
+        self.backend.delete_session(session_id).await
     }
 }
 
