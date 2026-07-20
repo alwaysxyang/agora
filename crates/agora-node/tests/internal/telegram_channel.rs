@@ -1,6 +1,6 @@
 use super::channel::{TelegramChannel, TelegramReplyTarget, TelegramUpdate};
 use super::telegram_api::TelegramApi;
-use crate::channel::{ChannelTask, ConfiguredChannel};
+use crate::channel::{ChannelAgentStatus, ChannelReply, ChannelTask, ConfiguredChannel};
 use crate::config::{ChannelConfig, TelegramChannelConfig};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -9,6 +9,24 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
+
+#[test]
+fn telegram_renders_agent_status_replies_without_interactive_controls() {
+    let list = ChannelReply::agent_list(vec![
+        ChannelAgentStatus::new("codex-dev", true),
+        ChannelAgentStatus::new("reviewer", false),
+    ]);
+    assert_eq!(
+        TelegramChannel::render_reply(&list),
+        "Agent status (current conversation)\n✓ codex-dev — Enabled\n− reviewer — Disabled"
+    );
+
+    let status = ChannelReply::agent_status(ChannelAgentStatus::new("reviewer", false));
+    assert_eq!(
+        TelegramChannel::render_reply(&status),
+        "Agent status (current conversation)\n− reviewer — Disabled"
+    );
+}
 
 #[test]
 fn normalizes_private_text_message() {

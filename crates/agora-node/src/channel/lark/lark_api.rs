@@ -1,5 +1,5 @@
 use super::LarkReplyTarget;
-use super::channel::{LarkEvent, LarkMessageEvent};
+use super::channel::LarkEvent;
 use crate::config::LarkChannelConfig;
 use agora_core::logger;
 use anyhow::{Context, Result, anyhow};
@@ -64,7 +64,7 @@ impl LarkApi {
 
     pub(super) async fn run_websocket_loop(
         &self,
-        events: mpsc::UnboundedSender<Result<LarkMessageEvent>>,
+        events: mpsc::UnboundedSender<Result<LarkEvent>>,
     ) -> Result<()> {
         let mut backoff = LarkReconnectBackoff::default();
         logger::info!("lark channel starting channel={}", self.name);
@@ -109,7 +109,7 @@ impl LarkApi {
 
     async fn run_websocket_once(
         &self,
-        events: mpsc::UnboundedSender<Result<LarkMessageEvent>>,
+        events: mpsc::UnboundedSender<Result<LarkEvent>>,
         connected: &mut bool,
     ) -> Result<()> {
         let (endpoint_url, client_config) = self.websocket_endpoint().await?;
@@ -220,7 +220,7 @@ impl LarkApi {
     fn handle_websocket_binary(
         &self,
         payload: &[u8],
-        events: &mpsc::UnboundedSender<Result<LarkMessageEvent>>,
+        events: &mpsc::UnboundedSender<Result<LarkEvent>>,
     ) -> Result<Option<LarkFrame>> {
         let frame = LarkFrame::decode(payload).context("decode lark websocket frame failed")?;
         match frame.method {
@@ -233,7 +233,7 @@ impl LarkApi {
     fn handle_data_frame(
         &self,
         frame: LarkFrame,
-        events: &mpsc::UnboundedSender<Result<LarkMessageEvent>>,
+        events: &mpsc::UnboundedSender<Result<LarkEvent>>,
     ) -> Result<Option<LarkFrame>> {
         if frame.header("type") != Some(LARK_MESSAGE_TYPE_EVENT) {
             return Ok(None);
@@ -241,7 +241,7 @@ impl LarkApi {
 
         let started = Instant::now();
         let status_code = match LarkEvent::from_lark_event_payload(&frame.payload) {
-            Ok(LarkEvent::Message(event)) => {
+            Ok(event @ (LarkEvent::Message(_) | LarkEvent::CardAction(_))) => {
                 self.send_event(events, event)?;
                 200
             }
@@ -258,8 +258,8 @@ impl LarkApi {
 
     fn send_event(
         &self,
-        events: &mpsc::UnboundedSender<Result<LarkMessageEvent>>,
-        event: LarkMessageEvent,
+        events: &mpsc::UnboundedSender<Result<LarkEvent>>,
+        event: LarkEvent,
     ) -> Result<()> {
         events
             .send(Ok(event))

@@ -107,6 +107,35 @@ impl TelegramChannel {
         let next = update_id.saturating_add(1);
         self.next_offset = Some(self.next_offset.map_or(next, |current| current.max(next)));
     }
+
+    pub(super) fn render_reply(reply: &ChannelReply) -> String {
+        match reply {
+            ChannelReply::Text(text) => text.clone(),
+            ChannelReply::AgentList(agents) => {
+                let mut lines = vec!["Agent status (current conversation)".to_string()];
+                lines.extend(agents.iter().map(|agent| {
+                    let (marker, state) = if agent.enabled() {
+                        ("✓", "Enabled")
+                    } else {
+                        ("−", "Disabled")
+                    };
+                    format!("{marker} {} — {state}", agent.name())
+                }));
+                lines.join("\n")
+            }
+            ChannelReply::AgentStatus(agent) => {
+                let (marker, state) = if agent.enabled() {
+                    ("✓", "Enabled")
+                } else {
+                    ("−", "Disabled")
+                };
+                format!(
+                    "Agent status (current conversation)\n{marker} {} — {state}",
+                    agent.name()
+                )
+            }
+        }
+    }
 }
 
 impl Channel for TelegramChannel {
@@ -132,7 +161,9 @@ impl Channel for TelegramChannel {
     }
 
     async fn reply(&self, task: &Self::Task, reply: ChannelReply) -> Result<()> {
-        self.api.reply_text(task.reply_target(), reply.text()).await
+        self.api
+            .reply_text(task.reply_target(), &Self::render_reply(&reply))
+            .await
     }
 }
 

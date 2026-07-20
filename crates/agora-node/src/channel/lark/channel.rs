@@ -1,7 +1,9 @@
 use super::LarkReplyTarget;
-use super::card::LarkAgentCard;
+use super::card::{LarkAgentCard, LarkReplyCard};
 use super::lark_api::LarkApi;
-use crate::channel::{Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, RunEvent};
+use crate::channel::{
+    Channel, ChannelAction, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, RunEvent,
+};
 use crate::config::LarkChannelConfig;
 use crate::task::{TaskAttachment, TaskContent};
 use agora_core::logger;
@@ -27,7 +29,16 @@ pub(super) struct LarkMessageEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum LarkEvent {
     Message(LarkMessageEvent),
+    CardAction(LarkCardActionEvent),
     Ignore { event_type: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LarkCardActionEvent {
+    pub(super) id: String,
+    pub(super) session_id: String,
+    pub(super) message_id: String,
+    pub(super) action: ChannelAction,
 }
 
 impl LarkEvent {
@@ -42,10 +53,64 @@ impl LarkEvent {
             "im.message.receive_v1" => {
                 LarkMessageEvent::from_lark_event_value(&value).map(Self::Message)
             }
+            "card.action.trigger"
+                if matches!(
+                    value
+                        .pointer("/event/action/value/action")
+                        .and_then(Value::as_str),
+                    Some("stop_task" | "set_agent_enabled")
+                ) =>
+            {
+                LarkCardActionEvent::from_lark_event_value(&value).map(Self::CardAction)
+            }
             _ => Ok(Self::Ignore {
                 event_type: event_type.to_string(),
             }),
         }
+    }
+}
+
+impl LarkCardActionEvent {
+    fn from_lark_event_value(value: &Value) -> Result<Self> {
+        let required = |path: &str, field: &str| {
+            value
+                .pointer(path)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("lark card action missing {field}"))
+        };
+        let action =
+            match required("/event/action/value/action", "event.action.value.action")?.as_str() {
+                "stop_task" => ChannelAction::StopTask {
+                    task_id: required("/event/action/value/task_id", "event.action.value.task_id")?,
+                    agent_name: required(
+                        "/event/action/value/agent_name",
+                        "event.action.value.agent_name",
+                    )?,
+                },
+                "set_agent_enabled" => ChannelAction::SetAgentEnabled {
+                    agent_name: required(
+                        "/event/action/value/agent_name",
+                        "event.action.value.agent_name",
+                    )?,
+                    enabled: value
+                        .pointer("/event/action/value/enabled")
+                        .and_then(Value::as_bool)
+                        .ok_or_else(|| {
+                            anyhow!("lark card action missing event.action.value.enabled")
+                        })?,
+                },
+                action => return Err(anyhow!("unsupported lark card action: {action}")),
+            };
+        Ok(Self {
+            id: required("/header/event_id", "header.event_id")?,
+            session_id: required("/event/context/open_chat_id", "event.context.open_chat_id")?,
+            message_id: required(
+                "/event/context/open_message_id",
+                "event.context.open_message_id",
+            )?,
+            action,
+        })
     }
 }
 
@@ -170,31 +235,63 @@ impl LarkMessageEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LarkTask {
-    event: LarkMessageEvent,
+    source: LarkTaskSource,
     content: TaskContent,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LarkTaskSource {
+    Message(LarkMessageEvent),
+    CardAction(LarkCardActionEvent),
+}
+
 impl LarkTask {
-    fn new(event: LarkMessageEvent, content: TaskContent) -> Self {
-        Self { event, content }
+    pub(super) fn from_message(event: LarkMessageEvent, content: TaskContent) -> Self {
+        Self {
+            source: LarkTaskSource::Message(event),
+            content,
+        }
     }
 
-    fn reply_target(&self) -> LarkReplyTarget {
-        self.event.reply_target()
+    pub(super) fn from_card_action(event: LarkCardActionEvent) -> Self {
+        Self {
+            source: LarkTaskSource::CardAction(event),
+            content: TaskContent::new(""),
+        }
+    }
+
+    fn reply_target(&self) -> Option<LarkReplyTarget> {
+        match &self.source {
+            LarkTaskSource::Message(event) => Some(event.reply_target()),
+            LarkTaskSource::CardAction(_) => None,
+        }
     }
 }
 
 impl ChannelTask for LarkTask {
     fn task_id(&self) -> &str {
-        &self.event.message_id
+        match &self.source {
+            LarkTaskSource::Message(event) => &event.message_id,
+            LarkTaskSource::CardAction(event) => &event.id,
+        }
     }
 
     fn session_id(&self) -> &str {
-        &self.event.chat_id
+        match &self.source {
+            LarkTaskSource::Message(event) => &event.chat_id,
+            LarkTaskSource::CardAction(event) => &event.session_id,
+        }
     }
 
     fn content(&self) -> &TaskContent {
         &self.content
+    }
+
+    fn action(&self) -> Option<&ChannelAction> {
+        match &self.source {
+            LarkTaskSource::Message(_) => None,
+            LarkTaskSource::CardAction(event) => Some(&event.action),
+        }
     }
 }
 
@@ -261,7 +358,7 @@ impl LarkChannel {
                 ));
             }
         }
-        Ok(LarkTask::new(event, content))
+        Ok(LarkTask::from_message(event, content))
     }
 
     fn image_extension(media_type: &str) -> &'static str {
@@ -291,38 +388,78 @@ impl Channel for LarkChannel {
             let Some(event) = self.receiver().next_event().await? else {
                 return Ok(None);
             };
-            if event.is_supported_message() {
-                let task = self.task_from_event(event).await?;
-                logger::info!(
-                    "lark message received channel={} session={} sender={} message_id={} input={} attachments={}",
-                    self.name(),
-                    task.event.session_id(),
-                    task.event.sender_id,
-                    task.event.message_id,
-                    task.content.text(),
-                    task.content.attachments().len()
-                );
-                return Ok(Some(task));
+            match event {
+                LarkEvent::Message(event) if event.is_supported_message() => {
+                    let session_id = event.session_id().to_string();
+                    let sender_id = event.sender_id.clone();
+                    let message_id = event.message_id.clone();
+                    let task = self.task_from_event(event).await?;
+                    logger::info!(
+                        "lark message received channel={} session={} sender={} message_id={} input={} attachments={}",
+                        self.name(),
+                        session_id,
+                        sender_id,
+                        message_id,
+                        task.content.text(),
+                        task.content.attachments().len()
+                    );
+                    return Ok(Some(task));
+                }
+                LarkEvent::CardAction(event) => {
+                    logger::info!(
+                        "lark card action received channel={} session={} event_id={}",
+                        self.name(),
+                        event.session_id,
+                        event.id
+                    );
+                    return Ok(Some(LarkTask::from_card_action(event)));
+                }
+                LarkEvent::Message(_) | LarkEvent::Ignore { .. } => {}
             }
         }
     }
 
     async fn open_run(&self, task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
+        let target = task
+            .reply_target()
+            .ok_or_else(|| anyhow!("lark card action cannot open an agent run"))?;
         Ok(LarkRun {
-            card: LarkAgentCard::new(task.reply_target(), context.agent.name, self.api.clone()),
+            card: LarkAgentCard::new(
+                target,
+                context.agent.name,
+                task.task_id().to_string(),
+                self.api.clone(),
+            ),
         })
     }
 
     async fn reply(&self, task: &Self::Task, reply: ChannelReply) -> Result<()> {
         let token = self.api.tenant_access_token().await?;
-        self.api
-            .reply_text(&token, &task.reply_target(), reply.text())
-            .await
+        match &task.source {
+            LarkTaskSource::Message(event) => match reply.as_text() {
+                Some(text) => {
+                    self.api
+                        .reply_text(&token, &event.reply_target(), text)
+                        .await
+                }
+                None => {
+                    self.api
+                        .reply_card(&token, &event.reply_target(), &LarkReplyCard::build(&reply))
+                        .await?;
+                    Ok(())
+                }
+            },
+            LarkTaskSource::CardAction(event) => {
+                self.api
+                    .patch_card(&token, &event.message_id, &LarkReplyCard::build(&reply))
+                    .await
+            }
+        }
     }
 }
 
 struct LarkWebSocketReceiver {
-    events: mpsc::UnboundedReceiver<Result<LarkMessageEvent>>,
+    events: mpsc::UnboundedReceiver<Result<LarkEvent>>,
     task: Option<JoinHandle<Result<()>>>,
 }
 
@@ -336,7 +473,7 @@ impl LarkWebSocketReceiver {
         }
     }
 
-    async fn next_event(&mut self) -> Result<Option<LarkMessageEvent>> {
+    async fn next_event(&mut self) -> Result<Option<LarkEvent>> {
         match self.events.recv().await {
             Some(event) => event.map(Some),
             None => {

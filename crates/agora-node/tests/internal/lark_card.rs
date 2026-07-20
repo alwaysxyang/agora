@@ -1,7 +1,10 @@
 use super::LarkReplyTarget;
-use super::card::{LarkAgentCard, LarkCardContent};
+use super::card::{LarkAgentCard, LarkCardContent, LarkReplyCard};
+use super::channel::{LarkCardActionEvent, LarkChannel, LarkMessageEvent, LarkTask};
 use super::lark_api::LarkApi;
-use crate::channel::{ChannelRun, RunEvent};
+use crate::channel::{
+    Channel, ChannelAction, ChannelAgentStatus, ChannelReply, ChannelRun, RunEvent,
+};
 use crate::config::LarkChannelConfig;
 use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
 use std::sync::Arc;
@@ -35,6 +38,72 @@ fn lark_card_uses_json_v2_for_standard_markdown() {
             .and_then(|v| v.as_str()),
         Some("> • Inspecting the channel")
     );
+}
+
+#[test]
+fn lark_agent_list_card_renders_one_right_aligned_toggle_button_per_agent() {
+    let reply = ChannelReply::agent_list(vec![
+        ChannelAgentStatus::new("codex-dev", true),
+        ChannelAgentStatus::new("reviewer", false),
+    ]);
+
+    let card = LarkReplyCard::build(&reply);
+    assert_eq!(card.pointer("/header/title/content").unwrap(), "Agent 状态");
+    assert_eq!(
+        card.pointer("/header/subtitle/content").unwrap(),
+        "当前对话 · 2 Agents"
+    );
+    let rows = card
+        .pointer("/body/elements")
+        .and_then(serde_json::Value::as_array)
+        .unwrap();
+    let first_button = rows[0].pointer("/columns/1/elements/0").unwrap();
+    let second_button = rows[2].pointer("/columns/1/elements/0").unwrap();
+    assert_eq!(first_button.pointer("/text/content").unwrap(), "Disable");
+    assert_eq!(first_button["type"], "default");
+    assert_eq!(
+        first_button.pointer("/behaviors/0/value").unwrap(),
+        &serde_json::json!({
+            "action": "set_agent_enabled",
+            "agent_name": "codex-dev",
+            "enabled": false
+        })
+    );
+    assert_eq!(second_button.pointer("/text/content").unwrap(), "Enable");
+    assert_eq!(second_button["type"], "primary");
+    assert_eq!(
+        second_button.pointer("/behaviors/0/value").unwrap(),
+        &serde_json::json!({
+            "action": "set_agent_enabled",
+            "agent_name": "reviewer",
+            "enabled": true
+        })
+    );
+    let rendered = serde_json::to_string(&card).unwrap();
+    assert!(rendered.contains("Enabled</font> · 接收后续消息"));
+    assert!(rendered.contains("Disabled</font> · 不接收后续消息"));
+    assert!(rendered.contains("配置仅对当前对话生效"));
+}
+
+#[test]
+fn lark_agent_status_card_is_compact_and_has_no_toggle_button() {
+    let reply = ChannelReply::agent_status(ChannelAgentStatus::new("reviewer", false));
+
+    let card = LarkReplyCard::build(&reply);
+    let rendered = serde_json::to_string(&card).unwrap();
+    assert_eq!(
+        card.pointer("/header/subtitle/content").unwrap(),
+        "当前对话"
+    );
+    assert!(rendered.contains("**reviewer**"));
+    assert!(rendered.contains("Disabled"));
+    assert_eq!(
+        card.pointer("/body/elements/0/columns/1/elements/0/text_align")
+            .unwrap(),
+        "right"
+    );
+    assert!(!rendered.contains("set_agent_enabled"));
+    assert!(!rendered.contains("\"tag\":\"button\""));
 }
 
 #[test]
@@ -211,7 +280,7 @@ fn lark_card_preserves_output_and_marks_the_run_as_stopped() {
     assert!(rendered.contains("<font color='grey'>■</font>  Run `cargo test`"));
     assert!(rendered.contains("<font color='grey'>1 stopped</font>"));
     assert!(rendered.contains("<font color='grey'>▌</font> **Run stopped**"));
-    assert!(rendered.contains("Stopped by `/stop`. Existing output is retained."));
+    assert!(rendered.contains("Stopped by request. Existing output is retained."));
     assert!(rendered.contains("<font color='blue'>▌</font> **Partial answer**"));
     assert!(rendered.contains("Work completed before the stop."));
 }
@@ -301,6 +370,48 @@ fn lark_card_shows_a_placeholder_before_agent_output() {
     let rendered = serde_json::to_string(&content.build_card()).unwrap();
 
     assert!(rendered.contains("> 正在等待 Agent 输出..."));
+}
+
+#[test]
+fn lark_card_shows_a_bottom_stop_button_only_while_the_task_is_active() {
+    let mut content = LarkCardContent::for_task("codex-dev".to_string(), "task-123".to_string());
+
+    let running = content.build_card();
+    let elements = running
+        .pointer("/body/elements")
+        .and_then(serde_json::Value::as_array)
+        .unwrap();
+    let action_row = elements.last().unwrap();
+    let button = action_row.pointer("/columns/0/elements/0").unwrap();
+
+    assert_eq!(action_row["tag"], "column_set");
+    assert_eq!(action_row["horizontal_align"], "right");
+    assert_eq!(button["tag"], "button");
+    assert_eq!(button["type"], "danger");
+    assert_eq!(button.pointer("/text/content").unwrap(), "结束任务");
+    assert_eq!(button.pointer("/behaviors/0/type").unwrap(), "callback");
+    assert_eq!(
+        button.pointer("/behaviors/0/value").unwrap(),
+        &serde_json::json!({
+            "action": "stop_task",
+            "task_id": "task-123",
+            "agent_name": "codex-dev"
+        })
+    );
+
+    content.queue(2);
+    assert!(
+        serde_json::to_string(&content.build_card())
+            .unwrap()
+            .contains("stop_task")
+    );
+
+    content.complete();
+    assert!(
+        !serde_json::to_string(&content.build_card())
+            .unwrap()
+            .contains("stop_task")
+    );
 }
 
 #[test]
@@ -458,6 +569,7 @@ async fn lark_card_coalesces_intermediate_updates_and_flushes_completion() {
             message_id: "om_source".to_string(),
         },
         "codex-dev".to_string(),
+        "run-1".to_string(),
         api,
     );
 
@@ -543,6 +655,100 @@ async fn lark_api_replies_to_commands_with_threaded_text() {
     assert_eq!(body["msg_type"], "text");
     assert_eq!(body["reply_in_thread"], true);
     assert_eq!(content["text"], "Stopped 1 agent: codex-dev.");
+}
+
+#[tokio::test]
+async fn lark_agent_toggle_action_patches_the_original_status_card() {
+    let server = TestHttpServer::start().await;
+    let api = LarkApi::with_base_url(
+        LarkChannelConfig {
+            name: "lark-test".to_string(),
+            app_id: "app-id".to_string(),
+            secret: "secret".to_string(),
+        },
+        server.base_url(),
+    )
+    .unwrap();
+    let channel = LarkChannel::with_api(api);
+    let task = LarkTask::from_card_action(LarkCardActionEvent {
+        id: "evt_action".to_string(),
+        session_id: "oc_chat".to_string(),
+        message_id: "om_status_card".to_string(),
+        action: ChannelAction::SetAgentEnabled {
+            agent_name: "reviewer".to_string(),
+            enabled: true,
+        },
+    });
+
+    channel
+        .reply(
+            &task,
+            ChannelReply::agent_list(vec![ChannelAgentStatus::new("reviewer", true)]),
+        )
+        .await
+        .unwrap();
+
+    let requests = server.requests().await;
+    let patch = requests
+        .iter()
+        .find(|request| {
+            request.method == "PATCH" && request.path == "/open-apis/im/v1/messages/om_status_card"
+        })
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&patch.body).unwrap();
+    let card: serde_json::Value = serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        card.pointer("/body/elements/0/columns/1/elements/0/text/content")
+            .unwrap(),
+        "Disable"
+    );
+}
+
+#[tokio::test]
+async fn lark_ask_message_replies_with_a_threaded_interactive_card() {
+    let server = TestHttpServer::start().await;
+    let api = LarkApi::with_base_url(
+        LarkChannelConfig {
+            name: "lark-test".to_string(),
+            app_id: "app-id".to_string(),
+            secret: "secret".to_string(),
+        },
+        server.base_url(),
+    )
+    .unwrap();
+    let channel = LarkChannel::with_api(api);
+    let task = LarkTask::from_message(
+        LarkMessageEvent {
+            id: "evt_message".to_string(),
+            message_id: "om_ask".to_string(),
+            chat_id: "oc_chat".to_string(),
+            chat_type: "group".to_string(),
+            sender_id: "ou_user".to_string(),
+            message_type: "text".to_string(),
+            content: "/ask list".to_string(),
+            image_keys: Vec::new(),
+        },
+        crate::task::TaskContent::new("/ask list"),
+    );
+
+    channel
+        .reply(
+            &task,
+            ChannelReply::agent_list(vec![ChannelAgentStatus::new("codex-dev", true)]),
+        )
+        .await
+        .unwrap();
+
+    let requests = server.requests().await;
+    let reply = requests
+        .iter()
+        .find(|request| request.path == "/open-apis/im/v1/messages/om_ask/reply")
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(body["msg_type"], "interactive");
+    assert_eq!(body["reply_in_thread"], true);
+    let card: serde_json::Value = serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
+    assert_eq!(card.pointer("/header/title/content").unwrap(), "Agent 状态");
 }
 
 #[derive(Clone, Debug)]

@@ -1,5 +1,5 @@
 use agora_node::config::IsolationScope;
-use agora_node::store::{SessionKey, SessionStore};
+use agora_node::store::{ChannelSessionKey, SessionKey, SessionStore};
 
 #[test]
 fn store_schema_is_embedded_from_a_sql_file() {
@@ -10,9 +10,37 @@ fn store_schema_is_embedded_from_a_sql_file() {
     let source = std::fs::read_to_string(store_dir.join("mod.rs")).unwrap();
 
     assert!(schema.contains("CREATE TABLE IF NOT EXISTS agent_sessions"));
+    assert!(schema.contains("CREATE TABLE IF NOT EXISTS channel_session_agent_blocks"));
     assert!(schema.contains("isolation_scope"));
     assert!(!schema.contains("scope_type"));
     assert!(source.contains("include_str!(\"schema.sql\")"));
+}
+
+#[test]
+fn session_store_persists_agent_access_per_channel_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("store.db");
+    let store = SessionStore::open(&path).unwrap();
+    let first = ChannelSessionKey::new("lark-1", "chat-1");
+    let second = ChannelSessionKey::new("lark-1", "chat-2");
+    let other_channel = ChannelSessionKey::new("telegram-1", "chat-1");
+
+    assert!(store.is_agent_enabled(&first, "codex-dev").unwrap());
+    assert!(store.disable_agent(&first, "codex-dev").unwrap());
+    assert!(!store.disable_agent(&first, "codex-dev").unwrap());
+    assert!(!store.is_agent_enabled(&first, "codex-dev").unwrap());
+    assert!(store.is_agent_enabled(&second, "codex-dev").unwrap());
+    assert!(store.is_agent_enabled(&other_channel, "codex-dev").unwrap());
+
+    drop(store);
+    let reopened = SessionStore::open(path).unwrap();
+    assert_eq!(
+        reopened.disabled_agents(&first).unwrap(),
+        vec!["codex-dev".to_string()]
+    );
+    assert!(reopened.enable_agent(&first, "codex-dev").unwrap());
+    assert!(!reopened.enable_agent(&first, "codex-dev").unwrap());
+    assert!(reopened.is_agent_enabled(&first, "codex-dev").unwrap());
 }
 
 #[test]

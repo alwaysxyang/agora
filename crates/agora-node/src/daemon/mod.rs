@@ -3,15 +3,16 @@ use crate::agent::{
     DeleteSessionOutcome,
 };
 use crate::channel::{
-    Channel, ChannelAgent, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask,
-    ConfiguredChannel, RunEvent,
+    Channel, ChannelAction, ChannelAgent, ChannelAgentStatus, ChannelReply, ChannelRun,
+    ChannelRunContext, ChannelTask, ConfiguredChannel, RunEvent,
 };
 use crate::config::NodeConfig;
-use crate::store::{SessionKey, SessionStore};
+use crate::store::{ChannelSessionKey, SessionKey, SessionStore};
 use crate::task::OutputEvent;
 use agora_core::logger;
 use anyhow::{Result, bail};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::{JoinError, JoinSet};
 
@@ -20,7 +21,10 @@ mod command;
 mod session_queue;
 
 use active_runs::{ActiveRunScope, ActiveRuns, RunCancellation};
-use command::{CommandParser, CommandRoute, NodeCommand};
+use command::{
+    CommandContext, CommandExecutor, CommandHandler, CommandRegistry, CommandResolution,
+    set_agent_enabled,
+};
 use session_queue::SessionQueues;
 
 #[cfg(test)]
@@ -97,6 +101,7 @@ impl AgentDispatcher {
             let mut active_run = self.active_runs.register(ActiveRunScope::new(
                 channel.name(),
                 task.session_id(),
+                task.task_id(),
                 key.clone(),
             ));
             let mut queue_ticket = self.queues.enqueue(&key);
@@ -108,6 +113,7 @@ impl AgentDispatcher {
                     ahead = tokio::select! {
                         ahead = queue_ticket.changed() => ahead?,
                         cancellation = active_run.cancelled() => {
+                            drop(queue_ticket);
                             return output.cancelled(cancellation).await;
                         }
                     };
@@ -121,6 +127,7 @@ impl AgentDispatcher {
                         &mut output,
                     ) => result,
                     cancellation = active_run.cancelled() => {
+                        drop(queue_ticket);
                         return output.cancelled(cancellation).await;
                     }
                 };
@@ -143,6 +150,70 @@ impl AgentDispatcher {
         agent_name: Option<&str>,
     ) -> Vec<String> {
         self.active_runs.stop(channel_name, session_id, agent_name)
+    }
+
+    fn stop_task(
+        &self,
+        channel_name: &str,
+        session_id: &str,
+        task_id: &str,
+        agent_name: &str,
+    ) -> bool {
+        self.active_runs
+            .stop_task(channel_name, session_id, task_id, agent_name)
+    }
+
+    fn agent_statuses(
+        &self,
+        channel_name: &str,
+        session_id: &str,
+        agents: &[ConfiguredAgent],
+    ) -> Result<Vec<ChannelAgentStatus>> {
+        let key = ChannelSessionKey::new(channel_name, session_id);
+        let disabled = self
+            .store
+            .disabled_agents(&key)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        Ok(agents
+            .iter()
+            .map(|agent| ChannelAgentStatus::new(agent.name(), !disabled.contains(agent.name())))
+            .collect())
+    }
+
+    fn enabled_agents(
+        &self,
+        channel_name: &str,
+        session_id: &str,
+        agents: &[ConfiguredAgent],
+    ) -> Result<Vec<ConfiguredAgent>> {
+        let key = ChannelSessionKey::new(channel_name, session_id);
+        let disabled = self
+            .store
+            .disabled_agents(&key)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        Ok(agents
+            .iter()
+            .filter(|agent| !disabled.contains(agent.name()))
+            .cloned()
+            .collect())
+    }
+
+    fn set_agent_enabled(
+        &self,
+        channel_name: &str,
+        session_id: &str,
+        agent_name: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        let key = ChannelSessionKey::new(channel_name, session_id);
+        if enabled {
+            self.store.enable_agent(&key, agent_name)?;
+        } else {
+            self.store.disable_agent(&key, agent_name)?;
+        }
+        Ok(())
     }
 
     async fn reset_sessions(
@@ -259,6 +330,7 @@ impl AgentDispatcher {
 pub struct Daemon {
     config: NodeConfig,
     dispatcher: AgentDispatcher,
+    commands: Arc<CommandRegistry<CommandHandler>>,
 }
 
 #[derive(Clone)]
@@ -290,6 +362,7 @@ impl Daemon {
         Ok(Self {
             config,
             dispatcher: AgentDispatcher::new(SessionStore::open_default()?),
+            commands: Arc::new(CommandRegistry::standard()?),
         })
     }
 
@@ -300,7 +373,11 @@ impl Daemon {
     }
 
     pub async fn run(self) -> Result<()> {
-        let Self { config, dispatcher } = self;
+        let Self {
+            config,
+            dispatcher,
+            commands,
+        } = self;
         let NodeConfig { channels, agents } = config;
         let agents = AgentRegistry::from_configs(agents)?;
         let shutdown = DaemonShutdown {
@@ -322,9 +399,10 @@ impl Daemon {
         let mut tasks = JoinSet::new();
         for (channel, subscribed_agents) in configured_channels {
             let dispatcher = dispatcher.clone();
-            tasks.spawn(
-                async move { Self::run_channel(channel, subscribed_agents, dispatcher).await },
-            );
+            let commands = Arc::clone(&commands);
+            tasks.spawn(async move {
+                Self::run_channel(channel, subscribed_agents, dispatcher, commands).await
+            });
         }
 
         while let Some(result) = tasks.join_next().await {
@@ -347,6 +425,7 @@ impl Daemon {
         mut channel: C,
         agents: Vec<ConfiguredAgent>,
         dispatcher: AgentDispatcher,
+        commands: Arc<CommandRegistry<CommandHandler>>,
     ) -> Result<()>
     where
         C: Channel + Send + Sync + 'static,
@@ -362,6 +441,7 @@ impl Daemon {
                             &channel,
                             &agents,
                             &dispatcher,
+                            &commands,
                             task,
                             &mut runs,
                         )
@@ -392,6 +472,7 @@ impl Daemon {
         channel: &C,
         agents: &[ConfiguredAgent],
         dispatcher: &AgentDispatcher,
+        commands: &CommandRegistry<CommandHandler>,
         task: C::Task,
         runs: &mut JoinSet<Result<()>>,
     ) -> Result<()>
@@ -400,58 +481,62 @@ impl Daemon {
         C::Task: Send + Sync + 'static,
         C::Run: Send + Sync + 'static,
     {
-        match CommandParser::parse(task.content().text()) {
-            CommandRoute::AgentInput => {
-                dispatcher
-                    .start_channel_task(channel, agents.to_vec(), task, runs)
-                    .await
-            }
-            CommandRoute::Command(NodeCommand::Stop { agent_name }) => {
+        match task.action() {
+            Some(ChannelAction::StopTask {
+                task_id,
+                agent_name,
+            }) => {
                 let stopped =
-                    dispatcher.stop_runs(channel.name(), task.session_id(), agent_name.as_deref());
-                channel
-                    .reply(&task, Self::stop_reply(agent_name.as_deref(), &stopped))
-                    .await
+                    dispatcher.stop_task(channel.name(), task.session_id(), task_id, agent_name);
+                logger::info!(
+                    "channel stop action channel={} session={} task_id={} agent={} stopped={}",
+                    channel.name(),
+                    task.session_id(),
+                    task_id,
+                    agent_name,
+                    stopped
+                );
+                return Ok(());
             }
-            CommandRoute::Command(NodeCommand::Reset) => {
-                let failed = dispatcher
-                    .reset_sessions(channel.name(), task.session_id(), agents)
-                    .await;
-                channel.reply(&task, Self::reset_reply(&failed)).await
+            Some(ChannelAction::SetAgentEnabled {
+                agent_name,
+                enabled,
+            }) => {
+                let reply = set_agent_enabled(
+                    CommandContext::new(channel.name(), task.session_id(), agents, dispatcher),
+                    agent_name,
+                    *enabled,
+                )?;
+                return channel.reply(&task, reply).await;
             }
-            CommandRoute::Invalid(message) => {
-                channel.reply(&task, ChannelReply::new(message)).await
-            }
-        }
-    }
-
-    fn stop_reply(agent_name: Option<&str>, stopped: &[String]) -> ChannelReply {
-        if stopped.is_empty() {
-            return match agent_name {
-                Some(agent_name) => ChannelReply::new(format!(
-                    "No running agent named {agent_name} in this conversation."
-                )),
-                None => ChannelReply::new("No running agents in this conversation."),
-            };
+            None => {}
         }
 
-        let suffix = if stopped.len() == 1 {
-            "agent"
-        } else {
-            "agents"
-        };
-        ChannelReply::new(format!(
-            "Stopped {} {suffix}: {}.",
-            stopped.len(),
-            stopped.join(", ")
-        ))
-    }
-
-    fn reset_reply(failed: &[String]) -> ChannelReply {
-        if failed.is_empty() {
-            ChannelReply::new("Reset successful.")
-        } else {
-            ChannelReply::new(format!("Reset failed for agents: {}.", failed.join(", ")))
+        match commands.route(task.content().text()) {
+            CommandResolution::AgentInput => {
+                let enabled =
+                    dispatcher.enabled_agents(channel.name(), task.session_id(), agents)?;
+                if enabled.is_empty() {
+                    channel
+                        .reply(
+                            &task,
+                            ChannelReply::new("No agents are enabled in this conversation."),
+                        )
+                        .await
+                } else {
+                    dispatcher
+                        .start_channel_task(channel, enabled, task, runs)
+                        .await
+                }
+            }
+            CommandResolution::Invocation(invocation) => {
+                let reply =
+                    CommandExecutor::new(channel.name(), task.session_id(), agents, dispatcher)
+                        .execute(invocation)
+                        .await?;
+                channel.reply(&task, reply).await
+            }
+            CommandResolution::Reply(reply) => channel.reply(&task, ChannelReply::new(reply)).await,
         }
     }
 }

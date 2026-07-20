@@ -1,6 +1,6 @@
 use super::LarkReplyTarget;
 use super::lark_api::LarkApi;
-use crate::channel::{ChannelRun, RunEvent};
+use crate::channel::{ChannelAgentStatus, ChannelReply, ChannelRun, RunEvent};
 use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
 use agora_core::logger;
 use anyhow::{Result, anyhow};
@@ -43,6 +43,7 @@ struct LarkAgentCardState {
 
 pub(super) struct LarkCardContent {
     agent_name: String,
+    stop_task_id: Option<String>,
     thinking: VecDeque<String>,
     progress: VecDeque<LarkProgressEntry>,
     answer: String,
@@ -65,16 +66,186 @@ struct LarkProgressEntry {
     status: ProgressStatus,
 }
 
+pub(super) struct LarkReplyCard;
+
+impl LarkReplyCard {
+    pub(super) fn build(reply: &ChannelReply) -> Value {
+        match reply {
+            ChannelReply::Text(text) => Self::card(
+                "Agent 状态",
+                "当前对话".to_string(),
+                vec![json!({
+                    "tag": "markdown",
+                    "content": text
+                })],
+            ),
+            ChannelReply::AgentList(agents) => Self::agent_list(agents),
+            ChannelReply::AgentStatus(agent) => Self::agent_status(agent),
+        }
+    }
+
+    fn agent_list(agents: &[ChannelAgentStatus]) -> Value {
+        let mut elements = Vec::new();
+        for (index, agent) in agents.iter().enumerate() {
+            if index > 0 {
+                elements.push(json!({ "tag": "hr" }));
+            }
+            elements.push(Self::agent_row(agent));
+        }
+        if !elements.is_empty() {
+            elements.push(json!({ "tag": "hr" }));
+        }
+        elements.push(json!({
+            "tag": "markdown",
+            "content": "<font color='grey'>配置仅对当前对话生效</font>"
+        }));
+        Self::card(
+            "Agent 状态",
+            format!("当前对话 · {} Agents", agents.len()),
+            elements,
+        )
+    }
+
+    fn agent_status(agent: &ChannelAgentStatus) -> Value {
+        let (color, state, _) = Self::status_text(agent.enabled());
+        Self::card(
+            "Agent 状态",
+            "当前对话".to_string(),
+            vec![json!({
+                "tag": "column_set",
+                "flex_mode": "none",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 1,
+                        "vertical_align": "center",
+                        "elements": [{
+                            "tag": "markdown",
+                            "content": format!(
+                                "**{}**\n<font color='grey'>消息接收状态</font>",
+                                agent.name()
+                            )
+                        }]
+                    },
+                    {
+                        "tag": "column",
+                        "width": "auto",
+                        "vertical_align": "center",
+                        "elements": [{
+                            "tag": "markdown",
+                            "content": format!("<font color='{color}'>● {state}</font>"),
+                            "text_align": "right"
+                        }]
+                    }
+                ]
+            })],
+        )
+    }
+
+    fn agent_row(agent: &ChannelAgentStatus) -> Value {
+        let (color, state, description) = Self::status_text(agent.enabled());
+        let (button_text, button_type) = if agent.enabled() {
+            ("Disable", "default")
+        } else {
+            ("Enable", "primary")
+        };
+        json!({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "horizontal_spacing": "default",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "vertical_align": "center",
+                    "elements": [{
+                        "tag": "markdown",
+                        "content": format!(
+                            "**{}**\n<font color='{color}'>{state}</font> · {description}",
+                            agent.name()
+                        )
+                    }]
+                },
+                {
+                    "tag": "column",
+                    "width": "auto",
+                    "vertical_align": "center",
+                    "elements": [{
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": button_text
+                        },
+                        "type": button_type,
+                        "size": "medium",
+                        "behaviors": [{
+                            "type": "callback",
+                            "value": {
+                                "action": "set_agent_enabled",
+                                "agent_name": agent.name(),
+                                "enabled": !agent.enabled()
+                            }
+                        }]
+                    }]
+                }
+            ]
+        })
+    }
+
+    fn status_text(enabled: bool) -> (&'static str, &'static str, &'static str) {
+        if enabled {
+            ("green", "Enabled", "接收后续消息")
+        } else {
+            ("grey", "Disabled", "不接收后续消息")
+        }
+    }
+
+    fn card(title: &str, subtitle: String, elements: Vec<Value>) -> Value {
+        json!({
+            "schema": "2.0",
+            "config": {
+                "update_multi": true,
+                "summary": {
+                    "content": title
+                }
+            },
+            "header": {
+                "template": "blue",
+                "title": {
+                    "tag": "plain_text",
+                    "content": title
+                },
+                "subtitle": {
+                    "tag": "plain_text",
+                    "content": subtitle
+                }
+            },
+            "body": {
+                "elements": elements
+            }
+        })
+    }
+}
+
 impl LarkCardContent {
     pub(super) fn new(agent_name: String) -> Self {
         Self {
             agent_name,
+            stop_task_id: None,
             thinking: VecDeque::new(),
             progress: VecDeque::new(),
             answer: String::new(),
             usage: None,
             state: LarkRunState::Running,
         }
+    }
+
+    pub(super) fn for_task(agent_name: String, task_id: String) -> Self {
+        let mut content = Self::new(agent_name);
+        content.stop_task_id = Some(task_id);
+        content
     }
 
     pub(super) fn apply_output(&mut self, event: OutputEvent) {
@@ -214,7 +385,7 @@ impl LarkCardContent {
             }
             elements.push(json!({
                 "tag": "markdown",
-                "content": "<font color='grey'>▌</font> **Run stopped**\nStopped by `/stop`. Existing output is retained."
+                "content": "<font color='grey'>▌</font> **Run stopped**\nStopped by request. Existing output is retained."
             }));
         }
 
@@ -268,6 +439,13 @@ impl LarkCardContent {
             }));
         }
 
+        if !finished && let Some(task_id) = &self.stop_task_id {
+            if !elements.is_empty() {
+                elements.push(json!({ "tag": "hr" }));
+            }
+            elements.push(self.stop_action(task_id));
+        }
+
         let mut card = json!({
             "schema": "2.0",
             "config": {
@@ -296,6 +474,37 @@ impl LarkCardContent {
             card["body"] = json!({ "elements": elements });
         }
         card
+    }
+
+    fn stop_action(&self, task_id: &str) -> Value {
+        json!({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "horizontal_align": "right",
+            "columns": [{
+                "tag": "column",
+                "width": "auto",
+                "elements": [{
+                    "tag": "button",
+                    "element_id": "stop_task_button",
+                    "text": {
+                        "tag": "plain_text",
+                        "content": "结束任务"
+                    },
+                    "type": "danger",
+                    "width": "default",
+                    "size": "medium",
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "action": "stop_task",
+                            "task_id": task_id,
+                            "agent_name": self.agent_name
+                        }
+                    }]
+                }]
+            }]
+        })
     }
 
     fn collapsible_panel(title: String, expanded: bool, content: String) -> Value {
@@ -464,7 +673,12 @@ impl LarkCardContent {
 }
 
 impl LarkAgentCard {
-    pub(super) fn new(target: LarkReplyTarget, agent_name: String, api: LarkApi) -> Self {
+    pub(super) fn new(
+        target: LarkReplyTarget,
+        agent_name: String,
+        task_id: String,
+        api: LarkApi,
+    ) -> Self {
         Self {
             inner: Arc::new(LarkAgentCardInner {
                 target,
@@ -472,7 +686,7 @@ impl LarkAgentCard {
                 state: Mutex::new(LarkAgentCardState {
                     token: None,
                     message_id: None,
-                    content: LarkCardContent::new(agent_name),
+                    content: LarkCardContent::for_task(agent_name, task_id),
                     version: 0,
                     sent_version: 0,
                     last_update: None,

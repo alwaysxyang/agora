@@ -35,6 +35,16 @@ pub trait ChannelTask: Clone {
     fn session_id(&self) -> &str;
 
     fn content(&self) -> &TaskContent;
+
+    fn action(&self) -> Option<&ChannelAction> {
+        None
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChannelAction {
+    StopTask { task_id: String, agent_name: String },
+    SetAgentEnabled { agent_name: String, enabled: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,17 +58,53 @@ pub struct ChannelAgent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChannelReply {
-    text: String,
+pub struct ChannelAgentStatus {
+    name: String,
+    enabled: bool,
+}
+
+impl ChannelAgentStatus {
+    pub fn new(name: impl Into<String>, enabled: bool) -> Self {
+        Self {
+            name: name.into(),
+            enabled,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChannelReply {
+    Text(String),
+    AgentList(Vec<ChannelAgentStatus>),
+    AgentStatus(ChannelAgentStatus),
 }
 
 impl ChannelReply {
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+        Self::Text(text.into())
     }
 
-    pub fn text(&self) -> &str {
-        &self.text
+    pub fn agent_list(agents: Vec<ChannelAgentStatus>) -> Self {
+        Self::AgentList(agents)
+    }
+
+    pub fn agent_status(agent: ChannelAgentStatus) -> Self {
+        Self::AgentStatus(agent)
+    }
+
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::AgentList(_) | Self::AgentStatus(_) => None,
+        }
     }
 }
 
@@ -91,6 +137,13 @@ impl ChannelTask for ConfiguredTask {
         match self {
             ConfiguredTask::Lark(task) => task.content(),
             ConfiguredTask::Telegram(task) => task.content(),
+        }
+    }
+
+    fn action(&self) -> Option<&ChannelAction> {
+        match self {
+            ConfiguredTask::Lark(task) => task.action(),
+            ConfiguredTask::Telegram(task) => task.action(),
         }
     }
 }

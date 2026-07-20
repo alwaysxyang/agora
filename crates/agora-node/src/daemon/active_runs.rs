@@ -8,6 +8,7 @@ use tokio::sync::watch;
 pub(super) struct ActiveRunScope {
     channel_name: String,
     session_id: String,
+    task_id: String,
     session_key: SessionKey,
 }
 
@@ -15,11 +16,13 @@ impl ActiveRunScope {
     pub(super) fn new(
         channel_name: impl Into<String>,
         session_id: impl Into<String>,
+        task_id: impl Into<String>,
         session_key: SessionKey,
     ) -> Self {
         Self {
             channel_name: channel_name.into(),
             session_id: session_id.into(),
+            task_id: task_id.into(),
             session_key,
         }
     }
@@ -115,6 +118,27 @@ impl ActiveRuns {
             }
         }
         stopped.into_iter().collect()
+    }
+
+    pub(super) fn stop_task(
+        &self,
+        channel_name: &str,
+        session_id: &str,
+        task_id: &str,
+        agent_name: &str,
+    ) -> bool {
+        let mut stopped = false;
+        for entry in self.entries().values() {
+            if entry.scope.channel_name == channel_name
+                && entry.scope.session_id == session_id
+                && entry.scope.task_id == task_id
+                && entry.scope.session_key.agent_name() == agent_name
+                && entry.control.send(RunControl::Stop).is_ok()
+            {
+                stopped = true;
+            }
+        }
+        stopped
     }
 
     pub(super) fn interrupt_all(&self) -> usize {

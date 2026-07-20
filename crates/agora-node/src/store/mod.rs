@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const CREATE_SCHEMA: &str = include_str!("schema.sql");
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -36,6 +36,29 @@ impl SessionKey {
 
     pub fn agent_name(&self) -> &str {
         &self.agent_name
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ChannelSessionKey {
+    channel_name: String,
+    session_id: String,
+}
+
+impl ChannelSessionKey {
+    pub fn new(channel_name: impl Into<String>, session_id: impl Into<String>) -> Self {
+        Self {
+            channel_name: channel_name.into(),
+            session_id: session_id.into(),
+        }
+    }
+
+    pub fn channel_name(&self) -> &str {
+        &self.channel_name
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 }
 
@@ -165,6 +188,74 @@ impl SessionStore {
             )
             .context("remove channel-agent session mapping failed")?;
         Ok(removed > 0)
+    }
+
+    pub fn disable_agent(&self, key: &ChannelSessionKey, agent_name: &str) -> Result<bool> {
+        let connection = self.lock_connection();
+        let inserted = connection
+            .execute(
+                "INSERT OR IGNORE INTO channel_session_agent_blocks (
+                     channel_name,
+                     channel_session_id,
+                     agent_name
+                 ) VALUES (?1, ?2, ?3)",
+                params![key.channel_name(), key.session_id(), agent_name],
+            )
+            .context("disable agent for channel session failed")?;
+        Ok(inserted > 0)
+    }
+
+    pub fn enable_agent(&self, key: &ChannelSessionKey, agent_name: &str) -> Result<bool> {
+        let connection = self.lock_connection();
+        let removed = connection
+            .execute(
+                "DELETE FROM channel_session_agent_blocks
+                 WHERE channel_name = ?1
+                   AND channel_session_id = ?2
+                   AND agent_name = ?3",
+                params![key.channel_name(), key.session_id(), agent_name],
+            )
+            .context("enable agent for channel session failed")?;
+        Ok(removed > 0)
+    }
+
+    pub fn is_agent_enabled(&self, key: &ChannelSessionKey, agent_name: &str) -> Result<bool> {
+        let connection = self.lock_connection();
+        let blocked = connection
+            .query_row(
+                "SELECT EXISTS (
+                     SELECT 1
+                     FROM channel_session_agent_blocks
+                     WHERE channel_name = ?1
+                       AND channel_session_id = ?2
+                       AND agent_name = ?3
+                 )",
+                params![key.channel_name(), key.session_id(), agent_name],
+                |row| row.get::<_, bool>(0),
+            )
+            .context("query agent status for channel session failed")?;
+        Ok(!blocked)
+    }
+
+    pub fn disabled_agents(&self, key: &ChannelSessionKey) -> Result<Vec<String>> {
+        let connection = self.lock_connection();
+        let mut statement = connection
+            .prepare(
+                "SELECT agent_name
+                 FROM channel_session_agent_blocks
+                 WHERE channel_name = ?1
+                   AND channel_session_id = ?2
+                 ORDER BY agent_name",
+            )
+            .context("prepare disabled agent query failed")?;
+        let names = statement
+            .query_map(params![key.channel_name(), key.session_id()], |row| {
+                row.get(0)
+            })
+            .context("query disabled agents for channel session failed")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("read disabled agents for channel session failed")?;
+        Ok(names)
     }
 
     fn initialize(connection: &Connection) -> Result<()> {

@@ -28,3 +28,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_shared_scope
 CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_session_scope
     ON agent_sessions (agent_name, channel_name, channel_session_id)
     WHERE isolation_scope = 'session';
+
+CREATE TABLE IF NOT EXISTS channel_session_agent_blocks (
+    channel_name       TEXT NOT NULL CHECK (length(channel_name) > 0),
+    channel_session_id TEXT NOT NULL CHECK (length(channel_session_id) > 0),
+    agent_name         TEXT NOT NULL CHECK (length(agent_name) > 0),
+    PRIMARY KEY (channel_name, channel_session_id, agent_name)
+) WITHOUT ROWID;

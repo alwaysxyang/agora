@@ -2,7 +2,7 @@ use super::channel::{LarkChannel, LarkEvent};
 use super::lark_api::{
     LarkApi, LarkFrame, LarkFrameHeader, LarkReconnectBackoff, LarkWebSocketEndpointResponse,
 };
-use crate::channel::ChannelTask;
+use crate::channel::{ChannelAction, ChannelTask};
 use crate::config::LarkChannelConfig;
 use crate::task::TaskAttachmentKind;
 use serde_json::Value;
@@ -273,6 +273,88 @@ fn ignores_lark_events_that_are_not_agent_tasks() {
         event,
         LarkEvent::Ignore {
             event_type: "im.message.message_read_v1".to_string()
+        }
+    );
+}
+
+#[test]
+fn parses_lark_stop_task_card_action() {
+    let LarkEvent::CardAction(event) = LarkEvent::from_lark_event_payload(
+        r#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt_action_1",
+                "event_type": "card.action.trigger"
+            },
+            "event": {
+                "operator": {"open_id": "ou_123"},
+                "action": {
+                    "tag": "button",
+                    "value": {
+                        "action": "stop_task",
+                        "task_id": "om_task_1",
+                        "agent_name": "codex-dev"
+                    }
+                },
+                "context": {
+                    "open_message_id": "om_card_1",
+                    "open_chat_id": "oc_123"
+                }
+            }
+        }"#,
+    )
+    .unwrap() else {
+        panic!("card action should contain a stop-task action");
+    };
+
+    assert_eq!(event.id, "evt_action_1");
+    assert_eq!(event.session_id, "oc_123");
+    assert_eq!(event.message_id, "om_card_1");
+    assert_eq!(
+        event.action,
+        ChannelAction::StopTask {
+            task_id: "om_task_1".to_string(),
+            agent_name: "codex-dev".to_string(),
+        }
+    );
+}
+
+#[test]
+fn parses_lark_agent_enabled_card_action() {
+    let LarkEvent::CardAction(event) = LarkEvent::from_lark_event_payload(
+        r#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt_action_2",
+                "event_type": "card.action.trigger"
+            },
+            "event": {
+                "operator": {"open_id": "ou_123"},
+                "action": {
+                    "tag": "button",
+                    "value": {
+                        "action": "set_agent_enabled",
+                        "agent_name": "reviewer",
+                        "enabled": true
+                    }
+                },
+                "context": {
+                    "open_message_id": "om_card_2",
+                    "open_chat_id": "oc_123"
+                }
+            }
+        }"#,
+    )
+    .unwrap() else {
+        panic!("card action should contain an agent-enabled action");
+    };
+
+    assert_eq!(event.message_id, "om_card_2");
+    assert_eq!(
+        event.action,
+        ChannelAction::SetAgentEnabled {
+            agent_name: "reviewer".to_string(),
+            enabled: true,
         }
     );
 }
