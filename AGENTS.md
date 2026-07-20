@@ -83,6 +83,11 @@ After editing:
 - Report commands run and any failures honestly.
 - Report spec consistency status in the final response.
 
+## Exit Criteria
+
+- Do not report work as complete while any warning or error remains.
+- All required validation commands must finish with zero warnings and zero errors.
+
 ## Specification Consistency Requirement
 
 The code and `spec/` documents must stay consistent.
