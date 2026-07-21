@@ -1,5 +1,6 @@
 use agora_node::agent::{
-    AgentOutput, AgentSessionUpdate, AgentTask, ConfiguredAgent, DeleteSessionOutcome,
+    AgentOutcome, AgentOutput, AgentRunCancellation, AgentRunControl, AgentRunOutcome,
+    AgentSessionUpdate, AgentTask, ConfiguredAgent, DeleteSessionOutcome,
 };
 use agora_node::config::{AgentConfig, AgentSandbox, AgentType, IsolateMode};
 use agora_node::task::{OutputEvent, ProgressStatus, TaskAttachment, TaskContent, TokenUsage};
@@ -27,6 +28,69 @@ impl VecAgentOutput {
             })
             .collect()
     }
+}
+
+fn completed(outcome: AgentRunOutcome) -> AgentOutcome {
+    let AgentRunOutcome::Completed(outcome) = outcome else {
+        panic!("agent run should complete");
+    };
+    outcome
+}
+
+#[tokio::test]
+async fn agent_run_control_keeps_the_first_cancellation_reason() {
+    let control = AgentRunControl::new();
+
+    assert!(control.stop());
+    assert!(!control.interrupt());
+    assert_eq!(control.cancelled().await, AgentRunCancellation::Stopped);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn configured_agent_run_owns_its_cancellation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("slow-agent");
+    let started = temp.path().join("started");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\nexec sleep 30\n", started.display()),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let agent =
+        ConfiguredAgent::from_config(agent(AgentType::Custom, &script, temp.path())).unwrap();
+    let control = AgentRunControl::new();
+    let stop = control.clone();
+    let run = tokio::spawn(async move {
+        let mut output = VecAgentOutput::default();
+        agent
+            .run(AgentTask::new("long task"), None, control, &mut output)
+            .await
+            .unwrap()
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !started.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(stop.stop());
+
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap(),
+        AgentRunOutcome::Cancelled(AgentRunCancellation::Stopped)
+    );
 }
 
 #[cfg(unix)]
@@ -65,23 +129,33 @@ async fn codex_agent_uses_the_session_supplied_by_its_caller() {
     let mut first_output = VecAgentOutput::default();
     let mut second_output = VecAgentOutput::default();
 
-    let first_outcome = agent
-        .run(AgentTask::new("first"), None, &mut first_output)
-        .await
-        .unwrap();
+    let first_outcome = completed(
+        agent
+            .run(
+                AgentTask::new("first"),
+                None,
+                AgentRunControl::new(),
+                &mut first_output,
+            )
+            .await
+            .unwrap(),
+    );
     assert_eq!(
         first_outcome.session_update(),
         &AgentSessionUpdate::Set("thread-123".to_string())
     );
 
-    let second_outcome = agent
-        .run(
-            AgentTask::new("second"),
-            Some("thread-123".to_string()),
-            &mut second_output,
-        )
-        .await
-        .unwrap();
+    let second_outcome = completed(
+        agent
+            .run(
+                AgentTask::new("second"),
+                Some("thread-123".to_string()),
+                AgentRunControl::new(),
+                &mut second_output,
+            )
+            .await
+            .unwrap(),
+    );
     assert_eq!(
         second_outcome.session_update(),
         &AgentSessionUpdate::Set("thread-123".to_string())
@@ -148,7 +222,12 @@ async fn codex_agent_classifies_thinking_progress_and_final_answer() {
     let mut output = VecAgentOutput::default();
 
     agent
-        .run(AgentTask::new("hello"), None, &mut output)
+        .run(
+            AgentTask::new("hello"),
+            None,
+            AgentRunControl::new(),
+            &mut output,
+        )
         .await
         .unwrap();
 
@@ -212,14 +291,17 @@ async fn codex_agent_reports_a_missing_session_without_persisting_it() {
         ConfiguredAgent::from_config(agent(AgentType::Codex, &script, temp.path())).unwrap();
     let mut output = VecAgentOutput::default();
 
-    let outcome = agent
-        .run(
-            AgentTask::new("hello"),
-            Some("missing".to_string()),
-            &mut output,
-        )
-        .await
-        .unwrap();
+    let outcome = completed(
+        agent
+            .run(
+                AgentTask::new("hello"),
+                Some("missing".to_string()),
+                AgentRunControl::new(),
+                &mut output,
+            )
+            .await
+            .unwrap(),
+    );
 
     assert_eq!(outcome.session_update(), &AgentSessionUpdate::NotFound);
     assert!(output.events.is_empty());
@@ -255,7 +337,12 @@ async fn codex_agent_does_not_publish_backend_stderr() {
     let mut output = VecAgentOutput::default();
 
     agent
-        .run(AgentTask::new("hello"), None, &mut output)
+        .run(
+            AgentTask::new("hello"),
+            None,
+            AgentRunControl::new(),
+            &mut output,
+        )
         .await
         .unwrap();
 
@@ -308,6 +395,7 @@ async fn codex_agent_passes_image_attachments_to_a_resumed_turn() {
         .run(
             AgentTask::new(content),
             Some("thread-123".to_string()),
+            AgentRunControl::new(),
             &mut output,
         )
         .await
@@ -337,10 +425,17 @@ async fn custom_agent_streams_raw_command_output() {
         ConfiguredAgent::from_config(agent(AgentType::Custom, "/bin/cat", temp.path())).unwrap();
     let mut output = VecAgentOutput::default();
 
-    let outcome = agent
-        .run(AgentTask::new("hello from custom"), None, &mut output)
-        .await
-        .unwrap();
+    let outcome = completed(
+        agent
+            .run(
+                AgentTask::new("hello from custom"),
+                None,
+                AgentRunControl::new(),
+                &mut output,
+            )
+            .await
+            .unwrap(),
+    );
 
     assert_eq!(outcome.exit_code(), 0);
     assert_eq!(outcome.session_update(), &AgentSessionUpdate::Unchanged);
@@ -361,7 +456,12 @@ async fn custom_agent_rejects_attachments_without_a_backend_contract() {
     let mut output = VecAgentOutput::default();
 
     let error = agent
-        .run(AgentTask::new(content), None, &mut output)
+        .run(
+            AgentTask::new(content),
+            None,
+            AgentRunControl::new(),
+            &mut output,
+        )
         .await
         .unwrap_err();
 

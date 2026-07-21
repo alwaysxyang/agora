@@ -1,13 +1,18 @@
 use super::LarkReplyTarget;
 use super::card::{LarkAgentCard, LarkReplyCard};
 use super::lark_api::LarkApi;
-use crate::channel::{Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, RunEvent};
+use crate::channel::{
+    Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, InterruptCallback, RunEvent,
+};
 use crate::config::LarkChannelConfig;
 use crate::task::{ChannelTaskInput, CommandRequest, TaskAttachment, TaskContent};
 use agora_core::logger;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -28,6 +33,7 @@ pub(super) struct LarkMessageEvent {
 pub(super) enum LarkEvent {
     Message(LarkMessageEvent),
     CardAction(LarkCardActionEvent),
+    Interrupt(LarkInterruptEvent),
     Ignore { event_type: String },
 }
 
@@ -37,6 +43,12 @@ pub(super) struct LarkCardActionEvent {
     pub(super) session_id: String,
     pub(super) message_id: String,
     pub(super) command: CommandRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LarkInterruptEvent {
+    pub(super) id: String,
+    pub(super) callback_id: String,
 }
 
 impl LarkEvent {
@@ -52,6 +64,13 @@ impl LarkEvent {
                 LarkMessageEvent::from_lark_event_value(&value).map(Self::Message)
             }
             "card.action.trigger"
+                if value
+                    .pointer("/event/action/value/agora_interrupt")
+                    .is_some() =>
+            {
+                LarkInterruptEvent::from_lark_event_value(&value).map(Self::Interrupt)
+            }
+            "card.action.trigger"
                 if value.pointer("/event/action/value/agora_command").is_some() =>
             {
                 LarkCardActionEvent::from_lark_event_value(&value).map(Self::CardAction)
@@ -60,6 +79,93 @@ impl LarkEvent {
                 event_type: event_type.to_string(),
             }),
         }
+    }
+}
+
+impl LarkInterruptEvent {
+    fn from_lark_event_value(value: &Value) -> Result<Self> {
+        let required = |path: &str, field: &str| {
+            value
+                .pointer(path)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("lark interrupt action missing {field}"))
+        };
+        Ok(Self {
+            id: required("/header/event_id", "header.event_id")?,
+            callback_id: required(
+                "/event/action/value/agora_interrupt",
+                "event.action.value.agora_interrupt",
+            )?,
+        })
+    }
+}
+
+struct LarkInterruptCallbacksInner {
+    next_id: AtomicU64,
+    callbacks: Mutex<HashMap<String, InterruptCallback>>,
+}
+
+#[derive(Clone)]
+pub(super) struct LarkInterruptCallbacks {
+    inner: Arc<LarkInterruptCallbacksInner>,
+}
+
+impl Default for LarkInterruptCallbacks {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(LarkInterruptCallbacksInner {
+                next_id: AtomicU64::new(1),
+                callbacks: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+}
+
+impl LarkInterruptCallbacks {
+    pub(super) fn register(&self, callback: InterruptCallback) -> LarkInterruptRegistration {
+        let id = format!(
+            "interrupt-{}",
+            self.inner.next_id.fetch_add(1, Ordering::Relaxed)
+        );
+        self.callbacks().insert(id.clone(), callback);
+        LarkInterruptRegistration {
+            id,
+            callbacks: self.clone(),
+        }
+    }
+
+    pub(super) fn trigger(&self, id: &str) -> bool {
+        let callback = self.callbacks().remove(id);
+        callback.is_some_and(|callback| callback.trigger())
+    }
+
+    fn remove(&self, id: &str) {
+        self.callbacks().remove(id);
+    }
+
+    fn callbacks(&self) -> std::sync::MutexGuard<'_, HashMap<String, InterruptCallback>> {
+        self.inner
+            .callbacks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+pub(super) struct LarkInterruptRegistration {
+    id: String,
+    callbacks: LarkInterruptCallbacks,
+}
+
+impl LarkInterruptRegistration {
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Drop for LarkInterruptRegistration {
+    fn drop(&mut self) {
+        self.callbacks.remove(&self.id);
     }
 }
 
@@ -276,6 +382,7 @@ impl ChannelRun for LarkRun {
 
 pub struct LarkChannel {
     api: LarkApi,
+    interrupts: LarkInterruptCallbacks,
     receiver: Option<LarkWebSocketReceiver>,
 }
 
@@ -283,6 +390,7 @@ impl LarkChannel {
     pub fn new(config: LarkChannelConfig) -> Result<Self> {
         Ok(Self {
             api: LarkApi::new(config)?,
+            interrupts: LarkInterruptCallbacks::default(),
             receiver: None,
         })
     }
@@ -291,6 +399,7 @@ impl LarkChannel {
     pub(super) fn with_api(api: LarkApi) -> Self {
         Self {
             api,
+            interrupts: LarkInterruptCallbacks::default(),
             receiver: None,
         }
     }
@@ -388,6 +497,15 @@ impl Channel for LarkChannel {
                     );
                     return Ok(Some(LarkTask::from_card_action(event)));
                 }
+                LarkEvent::Interrupt(event) => {
+                    let triggered = self.interrupts.trigger(&event.callback_id);
+                    logger::info!(
+                        "lark interrupt action received channel={} event_id={} triggered={}",
+                        self.name(),
+                        event.id,
+                        triggered
+                    );
+                }
                 LarkEvent::Message(_) | LarkEvent::Ignore { .. } => {}
             }
         }
@@ -397,13 +515,11 @@ impl Channel for LarkChannel {
         let target = task
             .reply_target()
             .ok_or_else(|| anyhow!("lark card action cannot open an agent run"))?;
+        let interrupt = context
+            .interrupt
+            .map(|callback| self.interrupts.register(callback));
         Ok(LarkRun {
-            card: LarkAgentCard::new(
-                target,
-                context.agent.name,
-                context.buttons,
-                self.api.clone(),
-            ),
+            card: LarkAgentCard::new(target, context.agent.name, interrupt, self.api.clone()),
         })
     }
 

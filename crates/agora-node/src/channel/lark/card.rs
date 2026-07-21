@@ -1,4 +1,5 @@
 use super::LarkReplyTarget;
+use super::channel::LarkInterruptRegistration;
 use super::lark_api::LarkApi;
 use crate::channel::{
     ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun, RunEvent,
@@ -30,6 +31,7 @@ impl Clone for LarkAgentCard {
 struct LarkAgentCardInner {
     target: LarkReplyTarget,
     api: LarkApi,
+    _interrupt: Option<LarkInterruptRegistration>,
     state: Mutex<LarkAgentCardState>,
 }
 
@@ -45,7 +47,7 @@ struct LarkAgentCardState {
 
 pub(super) struct LarkCardContent {
     agent_name: String,
-    buttons: Vec<ChannelButton>,
+    interrupt: Option<String>,
     thinking: VecDeque<String>,
     progress: VecDeque<LarkProgressEntry>,
     answer: String,
@@ -238,7 +240,7 @@ impl LarkCardContent {
     pub(super) fn new(agent_name: String) -> Self {
         Self {
             agent_name,
-            buttons: Vec::new(),
+            interrupt: None,
             thinking: VecDeque::new(),
             progress: VecDeque::new(),
             answer: String::new(),
@@ -247,9 +249,9 @@ impl LarkCardContent {
         }
     }
 
-    pub(super) fn with_buttons(agent_name: String, buttons: Vec<ChannelButton>) -> Self {
+    pub(super) fn with_interrupt(agent_name: String, interrupt: Option<String>) -> Self {
         Self {
-            buttons,
+            interrupt,
             ..Self::new(agent_name)
         }
     }
@@ -445,11 +447,13 @@ impl LarkCardContent {
             }));
         }
 
-        if !finished && !self.buttons.is_empty() {
+        if !finished && self.interrupt.is_some() {
             if !elements.is_empty() {
                 elements.push(json!({ "tag": "hr" }));
             }
-            elements.push(self.action_row());
+            if let Some(action_row) = self.action_row() {
+                elements.push(action_row);
+            }
         }
 
         let mut card = json!({
@@ -482,17 +486,32 @@ impl LarkCardContent {
         card
     }
 
-    fn action_row(&self) -> Value {
-        json!({
+    fn action_row(&self) -> Option<Value> {
+        let interrupt = self.interrupt.as_ref()?;
+        Some(json!({
             "tag": "column_set",
             "flex_mode": "none",
             "horizontal_align": "right",
-            "columns": self.buttons.iter().map(|button| json!({
+            "columns": [json!({
                 "tag": "column",
                 "width": "auto",
-                "elements": [LarkReplyCard::button(button)]
-            })).collect::<Vec<_>>()
-        })
+                "elements": [{
+                    "tag": "button",
+                    "text": {
+                        "tag": "plain_text",
+                        "content": "结束任务"
+                    },
+                    "type": "danger",
+                    "size": "medium",
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "agora_interrupt": interrupt
+                        }
+                    }]
+                }]
+            })]
+        }))
     }
 
     fn collapsible_panel(title: String, expanded: bool, content: String) -> Value {
@@ -664,17 +683,22 @@ impl LarkAgentCard {
     pub(super) fn new(
         target: LarkReplyTarget,
         agent_name: String,
-        buttons: Vec<ChannelButton>,
+        interrupt: Option<LarkInterruptRegistration>,
         api: LarkApi,
     ) -> Self {
+        let interrupt_id = interrupt
+            .as_ref()
+            .map(LarkInterruptRegistration::id)
+            .map(str::to_string);
         Self {
             inner: Arc::new(LarkAgentCardInner {
                 target,
                 api,
+                _interrupt: interrupt,
                 state: Mutex::new(LarkAgentCardState {
                     token: None,
                     message_id: None,
-                    content: LarkCardContent::with_buttons(agent_name, buttons),
+                    content: LarkCardContent::with_interrupt(agent_name, interrupt_id),
                     version: 0,
                     sent_version: 0,
                     last_update: None,

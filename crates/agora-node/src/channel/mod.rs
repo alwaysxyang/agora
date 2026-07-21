@@ -3,7 +3,9 @@ use crate::channel::telegram::{TelegramChannel, TelegramRun, TelegramTask};
 use crate::config::ChannelConfig;
 use crate::task::{ChannelTaskInput, CommandRequest, OutputEvent};
 use anyhow::{Result, bail};
+use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
 
 pub mod lark;
 mod telegram;
@@ -77,10 +79,33 @@ impl ChannelButton {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
+pub struct InterruptCallback {
+    callback: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl InterruptCallback {
+    pub(crate) fn new(callback: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            callback: Arc::new(callback),
+        }
+    }
+
+    pub fn trigger(&self) -> bool {
+        (self.callback)()
+    }
+}
+
+impl fmt::Debug for InterruptCallback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InterruptCallback")
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ChannelRunContext {
     pub agent: ChannelAgent,
-    pub buttons: Vec<ChannelButton>,
+    pub interrupt: Option<InterruptCallback>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

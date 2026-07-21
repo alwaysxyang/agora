@@ -5,16 +5,15 @@ mod reset;
 mod stop;
 
 use crate::agent::ConfiguredAgent;
-use crate::channel::{ChannelButton, ChannelReply};
-use crate::daemon::{ActiveRuns, SessionQueues};
+use crate::channel::ChannelReply;
+use crate::daemon::ExecutionScheduler;
 use crate::store::SessionStore;
 use crate::task::ChannelTaskInput;
 use anyhow::Result;
-use std::collections::HashMap;
 
 pub(super) use executor::{AgentDispatch, CommandContext, CommandExecution, CommandHandler};
 pub(super) use registry::{
-    Argument, CommandArguments, CommandNode, CommandRegistry, CommandResolution, CommandVisibility,
+    Argument, CommandArguments, CommandNode, CommandRegistry, CommandResolution,
 };
 
 pub(super) enum CommandOutcome {
@@ -28,19 +27,14 @@ pub(super) struct CommandRuntime {
 }
 
 impl CommandRuntime {
-    pub(super) fn new(
-        store: SessionStore,
-        queues: SessionQueues,
-        active_runs: ActiveRuns,
-    ) -> Result<Self> {
-        let stop = stop::StopCommand::new(active_runs.clone());
-        let reset = reset::ResetCommand::new(store.clone(), queues, active_runs);
+    pub(super) fn new(store: SessionStore, scheduler: ExecutionScheduler) -> Result<Self> {
+        let stop = stop::StopCommand::new(scheduler.clone());
+        let reset = reset::ResetCommand::new(store.clone(), scheduler);
         let ask = ask::AskCommand::new(store);
         let mut registry = CommandRegistry::new();
         registry.register(stop.command())?;
         registry.register(reset.command())?;
         registry.register(ask.command())?;
-        registry.register(stop.internal_command())?;
         Ok(Self { registry })
     }
 
@@ -76,21 +70,6 @@ impl CommandRuntime {
                 })
             }
         }
-    }
-
-    pub(super) fn run_buttons(
-        task_id: &str,
-        agents: &[ConfiguredAgent],
-    ) -> HashMap<String, Vec<ChannelButton>> {
-        agents
-            .iter()
-            .map(|agent| {
-                (
-                    agent.name().to_string(),
-                    vec![stop::StopCommand::run_button(task_id, agent.name())],
-                )
-            })
-            .collect()
     }
 
     #[cfg(test)]

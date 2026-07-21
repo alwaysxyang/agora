@@ -1,12 +1,14 @@
-use super::channel::{LarkChannel, LarkEvent};
+use super::channel::{LarkChannel, LarkEvent, LarkInterruptCallbacks};
 use super::lark_api::{
     LarkApi, LarkFrame, LarkFrameHeader, LarkReconnectBackoff, LarkWebSocketEndpointResponse,
 };
-use crate::channel::ChannelTask;
+use crate::channel::{ChannelTask, InterruptCallback};
 use crate::config::LarkChannelConfig;
 use crate::task::{CommandRequest, TaskAttachmentKind};
 use serde_json::Value;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -279,8 +281,8 @@ fn ignores_lark_events_that_are_not_agent_tasks() {
 }
 
 #[test]
-fn parses_lark_stop_task_card_action() {
-    let LarkEvent::CardAction(event) = LarkEvent::from_lark_event_payload(
+fn parses_lark_interrupt_card_action() {
+    let LarkEvent::Interrupt(event) = LarkEvent::from_lark_event_payload(
         r#"{
             "schema": "2.0",
             "header": {
@@ -292,13 +294,7 @@ fn parses_lark_stop_task_card_action() {
                 "action": {
                     "tag": "button",
                     "value": {
-                        "agora_command": {
-                            "path": ["run", "stop"],
-                            "arguments": {
-                                "task_id": "om_task_1",
-                                "agent_name": "codex-dev"
-                            }
-                        }
+                        "agora_interrupt": "interrupt-42"
                     }
                 },
                 "context": {
@@ -309,18 +305,32 @@ fn parses_lark_stop_task_card_action() {
         }"#,
     )
     .unwrap() else {
-        panic!("card action should contain a stop-task action");
+        panic!("card action should contain an interrupt action");
     };
 
     assert_eq!(event.id, "evt_action_1");
-    assert_eq!(event.session_id, "oc_123");
-    assert_eq!(event.message_id, "om_card_1");
-    assert_eq!(
-        event.command,
-        CommandRequest::new(["run", "stop"])
-            .with_argument("task_id", "om_task_1")
-            .with_argument("agent_name", "codex-dev")
-    );
+    assert_eq!(event.callback_id, "interrupt-42");
+}
+
+#[test]
+fn lark_interrupt_callbacks_are_one_shot_and_removed_with_their_registration() {
+    let callbacks = LarkInterruptCallbacks::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let callback_calls = Arc::clone(&calls);
+    let registration = callbacks.register(InterruptCallback::new(move || {
+        callback_calls.fetch_add(1, Ordering::Relaxed);
+        true
+    }));
+    let callback_id = registration.id().to_string();
+
+    assert!(callbacks.trigger(&callback_id));
+    assert!(!callbacks.trigger(&callback_id));
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    let registration = callbacks.register(InterruptCallback::new(|| true));
+    let callback_id = registration.id().to_string();
+    drop(registration);
+    assert!(!callbacks.trigger(&callback_id));
 }
 
 #[test]

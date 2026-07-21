@@ -20,10 +20,6 @@ impl AgentDispatch {
         Self { agents, content }
     }
 
-    pub(in crate::daemon) fn agents(&self) -> &[ConfiguredAgent] {
-        &self.agents
-    }
-
     pub(in crate::daemon) fn into_parts(self) -> (Vec<ConfiguredAgent>, TaskContent) {
         (self.agents, self.content)
     }

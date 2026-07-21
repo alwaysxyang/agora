@@ -1,16 +1,44 @@
-use agora_node::agent::{AgentRegistry, ConfiguredAgent};
-use agora_node::channel::{
+use super::AgentDispatcher;
+use crate::agent::{AgentRegistry, ConfiguredAgent};
+use crate::channel::{
     Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, ConfiguredChannel, RunEvent,
 };
-use agora_node::config::{
+use crate::config::{
     AgentConfig, AgentSubscription, AgentType, ChannelConfig, IsolateMode, IsolationScope,
     LarkChannelConfig, NodeConfig,
 };
-use agora_node::daemon::AgentDispatcher;
-use agora_node::store::{SessionKey, SessionStore};
-use agora_node::task::{ChannelTaskInput, OutputEvent, TaskContent};
+use crate::store::{SessionKey, SessionStore};
+use crate::task::{ChannelTaskInput, OutputEvent, TaskContent};
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
+use tokio::task::JoinSet;
+
+impl AgentDispatcher {
+    pub(super) fn new(store: SessionStore) -> Self {
+        Self::from_parts(store, Default::default())
+    }
+
+    async fn dispatch_channel_task<C>(
+        &self,
+        channel: &C,
+        agents: Vec<ConfiguredAgent>,
+        task: C::Task,
+    ) -> Result<()>
+    where
+        C: Channel + Sync,
+        C::Task: Send + Sync + 'static,
+        C::Run: Send + Sync + 'static,
+    {
+        let mut runs = JoinSet::new();
+        self.start_channel_task(channel, agents, task, &mut runs)
+            .await?;
+
+        while let Some(result) = runs.join_next().await {
+            result??;
+        }
+        Ok(())
+    }
+}
 
 #[test]
 fn selects_all_agents_subscribed_to_channel() {

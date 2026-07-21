@@ -390,16 +390,8 @@ fn lark_card_shows_a_placeholder_before_agent_output() {
 
 #[test]
 fn lark_card_shows_a_bottom_stop_button_only_while_the_task_is_active() {
-    let mut content = LarkCardContent::with_buttons(
-        "codex-dev".to_string(),
-        vec![ChannelButton::new(
-            "结束任务",
-            ChannelButtonStyle::Danger,
-            CommandRequest::new(["run", "stop"])
-                .with_argument("task_id", "task-123")
-                .with_argument("agent_name", "codex-dev"),
-        )],
-    );
+    let mut content =
+        LarkCardContent::with_interrupt("codex-dev".to_string(), Some("interrupt-42".to_string()));
 
     let running = content.build_card();
     let elements = running
@@ -418,13 +410,7 @@ fn lark_card_shows_a_bottom_stop_button_only_while_the_task_is_active() {
     assert_eq!(
         button.pointer("/behaviors/0/value").unwrap(),
         &serde_json::json!({
-            "agora_command": {
-                "path": ["run", "stop"],
-                "arguments": {
-                    "agent_name": "codex-dev",
-                    "task_id": "task-123"
-                }
-            }
+            "agora_interrupt": "interrupt-42"
         })
     );
 
@@ -432,14 +418,14 @@ fn lark_card_shows_a_bottom_stop_button_only_while_the_task_is_active() {
     assert!(
         serde_json::to_string(&content.build_card())
             .unwrap()
-            .contains("agora_command")
+            .contains("agora_interrupt")
     );
 
     content.complete();
     assert!(
         !serde_json::to_string(&content.build_card())
             .unwrap()
-            .contains("agora_command")
+            .contains("agora_interrupt")
     );
 }
 
@@ -598,7 +584,7 @@ async fn lark_card_coalesces_intermediate_updates_and_flushes_completion() {
             message_id: "om_source".to_string(),
         },
         "codex-dev".to_string(),
-        Vec::new(),
+        None,
         api,
     );
 

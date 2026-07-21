@@ -1,7 +1,7 @@
 use super::{CommandArguments, CommandContext, CommandHandler, CommandNode};
 use crate::agent::{ConfiguredAgent, DeleteSessionOutcome};
 use crate::channel::ChannelReply;
-use crate::daemon::{ActiveRuns, SessionQueues};
+use crate::daemon::ExecutionScheduler;
 use crate::store::{SessionKey, SessionStore};
 use agora_core::logger;
 use anyhow::{Result, bail};
@@ -10,17 +10,12 @@ use std::collections::VecDeque;
 #[derive(Clone)]
 pub(super) struct ResetCommand {
     store: SessionStore,
-    queues: SessionQueues,
-    active_runs: ActiveRuns,
+    scheduler: ExecutionScheduler,
 }
 
 impl ResetCommand {
-    pub(super) fn new(store: SessionStore, queues: SessionQueues, active_runs: ActiveRuns) -> Self {
-        Self {
-            store,
-            queues,
-            active_runs,
-        }
+    pub(super) fn new(store: SessionStore, scheduler: ExecutionScheduler) -> Self {
+        Self { store, scheduler }
     }
 
     pub(super) fn command(&self) -> CommandNode<CommandHandler> {
@@ -65,7 +60,7 @@ impl ResetCommand {
                     agent.name(),
                     agent.isolation_scope(channel_name, session_id),
                 );
-                let barrier = self.queues.enqueue(&key);
+                let barrier = self.scheduler.barrier(&key);
                 (agent.clone(), key, barrier)
             })
             .collect::<VecDeque<_>>();
@@ -73,7 +68,7 @@ impl ResetCommand {
             .iter()
             .map(|(_, key, _)| key.clone())
             .collect::<Vec<_>>();
-        self.active_runs.stop_session_keys(&keys);
+        self.scheduler.stop_session_keys(&keys);
 
         let mut failed = Vec::new();
         while let Some((agent, key, mut barrier)) = resets.pop_front() {

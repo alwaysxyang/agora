@@ -241,7 +241,10 @@ impl LarkApi {
 
         let started = Instant::now();
         let status_code = match LarkEvent::from_lark_event_payload(&frame.payload) {
-            Ok(event @ (LarkEvent::Message(_) | LarkEvent::CardAction(_))) => {
+            Ok(
+                event
+                @ (LarkEvent::Message(_) | LarkEvent::CardAction(_) | LarkEvent::Interrupt(_)),
+            ) => {
                 self.send_event(events, event)?;
                 200
             }

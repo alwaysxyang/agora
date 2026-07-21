@@ -1,74 +1,47 @@
 use crate::agent::{
-    AgentOutcome, AgentOutput, AgentRegistry, AgentSessionUpdate, AgentTask, ConfiguredAgent,
+    AgentOutput, AgentRegistry, AgentRunCancellation, AgentRunControl, AgentRunOutcome,
+    AgentSessionUpdate, AgentTask, ConfiguredAgent,
 };
 use crate::channel::{
-    Channel, ChannelAgent, ChannelButton, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask,
-    ConfiguredChannel, RunEvent,
+    Channel, ChannelAgent, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask,
+    ConfiguredChannel, InterruptCallback, RunEvent,
 };
 use crate::config::NodeConfig;
 use crate::store::{ChannelSessionKey, SessionKey, SessionStore};
 use crate::task::{OutputEvent, TaskContent};
 use agora_core::logger;
 use anyhow::{Result, bail};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::{JoinError, JoinSet};
 
-mod active_runs;
 mod command;
-mod session_queue;
+mod execution;
 
-use active_runs::{ActiveRunScope, ActiveRuns, RunCancellation};
 use command::{CommandOutcome, CommandRuntime};
-use session_queue::SessionQueues;
+use execution::{ExecutionScheduler, ExecutionScope};
 
 #[cfg(test)]
 #[path = "../../tests/internal/daemon_command.rs"]
 mod command_tests;
 
+#[cfg(test)]
+#[path = "../../tests/internal/daemon.rs"]
+mod tests;
+
 const CHANNEL_RETRY_DELAY: Duration = Duration::from_secs(1);
 const SHUTDOWN_RUN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
-pub struct AgentDispatcher {
+struct AgentDispatcher {
     store: SessionStore,
-    queues: SessionQueues,
-    active_runs: ActiveRuns,
+    scheduler: ExecutionScheduler,
 }
 
 impl AgentDispatcher {
-    pub fn new(store: SessionStore) -> Self {
-        Self::from_parts(store, SessionQueues::default(), ActiveRuns::default())
-    }
-
-    fn from_parts(store: SessionStore, queues: SessionQueues, active_runs: ActiveRuns) -> Self {
-        Self {
-            store,
-            queues,
-            active_runs,
-        }
-    }
-
-    pub async fn dispatch_channel_task<C>(
-        &self,
-        channel: &C,
-        agents: Vec<ConfiguredAgent>,
-        task: C::Task,
-    ) -> Result<()>
-    where
-        C: Channel + Sync,
-        C::Task: Send + Sync + 'static,
-        C::Run: Send + Sync + 'static,
-    {
-        let mut runs: JoinSet<Result<()>> = JoinSet::new();
-        self.start_channel_task(channel, agents, task, HashMap::new(), &mut runs)
-            .await?;
-
-        while let Some(result) = runs.join_next().await {
-            Self::log_run_result(result);
-        }
-        Ok(())
+    fn from_parts(store: SessionStore, scheduler: ExecutionScheduler) -> Self {
+        Self { store, scheduler }
     }
 
     async fn start_channel_task<C>(
@@ -76,7 +49,6 @@ impl AgentDispatcher {
         channel: &C,
         agents: Vec<ConfiguredAgent>,
         task: C::Task,
-        buttons: HashMap<String, Vec<ChannelButton>>,
         runs: &mut JoinSet<Result<()>>,
     ) -> Result<()>
     where
@@ -98,7 +70,7 @@ impl AgentDispatcher {
             .message()
             .ok_or_else(|| anyhow::anyhow!("command input cannot start an agent run"))?
             .clone();
-        self.start_agent_runs(channel, agents, task, content, buttons, runs)
+        self.start_agent_runs(channel, agents, task, content, runs)
             .await
     }
 
@@ -108,7 +80,6 @@ impl AgentDispatcher {
         agents: Vec<ConfiguredAgent>,
         task: C::Task,
         content: TaskContent,
-        buttons: HashMap<String, Vec<ChannelButton>>,
         runs: &mut JoinSet<Result<()>>,
     ) -> Result<()>
     where
@@ -117,6 +88,16 @@ impl AgentDispatcher {
         C::Run: Send + Sync + 'static,
     {
         for agent in agents {
+            let agent_task = AgentTask::new(content.clone());
+            let isolation_scope = agent.isolation_scope(channel.name(), task.session_id());
+            let key = SessionKey::new(agent.name(), isolation_scope.clone());
+            let mut execution = self.scheduler.enqueue(ExecutionScope::new(
+                channel.name(),
+                task.session_id(),
+                key.clone(),
+            ));
+            let control = execution.control();
+            let interrupt_control = control.clone();
             let run = channel
                 .open_run(
                     &task,
@@ -124,49 +105,35 @@ impl AgentDispatcher {
                         agent: ChannelAgent {
                             name: agent.name().to_string(),
                         },
-                        buttons: buttons.get(agent.name()).cloned().unwrap_or_default(),
+                        interrupt: Some(InterruptCallback::new(move || interrupt_control.stop())),
                     },
                 )
                 .await?;
             let mut output = AgentRunOutput::new(run);
-            let agent_task = AgentTask::new(content.clone());
-            let isolation_scope = agent.isolation_scope(channel.name(), task.session_id());
-            let key = SessionKey::new(agent.name(), isolation_scope.clone());
-            let mut active_run = self.active_runs.register(ActiveRunScope::new(
-                channel.name(),
-                task.session_id(),
-                task.task_id(),
-                key.clone(),
-            ));
-            let mut queue_ticket = self.queues.enqueue(&key);
             let dispatcher = self.clone();
             runs.spawn(async move {
-                let mut ahead = queue_ticket.ahead();
+                let mut ahead = execution.ahead();
                 while ahead > 0 {
                     output.queued(ahead).await?;
                     ahead = tokio::select! {
-                        ahead = queue_ticket.changed() => ahead?,
-                        cancellation = active_run.cancelled() => {
-                            drop(queue_ticket);
+                        ahead = execution.changed() => ahead?,
+                        cancellation = control.cancelled() => {
+                            drop(execution);
                             return output.cancelled(cancellation).await;
                         }
                     };
                 }
                 output.started().await?;
-                let result = tokio::select! {
-                    result = dispatcher.execute_agent(
-                        &key,
-                        &agent,
-                        agent_task,
-                        &mut output,
-                    ) => result,
-                    cancellation = active_run.cancelled() => {
-                        drop(queue_ticket);
-                        return output.cancelled(cancellation).await;
-                    }
-                };
+                let result = dispatcher
+                    .execute_agent(&key, &agent, agent_task, control, &mut output)
+                    .await;
                 match result {
-                    Ok(outcome) => output.completed(outcome.exit_code()).await,
+                    Ok(AgentRunOutcome::Completed(outcome)) => {
+                        output.completed(outcome.exit_code()).await
+                    }
+                    Ok(AgentRunOutcome::Cancelled(cancellation)) => {
+                        output.cancelled(cancellation).await
+                    }
                     Err(err) => {
                         output.failed(err.to_string()).await?;
                         Err(err)
@@ -209,13 +176,20 @@ impl AgentDispatcher {
         key: &SessionKey,
         agent: &ConfiguredAgent,
         task: AgentTask,
+        control: AgentRunControl,
         output: &mut O,
-    ) -> Result<AgentOutcome>
+    ) -> Result<AgentRunOutcome>
     where
         O: AgentOutput + Send,
     {
         let session_id = self.store.get(key)?;
-        let mut outcome = agent.run(task.clone(), session_id.clone(), output).await?;
+        let mut outcome = match agent
+            .run(task.clone(), session_id.clone(), control.clone(), output)
+            .await?
+        {
+            AgentRunOutcome::Completed(outcome) => outcome,
+            cancelled @ AgentRunOutcome::Cancelled(_) => return Ok(cancelled),
+        };
 
         if outcome.session_update() == &AgentSessionUpdate::NotFound {
             let Some(stale_session_id) = session_id else {
@@ -227,7 +201,10 @@ impl AgentDispatcher {
                 key.agent_name(),
                 key.isolation_scope().as_str()
             );
-            outcome = agent.run(task, None, output).await?;
+            outcome = match agent.run(task, None, control, output).await? {
+                AgentRunOutcome::Completed(outcome) => outcome,
+                cancelled @ AgentRunOutcome::Cancelled(_) => return Ok(cancelled),
+            };
             if outcome.session_update() == &AgentSessionUpdate::NotFound {
                 bail!("agent reported a missing session after starting without a session");
             }
@@ -236,7 +213,7 @@ impl AgentDispatcher {
         if let AgentSessionUpdate::Set(session_id) = outcome.session_update() {
             self.store.save(key, session_id)?;
         }
-        Ok(outcome)
+        Ok(AgentRunOutcome::Completed(outcome))
     }
 }
 
@@ -248,17 +225,17 @@ pub struct Daemon {
 
 #[derive(Clone)]
 pub struct DaemonShutdown {
-    active_runs: ActiveRuns,
+    scheduler: ExecutionScheduler,
 }
 
 impl DaemonShutdown {
     pub async fn interrupt(&self) {
-        let interrupted = self.active_runs.interrupt_all();
+        let interrupted = self.scheduler.interrupt_all();
         if interrupted == 0 {
             return;
         }
         logger::info!("interrupting {} agent runs before shutdown", interrupted);
-        if tokio::time::timeout(SHUTDOWN_RUN_TIMEOUT, self.active_runs.wait_until_empty())
+        if tokio::time::timeout(SHUTDOWN_RUN_TIMEOUT, self.scheduler.wait_until_empty())
             .await
             .is_err()
         {
@@ -273,22 +250,17 @@ impl DaemonShutdown {
 impl Daemon {
     pub fn new(config: NodeConfig) -> Result<Self> {
         let store = SessionStore::open_default()?;
-        let queues = SessionQueues::default();
-        let active_runs = ActiveRuns::default();
+        let scheduler = ExecutionScheduler::default();
         Ok(Self {
             config,
-            dispatcher: AgentDispatcher::from_parts(
-                store.clone(),
-                queues.clone(),
-                active_runs.clone(),
-            ),
-            commands: Arc::new(CommandRuntime::new(store, queues, active_runs)?),
+            dispatcher: AgentDispatcher::from_parts(store.clone(), scheduler.clone()),
+            commands: Arc::new(CommandRuntime::new(store, scheduler)?),
         })
     }
 
     pub fn shutdown_handle(&self) -> DaemonShutdown {
         DaemonShutdown {
-            active_runs: self.dispatcher.active_runs.clone(),
+            scheduler: self.dispatcher.scheduler.clone(),
         }
     }
 
@@ -301,7 +273,7 @@ impl Daemon {
         let NodeConfig { channels, agents } = config;
         let agents = AgentRegistry::from_configs(agents)?;
         let shutdown = DaemonShutdown {
-            active_runs: dispatcher.active_runs.clone(),
+            scheduler: dispatcher.scheduler.clone(),
         };
         let mut configured_channels = Vec::new();
 
@@ -406,18 +378,16 @@ impl Daemon {
             .await?
         {
             CommandOutcome::PassThrough => {
-                let buttons = CommandRuntime::run_buttons(task.task_id(), agents);
                 dispatcher
-                    .start_channel_task(channel, agents.to_vec(), task, buttons, runs)
+                    .start_channel_task(channel, agents.to_vec(), task, runs)
                     .await
             }
             CommandOutcome::Reply(Some(reply)) => channel.reply(&task, reply).await,
             CommandOutcome::Reply(None) => Ok(()),
             CommandOutcome::Dispatch(dispatch) => {
-                let buttons = CommandRuntime::run_buttons(task.task_id(), dispatch.agents());
                 let (agents, content) = dispatch.into_parts();
                 dispatcher
-                    .start_agent_runs(channel, agents, task, content, buttons, runs)
+                    .start_agent_runs(channel, agents, task, content, runs)
                     .await
             }
         }
@@ -468,10 +438,10 @@ where
         result
     }
 
-    async fn cancelled(&self, cancellation: RunCancellation) -> Result<()> {
+    async fn cancelled(&self, cancellation: AgentRunCancellation) -> Result<()> {
         match cancellation {
-            RunCancellation::Stopped => self.stopped().await,
-            RunCancellation::Interrupted => self.interrupted().await,
+            AgentRunCancellation::Stopped => self.stopped().await,
+            AgentRunCancellation::Interrupted => self.interrupted().await,
         }
     }
 }

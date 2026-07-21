@@ -4,13 +4,6 @@ use std::collections::HashSet;
 
 const HELP: &str = "help";
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::daemon) enum CommandVisibility {
-    #[default]
-    Public,
-    Internal,
-}
-
 #[derive(Clone, Debug)]
 pub(in crate::daemon) struct Argument {
     name: &'static str,
@@ -72,7 +65,6 @@ impl Argument {
 pub(in crate::daemon) struct CommandNode<H> {
     name: &'static str,
     description: &'static str,
-    visibility: CommandVisibility,
     arguments: Vec<Argument>,
     handler: Option<H>,
     subcommands: Vec<CommandNode<H>>,
@@ -83,7 +75,6 @@ impl<H> CommandNode<H> {
         Self {
             name,
             description,
-            visibility: CommandVisibility::Public,
             arguments: Vec::new(),
             handler: None,
             subcommands: Vec::new(),
@@ -92,11 +83,6 @@ impl<H> CommandNode<H> {
 
     pub(in crate::daemon) fn argument(mut self, argument: Argument) -> Self {
         self.arguments.push(argument);
-        self
-    }
-
-    pub(in crate::daemon) fn visibility(mut self, visibility: CommandVisibility) -> Self {
-        self.visibility = visibility;
         self
     }
 
@@ -197,11 +183,7 @@ impl<H> CommandNode<H> {
         if !self.subcommands.is_empty() {
             lines.push(String::new());
             lines.push("Subcommands:".to_string());
-            for subcommand in self
-                .subcommands
-                .iter()
-                .filter(|subcommand| subcommand.visibility == CommandVisibility::Public)
-            {
+            for subcommand in &self.subcommands {
                 let mut subcommand_path = path.to_vec();
                 subcommand_path.push(subcommand.name);
                 lines.push(subcommand.syntax(&subcommand_path));
@@ -313,9 +295,11 @@ where
             };
         }
 
-        let Some(command) = self.commands.iter().find(|command| {
-            command.name == command_name && command.visibility == CommandVisibility::Public
-        }) else {
+        let Some(command) = self
+            .commands
+            .iter()
+            .find(|command| command.name == command_name)
+        else {
             return CommandResolution::Reply(format!(
                 "Unknown command: {token}\nUse /help to list commands."
             ));
@@ -402,9 +386,11 @@ where
                     CommandResolution::Reply(format!("Usage: /{} help", path.join(" ")))
                 };
             }
-            if let Some(subcommand) = command.subcommands.iter().find(|subcommand| {
-                subcommand.name == *token && subcommand.visibility == CommandVisibility::Public
-            }) {
+            if let Some(subcommand) = command
+                .subcommands
+                .iter()
+                .find(|subcommand| subcommand.name == *token)
+            {
                 path.push(subcommand.name);
                 return Self::resolve(subcommand, path, &remaining[1..]);
             }
@@ -470,7 +456,6 @@ where
         lines.extend(
             self.commands
                 .iter()
-                .filter(|command| command.visibility == CommandVisibility::Public)
                 .map(|command| format!("/{} - {}", command.name, command.description)),
         );
         lines.push("/help - Show all commands.".to_string());

@@ -8,9 +8,11 @@ pub mod command;
 
 mod codex;
 mod custom;
+mod run;
 
 use codex::CodexAgent;
 use custom::CustomAgent;
+pub use run::{AgentRunCancellation, AgentRunControl, AgentRunOutcome};
 
 pub trait AgentOutput {
     fn write(&mut self, event: OutputEvent) -> impl Future<Output = Result<()>> + Send;
@@ -183,14 +185,22 @@ impl ConfiguredAgent {
         &self,
         task: AgentTask,
         session_id: Option<String>,
+        control: AgentRunControl,
         output: &mut O,
-    ) -> Result<AgentOutcome>
+    ) -> Result<AgentRunOutcome>
     where
         O: AgentOutput + Send,
     {
-        self.backend
-            .run(task.into_request(&self.config, session_id)?, output)
-            .await
+        let request = task.into_request(&self.config, session_id)?;
+        tokio::select! {
+            biased;
+            cancellation = control.cancelled() => {
+                Ok(AgentRunOutcome::Cancelled(cancellation))
+            }
+            outcome = self.backend.run(request, output) => {
+                outcome.map(AgentRunOutcome::Completed)
+            }
+        }
     }
 
     pub async fn delete_session(&self, session_id: &str) -> Result<DeleteSessionOutcome> {

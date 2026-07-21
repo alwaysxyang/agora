@@ -1,13 +1,15 @@
-use super::active_runs::{ActiveRunScope, ActiveRuns, RunCancellation};
 use super::command::{
     Argument, CommandContext, CommandExecution, CommandHandler, CommandNode, CommandRegistry,
-    CommandResolution, CommandRuntime, CommandVisibility,
+    CommandResolution, CommandRuntime,
 };
+use super::execution::{ExecutionScheduler, ExecutionScope, ExecutionTicket};
 use super::{AgentDispatcher, Daemon};
-use crate::agent::{AgentOutput, AgentTask, ConfiguredAgent};
+use crate::agent::{
+    AgentOutput, AgentRunCancellation, AgentRunControl, AgentTask, ConfiguredAgent,
+};
 use crate::channel::{
     Channel, ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun,
-    ChannelRunContext, ChannelTask, RunEvent,
+    ChannelRunContext, ChannelTask, InterruptCallback, RunEvent,
 };
 use crate::config::{AgentConfig, AgentType, IsolateMode, IsolationScope};
 use crate::store::{SessionKey, SessionStore};
@@ -32,11 +34,78 @@ fn neutral_command_request_and_button_preserve_data() {
     assert_eq!(button.command(), &request);
 }
 
-fn active_scope(channel_name: &str, session_id: &str, agent_name: &str) -> ActiveRunScope {
-    ActiveRunScope::new(
+#[tokio::test]
+async fn interrupt_callback_stops_only_its_registered_agent_run() {
+    let scheduler = ExecutionScheduler::default();
+    let key = SessionKey::new("codex", IsolationScope::session("lark", "chat-1"));
+    let (_target_ticket, target) = scheduled_run(
+        &scheduler,
+        ExecutionScope::new("lark", "chat-1", key.clone()),
+    );
+    let (_duplicate_ticket, duplicate) =
+        scheduled_run(&scheduler, ExecutionScope::new("lark", "chat-1", key));
+    let interrupt_control = target.clone();
+    let interrupt = InterruptCallback::new(move || interrupt_control.stop());
+
+    assert!(interrupt.trigger());
+    assert_eq!(target.cancelled().await, AgentRunCancellation::Stopped);
+    assert!(
+        timeout(Duration::from_millis(20), duplicate.cancelled())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn execution_ticket_combines_fifo_admission_and_run_cancellation() {
+    let scheduler = ExecutionScheduler::default();
+    let scope = ExecutionScope::new(
+        "lark",
+        "chat-1",
+        SessionKey::new("codex", IsolationScope::session("lark", "chat-1")),
+    );
+    let first = scheduler.enqueue(scope.clone());
+    let mut second = scheduler.enqueue(scope);
+    let first_control = first.control();
+    let second_control = second.control();
+
+    assert_eq!(first.ahead(), 0);
+    assert_eq!(second.ahead(), 1);
+    assert!(first_control.stop());
+    assert_eq!(
+        first_control.cancelled().await,
+        AgentRunCancellation::Stopped
+    );
+    assert!(
+        timeout(Duration::from_millis(20), second_control.cancelled())
+            .await
+            .is_err()
+    );
+
+    drop(first);
+    assert_eq!(second.changed().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn scheduler_barrier_serializes_reset_without_becoming_an_agent_run() {
+    let scheduler = ExecutionScheduler::default();
+    let key = SessionKey::new("codex", IsolationScope::session("lark", "chat-1"));
+    let run = scheduler.enqueue(ExecutionScope::new("lark", "chat-1", key.clone()));
+    let mut barrier = scheduler.barrier(&key);
+
+    assert_eq!(barrier.ahead(), 1);
+    assert_eq!(scheduler.interrupt_all(), 1);
+    drop(run);
+    barrier.wait_until_front().await.unwrap();
+    timeout(Duration::from_millis(20), scheduler.wait_until_empty())
+        .await
+        .unwrap();
+}
+
+fn run_scope(channel_name: &str, session_id: &str, agent_name: &str) -> ExecutionScope {
+    ExecutionScope::new(
         channel_name,
         session_id,
-        "task-1",
         SessionKey::new(
             agent_name,
             IsolationScope::session(channel_name, session_id),
@@ -44,13 +113,17 @@ fn active_scope(channel_name: &str, session_id: &str, agent_name: &str) -> Activ
     )
 }
 
+fn scheduled_run(
+    scheduler: &ExecutionScheduler,
+    scope: ExecutionScope,
+) -> (ExecutionTicket, AgentRunControl) {
+    let ticket = scheduler.enqueue(scope);
+    let control = ticket.control();
+    (ticket, control)
+}
+
 fn command_runtime(dispatcher: &AgentDispatcher) -> CommandRuntime {
-    CommandRuntime::new(
-        dispatcher.store.clone(),
-        dispatcher.queues.clone(),
-        dispatcher.active_runs.clone(),
-    )
-    .unwrap()
+    CommandRuntime::new(dispatcher.store.clone(), dispatcher.scheduler.clone()).unwrap()
 }
 
 fn isolated_command_runtime() -> CommandRuntime {
@@ -249,48 +322,6 @@ fn command_registry_resolves_arbitrarily_nested_subcommands() {
 }
 
 #[test]
-fn command_registry_hides_internal_commands_from_text_and_help() {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum TestHandler {
-        Public,
-        Internal,
-    }
-
-    let mut registry = CommandRegistry::new();
-    registry
-        .register(CommandNode::new("public", "Public command").handler(TestHandler::Public))
-        .unwrap();
-    registry
-        .register(
-            CommandNode::new("run-stop", "Stop one run")
-                .visibility(CommandVisibility::Internal)
-                .argument(Argument::required("task_id", "Task id"))
-                .handler(TestHandler::Internal),
-        )
-        .unwrap();
-
-    let CommandResolution::Reply(help) = registry.route_text("/help") else {
-        panic!("expected root help");
-    };
-    assert!(help.contains("/public - Public command"));
-    assert!(!help.contains("run-stop"));
-    assert_eq!(
-        registry.route_text("/run-stop task-1"),
-        CommandResolution::Reply(
-            "Unknown command: /run-stop\nUse /help to list commands.".to_string()
-        )
-    );
-
-    let request = CommandRequest::new(["run-stop"]).with_argument("task_id", "task-1");
-    let CommandResolution::Invocation(invocation) = registry.route_structured(&request) else {
-        panic!("expected internal structured invocation");
-    };
-    let (handler, arguments) = invocation.into_parts();
-    assert_eq!(handler, TestHandler::Internal);
-    assert_eq!(arguments.argument("task_id"), Some("task-1"));
-}
-
-#[test]
 fn command_registry_validates_structured_arguments() {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum TestHandler {
@@ -467,14 +498,16 @@ fn command_reply(registry: &CommandRegistry<CommandHandler>, input: &str) -> Cha
 }
 
 #[tokio::test]
-async fn active_runs_stop_all_agents_only_in_the_current_session() {
-    let runs = ActiveRuns::default();
-    let mut codex = runs.register(active_scope("lark", "chat-1", "codex"));
-    let mut reviewer = runs.register(active_scope("lark", "chat-1", "reviewer"));
-    let mut other_session = runs.register(active_scope("lark", "chat-2", "codex"));
+async fn execution_stops_all_agents_only_in_the_current_session() {
+    let scheduler = ExecutionScheduler::default();
+    let (_codex_ticket, codex) = scheduled_run(&scheduler, run_scope("lark", "chat-1", "codex"));
+    let (_reviewer_ticket, reviewer) =
+        scheduled_run(&scheduler, run_scope("lark", "chat-1", "reviewer"));
+    let (_other_ticket, other_session) =
+        scheduled_run(&scheduler, run_scope("lark", "chat-2", "codex"));
 
     assert_eq!(
-        runs.stop("lark", "chat-1", None),
+        scheduler.stop("lark", "chat-1", None),
         vec!["codex".to_string(), "reviewer".to_string()]
     );
     timeout(Duration::from_millis(50), codex.cancelled())
@@ -491,13 +524,14 @@ async fn active_runs_stop_all_agents_only_in_the_current_session() {
 }
 
 #[tokio::test]
-async fn active_runs_stop_only_the_named_agent() {
-    let runs = ActiveRuns::default();
-    let mut codex = runs.register(active_scope("lark", "chat-1", "codex"));
-    let mut reviewer = runs.register(active_scope("lark", "chat-1", "reviewer"));
+async fn execution_stops_only_the_named_agent() {
+    let scheduler = ExecutionScheduler::default();
+    let (_codex_ticket, codex) = scheduled_run(&scheduler, run_scope("lark", "chat-1", "codex"));
+    let (_reviewer_ticket, reviewer) =
+        scheduled_run(&scheduler, run_scope("lark", "chat-1", "reviewer"));
 
     assert_eq!(
-        runs.stop("lark", "chat-1", Some("codex")),
+        scheduler.stop("lark", "chat-1", Some("codex")),
         vec!["codex".to_string()]
     );
     timeout(Duration::from_millis(50), codex.cancelled())
@@ -508,57 +542,6 @@ async fn active_runs_stop_only_the_named_agent() {
             .await
             .is_err()
     );
-}
-
-#[tokio::test]
-async fn card_stop_action_cancels_only_the_target_logical_task() {
-    let temp = tempfile::tempdir().unwrap();
-    let dispatcher =
-        AgentDispatcher::new(SessionStore::open(temp.path().join("store.db")).unwrap());
-    let key = SessionKey::new("codex", IsolationScope::session("lark", "chat-1"));
-    let mut target = dispatcher.active_runs.register(ActiveRunScope::new(
-        "lark",
-        "chat-1",
-        "task-2",
-        key.clone(),
-    ));
-    let mut duplicate = dispatcher.active_runs.register(ActiveRunScope::new(
-        "lark",
-        "chat-1",
-        "task-2",
-        key.clone(),
-    ));
-    let mut other = dispatcher
-        .active_runs
-        .register(ActiveRunScope::new("lark", "chat-1", "task-3", key));
-    let replies = Arc::new(Mutex::new(Vec::new()));
-    let channel = CommandTestChannel {
-        tasks: VecDeque::new(),
-        events: Arc::new(Mutex::new(Vec::new())),
-        contexts: Arc::new(Mutex::new(Vec::new())),
-        replies: Arc::clone(&replies),
-    };
-    let mut runs = tokio::task::JoinSet::new();
-
-    Daemon::route_channel_task(
-        &channel,
-        &[],
-        &dispatcher,
-        &command_runtime(&dispatcher),
-        CommandTestTask::stop_action("callback-1", "chat-1", "task-2", "codex"),
-        &mut runs,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(target.cancelled().await, RunCancellation::Stopped);
-    assert_eq!(duplicate.cancelled().await, RunCancellation::Stopped);
-    assert!(
-        timeout(Duration::from_millis(20), other.cancelled())
-            .await
-            .is_err()
-    );
-    assert!(replies.lock().unwrap().is_empty());
 }
 
 #[cfg(unix)]
@@ -588,11 +571,13 @@ async fn stopping_a_card_run_advances_the_next_queued_task() {
     .unwrap();
     let events = Arc::new(Mutex::new(Vec::new()));
     let contexts = Arc::new(Mutex::new(Vec::new()));
+    let interrupts = Arc::new(Mutex::new(Vec::new()));
     let replies = Arc::new(Mutex::new(Vec::new()));
     let channel = CommandTestChannel {
         tasks: VecDeque::new(),
         events: Arc::clone(&events),
         contexts: Arc::clone(&contexts),
+        interrupts: Arc::clone(&interrupts),
         replies: Arc::clone(&replies),
     };
     let dispatcher =
@@ -650,16 +635,7 @@ async fn stopping_a_card_run_advances_the_next_queued_task() {
     .await
     .unwrap();
 
-    Daemon::route_channel_task(
-        &channel,
-        &[],
-        &dispatcher,
-        &command_runtime(&dispatcher),
-        CommandTestTask::stop_action("callback-1", "chat-1", "task-1", "codex-dev"),
-        &mut runs,
-    )
-    .await
-    .unwrap();
+    assert!(interrupts.lock().unwrap()[0].trigger());
     timeout(Duration::from_secs(2), async {
         loop {
             let started = events
@@ -677,16 +653,7 @@ async fn stopping_a_card_run_advances_the_next_queued_task() {
     .await
     .unwrap();
 
-    Daemon::route_channel_task(
-        &channel,
-        &[],
-        &dispatcher,
-        &command_runtime(&dispatcher),
-        CommandTestTask::stop_action("callback-2", "chat-1", "task-2", "codex-dev"),
-        &mut runs,
-    )
-    .await
-    .unwrap();
+    assert!(interrupts.lock().unwrap()[1].trigger());
     timeout(Duration::from_secs(2), async {
         while let Some(result) = runs.join_next().await {
             result.unwrap().unwrap();
@@ -719,30 +686,27 @@ async fn stopping_a_card_run_advances_the_next_queued_task() {
 }
 
 #[tokio::test]
-async fn active_runs_stop_every_run_using_a_reset_session_key() {
-    let runs = ActiveRuns::default();
+async fn execution_stops_every_run_using_a_reset_session_key() {
+    let scheduler = ExecutionScheduler::default();
     let shared = SessionKey::new("codex", IsolationScope::Shared);
     let other = SessionKey::new("reviewer", IsolationScope::Shared);
-    let mut lark = runs.register(ActiveRunScope::new(
-        "lark",
-        "chat-1",
-        "task-1",
-        shared.clone(),
-    ));
-    let mut telegram = runs.register(ActiveRunScope::new(
-        "telegram",
-        "chat-2",
-        "task-2",
-        shared.clone(),
-    ));
-    let mut reviewer = runs.register(ActiveRunScope::new("lark", "chat-1", "task-3", other));
+    let (_lark_ticket, lark) = scheduled_run(
+        &scheduler,
+        ExecutionScope::new("lark", "chat-1", shared.clone()),
+    );
+    let (_telegram_ticket, telegram) = scheduled_run(
+        &scheduler,
+        ExecutionScope::new("telegram", "chat-2", shared.clone()),
+    );
+    let (_reviewer_ticket, reviewer) =
+        scheduled_run(&scheduler, ExecutionScope::new("lark", "chat-1", other));
 
     assert_eq!(
-        runs.stop_session_keys(std::slice::from_ref(&shared)),
+        scheduler.stop_session_keys(std::slice::from_ref(&shared)),
         vec!["codex".to_string()]
     );
-    assert_eq!(lark.cancelled().await, RunCancellation::Stopped);
-    assert_eq!(telegram.cancelled().await, RunCancellation::Stopped);
+    assert_eq!(lark.cancelled().await, AgentRunCancellation::Stopped);
+    assert_eq!(telegram.cancelled().await, AgentRunCancellation::Stopped);
     assert!(
         timeout(Duration::from_millis(20), reviewer.cancelled())
             .await
@@ -751,14 +715,18 @@ async fn active_runs_stop_every_run_using_a_reset_session_key() {
 }
 
 #[tokio::test]
-async fn active_runs_interrupt_every_run_during_process_shutdown() {
-    let runs = ActiveRuns::default();
-    let mut codex = runs.register(active_scope("lark", "chat-1", "codex"));
-    let mut reviewer = runs.register(active_scope("lark", "chat-2", "reviewer"));
+async fn execution_interrupts_every_run_during_process_shutdown() {
+    let scheduler = ExecutionScheduler::default();
+    let (_codex_ticket, codex) = scheduled_run(&scheduler, run_scope("lark", "chat-1", "codex"));
+    let (_reviewer_ticket, reviewer) =
+        scheduled_run(&scheduler, run_scope("lark", "chat-2", "reviewer"));
 
-    assert_eq!(runs.interrupt_all(), 2);
-    assert_eq!(codex.cancelled().await, RunCancellation::Interrupted);
-    assert_eq!(reviewer.cancelled().await, RunCancellation::Interrupted);
+    assert_eq!(scheduler.interrupt_all(), 2);
+    assert_eq!(codex.cancelled().await, AgentRunCancellation::Interrupted);
+    assert_eq!(
+        reviewer.cancelled().await,
+        AgentRunCancellation::Interrupted
+    );
 }
 
 #[cfg(unix)]
@@ -783,6 +751,7 @@ async fn channel_loop_routes_stop_without_sending_it_to_the_agent() {
         ]),
         events: Arc::clone(&events),
         contexts: Arc::clone(&contexts),
+        interrupts: Arc::new(Mutex::new(Vec::new())),
         replies: Arc::clone(&replies),
     };
     let agent = ConfiguredAgent::from_config(AgentConfig {
@@ -873,15 +842,16 @@ async fn reset_stops_the_scope_deletes_the_session_and_starts_fresh_next_time() 
     let key = SessionKey::new(agent.name(), agent.isolation_scope("lark", "chat-1"));
     store.save(&key, "old-session").unwrap();
 
-    let active_ticket = dispatcher.queues.enqueue(&key);
-    let mut active_run = dispatcher.active_runs.register(ActiveRunScope::new(
-        "telegram",
-        "chat-2",
-        "active-task",
-        key.clone(),
-    ));
+    let active_ticket =
+        dispatcher
+            .scheduler
+            .enqueue(ExecutionScope::new("telegram", "chat-2", key.clone()));
+    let active_control = active_ticket.control();
     let active_run = tokio::spawn(async move {
-        assert_eq!(active_run.cancelled().await, RunCancellation::Stopped);
+        assert_eq!(
+            active_control.cancelled().await,
+            AgentRunCancellation::Stopped
+        );
         drop(active_ticket);
     });
 
@@ -890,6 +860,7 @@ async fn reset_stops_the_scope_deletes_the_session_and_starts_fresh_next_time() 
         tasks: VecDeque::new(),
         events: Arc::new(Mutex::new(Vec::new())),
         contexts: Arc::new(Mutex::new(Vec::new())),
+        interrupts: Arc::new(Mutex::new(Vec::new())),
         replies: Arc::clone(&replies),
     };
     let mut runs = tokio::task::JoinSet::new();
@@ -916,7 +887,13 @@ async fn reset_stops_the_scope_deletes_the_session_and_starts_fresh_next_time() 
 
     let mut output = IgnoreAgentOutput;
     dispatcher
-        .execute_agent(&key, &agent, AgentTask::new("next task"), &mut output)
+        .execute_agent(
+            &key,
+            &agent,
+            AgentTask::new("next task"),
+            AgentRunControl::new(),
+            &mut output,
+        )
         .await
         .unwrap();
 
@@ -966,6 +943,7 @@ async fn reset_preserves_the_mapping_when_backend_deletion_fails() {
         tasks: VecDeque::new(),
         events: Arc::new(Mutex::new(Vec::new())),
         contexts: Arc::new(Mutex::new(Vec::new())),
+        interrupts: Arc::new(Mutex::new(Vec::new())),
         replies: Arc::clone(&replies),
     };
     let mut runs = tokio::task::JoinSet::new();
@@ -1153,6 +1131,7 @@ async fn disabled_agents_do_not_receive_new_tasks_or_open_run_cards() {
         tasks: VecDeque::new(),
         events: Arc::new(Mutex::new(Vec::new())),
         contexts: Arc::clone(&contexts),
+        interrupts: Arc::new(Mutex::new(Vec::new())),
         replies: Arc::new(Mutex::new(Vec::new())),
     };
     let mut runs = tokio::task::JoinSet::new();
@@ -1189,6 +1168,7 @@ async fn targeted_ask_runs_only_the_named_agent_even_when_it_is_disabled() {
         tasks: VecDeque::new(),
         events: Arc::clone(&events),
         contexts: Arc::clone(&contexts),
+        interrupts: Arc::new(Mutex::new(Vec::new())),
         replies: Arc::clone(&replies),
     };
     let mut runs = tokio::task::JoinSet::new();
@@ -1234,6 +1214,7 @@ async fn targeted_ask_rejects_an_agent_that_is_not_subscribed() {
         tasks: VecDeque::new(),
         events: Arc::new(Mutex::new(Vec::new())),
         contexts: Arc::clone(&contexts),
+        interrupts: Arc::new(Mutex::new(Vec::new())),
         replies: Arc::clone(&replies),
     };
     let mut runs = tokio::task::JoinSet::new();
@@ -1347,23 +1328,6 @@ impl CommandTestTask {
         }
     }
 
-    fn stop_action(
-        task_id: &str,
-        session_id: &str,
-        target_task_id: &str,
-        agent_name: &str,
-    ) -> Self {
-        Self {
-            task_id: task_id.to_string(),
-            session_id: session_id.to_string(),
-            input: ChannelTaskInput::Command(
-                CommandRequest::new(["run", "stop"])
-                    .with_argument("task_id", target_task_id)
-                    .with_argument("agent_name", agent_name),
-            ),
-        }
-    }
-
     fn agent_enabled_action(
         task_id: &str,
         session_id: &str,
@@ -1411,6 +1375,7 @@ struct CommandTestChannel {
     tasks: VecDeque<CommandTestTask>,
     events: Arc<Mutex<Vec<RunEvent>>>,
     contexts: Arc<Mutex<Vec<String>>>,
+    interrupts: Arc<Mutex<Vec<InterruptCallback>>>,
     replies: Arc<Mutex<Vec<ChannelReply>>>,
 }
 
@@ -1420,6 +1385,7 @@ impl CommandTestChannel {
             tasks: VecDeque::new(),
             events: Arc::new(Mutex::new(Vec::new())),
             contexts: Arc::new(Mutex::new(Vec::new())),
+            interrupts: Arc::new(Mutex::new(Vec::new())),
             replies,
         }
     }
@@ -1443,6 +1409,9 @@ impl Channel for CommandTestChannel {
 
     async fn open_run(&self, _task: &Self::Task, context: ChannelRunContext) -> Result<Self::Run> {
         self.contexts.lock().unwrap().push(context.agent.name);
+        if let Some(interrupt) = context.interrupt {
+            self.interrupts.lock().unwrap().push(interrupt);
+        }
         Ok(CommandTestRun {
             events: Arc::clone(&self.events),
         })
