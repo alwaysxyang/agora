@@ -47,7 +47,7 @@ fn normalizes_private_text_message() {
 
     assert_eq!(task.task_id(), "101");
     assert_eq!(task.session_id(), "chat:1");
-    assert_eq!(task.content().text(), "hello");
+    assert_eq!(task.input().message().unwrap().text(), "hello");
     assert_eq!(task.reply_target().chat_id, 1);
     assert_eq!(task.reply_target().message_id, 7);
     assert_eq!(task.reply_target().message_thread_id, None);
@@ -74,7 +74,7 @@ fn normalizes_forum_topic_session_and_reply_target() {
 
     assert_eq!(task.task_id(), "102");
     assert_eq!(task.session_id(), "chat:-1001:topic:44");
-    assert_eq!(task.content().text(), "run tests");
+    assert_eq!(task.input().message().unwrap().text(), "run tests");
     assert_eq!(task.reply_target().chat_id, -1001);
     assert_eq!(task.reply_target().message_id, 8);
     assert_eq!(task.reply_target().message_thread_id, Some(44));
@@ -122,7 +122,7 @@ fn normalizes_commands_addressed_to_this_bot() {
 
     let task = update.into_task("agora_bot").unwrap();
 
-    assert_eq!(task.content().text(), "/stop codex-dev");
+    assert_eq!(task.input().message().unwrap().text(), "/stop codex-dev");
 }
 
 #[test]
@@ -251,9 +251,9 @@ async fn telegram_channel_returns_supported_updates_in_order_and_advances_offset
     let second = channel.next_task().await.unwrap();
     let third = channel.next_task().await.unwrap();
 
-    assert_eq!(first.content().text(), "first");
-    assert_eq!(second.content().text(), "second");
-    assert_eq!(third.content().text(), "third");
+    assert_eq!(first.input().message().unwrap().text(), "first");
+    assert_eq!(second.input().message().unwrap().text(), "second");
+    assert_eq!(third.input().message().unwrap().text(), "third");
     let requests = server.requests().await;
     assert_eq!(requests.len(), 3);
     let second_poll: serde_json::Value = serde_json::from_str(&requests[2].body).unwrap();

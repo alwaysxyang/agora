@@ -1,11 +1,9 @@
 use super::LarkReplyTarget;
 use super::card::{LarkAgentCard, LarkReplyCard};
 use super::lark_api::LarkApi;
-use crate::channel::{
-    Channel, ChannelAction, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, RunEvent,
-};
+use crate::channel::{Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, RunEvent};
 use crate::config::LarkChannelConfig;
-use crate::task::{TaskAttachment, TaskContent};
+use crate::task::{ChannelTaskInput, CommandRequest, TaskAttachment, TaskContent};
 use agora_core::logger;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -38,7 +36,7 @@ pub(super) struct LarkCardActionEvent {
     pub(super) id: String,
     pub(super) session_id: String,
     pub(super) message_id: String,
-    pub(super) action: ChannelAction,
+    pub(super) command: CommandRequest,
 }
 
 impl LarkEvent {
@@ -54,12 +52,7 @@ impl LarkEvent {
                 LarkMessageEvent::from_lark_event_value(&value).map(Self::Message)
             }
             "card.action.trigger"
-                if matches!(
-                    value
-                        .pointer("/event/action/value/action")
-                        .and_then(Value::as_str),
-                    Some("stop_task" | "set_agent_enabled")
-                ) =>
+                if value.pointer("/event/action/value/agora_command").is_some() =>
             {
                 LarkCardActionEvent::from_lark_event_value(&value).map(Self::CardAction)
             }
@@ -79,29 +72,10 @@ impl LarkCardActionEvent {
                 .map(str::to_string)
                 .ok_or_else(|| anyhow!("lark card action missing {field}"))
         };
-        let action =
-            match required("/event/action/value/action", "event.action.value.action")?.as_str() {
-                "stop_task" => ChannelAction::StopTask {
-                    task_id: required("/event/action/value/task_id", "event.action.value.task_id")?,
-                    agent_name: required(
-                        "/event/action/value/agent_name",
-                        "event.action.value.agent_name",
-                    )?,
-                },
-                "set_agent_enabled" => ChannelAction::SetAgentEnabled {
-                    agent_name: required(
-                        "/event/action/value/agent_name",
-                        "event.action.value.agent_name",
-                    )?,
-                    enabled: value
-                        .pointer("/event/action/value/enabled")
-                        .and_then(Value::as_bool)
-                        .ok_or_else(|| {
-                            anyhow!("lark card action missing event.action.value.enabled")
-                        })?,
-                },
-                action => return Err(anyhow!("unsupported lark card action: {action}")),
-            };
+        let command = value
+            .pointer("/event/action/value/agora_command")
+            .cloned()
+            .ok_or_else(|| anyhow!("lark card action missing event.action.value.agora_command"))?;
         Ok(Self {
             id: required("/header/event_id", "header.event_id")?,
             session_id: required("/event/context/open_chat_id", "event.context.open_chat_id")?,
@@ -109,7 +83,8 @@ impl LarkCardActionEvent {
                 "/event/context/open_message_id",
                 "event.context.open_message_id",
             )?,
-            action,
+            command: serde_json::from_value(command)
+                .context("lark card action has an invalid agora command")?,
         })
     }
 }
@@ -236,7 +211,7 @@ impl LarkMessageEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LarkTask {
     source: LarkTaskSource,
-    content: TaskContent,
+    input: ChannelTaskInput,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -249,14 +224,14 @@ impl LarkTask {
     pub(super) fn from_message(event: LarkMessageEvent, content: TaskContent) -> Self {
         Self {
             source: LarkTaskSource::Message(event),
-            content,
+            input: ChannelTaskInput::Message(content),
         }
     }
 
     pub(super) fn from_card_action(event: LarkCardActionEvent) -> Self {
         Self {
+            input: ChannelTaskInput::Command(event.command.clone()),
             source: LarkTaskSource::CardAction(event),
-            content: TaskContent::new(""),
         }
     }
 
@@ -283,15 +258,8 @@ impl ChannelTask for LarkTask {
         }
     }
 
-    fn content(&self) -> &TaskContent {
-        &self.content
-    }
-
-    fn action(&self) -> Option<&ChannelAction> {
-        match &self.source {
-            LarkTaskSource::Message(_) => None,
-            LarkTaskSource::CardAction(event) => Some(&event.action),
-        }
+    fn input(&self) -> &ChannelTaskInput {
+        &self.input
     }
 }
 
@@ -400,8 +368,14 @@ impl Channel for LarkChannel {
                         session_id,
                         sender_id,
                         message_id,
-                        task.content.text(),
-                        task.content.attachments().len()
+                        task.input
+                            .message()
+                            .map(TaskContent::text)
+                            .unwrap_or_default(),
+                        task.input
+                            .message()
+                            .map(|content| content.attachments().len())
+                            .unwrap_or_default()
                     );
                     return Ok(Some(task));
                 }
@@ -427,7 +401,7 @@ impl Channel for LarkChannel {
             card: LarkAgentCard::new(
                 target,
                 context.agent.name,
-                task.task_id().to_string(),
+                context.buttons,
                 self.api.clone(),
             ),
         })

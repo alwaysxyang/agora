@@ -1,6 +1,8 @@
 use super::LarkReplyTarget;
 use super::lark_api::LarkApi;
-use crate::channel::{ChannelAgentStatus, ChannelReply, ChannelRun, RunEvent};
+use crate::channel::{
+    ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun, RunEvent,
+};
 use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
 use agora_core::logger;
 use anyhow::{Result, anyhow};
@@ -43,7 +45,7 @@ struct LarkAgentCardState {
 
 pub(super) struct LarkCardContent {
     agent_name: String,
-    stop_task_id: Option<String>,
+    buttons: Vec<ChannelButton>,
     thinking: VecDeque<String>,
     progress: VecDeque<LarkProgressEntry>,
     answer: String,
@@ -145,52 +147,55 @@ impl LarkReplyCard {
 
     fn agent_row(agent: &ChannelAgentStatus) -> Value {
         let (color, state, description) = Self::status_text(agent.enabled());
-        let (button_text, button_type) = if agent.enabled() {
-            ("Disable", "default")
-        } else {
-            ("Enable", "primary")
-        };
+        let mut columns = vec![json!({
+            "tag": "column",
+            "width": "weighted",
+            "weight": 1,
+            "vertical_align": "center",
+            "elements": [{
+                "tag": "markdown",
+                "content": format!(
+                    "**{}**\n<font color='{color}'>{state}</font> · {description}",
+                    agent.name()
+                )
+            }]
+        })];
+        if let Some(button) = agent.button() {
+            columns.push(json!({
+                "tag": "column",
+                "width": "auto",
+                "vertical_align": "center",
+                "elements": [Self::button(button)]
+            }));
+        }
         json!({
             "tag": "column_set",
             "flex_mode": "none",
             "horizontal_spacing": "default",
-            "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "vertical_align": "center",
-                    "elements": [{
-                        "tag": "markdown",
-                        "content": format!(
-                            "**{}**\n<font color='{color}'>{state}</font> · {description}",
-                            agent.name()
-                        )
-                    }]
-                },
-                {
-                    "tag": "column",
-                    "width": "auto",
-                    "vertical_align": "center",
-                    "elements": [{
-                        "tag": "button",
-                        "text": {
-                            "tag": "plain_text",
-                            "content": button_text
-                        },
-                        "type": button_type,
-                        "size": "medium",
-                        "behaviors": [{
-                            "type": "callback",
-                            "value": {
-                                "action": "set_agent_enabled",
-                                "agent_name": agent.name(),
-                                "enabled": !agent.enabled()
-                            }
-                        }]
-                    }]
+            "columns": columns
+        })
+    }
+
+    fn button(button: &ChannelButton) -> Value {
+        let button_type = match button.style() {
+            ChannelButtonStyle::Default => "default",
+            ChannelButtonStyle::Primary => "primary",
+            ChannelButtonStyle::Danger => "danger",
+        };
+        json!({
+            "tag": "button",
+            "text": {
+                "tag": "plain_text",
+                "content": button.text()
+            },
+            "type": button_type,
+            "size": "medium",
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "agora_command": button.command()
                 }
-            ]
+            }]
         })
     }
 
@@ -233,7 +238,7 @@ impl LarkCardContent {
     pub(super) fn new(agent_name: String) -> Self {
         Self {
             agent_name,
-            stop_task_id: None,
+            buttons: Vec::new(),
             thinking: VecDeque::new(),
             progress: VecDeque::new(),
             answer: String::new(),
@@ -242,10 +247,11 @@ impl LarkCardContent {
         }
     }
 
-    pub(super) fn for_task(agent_name: String, task_id: String) -> Self {
-        let mut content = Self::new(agent_name);
-        content.stop_task_id = Some(task_id);
-        content
+    pub(super) fn with_buttons(agent_name: String, buttons: Vec<ChannelButton>) -> Self {
+        Self {
+            buttons,
+            ..Self::new(agent_name)
+        }
     }
 
     pub(super) fn apply_output(&mut self, event: OutputEvent) {
@@ -439,11 +445,11 @@ impl LarkCardContent {
             }));
         }
 
-        if !finished && let Some(task_id) = &self.stop_task_id {
+        if !finished && !self.buttons.is_empty() {
             if !elements.is_empty() {
                 elements.push(json!({ "tag": "hr" }));
             }
-            elements.push(self.stop_action(task_id));
+            elements.push(self.action_row());
         }
 
         let mut card = json!({
@@ -476,34 +482,16 @@ impl LarkCardContent {
         card
     }
 
-    fn stop_action(&self, task_id: &str) -> Value {
+    fn action_row(&self) -> Value {
         json!({
             "tag": "column_set",
             "flex_mode": "none",
             "horizontal_align": "right",
-            "columns": [{
+            "columns": self.buttons.iter().map(|button| json!({
                 "tag": "column",
                 "width": "auto",
-                "elements": [{
-                    "tag": "button",
-                    "element_id": "stop_task_button",
-                    "text": {
-                        "tag": "plain_text",
-                        "content": "结束任务"
-                    },
-                    "type": "danger",
-                    "width": "default",
-                    "size": "medium",
-                    "behaviors": [{
-                        "type": "callback",
-                        "value": {
-                            "action": "stop_task",
-                            "task_id": task_id,
-                            "agent_name": self.agent_name
-                        }
-                    }]
-                }]
-            }]
+                "elements": [LarkReplyCard::button(button)]
+            })).collect::<Vec<_>>()
         })
     }
 
@@ -676,7 +664,7 @@ impl LarkAgentCard {
     pub(super) fn new(
         target: LarkReplyTarget,
         agent_name: String,
-        task_id: String,
+        buttons: Vec<ChannelButton>,
         api: LarkApi,
     ) -> Self {
         Self {
@@ -686,7 +674,7 @@ impl LarkAgentCard {
                 state: Mutex::new(LarkAgentCardState {
                     token: None,
                     message_id: None,
-                    content: LarkCardContent::for_task(agent_name, task_id),
+                    content: LarkCardContent::with_buttons(agent_name, buttons),
                     version: 0,
                     sent_version: 0,
                     last_update: None,

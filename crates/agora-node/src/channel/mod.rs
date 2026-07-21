@@ -1,7 +1,7 @@
 use crate::channel::lark::{LarkChannel, LarkRun, LarkTask};
 use crate::channel::telegram::{TelegramChannel, TelegramRun, TelegramTask};
 use crate::config::ChannelConfig;
-use crate::task::{OutputEvent, TaskContent};
+use crate::task::{ChannelTaskInput, CommandRequest, OutputEvent};
 use anyhow::{Result, bail};
 use std::future::Future;
 
@@ -34,22 +34,53 @@ pub trait ChannelTask: Clone {
 
     fn session_id(&self) -> &str;
 
-    fn content(&self) -> &TaskContent;
+    fn input(&self) -> &ChannelTaskInput;
+}
 
-    fn action(&self) -> Option<&ChannelAction> {
-        None
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelButtonStyle {
+    Default,
+    Primary,
+    Danger,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ChannelAction {
-    StopTask { task_id: String, agent_name: String },
-    SetAgentEnabled { agent_name: String, enabled: bool },
+pub struct ChannelButton {
+    text: String,
+    style: ChannelButtonStyle,
+    command: CommandRequest,
+}
+
+impl ChannelButton {
+    pub fn new(
+        text: impl Into<String>,
+        style: ChannelButtonStyle,
+        command: CommandRequest,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            command,
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn style(&self) -> ChannelButtonStyle {
+        self.style
+    }
+
+    pub fn command(&self) -> &CommandRequest {
+        &self.command
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelRunContext {
     pub agent: ChannelAgent,
+    pub buttons: Vec<ChannelButton>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +92,7 @@ pub struct ChannelAgent {
 pub struct ChannelAgentStatus {
     name: String,
     enabled: bool,
+    button: Option<ChannelButton>,
 }
 
 impl ChannelAgentStatus {
@@ -68,7 +100,13 @@ impl ChannelAgentStatus {
         Self {
             name: name.into(),
             enabled,
+            button: None,
         }
+    }
+
+    pub fn with_button(mut self, button: ChannelButton) -> Self {
+        self.button = Some(button);
+        self
     }
 
     pub fn name(&self) -> &str {
@@ -77,6 +115,10 @@ impl ChannelAgentStatus {
 
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub fn button(&self) -> Option<&ChannelButton> {
+        self.button.as_ref()
     }
 }
 
@@ -133,17 +175,10 @@ impl ChannelTask for ConfiguredTask {
         }
     }
 
-    fn content(&self) -> &TaskContent {
+    fn input(&self) -> &ChannelTaskInput {
         match self {
-            ConfiguredTask::Lark(task) => task.content(),
-            ConfiguredTask::Telegram(task) => task.content(),
-        }
-    }
-
-    fn action(&self) -> Option<&ChannelAction> {
-        match self {
-            ConfiguredTask::Lark(task) => task.action(),
-            ConfiguredTask::Telegram(task) => task.action(),
+            ConfiguredTask::Lark(task) => task.input(),
+            ConfiguredTask::Telegram(task) => task.input(),
         }
     }
 }

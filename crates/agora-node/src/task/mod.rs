@@ -2,8 +2,68 @@ mod output;
 
 pub use output::{OutputEvent, ProgressStatus, TokenUsage};
 
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct CommandRequest {
+    path: Vec<String>,
+    arguments: BTreeMap<String, String>,
+}
+
+impl CommandRequest {
+    pub fn new<I, S>(path: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            path: path.into_iter().map(Into::into).collect(),
+            arguments: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_argument(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.arguments.insert(name.into(), value.into());
+        self
+    }
+
+    pub fn path(&self) -> &[String] {
+        &self.path
+    }
+
+    pub fn arguments(&self) -> &BTreeMap<String, String> {
+        &self.arguments
+    }
+
+    pub fn argument(&self, name: &str) -> Option<&str> {
+        self.arguments.get(name).map(String::as_str)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChannelTaskInput {
+    Message(TaskContent),
+    Command(CommandRequest),
+}
+
+impl ChannelTaskInput {
+    pub fn message(&self) -> Option<&TaskContent> {
+        match self {
+            Self::Message(content) => Some(content),
+            Self::Command(_) => None,
+        }
+    }
+
+    pub fn command(&self) -> Option<&CommandRequest> {
+        match self {
+            Self::Message(_) => None,
+            Self::Command(command) => Some(command),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskAttachmentKind {

@@ -1,13 +1,22 @@
+use crate::task::CommandRequest;
 use anyhow::{Result, bail};
 use std::collections::HashSet;
 
 const HELP: &str = "help";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::daemon) enum CommandVisibility {
+    #[default]
+    Public,
+    Internal,
+}
 
 #[derive(Clone, Debug)]
 pub(in crate::daemon) struct Argument {
     name: &'static str,
     description: &'static str,
     required: bool,
+    consume_remaining: bool,
 }
 
 impl Argument {
@@ -16,6 +25,19 @@ impl Argument {
             name,
             description,
             required: true,
+            consume_remaining: false,
+        }
+    }
+
+    pub(in crate::daemon) fn required_remaining(
+        name: &'static str,
+        description: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            required: true,
+            consume_remaining: true,
         }
     }
 
@@ -24,6 +46,7 @@ impl Argument {
             name,
             description,
             required: false,
+            consume_remaining: false,
         }
     }
 
@@ -49,6 +72,7 @@ impl Argument {
 pub(in crate::daemon) struct CommandNode<H> {
     name: &'static str,
     description: &'static str,
+    visibility: CommandVisibility,
     arguments: Vec<Argument>,
     handler: Option<H>,
     subcommands: Vec<CommandNode<H>>,
@@ -59,6 +83,7 @@ impl<H> CommandNode<H> {
         Self {
             name,
             description,
+            visibility: CommandVisibility::Public,
             arguments: Vec::new(),
             handler: None,
             subcommands: Vec::new(),
@@ -67,6 +92,11 @@ impl<H> CommandNode<H> {
 
     pub(in crate::daemon) fn argument(mut self, argument: Argument) -> Self {
         self.arguments.push(argument);
+        self
+    }
+
+    pub(in crate::daemon) fn visibility(mut self, visibility: CommandVisibility) -> Self {
+        self.visibility = visibility;
         self
     }
 
@@ -104,7 +134,7 @@ impl<H> CommandNode<H> {
 
         let mut optional_seen = false;
         let mut argument_names = HashSet::new();
-        for argument in &self.arguments {
+        for (index, argument) in self.arguments.iter().enumerate() {
             if !Self::valid_name(argument.name) {
                 bail!("invalid argument name in /{path}: {}", argument.name);
             }
@@ -113,6 +143,12 @@ impl<H> CommandNode<H> {
             }
             if optional_seen && argument.required {
                 bail!("required argument follows an optional argument in /{path}");
+            }
+            if argument.consume_remaining && index + 1 != self.arguments.len() {
+                bail!(
+                    "remaining argument is not last in /{path}: {}",
+                    argument.name
+                );
             }
             optional_seen |= !argument.required;
         }
@@ -161,7 +197,11 @@ impl<H> CommandNode<H> {
         if !self.subcommands.is_empty() {
             lines.push(String::new());
             lines.push("Subcommands:".to_string());
-            for subcommand in &self.subcommands {
+            for subcommand in self
+                .subcommands
+                .iter()
+                .filter(|subcommand| subcommand.visibility == CommandVisibility::Public)
+            {
                 let mut subcommand_path = path.to_vec();
                 subcommand_path.push(subcommand.name);
                 lines.push(subcommand.syntax(&subcommand_path));
@@ -249,7 +289,12 @@ where
         Ok(())
     }
 
+    #[cfg(test)]
     pub(in crate::daemon) fn route(&self, input: &str) -> CommandResolution<H> {
+        self.route_text(input)
+    }
+
+    pub(in crate::daemon) fn route_text(&self, input: &str) -> CommandResolution<H> {
         let input = input.trim();
         if !input.starts_with('/') {
             return CommandResolution::AgentInput;
@@ -268,11 +313,9 @@ where
             };
         }
 
-        let Some(command) = self
-            .commands
-            .iter()
-            .find(|command| command.name == command_name)
-        else {
+        let Some(command) = self.commands.iter().find(|command| {
+            command.name == command_name && command.visibility == CommandVisibility::Public
+        }) else {
             return CommandResolution::Reply(format!(
                 "Unknown command: {token}\nUse /help to list commands."
             ));
@@ -280,6 +323,70 @@ where
 
         let mut path = vec![command.name];
         Self::resolve(command, &mut path, &remaining)
+    }
+
+    pub(in crate::daemon) fn route_structured(
+        &self,
+        request: &CommandRequest,
+    ) -> CommandResolution<H> {
+        let Some((root, remaining)) = request.path().split_first() else {
+            return CommandResolution::Reply("Unknown structured command.".to_string());
+        };
+        let Some(mut command) = self.commands.iter().find(|command| command.name == root) else {
+            return CommandResolution::Reply(format!(
+                "Unknown command: /{}\nUse /help to list commands.",
+                request.path().join(" ")
+            ));
+        };
+        let mut path = vec![command.name];
+        for name in remaining {
+            let Some(subcommand) = command
+                .subcommands
+                .iter()
+                .find(|subcommand| subcommand.name == name)
+            else {
+                return CommandResolution::Reply(format!(
+                    "Unknown command: /{}\nUse /help to list commands.",
+                    request.path().join(" ")
+                ));
+            };
+            command = subcommand;
+            path.push(command.name);
+        }
+
+        let Some(handler) = &command.handler else {
+            return CommandResolution::Reply(command.help(&path));
+        };
+        if request.arguments().keys().any(|name| {
+            !command
+                .arguments
+                .iter()
+                .any(|argument| argument.name == name)
+        }) || command
+            .arguments
+            .iter()
+            .any(|argument| argument.required && request.argument(argument.name).is_none())
+        {
+            return CommandResolution::Reply(format!("Usage: {}", command.syntax(&path)));
+        }
+
+        CommandResolution::Invocation(CommandInvocation {
+            handler: handler.clone(),
+            arguments: CommandArguments {
+                values: command
+                    .arguments
+                    .iter()
+                    .filter_map(|definition| {
+                        request
+                            .argument(definition.name)
+                            .map(|value| ParsedArgument {
+                                name: definition.name,
+                                value: value.to_string(),
+                            })
+                    })
+                    .collect(),
+            },
+        })
     }
 
     fn resolve(
@@ -295,11 +402,9 @@ where
                     CommandResolution::Reply(format!("Usage: /{} help", path.join(" ")))
                 };
             }
-            if let Some(subcommand) = command
-                .subcommands
-                .iter()
-                .find(|subcommand| subcommand.name == *token)
-            {
+            if let Some(subcommand) = command.subcommands.iter().find(|subcommand| {
+                subcommand.name == *token && subcommand.visibility == CommandVisibility::Public
+            }) {
                 path.push(subcommand.name);
                 return Self::resolve(subcommand, path, &remaining[1..]);
             }
@@ -317,12 +422,22 @@ where
             };
         };
 
+        if remaining.is_empty() && !command.subcommands.is_empty() {
+            return CommandResolution::Reply(command.help(path));
+        }
+
         let required = command
             .arguments
             .iter()
             .filter(|argument| argument.required)
             .count();
-        if remaining.len() < required || remaining.len() > command.arguments.len() {
+        let consume_remaining = command
+            .arguments
+            .last()
+            .is_some_and(|argument| argument.consume_remaining);
+        if remaining.len() < required
+            || (!consume_remaining && remaining.len() > command.arguments.len())
+        {
             return CommandResolution::Reply(format!("Usage: {}", command.syntax(path)));
         }
 
@@ -330,10 +445,17 @@ where
             values: command
                 .arguments
                 .iter()
-                .zip(remaining)
-                .map(|(definition, value)| ParsedArgument {
-                    name: definition.name,
-                    value: (*value).to_string(),
+                .enumerate()
+                .filter_map(|(index, definition)| {
+                    let value = if definition.consume_remaining {
+                        remaining[index..].join(" ")
+                    } else {
+                        remaining.get(index)?.to_string()
+                    };
+                    Some(ParsedArgument {
+                        name: definition.name,
+                        value,
+                    })
                 })
                 .collect(),
         };
@@ -348,6 +470,7 @@ where
         lines.extend(
             self.commands
                 .iter()
+                .filter(|command| command.visibility == CommandVisibility::Public)
                 .map(|command| format!("/{} - {}", command.name, command.description)),
         );
         lines.push("/help - Show all commands.".to_string());

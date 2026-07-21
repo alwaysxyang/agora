@@ -2,7 +2,7 @@ use super::rich_message::TelegramRichMessage;
 use super::telegram_api::TelegramApi;
 use crate::channel::{Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, RunEvent};
 use crate::config::TelegramChannelConfig;
-use crate::task::TaskContent;
+use crate::task::{ChannelTaskInput, TaskContent};
 use agora_core::logger;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -72,7 +72,10 @@ impl TelegramChannel {
                                 self.api.name(),
                                 task.session_id(),
                                 task.reply_target.message_id,
-                                task.content.text()
+                                task.input
+                                    .message()
+                                    .map(TaskContent::text)
+                                    .unwrap_or_default()
                             );
                             self.pending.push_back(task);
                         }
@@ -179,7 +182,7 @@ pub(super) struct TelegramReplyTarget {
 pub struct TelegramTask {
     task_id: String,
     session_id: String,
-    content: TaskContent,
+    input: ChannelTaskInput,
     reply_target: TelegramReplyTarget,
 }
 
@@ -198,8 +201,8 @@ impl ChannelTask for TelegramTask {
         &self.session_id
     }
 
-    fn content(&self) -> &TaskContent {
-        &self.content
+    fn input(&self) -> &ChannelTaskInput {
+        &self.input
     }
 }
 
@@ -245,7 +248,7 @@ impl TelegramUpdate {
         Some(TelegramTask {
             task_id: self.update_id.to_string(),
             session_id,
-            content: TaskContent::new(text),
+            input: ChannelTaskInput::Message(TaskContent::new(text)),
             reply_target,
         })
     }

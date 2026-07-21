@@ -1,22 +1,36 @@
 use super::active_runs::{ActiveRunScope, ActiveRuns, RunCancellation};
 use super::command::{
-    Argument, CommandArguments, CommandContext, CommandExecutor, CommandFuture, CommandHandler,
-    CommandNode, CommandRegistry, CommandResolution,
+    Argument, CommandContext, CommandExecution, CommandHandler, CommandNode, CommandRegistry,
+    CommandResolution, CommandRuntime, CommandVisibility,
 };
 use super::{AgentDispatcher, Daemon};
 use crate::agent::{AgentOutput, AgentTask, ConfiguredAgent};
 use crate::channel::{
-    Channel, ChannelAction, ChannelAgentStatus, ChannelReply, ChannelRun, ChannelRunContext,
-    ChannelTask, RunEvent,
+    Channel, ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun,
+    ChannelRunContext, ChannelTask, RunEvent,
 };
 use crate::config::{AgentConfig, AgentType, IsolateMode, IsolationScope};
 use crate::store::{SessionKey, SessionStore};
-use crate::task::{OutputEvent, TaskContent};
+use crate::task::{ChannelTaskInput, CommandRequest, OutputEvent, TaskContent};
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::future::pending;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, timeout};
+
+#[test]
+fn neutral_command_request_and_button_preserve_data() {
+    let request = CommandRequest::new(["ask", "disable"]).with_argument("agent_name", "codex-dev");
+    let input = ChannelTaskInput::Command(request.clone());
+    let button = ChannelButton::new("Disable", ChannelButtonStyle::Default, request.clone());
+
+    assert_eq!(request.path(), ["ask", "disable"]);
+    assert_eq!(request.argument("agent_name"), Some("codex-dev"));
+    assert_eq!(input.command(), Some(&request));
+    assert_eq!(button.text(), "Disable");
+    assert_eq!(button.style(), ChannelButtonStyle::Default);
+    assert_eq!(button.command(), &request);
+}
 
 fn active_scope(channel_name: &str, session_id: &str, agent_name: &str) -> ActiveRunScope {
     ActiveRunScope::new(
@@ -30,14 +44,26 @@ fn active_scope(channel_name: &str, session_id: &str, agent_name: &str) -> Activ
     )
 }
 
-fn command_registry() -> &'static CommandRegistry<CommandHandler> {
-    static REGISTRY: OnceLock<CommandRegistry<CommandHandler>> = OnceLock::new();
-    REGISTRY.get_or_init(|| CommandRegistry::standard().unwrap())
+fn command_runtime(dispatcher: &AgentDispatcher) -> CommandRuntime {
+    CommandRuntime::new(
+        dispatcher.store.clone(),
+        dispatcher.queues.clone(),
+        dispatcher.active_runs.clone(),
+    )
+    .unwrap()
+}
+
+fn isolated_command_runtime() -> CommandRuntime {
+    let temp = tempfile::tempdir().unwrap();
+    let dispatcher =
+        AgentDispatcher::new(SessionStore::open(temp.path().join("store.db")).unwrap());
+    command_runtime(&dispatcher)
 }
 
 #[test]
 fn command_registry_routes_default_handlers_and_subcommands() {
-    let registry = CommandRegistry::standard().unwrap();
+    let runtime = isolated_command_runtime();
+    let registry = runtime.registry();
 
     let CommandResolution::Invocation(stop) = registry.route("/stop codex-dev") else {
         panic!("expected stop invocation");
@@ -57,8 +83,31 @@ fn command_registry_routes_default_handlers_and_subcommands() {
 }
 
 #[test]
+fn command_registry_routes_ask_prompt_to_the_default_handler() {
+    let runtime = isolated_command_runtime();
+    let registry = runtime.registry();
+
+    let CommandResolution::Invocation(invocation) =
+        registry.route("/ask codex-dev review this project")
+    else {
+        panic!("expected targeted ask invocation");
+    };
+    let (_, arguments) = invocation.into_parts();
+    assert_eq!(arguments.argument("agent_name"), Some("codex-dev"));
+    assert_eq!(arguments.argument("prompt"), Some("review this project"));
+
+    let CommandResolution::Invocation(list) = registry.route("/ask list") else {
+        panic!("expected ask list invocation");
+    };
+    let (_, arguments) = list.into_parts();
+    assert_eq!(arguments.argument("agent_name"), None);
+    assert_eq!(arguments.argument("prompt"), None);
+}
+
+#[test]
 fn command_registry_generates_root_and_command_help() {
-    let registry = CommandRegistry::standard().unwrap();
+    let runtime = isolated_command_runtime();
+    let registry = runtime.registry();
 
     assert_eq!(
         registry.route("/help"),
@@ -66,7 +115,7 @@ fn command_registry_generates_root_and_command_help() {
             "Agora commands:\n\
 /stop - Stop running or queued agent tasks in the current conversation.\n\
 /reset - Stop tasks and reset backend agent sessions.\n\
-/ask - Control which agents receive messages in the current conversation.\n\
+/ask - Ask one agent or control agent message delivery.\n\
 /help - Show all commands.\n\n\
 Use /{command} help for details."
                 .to_string()
@@ -96,9 +145,15 @@ Usage:\n\
 
 #[test]
 fn command_registry_generates_subcommand_and_argument_help() {
-    let registry = CommandRegistry::standard().unwrap();
+    let runtime = isolated_command_runtime();
+    let registry = runtime.registry();
     let expected = concat!(
-        "/ask - Control which agents receive messages in the current conversation.\n\n",
+        "/ask - Ask one agent or control agent message delivery.\n\n",
+        "Usage:\n",
+        "/ask {agent_name} {prompt}\n\n",
+        "Arguments:\n",
+        "agent_name (required) - Configured agent name in this conversation.\n",
+        "prompt (required) - Prompt sent only to the selected agent.\n\n",
         "Subcommands:\n",
         "/ask list\n",
         "  List all subscribed agents and their current status.\n",
@@ -137,7 +192,8 @@ agent_name (required) - Configured agent name in this conversation."
 
 #[test]
 fn command_registry_generates_validation_errors_from_registered_arguments() {
-    let registry = CommandRegistry::standard().unwrap();
+    let runtime = isolated_command_runtime();
+    let registry = runtime.registry();
 
     assert_eq!(
         registry.route("run cargo test"),
@@ -153,9 +209,7 @@ fn command_registry_generates_validation_errors_from_registered_arguments() {
     );
     assert_eq!(
         registry.route("/ask unknown"),
-        CommandResolution::Reply(
-            "Unknown subcommand: /ask unknown\nUse /ask help for usage.".to_string()
-        )
+        CommandResolution::Reply("Usage: /ask {agent_name} {prompt}".to_string())
     );
     assert_eq!(
         registry.route("/unknown"),
@@ -194,34 +248,109 @@ fn command_registry_resolves_arbitrarily_nested_subcommands() {
     assert_eq!(arguments.argument("value"), Some("payload"));
 }
 
-#[tokio::test]
-async fn command_registry_executes_a_registered_handler_without_central_dispatch() {
-    fn echo<'a>(_context: CommandContext<'a>, arguments: CommandArguments) -> CommandFuture<'a> {
-        let value = arguments.argument("value").unwrap_or_default().to_string();
-        Box::pin(async move { Ok(ChannelReply::new(format!("Echo: {value}"))) })
+#[test]
+fn command_registry_hides_internal_commands_from_text_and_help() {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TestHandler {
+        Public,
+        Internal,
     }
 
+    let mut registry = CommandRegistry::new();
+    registry
+        .register(CommandNode::new("public", "Public command").handler(TestHandler::Public))
+        .unwrap();
+    registry
+        .register(
+            CommandNode::new("run-stop", "Stop one run")
+                .visibility(CommandVisibility::Internal)
+                .argument(Argument::required("task_id", "Task id"))
+                .handler(TestHandler::Internal),
+        )
+        .unwrap();
+
+    let CommandResolution::Reply(help) = registry.route_text("/help") else {
+        panic!("expected root help");
+    };
+    assert!(help.contains("/public - Public command"));
+    assert!(!help.contains("run-stop"));
+    assert_eq!(
+        registry.route_text("/run-stop task-1"),
+        CommandResolution::Reply(
+            "Unknown command: /run-stop\nUse /help to list commands.".to_string()
+        )
+    );
+
+    let request = CommandRequest::new(["run-stop"]).with_argument("task_id", "task-1");
+    let CommandResolution::Invocation(invocation) = registry.route_structured(&request) else {
+        panic!("expected internal structured invocation");
+    };
+    let (handler, arguments) = invocation.into_parts();
+    assert_eq!(handler, TestHandler::Internal);
+    assert_eq!(arguments.argument("task_id"), Some("task-1"));
+}
+
+#[test]
+fn command_registry_validates_structured_arguments() {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TestHandler {
+        Enable,
+    }
+
+    let mut registry = CommandRegistry::new();
+    registry
+        .register(
+            CommandNode::new("ask", "Control agents").subcommand(
+                CommandNode::new("enable", "Enable one agent")
+                    .argument(Argument::required("agent_name", "Agent name"))
+                    .handler(TestHandler::Enable),
+            ),
+        )
+        .unwrap();
+
+    let valid = CommandRequest::new(["ask", "enable"]).with_argument("agent_name", "codex-dev");
+    let CommandResolution::Invocation(invocation) = registry.route_structured(&valid) else {
+        panic!("expected structured invocation");
+    };
+    let (handler, arguments) = invocation.into_parts();
+    assert_eq!(handler, TestHandler::Enable);
+    assert_eq!(arguments.argument("agent_name"), Some("codex-dev"));
+
+    assert_eq!(
+        registry.route_structured(&CommandRequest::new(["ask", "enable"])),
+        CommandResolution::Reply("Usage: /ask enable {agent_name}".to_string())
+    );
+}
+
+#[tokio::test]
+async fn command_registry_executes_a_registered_handler_without_central_dispatch() {
     let mut registry: CommandRegistry<CommandHandler> = CommandRegistry::new();
     registry
         .register(
             CommandNode::new("echo", "Echo one value")
                 .argument(Argument::required("value", "Value to echo"))
-                .handler(echo as CommandHandler),
+                .handler(CommandHandler::new(|_context, arguments| async move {
+                    let value = arguments.argument("value").unwrap_or_default();
+                    Ok(Some(ChannelReply::new(format!("Echo: {value}"))))
+                })),
         )
         .unwrap();
-    let CommandResolution::Invocation(invocation) = registry.route("/echo hello") else {
+    let CommandResolution::Invocation(invocation) = registry.route_text("/echo hello") else {
         panic!("expected echo invocation");
     };
-
-    let temp = tempfile::tempdir().unwrap();
-    let dispatcher =
-        AgentDispatcher::new(SessionStore::open(temp.path().join("store.db")).unwrap());
-    let reply = CommandExecutor::new("test", "session", &[], &dispatcher)
-        .execute(invocation)
+    let (handler, arguments) = invocation.into_parts();
+    let execution = handler
+        .execute(
+            CommandContext::text("test", "session", Vec::new()),
+            arguments,
+        )
         .await
         .unwrap();
+    let CommandExecution::Reply(reply) = execution else {
+        panic!("expected command reply");
+    };
 
-    assert_eq!(reply, ChannelReply::new("Echo: hello"));
+    assert_eq!(reply, Some(ChannelReply::new("Echo: hello")));
 }
 
 #[test]
@@ -253,6 +382,18 @@ fn command_registry_rejects_invalid_tree_definitions() {
             .to_string(),
         "required argument follows an optional argument in /run"
     );
+
+    let invalid_remaining = CommandNode::new("ask", "Ask one agent")
+        .argument(Argument::required_remaining("prompt", "Prompt"))
+        .argument(Argument::required("agent_name", "Agent name"))
+        .handler(TestHandler::Run);
+    assert_eq!(
+        CommandRegistry::new()
+            .register(invalid_remaining)
+            .unwrap_err()
+            .to_string(),
+        "remaining argument is not last in /ask: prompt"
+    );
 }
 
 #[tokio::test]
@@ -263,13 +404,14 @@ async fn help_commands_reply_without_starting_agents() {
     let replies = Arc::new(Mutex::new(Vec::new()));
     let channel = CommandTestChannel::new(Arc::clone(&replies));
     let mut runs = tokio::task::JoinSet::new();
-    let registry = CommandRegistry::standard().unwrap();
+    let commands = command_runtime(&dispatcher);
+    let registry = commands.registry();
 
     Daemon::route_channel_task(
         &channel,
         &[],
         &dispatcher,
-        &registry,
+        &commands,
         CommandTestTask::new("ask-help", "chat-1", "/ask help"),
         &mut runs,
     )
@@ -279,7 +421,7 @@ async fn help_commands_reply_without_starting_agents() {
         &channel,
         &[],
         &dispatcher,
-        &registry,
+        &commands,
         CommandTestTask::new("stop-help", "chat-1", "/stop help"),
         &mut runs,
     )
@@ -289,7 +431,7 @@ async fn help_commands_reply_without_starting_agents() {
         &channel,
         &[],
         &dispatcher,
-        &registry,
+        &commands,
         CommandTestTask::new("reset-help", "chat-1", "/reset help"),
         &mut runs,
     )
@@ -299,7 +441,7 @@ async fn help_commands_reply_without_starting_agents() {
         &channel,
         &[],
         &dispatcher,
-        &registry,
+        &commands,
         CommandTestTask::new("root-help", "chat-1", "/help"),
         &mut runs,
     )
@@ -309,10 +451,10 @@ async fn help_commands_reply_without_starting_agents() {
     assert_eq!(
         replies.lock().unwrap().as_slice(),
         [
-            command_reply(&registry, "/ask help"),
-            command_reply(&registry, "/stop help"),
-            command_reply(&registry, "/reset help"),
-            command_reply(&registry, "/help"),
+            command_reply(registry, "/ask help"),
+            command_reply(registry, "/stop help"),
+            command_reply(registry, "/reset help"),
+            command_reply(registry, "/help"),
         ]
     );
 }
@@ -402,7 +544,7 @@ async fn card_stop_action_cancels_only_the_target_logical_task() {
         &channel,
         &[],
         &dispatcher,
-        command_registry(),
+        &command_runtime(&dispatcher),
         CommandTestTask::stop_action("callback-1", "chat-1", "task-2", "codex"),
         &mut runs,
     )
@@ -461,7 +603,7 @@ async fn stopping_a_card_run_advances_the_next_queued_task() {
         &channel,
         std::slice::from_ref(&agent),
         &dispatcher,
-        command_registry(),
+        &command_runtime(&dispatcher),
         CommandTestTask::new("task-1", "chat-1", "first task"),
         &mut runs,
     )
@@ -487,7 +629,7 @@ async fn stopping_a_card_run_advances_the_next_queued_task() {
         &channel,
         std::slice::from_ref(&agent),
         &dispatcher,
-        command_registry(),
+        &command_runtime(&dispatcher),
         CommandTestTask::new("task-2", "chat-1", "second task"),
         &mut runs,
     )
@@ -512,7 +654,7 @@ async fn stopping_a_card_run_advances_the_next_queued_task() {
         &channel,
         &[],
         &dispatcher,
-        command_registry(),
+        &command_runtime(&dispatcher),
         CommandTestTask::stop_action("callback-1", "chat-1", "task-1", "codex-dev"),
         &mut runs,
     )
@@ -539,7 +681,7 @@ async fn stopping_a_card_run_advances_the_next_queued_task() {
         &channel,
         &[],
         &dispatcher,
-        command_registry(),
+        &command_runtime(&dispatcher),
         CommandTestTask::stop_action("callback-2", "chat-1", "task-2", "codex-dev"),
         &mut runs,
     )
@@ -658,12 +800,13 @@ async fn channel_loop_routes_stop_without_sending_it_to_the_agent() {
     .unwrap();
     let dispatcher =
         AgentDispatcher::new(SessionStore::open(temp.path().join("store.db")).unwrap());
+    let commands = Arc::new(command_runtime(&dispatcher));
 
     let daemon = tokio::spawn(Daemon::run_channel(
         channel,
         vec![agent],
         dispatcher,
-        Arc::new(CommandRegistry::standard().unwrap()),
+        commands,
     ));
     timeout(Duration::from_secs(2), async {
         loop {
@@ -754,7 +897,7 @@ async fn reset_stops_the_scope_deletes_the_session_and_starts_fresh_next_time() 
         &channel,
         std::slice::from_ref(&agent),
         &dispatcher,
-        command_registry(),
+        &command_runtime(&dispatcher),
         CommandTestTask::new("reset", "chat-1", "/reset"),
         &mut runs,
     )
@@ -830,7 +973,7 @@ async fn reset_preserves_the_mapping_when_backend_deletion_fails() {
         &channel,
         std::slice::from_ref(&agent),
         &dispatcher,
-        command_registry(),
+        &command_runtime(&dispatcher),
         CommandTestTask::new("reset", "chat-1", "/reset"),
         &mut runs,
     )
@@ -864,14 +1007,26 @@ async fn reset_removes_the_mapping_when_backend_deletion_is_unsupported() {
     let dispatcher = AgentDispatcher::new(store.clone());
     let key = SessionKey::new(agent.name(), agent.isolation_scope("lark", "chat-1"));
     store.save(&key, "custom-session").unwrap();
+    let replies = Arc::new(Mutex::new(Vec::new()));
+    let channel = CommandTestChannel::new(Arc::clone(&replies));
+    let mut runs = tokio::task::JoinSet::new();
 
-    assert!(
-        dispatcher
-            .reset_sessions("lark", "chat-1", &[agent])
-            .await
-            .is_empty()
-    );
+    Daemon::route_channel_task(
+        &channel,
+        std::slice::from_ref(&agent),
+        &dispatcher,
+        &command_runtime(&dispatcher),
+        CommandTestTask::new("reset", "chat-1", "/reset"),
+        &mut runs,
+    )
+    .await
+    .unwrap();
+
     assert_eq!(store.get(&key).unwrap(), None);
+    assert_eq!(
+        replies.lock().unwrap().as_slice(),
+        [ChannelReply::new("Reset successful.")]
+    );
 }
 
 #[tokio::test]
@@ -891,7 +1046,7 @@ async fn ask_commands_persist_and_report_agent_status_for_the_current_session() 
         &channel,
         &agents,
         &dispatcher,
-        command_registry(),
+        &command_runtime(&dispatcher),
         CommandTestTask::new("disable", "chat-1", "/ask disable codex-dev"),
         &mut runs,
     )
@@ -910,7 +1065,7 @@ async fn ask_commands_persist_and_report_agent_status_for_the_current_session() 
         &channel,
         &agents,
         &dispatcher,
-        command_registry(),
+        &command_runtime(&dispatcher),
         CommandTestTask::new("list", "chat-1", "/ask list"),
         &mut runs,
     )
@@ -919,8 +1074,8 @@ async fn ask_commands_persist_and_report_agent_status_for_the_current_session() 
     assert_eq!(
         replies.lock().unwrap().as_slice(),
         [ChannelReply::agent_list(vec![
-            ChannelAgentStatus::new("codex-dev", false),
-            ChannelAgentStatus::new("reviewer", true),
+            agent_status_with_button("codex-dev", false),
+            agent_status_with_button("reviewer", true),
         ])]
     );
 
@@ -929,7 +1084,7 @@ async fn ask_commands_persist_and_report_agent_status_for_the_current_session() 
         &channel,
         &agents,
         &dispatcher,
-        command_registry(),
+        &command_runtime(&dispatcher),
         CommandTestTask::new("status", "chat-1", "/ask status reviewer"),
         &mut runs,
     )
@@ -964,7 +1119,7 @@ async fn ask_button_action_updates_status_and_returns_the_full_agent_list() {
         &channel,
         &agents,
         &dispatcher,
-        command_registry(),
+        &command_runtime(&dispatcher),
         CommandTestTask::agent_enabled_action("action", "chat-1", "reviewer", false),
         &mut runs,
     )
@@ -974,8 +1129,8 @@ async fn ask_button_action_updates_status_and_returns_the_full_agent_list() {
     assert_eq!(
         replies.lock().unwrap().as_slice(),
         [ChannelReply::agent_list(vec![
-            ChannelAgentStatus::new("codex-dev", true),
-            ChannelAgentStatus::new("reviewer", false),
+            agent_status_with_button("codex-dev", true),
+            agent_status_with_button("reviewer", false),
         ])]
     );
     let session = crate::store::ChannelSessionKey::new("lark", "chat-1");
@@ -1006,7 +1161,7 @@ async fn disabled_agents_do_not_receive_new_tasks_or_open_run_cards() {
         &channel,
         &agents,
         &dispatcher,
-        command_registry(),
+        &command_runtime(&dispatcher),
         CommandTestTask::new("task", "chat-1", "review this project"),
         &mut runs,
     )
@@ -1014,6 +1169,98 @@ async fn disabled_agents_do_not_receive_new_tasks_or_open_run_cards() {
     .unwrap();
 
     assert_eq!(contexts.lock().unwrap().as_slice(), ["reviewer"]);
+}
+
+#[tokio::test]
+async fn targeted_ask_runs_only_the_named_agent_even_when_it_is_disabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let agents = vec![
+        command_test_agent("codex-dev", temp.path()),
+        command_test_agent("reviewer", temp.path()),
+    ];
+    let store = SessionStore::open(temp.path().join("store.db")).unwrap();
+    let session = crate::store::ChannelSessionKey::new("lark", "chat-1");
+    store.disable_agent(&session, "codex-dev").unwrap();
+    let dispatcher = AgentDispatcher::new(store.clone());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let replies = Arc::new(Mutex::new(Vec::new()));
+    let channel = CommandTestChannel {
+        tasks: VecDeque::new(),
+        events: Arc::clone(&events),
+        contexts: Arc::clone(&contexts),
+        replies: Arc::clone(&replies),
+    };
+    let mut runs = tokio::task::JoinSet::new();
+
+    Daemon::route_channel_task(
+        &channel,
+        &agents,
+        &dispatcher,
+        &command_runtime(&dispatcher),
+        CommandTestTask::new(
+            "targeted-ask",
+            "chat-1",
+            "/ask codex-dev review this project",
+        ),
+        &mut runs,
+    )
+    .await
+    .unwrap();
+    while let Some(result) = runs.join_next().await {
+        result.unwrap().unwrap();
+    }
+
+    assert_eq!(contexts.lock().unwrap().as_slice(), ["codex-dev"]);
+    assert!(replies.lock().unwrap().is_empty());
+    assert!(!store.is_agent_enabled(&session, "codex-dev").unwrap());
+    assert!(events.lock().unwrap().iter().any(|event| {
+        matches!(
+            event,
+            RunEvent::Output(OutputEvent::Answer { text }) if text == "review this project"
+        )
+    }));
+}
+
+#[tokio::test]
+async fn targeted_ask_rejects_an_agent_that_is_not_subscribed() {
+    let temp = tempfile::tempdir().unwrap();
+    let agents = vec![command_test_agent("codex-dev", temp.path())];
+    let dispatcher =
+        AgentDispatcher::new(SessionStore::open(temp.path().join("store.db")).unwrap());
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let replies = Arc::new(Mutex::new(Vec::new()));
+    let channel = CommandTestChannel {
+        tasks: VecDeque::new(),
+        events: Arc::new(Mutex::new(Vec::new())),
+        contexts: Arc::clone(&contexts),
+        replies: Arc::clone(&replies),
+    };
+    let mut runs = tokio::task::JoinSet::new();
+
+    Daemon::route_channel_task(
+        &channel,
+        &agents,
+        &dispatcher,
+        &command_runtime(&dispatcher),
+        CommandTestTask::new(
+            "targeted-ask",
+            "chat-1",
+            "/ask reviewer review this project",
+        ),
+        &mut runs,
+    )
+    .await
+    .unwrap();
+
+    assert!(runs.is_empty());
+    assert!(contexts.lock().unwrap().is_empty());
+    assert_eq!(
+        replies.lock().unwrap().as_slice(),
+        [ChannelReply::new(
+            "Unknown agent in this conversation: reviewer."
+        )]
+    );
 }
 
 #[tokio::test]
@@ -1032,7 +1279,7 @@ async fn agent_input_gets_a_reply_when_every_agent_is_disabled() {
         &channel,
         &agents,
         &dispatcher,
-        command_registry(),
+        &command_runtime(&dispatcher),
         CommandTestTask::new("task", "chat-1", "review this project"),
         &mut runs,
     )
@@ -1063,6 +1310,19 @@ fn command_test_agent(name: &str, workspace: &std::path::Path) -> ConfiguredAgen
     .unwrap()
 }
 
+fn agent_status_with_button(name: &str, enabled: bool) -> ChannelAgentStatus {
+    let (text, style, command) = if enabled {
+        ("Disable", ChannelButtonStyle::Default, "disable")
+    } else {
+        ("Enable", ChannelButtonStyle::Primary, "enable")
+    };
+    ChannelAgentStatus::new(name, enabled).with_button(ChannelButton::new(
+        text,
+        style,
+        CommandRequest::new(["ask", command]).with_argument("agent_name", name),
+    ))
+}
+
 struct IgnoreAgentOutput;
 
 impl AgentOutput for IgnoreAgentOutput {
@@ -1075,8 +1335,7 @@ impl AgentOutput for IgnoreAgentOutput {
 struct CommandTestTask {
     task_id: String,
     session_id: String,
-    content: TaskContent,
-    action: Option<ChannelAction>,
+    input: ChannelTaskInput,
 }
 
 impl CommandTestTask {
@@ -1084,8 +1343,7 @@ impl CommandTestTask {
         Self {
             task_id: task_id.to_string(),
             session_id: session_id.to_string(),
-            content: TaskContent::new(content),
-            action: None,
+            input: ChannelTaskInput::Message(TaskContent::new(content)),
         }
     }
 
@@ -1098,11 +1356,11 @@ impl CommandTestTask {
         Self {
             task_id: task_id.to_string(),
             session_id: session_id.to_string(),
-            content: TaskContent::new(""),
-            action: Some(ChannelAction::StopTask {
-                task_id: target_task_id.to_string(),
-                agent_name: agent_name.to_string(),
-            }),
+            input: ChannelTaskInput::Command(
+                CommandRequest::new(["run", "stop"])
+                    .with_argument("task_id", target_task_id)
+                    .with_argument("agent_name", agent_name),
+            ),
         }
     }
 
@@ -1115,11 +1373,10 @@ impl CommandTestTask {
         Self {
             task_id: task_id.to_string(),
             session_id: session_id.to_string(),
-            content: TaskContent::new(""),
-            action: Some(ChannelAction::SetAgentEnabled {
-                agent_name: agent_name.to_string(),
-                enabled,
-            }),
+            input: ChannelTaskInput::Command(
+                CommandRequest::new(["ask", if enabled { "enable" } else { "disable" }])
+                    .with_argument("agent_name", agent_name),
+            ),
         }
     }
 }
@@ -1133,12 +1390,8 @@ impl ChannelTask for CommandTestTask {
         &self.session_id
     }
 
-    fn content(&self) -> &TaskContent {
-        &self.content
-    }
-
-    fn action(&self) -> Option<&ChannelAction> {
-        self.action.as_ref()
+    fn input(&self) -> &ChannelTaskInput {
+        &self.input
     }
 }
 

@@ -1,153 +1,252 @@
 use super::{
-    Argument, CommandArguments, CommandContext, CommandFuture, CommandHandler, CommandNode,
+    AgentDispatch, Argument, CommandArguments, CommandContext, CommandExecution, CommandHandler,
+    CommandNode,
 };
-use crate::channel::{ChannelAgentStatus, ChannelReply};
-use crate::store::ChannelSessionKey;
+use crate::channel::{ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply};
+use crate::store::{ChannelSessionKey, SessionStore};
+use crate::task::{CommandRequest, TaskContent};
 use anyhow::{Result, bail};
+use std::collections::HashSet;
 
 const AGENT_NAME_DESCRIPTION: &str = "Configured agent name in this conversation.";
 
-pub(super) fn command() -> CommandNode<CommandHandler> {
-    CommandNode::new(
-        "ask",
-        "Control which agents receive messages in the current conversation.",
-    )
-    .subcommand(
+#[derive(Clone)]
+pub(super) struct AskCommand {
+    store: SessionStore,
+}
+
+impl AskCommand {
+    pub(super) fn new(store: SessionStore) -> Self {
+        Self { store }
+    }
+
+    pub(super) fn command(&self) -> CommandNode<CommandHandler> {
+        let command = self.clone();
+        CommandNode::new("ask", "Ask one agent or control agent message delivery.")
+            .argument(Argument::required("agent_name", AGENT_NAME_DESCRIPTION))
+            .argument(Argument::required_remaining(
+                "prompt",
+                "Prompt sent only to the selected agent.",
+            ))
+            .handler(CommandHandler::new(move |context, arguments| {
+                let command = command.clone();
+                async move { command.ask(context, arguments) }
+            }))
+            .subcommand(self.list_command())
+            .subcommand(self.agent_command(
+                "status",
+                "Show one agent's current status.",
+                Self::status,
+            ))
+            .subcommand(self.agent_command(
+                "disable",
+                "Disable an agent for subsequent messages.",
+                Self::disable,
+            ))
+            .subcommand(self.agent_command(
+                "enable",
+                "Enable an agent for subsequent messages.",
+                Self::enable,
+            ))
+    }
+
+    fn ask(
+        &self,
+        context: CommandContext,
+        arguments: CommandArguments,
+    ) -> Result<CommandExecution> {
+        let agent_name = Self::required_argument(&arguments, "agent_name")?;
+        let prompt = Self::required_argument(&arguments, "prompt")?;
+        let Some(agent) = context
+            .agents()
+            .iter()
+            .find(|agent| agent.name() == agent_name)
+            .cloned()
+        else {
+            return Ok(CommandExecution::Reply(Some(Self::unknown_agent_reply(
+                &agent_name,
+            ))));
+        };
+        let mut content = TaskContent::new(prompt);
+        if let Some(message) = context.message() {
+            for attachment in message.attachments() {
+                content = content.with_attachment(attachment.clone());
+            }
+        }
+        Ok(CommandExecution::Dispatch(AgentDispatch::new(
+            vec![agent],
+            content,
+        )))
+    }
+
+    fn list_command(&self) -> CommandNode<CommandHandler> {
+        let command = self.clone();
         CommandNode::new(
             "list",
             "List all subscribed agents and their current status.",
         )
-        .handler(list as CommandHandler),
-    )
-    .subcommand(agent_command(
-        "status",
-        "Show one agent's current status.",
-        status,
-    ))
-    .subcommand(agent_command(
-        "disable",
-        "Disable an agent for subsequent messages.",
-        disable,
-    ))
-    .subcommand(agent_command(
-        "enable",
-        "Enable an agent for subsequent messages.",
-        enable,
-    ))
-}
-
-pub(in crate::daemon) fn set_agent_enabled(
-    context: CommandContext<'_>,
-    agent_name: &str,
-    enabled: bool,
-) -> Result<ChannelReply> {
-    if update_agent(context, agent_name, enabled)?.is_none() {
-        return Ok(unknown_agent_reply(agent_name));
+        .handler(CommandHandler::new(move |context, arguments| {
+            let command = command.clone();
+            async move { command.list(context, arguments).await }
+        }))
     }
-    Ok(ChannelReply::agent_list(
-        context.dispatcher().agent_statuses(
+
+    fn agent_command(
+        &self,
+        name: &'static str,
+        description: &'static str,
+        handler: fn(&Self, CommandContext, CommandArguments) -> Result<Option<ChannelReply>>,
+    ) -> CommandNode<CommandHandler> {
+        let command = self.clone();
+        CommandNode::new(name, description)
+            .argument(Argument::required("agent_name", AGENT_NAME_DESCRIPTION))
+            .handler(CommandHandler::new(move |context, arguments| {
+                let command = command.clone();
+                async move { handler(&command, context, arguments) }
+            }))
+    }
+
+    async fn list(
+        &self,
+        context: CommandContext,
+        _arguments: CommandArguments,
+    ) -> Result<Option<ChannelReply>> {
+        Ok(Some(ChannelReply::agent_list(self.agent_statuses(
             context.channel_name(),
             context.session_id(),
             context.agents(),
-        )?,
-    ))
-}
+        )?)))
+    }
 
-fn agent_command(
-    name: &'static str,
-    description: &'static str,
-    handler: CommandHandler,
-) -> CommandNode<CommandHandler> {
-    CommandNode::new(name, description)
-        .argument(Argument::required("agent_name", AGENT_NAME_DESCRIPTION))
-        .handler(handler)
-}
-
-fn list(context: CommandContext, _arguments: CommandArguments) -> CommandFuture {
-    Box::pin(async move {
-        Ok(ChannelReply::agent_list(
-            context.dispatcher().agent_statuses(
-                context.channel_name(),
-                context.session_id(),
-                context.agents(),
-            )?,
-        ))
-    })
-}
-
-fn status(context: CommandContext, arguments: CommandArguments) -> CommandFuture {
-    Box::pin(async move {
-        let agent_name = required_argument(&arguments, "agent_name")?;
+    fn status(
+        &self,
+        context: CommandContext,
+        arguments: CommandArguments,
+    ) -> Result<Option<ChannelReply>> {
+        let agent_name = Self::required_argument(&arguments, "agent_name")?;
         let Some(agent) = context
             .agents()
             .iter()
             .find(|agent| agent.name() == agent_name)
         else {
-            return Ok(unknown_agent_reply(agent_name));
+            return Ok(Some(Self::unknown_agent_reply(&agent_name)));
         };
         let key = ChannelSessionKey::new(context.channel_name(), context.session_id());
-        Ok(ChannelReply::agent_status(ChannelAgentStatus::new(
+        Ok(Some(ChannelReply::agent_status(ChannelAgentStatus::new(
             agent.name(),
-            context
-                .dispatcher()
-                .store
-                .is_agent_enabled(&key, agent.name())?,
-        )))
-    })
-}
+            self.store.is_agent_enabled(&key, agent.name())?,
+        ))))
+    }
 
-fn disable(context: CommandContext, arguments: CommandArguments) -> CommandFuture {
-    Box::pin(async move {
-        let agent_name = required_argument(&arguments, "agent_name")?;
-        update_agent_status(context, agent_name, false)
-    })
-}
+    fn disable(
+        &self,
+        context: CommandContext,
+        arguments: CommandArguments,
+    ) -> Result<Option<ChannelReply>> {
+        self.update_agent_status(context, arguments, false)
+    }
 
-fn enable(context: CommandContext, arguments: CommandArguments) -> CommandFuture {
-    Box::pin(async move {
-        let agent_name = required_argument(&arguments, "agent_name")?;
-        update_agent_status(context, agent_name, true)
-    })
-}
+    fn enable(
+        &self,
+        context: CommandContext,
+        arguments: CommandArguments,
+    ) -> Result<Option<ChannelReply>> {
+        self.update_agent_status(context, arguments, true)
+    }
 
-fn update_agent_status(
-    context: CommandContext<'_>,
-    agent_name: &str,
-    enabled: bool,
-) -> Result<ChannelReply> {
-    Ok(update_agent(context, agent_name, enabled)?
-        .map(ChannelReply::agent_status)
-        .unwrap_or_else(|| unknown_agent_reply(agent_name)))
-}
+    fn update_agent_status(
+        &self,
+        context: CommandContext,
+        arguments: CommandArguments,
+        enabled: bool,
+    ) -> Result<Option<ChannelReply>> {
+        let agent_name = Self::required_argument(&arguments, "agent_name")?;
+        let Some(agent) = context
+            .agents()
+            .iter()
+            .find(|agent| agent.name() == agent_name)
+        else {
+            return Ok(Some(Self::unknown_agent_reply(&agent_name)));
+        };
+        self.set_agent_enabled(
+            context.channel_name(),
+            context.session_id(),
+            agent.name(),
+            enabled,
+        )?;
 
-fn update_agent(
-    context: CommandContext<'_>,
-    agent_name: &str,
-    enabled: bool,
-) -> Result<Option<ChannelAgentStatus>> {
-    let Some(agent) = context
-        .agents()
-        .iter()
-        .find(|agent| agent.name() == agent_name)
-    else {
-        return Ok(None);
-    };
-    context.dispatcher().set_agent_enabled(
-        context.channel_name(),
-        context.session_id(),
-        agent.name(),
-        enabled,
-    )?;
-    Ok(Some(ChannelAgentStatus::new(agent.name(), enabled)))
-}
+        if context.is_structured() {
+            return Ok(Some(ChannelReply::agent_list(self.agent_statuses(
+                context.channel_name(),
+                context.session_id(),
+                context.agents(),
+            )?)));
+        }
+        Ok(Some(ChannelReply::agent_status(ChannelAgentStatus::new(
+            agent.name(),
+            enabled,
+        ))))
+    }
 
-fn required_argument<'a>(arguments: &'a CommandArguments, name: &str) -> Result<&'a str> {
-    let Some(value) = arguments.argument(name) else {
-        bail!("validated command invocation is missing argument: {name}");
-    };
-    Ok(value)
-}
+    fn agent_statuses(
+        &self,
+        channel_name: &str,
+        session_id: &str,
+        agents: &[crate::agent::ConfiguredAgent],
+    ) -> Result<Vec<ChannelAgentStatus>> {
+        let key = ChannelSessionKey::new(channel_name, session_id);
+        let disabled = self
+            .store
+            .disabled_agents(&key)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        Ok(agents
+            .iter()
+            .map(|agent| {
+                let enabled = !disabled.contains(agent.name());
+                ChannelAgentStatus::new(agent.name(), enabled)
+                    .with_button(Self::agent_button(agent.name(), enabled))
+            })
+            .collect())
+    }
 
-fn unknown_agent_reply(agent_name: &str) -> ChannelReply {
-    ChannelReply::new(format!("Unknown agent in this conversation: {agent_name}."))
+    fn set_agent_enabled(
+        &self,
+        channel_name: &str,
+        session_id: &str,
+        agent_name: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        let key = ChannelSessionKey::new(channel_name, session_id);
+        if enabled {
+            self.store.enable_agent(&key, agent_name)?;
+        } else {
+            self.store.disable_agent(&key, agent_name)?;
+        }
+        Ok(())
+    }
+
+    fn agent_button(agent_name: &str, enabled: bool) -> ChannelButton {
+        let (text, style, command) = if enabled {
+            ("Disable", ChannelButtonStyle::Default, "disable")
+        } else {
+            ("Enable", ChannelButtonStyle::Primary, "enable")
+        };
+        ChannelButton::new(
+            text,
+            style,
+            CommandRequest::new(["ask", command]).with_argument("agent_name", agent_name),
+        )
+    }
+
+    fn required_argument(arguments: &CommandArguments, name: &str) -> Result<String> {
+        let Some(value) = arguments.argument(name) else {
+            bail!("validated command invocation is missing argument: {name}");
+        };
+        Ok(value.to_string())
+    }
+
+    fn unknown_agent_reply(agent_name: &str) -> ChannelReply {
+        ChannelReply::new(format!("Unknown agent in this conversation: {agent_name}."))
+    }
 }

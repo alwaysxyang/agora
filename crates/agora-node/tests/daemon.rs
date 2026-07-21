@@ -8,7 +8,7 @@ use agora_node::config::{
 };
 use agora_node::daemon::AgentDispatcher;
 use agora_node::store::{SessionKey, SessionStore};
-use agora_node::task::{OutputEvent, TaskContent};
+use agora_node::task::{ChannelTaskInput, OutputEvent, TaskContent};
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 
@@ -659,9 +659,9 @@ impl ChannelTask for TestTask {
         "session-1"
     }
 
-    fn content(&self) -> &TaskContent {
-        static CONTENT: std::sync::OnceLock<TaskContent> = std::sync::OnceLock::new();
-        CONTENT.get_or_init(|| TaskContent::new("hello"))
+    fn input(&self) -> &ChannelTaskInput {
+        static INPUT: std::sync::OnceLock<ChannelTaskInput> = std::sync::OnceLock::new();
+        INPUT.get_or_init(|| ChannelTaskInput::Message(TaskContent::new("hello")))
     }
 }
 
@@ -710,7 +710,7 @@ impl Channel for RecordingChannel {
 struct ScopedTask {
     task_id: String,
     session_id: String,
-    content: TaskContent,
+    input: ChannelTaskInput,
 }
 
 impl ScopedTask {
@@ -718,7 +718,7 @@ impl ScopedTask {
         Self {
             task_id: task_id.to_string(),
             session_id: session_id.to_string(),
-            content: TaskContent::new("hello"),
+            input: ChannelTaskInput::Message(TaskContent::new("hello")),
         }
     }
 }
@@ -732,8 +732,8 @@ impl ChannelTask for ScopedTask {
         &self.session_id
     }
 
-    fn content(&self) -> &TaskContent {
-        &self.content
+    fn input(&self) -> &ChannelTaskInput {
+        &self.input
     }
 }
 

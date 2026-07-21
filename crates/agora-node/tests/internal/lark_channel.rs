@@ -2,9 +2,9 @@ use super::channel::{LarkChannel, LarkEvent};
 use super::lark_api::{
     LarkApi, LarkFrame, LarkFrameHeader, LarkReconnectBackoff, LarkWebSocketEndpointResponse,
 };
-use crate::channel::{ChannelAction, ChannelTask};
+use crate::channel::ChannelTask;
 use crate::config::LarkChannelConfig;
-use crate::task::TaskAttachmentKind;
+use crate::task::{CommandRequest, TaskAttachmentKind};
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
@@ -237,8 +237,9 @@ async fn resolves_lark_post_images_into_task_attachments() {
 
     let task = channel.task_from_event(event).await.unwrap();
 
-    assert_eq!(task.content().text(), "analyze this image");
-    let [image] = task.content().attachments() else {
+    let content = task.input().message().unwrap();
+    assert_eq!(content.text(), "analyze this image");
+    let [image] = content.attachments() else {
         panic!("task should contain one image");
     };
     assert_eq!(image.kind(), TaskAttachmentKind::Image);
@@ -291,9 +292,13 @@ fn parses_lark_stop_task_card_action() {
                 "action": {
                     "tag": "button",
                     "value": {
-                        "action": "stop_task",
-                        "task_id": "om_task_1",
-                        "agent_name": "codex-dev"
+                        "agora_command": {
+                            "path": ["run", "stop"],
+                            "arguments": {
+                                "task_id": "om_task_1",
+                                "agent_name": "codex-dev"
+                            }
+                        }
                     }
                 },
                 "context": {
@@ -311,11 +316,10 @@ fn parses_lark_stop_task_card_action() {
     assert_eq!(event.session_id, "oc_123");
     assert_eq!(event.message_id, "om_card_1");
     assert_eq!(
-        event.action,
-        ChannelAction::StopTask {
-            task_id: "om_task_1".to_string(),
-            agent_name: "codex-dev".to_string(),
-        }
+        event.command,
+        CommandRequest::new(["run", "stop"])
+            .with_argument("task_id", "om_task_1")
+            .with_argument("agent_name", "codex-dev")
     );
 }
 
@@ -333,9 +337,12 @@ fn parses_lark_agent_enabled_card_action() {
                 "action": {
                     "tag": "button",
                     "value": {
-                        "action": "set_agent_enabled",
-                        "agent_name": "reviewer",
-                        "enabled": true
+                        "agora_command": {
+                            "path": ["ask", "enable"],
+                            "arguments": {
+                                "agent_name": "reviewer"
+                            }
+                        }
                     }
                 },
                 "context": {
@@ -351,11 +358,8 @@ fn parses_lark_agent_enabled_card_action() {
 
     assert_eq!(event.message_id, "om_card_2");
     assert_eq!(
-        event.action,
-        ChannelAction::SetAgentEnabled {
-            agent_name: "reviewer".to_string(),
-            enabled: true,
-        }
+        event.command,
+        CommandRequest::new(["ask", "enable"]).with_argument("agent_name", "reviewer")
     );
 }
 

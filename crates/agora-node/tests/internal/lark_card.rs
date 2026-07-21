@@ -3,16 +3,30 @@ use super::card::{LarkAgentCard, LarkCardContent, LarkReplyCard};
 use super::channel::{LarkCardActionEvent, LarkChannel, LarkMessageEvent, LarkTask};
 use super::lark_api::LarkApi;
 use crate::channel::{
-    Channel, ChannelAction, ChannelAgentStatus, ChannelReply, ChannelRun, RunEvent,
+    Channel, ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun,
+    RunEvent,
 };
 use crate::config::LarkChannelConfig;
-use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
+use crate::task::{CommandRequest, OutputEvent, ProgressStatus, TokenUsage};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
+
+fn agent_status_with_button(name: &str, enabled: bool) -> ChannelAgentStatus {
+    let (text, style, command) = if enabled {
+        ("Disable", ChannelButtonStyle::Default, "disable")
+    } else {
+        ("Enable", ChannelButtonStyle::Primary, "enable")
+    };
+    ChannelAgentStatus::new(name, enabled).with_button(ChannelButton::new(
+        text,
+        style,
+        CommandRequest::new(["ask", command]).with_argument("agent_name", name),
+    ))
+}
 
 #[test]
 fn lark_card_uses_json_v2_for_standard_markdown() {
@@ -43,8 +57,8 @@ fn lark_card_uses_json_v2_for_standard_markdown() {
 #[test]
 fn lark_agent_list_card_renders_one_right_aligned_toggle_button_per_agent() {
     let reply = ChannelReply::agent_list(vec![
-        ChannelAgentStatus::new("codex-dev", true),
-        ChannelAgentStatus::new("reviewer", false),
+        agent_status_with_button("codex-dev", true),
+        agent_status_with_button("reviewer", false),
     ]);
 
     let card = LarkReplyCard::build(&reply);
@@ -64,9 +78,10 @@ fn lark_agent_list_card_renders_one_right_aligned_toggle_button_per_agent() {
     assert_eq!(
         first_button.pointer("/behaviors/0/value").unwrap(),
         &serde_json::json!({
-            "action": "set_agent_enabled",
-            "agent_name": "codex-dev",
-            "enabled": false
+            "agora_command": {
+                "path": ["ask", "disable"],
+                "arguments": { "agent_name": "codex-dev" }
+            }
         })
     );
     assert_eq!(second_button.pointer("/text/content").unwrap(), "Enable");
@@ -74,9 +89,10 @@ fn lark_agent_list_card_renders_one_right_aligned_toggle_button_per_agent() {
     assert_eq!(
         second_button.pointer("/behaviors/0/value").unwrap(),
         &serde_json::json!({
-            "action": "set_agent_enabled",
-            "agent_name": "reviewer",
-            "enabled": true
+            "agora_command": {
+                "path": ["ask", "enable"],
+                "arguments": { "agent_name": "reviewer" }
+            }
         })
     );
     let rendered = serde_json::to_string(&card).unwrap();
@@ -374,7 +390,16 @@ fn lark_card_shows_a_placeholder_before_agent_output() {
 
 #[test]
 fn lark_card_shows_a_bottom_stop_button_only_while_the_task_is_active() {
-    let mut content = LarkCardContent::for_task("codex-dev".to_string(), "task-123".to_string());
+    let mut content = LarkCardContent::with_buttons(
+        "codex-dev".to_string(),
+        vec![ChannelButton::new(
+            "结束任务",
+            ChannelButtonStyle::Danger,
+            CommandRequest::new(["run", "stop"])
+                .with_argument("task_id", "task-123")
+                .with_argument("agent_name", "codex-dev"),
+        )],
+    );
 
     let running = content.build_card();
     let elements = running
@@ -393,9 +418,13 @@ fn lark_card_shows_a_bottom_stop_button_only_while_the_task_is_active() {
     assert_eq!(
         button.pointer("/behaviors/0/value").unwrap(),
         &serde_json::json!({
-            "action": "stop_task",
-            "task_id": "task-123",
-            "agent_name": "codex-dev"
+            "agora_command": {
+                "path": ["run", "stop"],
+                "arguments": {
+                    "agent_name": "codex-dev",
+                    "task_id": "task-123"
+                }
+            }
         })
     );
 
@@ -403,14 +432,14 @@ fn lark_card_shows_a_bottom_stop_button_only_while_the_task_is_active() {
     assert!(
         serde_json::to_string(&content.build_card())
             .unwrap()
-            .contains("stop_task")
+            .contains("agora_command")
     );
 
     content.complete();
     assert!(
         !serde_json::to_string(&content.build_card())
             .unwrap()
-            .contains("stop_task")
+            .contains("agora_command")
     );
 }
 
@@ -569,7 +598,7 @@ async fn lark_card_coalesces_intermediate_updates_and_flushes_completion() {
             message_id: "om_source".to_string(),
         },
         "codex-dev".to_string(),
-        "run-1".to_string(),
+        Vec::new(),
         api,
     );
 
@@ -674,16 +703,13 @@ async fn lark_agent_toggle_action_patches_the_original_status_card() {
         id: "evt_action".to_string(),
         session_id: "oc_chat".to_string(),
         message_id: "om_status_card".to_string(),
-        action: ChannelAction::SetAgentEnabled {
-            agent_name: "reviewer".to_string(),
-            enabled: true,
-        },
+        command: CommandRequest::new(["ask", "enable"]).with_argument("agent_name", "reviewer"),
     });
 
     channel
         .reply(
             &task,
-            ChannelReply::agent_list(vec![ChannelAgentStatus::new("reviewer", true)]),
+            ChannelReply::agent_list(vec![agent_status_with_button("reviewer", true)]),
         )
         .await
         .unwrap();
@@ -734,7 +760,7 @@ async fn lark_ask_message_replies_with_a_threaded_interactive_card() {
     channel
         .reply(
             &task,
-            ChannelReply::agent_list(vec![ChannelAgentStatus::new("codex-dev", true)]),
+            ChannelReply::agent_list(vec![agent_status_with_button("codex-dev", true)]),
         )
         .await
         .unwrap();
