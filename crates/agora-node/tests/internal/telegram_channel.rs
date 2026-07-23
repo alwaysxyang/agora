@@ -18,13 +18,13 @@ fn telegram_renders_agent_status_replies_without_interactive_controls() {
     ]);
     assert_eq!(
         TelegramChannel::render_reply(&list),
-        "Agent status (current conversation)\n✓ codex-dev — Enabled\n− reviewer — Disabled"
+        "当前对话的 Agent 状态\n✓ codex-dev — 已启用\n− reviewer — 已禁用"
     );
 
     let status = ChannelReply::agent_status(ChannelAgentStatus::new("reviewer", false));
     assert_eq!(
         TelegramChannel::render_reply(&status),
-        "Agent status (current conversation)\n− reviewer — Disabled"
+        "当前对话的 Agent 状态\n− reviewer — 已禁用"
     );
 }
 

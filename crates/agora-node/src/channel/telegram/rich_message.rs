@@ -1,6 +1,7 @@
 use super::channel::TelegramReplyTarget;
 use super::telegram_api::TelegramApi;
 use crate::channel::{ChannelRun, RunEvent};
+use crate::i18n::{self, RunStatus};
 use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
 use agora_core::logger;
 use anyhow::Result;
@@ -325,7 +326,7 @@ impl TelegramRichContent {
                 .thinking
                 .front()
                 .map(String::as_str)
-                .unwrap_or("Waiting for agent output...");
+                .unwrap_or(i18n::WAITING_FOR_AGENT);
             sections.push(format!(
                 "<tg-thinking>{}</tg-thinking>",
                 Self::escape_structural_text(thinking)
@@ -339,25 +340,29 @@ impl TelegramRichContent {
         }
 
         match &self.state {
-            TelegramRunState::Queued { ahead } if self.thinking.is_empty() && self.progress.is_empty() => {
-                let suffix = if *ahead == 1 { "task" } else { "tasks" };
-                sections.push(format!("> Queued with {ahead} {suffix} ahead."));
+            TelegramRunState::Queued { ahead }
+                if self.thinking.is_empty() && self.progress.is_empty() =>
+            {
+                sections.push(format!("> {}", i18n::queued_message(*ahead)));
             }
             TelegramRunState::Running
                 if self.thinking.is_empty()
                     && self.progress.is_empty()
                     && self.answer.is_empty() =>
             {
-                sections.push("> Waiting for agent output...".to_string());
+                sections.push(format!("> {}", i18n::WAITING_FOR_AGENT));
             }
             TelegramRunState::Failed(message) => sections.push(Self::failure_section(message)),
-            TelegramRunState::Stopped => sections.push(
-                "## Run stopped\n\nStopped by `/stop`. Existing output is retained.".to_string(),
-            ),
-            TelegramRunState::Interrupted => sections.push(
-                "## Run interrupted\n\nAgora Node is shutting down. This run was interrupted and its current output is retained."
-                    .to_string(),
-            ),
+            TelegramRunState::Stopped => sections.push(format!(
+                "## {}\n\n{}",
+                i18n::RUN_STOPPED_TITLE,
+                i18n::RUN_STOPPED_BODY
+            )),
+            TelegramRunState::Interrupted => sections.push(format!(
+                "## {}\n\n{}",
+                i18n::RUN_INTERRUPTED_TITLE,
+                i18n::RUN_INTERRUPTED_BODY
+            )),
             TelegramRunState::Queued { .. }
             | TelegramRunState::Running
             | TelegramRunState::Completed => {}
@@ -370,9 +375,9 @@ impl TelegramRichContent {
                     | TelegramRunState::Stopped
                     | TelegramRunState::Interrupted
             ) {
-                "Partial answer"
+                i18n::PARTIAL_ANSWER_TITLE
             } else {
-                "Final answer"
+                i18n::FINAL_ANSWER_TITLE
             };
             sections.push(format!("## {title}\n\n{}", self.answer));
         }
@@ -423,18 +428,17 @@ impl TelegramRichContent {
 
     fn status(&self) -> &'static str {
         match self.state {
-            TelegramRunState::Queued { .. } => "Queued",
-            TelegramRunState::Running => "Running",
-            TelegramRunState::Completed => "Completed",
-            TelegramRunState::Failed(_) => "Failed",
-            TelegramRunState::Stopped => "Stopped",
-            TelegramRunState::Interrupted => "Interrupted",
+            TelegramRunState::Queued { .. } => i18n::run_status(RunStatus::Queued),
+            TelegramRunState::Running => i18n::run_status(RunStatus::Running),
+            TelegramRunState::Completed => i18n::run_status(RunStatus::Completed),
+            TelegramRunState::Failed(_) => i18n::run_status(RunStatus::Failed),
+            TelegramRunState::Stopped => i18n::run_status(RunStatus::Stopped),
+            TelegramRunState::Interrupted => i18n::run_status(RunStatus::Interrupted),
         }
     }
 
     fn thinking_section(&self) -> String {
         let count = self.thinking.len();
-        let suffix = if count == 1 { "update" } else { "updates" };
         let body = self
             .thinking
             .iter()
@@ -442,8 +446,10 @@ impl TelegramRichContent {
             .collect::<Vec<_>>()
             .join("\n");
         format!(
-            "{}<summary>Thinking · {count} {suffix}</summary>\n\n{body}\n\n</details>",
-            self.details_opening()
+            "{}<summary>{} · {}</summary>\n\n{body}\n\n</details>",
+            self.details_opening(),
+            i18n::THINKING_TITLE,
+            i18n::update_count(count)
         )
     }
 
@@ -455,8 +461,9 @@ impl TelegramRichContent {
             .collect::<Vec<_>>()
             .join("\n");
         format!(
-            "{}<summary>Progress · {}</summary>\n\n{body}\n\n</details>",
+            "{}<summary>{} · {}</summary>\n\n{body}\n\n</details>",
             self.details_opening(),
+            i18n::PROGRESS_TITLE,
             self.progress_summary()
         )
     }
@@ -484,16 +491,28 @@ impl TelegramRichContent {
         }
         let mut parts = Vec::new();
         if completed > 0 {
-            parts.push(format!("✓ {completed} completed"));
+            parts.push(format!(
+                "✓ {}",
+                i18n::progress_count(ProgressStatus::Completed, completed)
+            ));
         }
         if running > 0 {
-            parts.push(format!("● {running} running"));
+            parts.push(format!(
+                "● {}",
+                i18n::progress_count(ProgressStatus::Running, running)
+            ));
         }
         if failed > 0 {
-            parts.push(format!("× {failed} failed"));
+            parts.push(format!(
+                "× {}",
+                i18n::progress_count(ProgressStatus::Failed, failed)
+            ));
         }
         if stopped > 0 {
-            parts.push(format!("■ {stopped} stopped"));
+            parts.push(format!(
+                "■ {}",
+                i18n::progress_count(ProgressStatus::Stopped, stopped)
+            ));
         }
         parts.join(" · ")
     }
@@ -521,35 +540,27 @@ impl TelegramRichContent {
     }
 
     fn failure_section(message: &str) -> String {
-        let message = message.to_ascii_lowercase();
-        let summary = if message.contains("timed out") || message.contains("timeout") {
-            "Agent execution timed out."
-        } else if message.contains("session")
-            && (message.contains("not found")
-                || message.contains("missing")
-                || message.contains("unavailable"))
-        {
-            "The backend agent session is unavailable."
-        } else if message.contains("attachment") {
-            "The agent could not process an attachment."
-        } else if message.contains("exit") {
-            "Agent process exited before completing the task."
-        } else {
-            "The agent could not complete this task."
-        };
+        let copy = i18n::failure_copy(message);
         format!(
-            "## Run failed\n\n{summary}\n\nPlease retry. Full details are available in the daemon log."
+            "## {}\n\n{}\n\n{}",
+            i18n::RUN_FAILED_TITLE,
+            copy.summary,
+            i18n::RETRY_ADVICE
         )
     }
 
     fn usage_section(usage: TokenUsage) -> String {
         let total = usage.input_tokens.saturating_add(usage.output_tokens);
         format!(
-            "---\n\nTotal **{}** · Input **{}** · {} cached · Output **{}** · Reasoning **{}**",
+            "---\n\n{} **{}** · {} **{}** · {} · {} **{}** · {} **{}**",
+            i18n::TOTAL,
             Self::format_tokens(total),
+            i18n::INPUT,
             Self::format_tokens(usage.input_tokens),
-            Self::format_tokens(usage.cached_input_tokens),
+            i18n::cached_tokens(Self::format_tokens(usage.cached_input_tokens)),
+            i18n::OUTPUT,
             Self::format_tokens(usage.output_tokens),
+            i18n::REASONING,
             Self::format_tokens(usage.reasoning_output_tokens)
         )
     }

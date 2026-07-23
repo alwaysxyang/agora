@@ -4,6 +4,7 @@ use super::lark_api::LarkApi;
 use crate::channel::{
     ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun, RunEvent,
 };
+use crate::i18n::{self, RunStatus};
 use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
 use agora_core::logger;
 use anyhow::{Result, anyhow};
@@ -76,8 +77,8 @@ impl LarkReplyCard {
     pub(super) fn build(reply: &ChannelReply) -> Value {
         match reply {
             ChannelReply::Text(text) => Self::card(
-                "Agent 状态",
-                "当前对话".to_string(),
+                i18n::AGENT_STATUS_TITLE,
+                i18n::CURRENT_CONVERSATION.to_string(),
                 vec![json!({
                     "tag": "markdown",
                     "content": text
@@ -101,11 +102,14 @@ impl LarkReplyCard {
         }
         elements.push(json!({
             "tag": "markdown",
-            "content": "<font color='grey'>配置仅对当前对话生效</font>"
+            "content": format!(
+                "<font color='grey'>{}</font>",
+                i18n::CURRENT_CONVERSATION_ONLY
+            )
         }));
         Self::card(
-            "Agent 状态",
-            format!("当前对话 · {} Agents", agents.len()),
+            i18n::AGENT_STATUS_TITLE,
+            i18n::agent_count(agents.len()),
             elements,
         )
     }
@@ -113,8 +117,8 @@ impl LarkReplyCard {
     fn agent_status(agent: &ChannelAgentStatus) -> Value {
         let (color, state, _) = Self::status_text(agent.enabled());
         Self::card(
-            "Agent 状态",
-            "当前对话".to_string(),
+            i18n::AGENT_STATUS_TITLE,
+            i18n::CURRENT_CONVERSATION.to_string(),
             vec![json!({
                 "tag": "column_set",
                 "flex_mode": "none",
@@ -127,8 +131,9 @@ impl LarkReplyCard {
                         "elements": [{
                             "tag": "markdown",
                             "content": format!(
-                                "**{}**\n<font color='grey'>消息接收状态</font>",
-                                agent.name()
+                                "**{}**\n<font color='grey'>{}</font>",
+                                agent.name(),
+                                i18n::MESSAGE_DELIVERY_STATUS
                             )
                         }]
                     },
@@ -203,9 +208,17 @@ impl LarkReplyCard {
 
     fn status_text(enabled: bool) -> (&'static str, &'static str, &'static str) {
         if enabled {
-            ("green", "Enabled", "接收后续消息")
+            (
+                "green",
+                i18n::AGENT_ENABLED,
+                i18n::AGENT_ENABLED_DESCRIPTION,
+            )
         } else {
-            ("grey", "Disabled", "不接收后续消息")
+            (
+                "grey",
+                i18n::AGENT_DISABLED,
+                i18n::AGENT_DISABLED_DESCRIPTION,
+            )
         }
     }
 
@@ -311,12 +324,14 @@ impl LarkCardContent {
 
     pub(super) fn build_card(&self) -> Value {
         let (template, status, status_color) = match &self.state {
-            LarkRunState::Queued { .. } => ("grey", "Queued", "grey"),
-            LarkRunState::Running => ("blue", "Running", "blue"),
-            LarkRunState::Completed => ("green", "Completed", "green"),
-            LarkRunState::Failed(_) => ("red", "Failed", "red"),
-            LarkRunState::Stopped => ("grey", "Stopped", "grey"),
-            LarkRunState::Interrupted => ("orange", "Interrupted", "orange"),
+            LarkRunState::Queued { .. } => ("grey", i18n::run_status(RunStatus::Queued), "grey"),
+            LarkRunState::Running => ("blue", i18n::run_status(RunStatus::Running), "blue"),
+            LarkRunState::Completed => ("green", i18n::run_status(RunStatus::Completed), "green"),
+            LarkRunState::Failed(_) => ("red", i18n::run_status(RunStatus::Failed), "red"),
+            LarkRunState::Stopped => ("grey", i18n::run_status(RunStatus::Stopped), "grey"),
+            LarkRunState::Interrupted => {
+                ("orange", i18n::run_status(RunStatus::Interrupted), "orange")
+            }
         };
         let failure_view = match &self.state {
             LarkRunState::Failed(message) => Some(Self::failure_view(message)),
@@ -337,9 +352,12 @@ impl LarkCardContent {
                 .collect::<Vec<_>>()
                 .join("\n");
             let count = self.thinking.len();
-            let suffix = if count == 1 { "update" } else { "updates" };
             elements.push(Self::collapsible_panel(
-                format!("**Thinking**  <font color='grey'>· {count} {suffix}</font>"),
+                format!(
+                    "**{}**  <font color='grey'>· {}</font>",
+                    i18n::THINKING_TITLE,
+                    i18n::update_count(count)
+                ),
                 false,
                 thinking,
             ));
@@ -362,7 +380,8 @@ impl LarkCardContent {
                 .join("\n");
             elements.push(Self::collapsible_panel(
                 format!(
-                    "**Progress**  <font color='grey'>·</font> {}",
+                    "**{}**  <font color='grey'>·</font> {}",
+                    i18n::PROGRESS_TITLE,
                     self.progress_summary()
                 ),
                 !finished,
@@ -377,13 +396,19 @@ impl LarkCardContent {
             elements.push(json!({
                 "tag": "markdown",
                 "content": format!(
-                    "<font color='red'>▌</font> **Run failed**\nAgent 未能完成本次任务。\n\n<font color='grey'>{summary}</font>\n<font color='grey'>建议：请重试；如果仍然失败，请查看 Technical details 和 daemon 日志。</font>"
+                    "<font color='red'>▌</font> **{}**\n{}\n\n<font color='grey'>{summary}</font>\n<font color='grey'>{}</font>",
+                    i18n::RUN_FAILED_TITLE,
+                    i18n::AGENT_RUN_FAILED,
+                    i18n::RETRY_ADVICE
                 )
             }));
             elements.push(Self::collapsible_panel(
-                format!("**Technical details**  <font color='grey'>· {category}</font>"),
+                format!(
+                    "**{}**  <font color='grey'>· {category}</font>",
+                    i18n::TECHNICAL_DETAILS_TITLE
+                ),
                 false,
-                "完整错误已写入 daemon 日志。".to_string(),
+                i18n::ERROR_WRITTEN_TO_LOG.to_string(),
             ));
         }
 
@@ -393,7 +418,11 @@ impl LarkCardContent {
             }
             elements.push(json!({
                 "tag": "markdown",
-                "content": "<font color='grey'>▌</font> **Run stopped**\nStopped by request. Existing output is retained."
+                "content": format!(
+                    "<font color='grey'>▌</font> **{}**\n{}",
+                    i18n::RUN_STOPPED_TITLE,
+                    i18n::RUN_STOPPED_BODY
+                )
             }));
         }
 
@@ -403,7 +432,11 @@ impl LarkCardContent {
             }
             elements.push(json!({
                 "tag": "markdown",
-                "content": "<font color='orange'>▌</font> **Run interrupted**\nAgora Node 即将退出，本次任务已中断，当前输出已保留。\nNode 恢复后，请重新发送消息继续。"
+                "content": format!(
+                    "<font color='orange'>▌</font> **{}**\n{}",
+                    i18n::RUN_INTERRUPTED_TITLE,
+                    i18n::RUN_INTERRUPTED_BODY
+                )
             }));
         }
 
@@ -415,9 +448,9 @@ impl LarkCardContent {
                 &self.state,
                 LarkRunState::Failed(_) | LarkRunState::Stopped | LarkRunState::Interrupted
             ) {
-                "Partial answer"
+                i18n::PARTIAL_ANSWER_TITLE
             } else {
-                "Final answer"
+                i18n::FINAL_ANSWER_TITLE
             };
             elements.push(json!({
                 "tag": "markdown",
@@ -440,9 +473,9 @@ impl LarkCardContent {
                 "tag": "markdown",
                 "content": match &self.state {
                     LarkRunState::Queued { ahead } => {
-                        format!("> 正在排队，前面还有 {ahead} 个任务...")
+                        format!("> {}", i18n::queued_message(*ahead))
                     }
-                    _ => "> 正在等待 Agent 输出...".to_string(),
+                    _ => format!("> {}", i18n::WAITING_FOR_AGENT),
                 }
             }));
         }
@@ -499,7 +532,7 @@ impl LarkCardContent {
                     "tag": "button",
                     "text": {
                         "tag": "plain_text",
-                        "content": "结束任务"
+                        "content": i18n::STOP_TASK
                     },
                     "type": "danger",
                     "size": "medium",
@@ -572,44 +605,34 @@ impl LarkCardContent {
         let mut parts = Vec::new();
         if completed > 0 {
             parts.push(format!(
-                "<font color='green'>✓</font> <font color='grey'>{completed} completed</font>"
+                "<font color='green'>✓</font> <font color='grey'>{}</font>",
+                i18n::progress_count(ProgressStatus::Completed, completed)
             ));
         }
         if running > 0 {
             parts.push(format!(
-                "<font color='blue'>●</font> <font color='grey'>{running} running</font>"
+                "<font color='blue'>●</font> <font color='grey'>{}</font>",
+                i18n::progress_count(ProgressStatus::Running, running)
             ));
         }
         if failed > 0 {
             parts.push(format!(
-                "<font color='red'>×</font> <font color='grey'>{failed} failed</font>"
+                "<font color='red'>×</font> <font color='grey'>{}</font>",
+                i18n::progress_count(ProgressStatus::Failed, failed)
             ));
         }
         if stopped > 0 {
             parts.push(format!(
-                "<font color='grey'>■</font> <font color='grey'>{stopped} stopped</font>"
+                "<font color='grey'>■</font> <font color='grey'>{}</font>",
+                i18n::progress_count(ProgressStatus::Stopped, stopped)
             ));
         }
         parts.join(" · ")
     }
 
     fn failure_view(message: &str) -> (&'static str, &'static str) {
-        let message = message.to_ascii_lowercase();
-        if message.contains("timed out") || message.contains("timeout") {
-            ("Execution timeout", "Agent 执行超时。")
-        } else if message.contains("session")
-            && (message.contains("not found")
-                || message.contains("missing")
-                || message.contains("unavailable"))
-        {
-            ("Session unavailable", "Agent 会话不可用。")
-        } else if message.contains("attachment") {
-            ("Attachment error", "Agent 无法处理附件。")
-        } else if message.contains("exit") {
-            ("Process exit", "Agent 进程在完成任务前退出。")
-        } else {
-            ("Agent error", "Agent 执行失败。")
-        }
+        let copy = i18n::failure_copy(message);
+        (copy.category, copy.summary)
     }
 
     fn usage_element(usage: TokenUsage) -> Value {
@@ -620,17 +643,17 @@ impl LarkCardContent {
             "horizontal_spacing": "small",
             "horizontal_align": "left",
             "columns": [
-                Self::usage_column("Total", total_tokens, "tokens"),
+                Self::usage_column(i18n::TOTAL, total_tokens, i18n::TOKENS),
                 Self::usage_column(
-                    "Input",
+                    i18n::INPUT,
                     usage.input_tokens,
-                    &format!("{} cached", Self::format_tokens(usage.cached_input_tokens)),
+                    &i18n::cached_tokens(Self::format_tokens(usage.cached_input_tokens)),
                 ),
-                Self::usage_column("Output", usage.output_tokens, "tokens"),
+                Self::usage_column(i18n::OUTPUT, usage.output_tokens, i18n::TOKENS),
                 Self::usage_column(
-                    "Reasoning",
+                    i18n::REASONING,
                     usage.reasoning_output_tokens,
-                    "of output",
+                    i18n::REASONING_DETAIL,
                 ),
             ]
         })
@@ -669,7 +692,7 @@ impl LarkCardContent {
         if answer.len() <= MAX_ANSWER_BYTES {
             return answer.to_string();
         }
-        let marker = "[output truncated]\n\n";
+        let marker = i18n::OUTPUT_TRUNCATED;
         let budget = MAX_ANSWER_BYTES.saturating_sub(marker.len());
         let mut start = answer.len().saturating_sub(budget);
         while !answer.is_char_boundary(start) {

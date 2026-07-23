@@ -62,10 +62,13 @@ fn lark_agent_list_card_renders_one_right_aligned_toggle_button_per_agent() {
     ]);
 
     let card = LarkReplyCard::build(&reply);
-    assert_eq!(card.pointer("/header/title/content").unwrap(), "Agent 状态");
+    assert_eq!(
+        card.pointer("/header/title/content").unwrap(),
+        "当前对话的 Agent 状态"
+    );
     assert_eq!(
         card.pointer("/header/subtitle/content").unwrap(),
-        "当前对话 · 2 Agents"
+        "当前对话 · 2 个 Agent"
     );
     let rows = card
         .pointer("/body/elements")
@@ -96,8 +99,8 @@ fn lark_agent_list_card_renders_one_right_aligned_toggle_button_per_agent() {
         })
     );
     let rendered = serde_json::to_string(&card).unwrap();
-    assert!(rendered.contains("Enabled</font> · 接收后续消息"));
-    assert!(rendered.contains("Disabled</font> · 不接收后续消息"));
+    assert!(rendered.contains("已启用</font> · 接收后续消息"));
+    assert!(rendered.contains("已禁用</font> · 不接收后续消息"));
     assert!(rendered.contains("配置仅对当前对话生效"));
 }
 
@@ -112,7 +115,7 @@ fn lark_agent_status_card_is_compact_and_has_no_toggle_button() {
         "当前对话"
     );
     assert!(rendered.contains("**reviewer**"));
-    assert!(rendered.contains("Disabled"));
+    assert!(rendered.contains("已禁用"));
     assert_eq!(
         card.pointer("/body/elements/0/columns/1/elements/0/text_align")
             .unwrap(),
@@ -120,6 +123,47 @@ fn lark_agent_status_card_is_compact_and_has_no_toggle_button() {
     );
     assert!(!rendered.contains("set_agent_enabled"));
     assert!(!rendered.contains("\"tag\":\"button\""));
+}
+
+#[test]
+fn lark_card_uses_chinese_system_labels() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.apply_output(OutputEvent::Thinking {
+        text: "Inspecting the project".to_string(),
+    });
+    content.apply_output(OutputEvent::Progress {
+        id: "command-1".to_string(),
+        text: "Run `cargo test`".to_string(),
+        status: ProgressStatus::Completed,
+    });
+    content.apply_output(OutputEvent::Answer {
+        text: "All checks passed.".to_string(),
+    });
+    content.apply_output(OutputEvent::Usage(TokenUsage {
+        input_tokens: 42_800,
+        cached_input_tokens: 31_600,
+        output_tokens: 3_200,
+        reasoning_output_tokens: 1_900,
+    }));
+    content.complete();
+
+    let card = content.build_card();
+    let rendered = serde_json::to_string(&card).unwrap();
+
+    assert_eq!(
+        card.pointer("/header/text_tag_list/0/text/content")
+            .and_then(serde_json::Value::as_str),
+        Some("已完成")
+    );
+    assert!(rendered.contains("**思考过程**"));
+    assert!(rendered.contains("1 条"));
+    assert!(rendered.contains("**执行进度**"));
+    assert!(rendered.contains("1 项已完成"));
+    assert!(rendered.contains("**最终回答**"));
+    assert!(rendered.contains("<font color='grey'>总计</font>"));
+    assert!(rendered.contains("<font color='grey'>输入</font>"));
+    assert!(rendered.contains("<font color='grey'>输出</font>"));
+    assert!(rendered.contains("<font color='grey'>推理</font>"));
 }
 
 #[test]
@@ -151,7 +195,7 @@ fn lark_card_collapses_thinking_and_expands_running_progress() {
     );
     assert_eq!(
         thinking.pointer("/header/title/content").unwrap(),
-        "**Thinking**  <font color='grey'>· 1 update</font>"
+        "**思考过程**  <font color='grey'>· 1 条</font>"
     );
     assert_eq!(progress["tag"], "collapsible_panel");
     assert_eq!(progress["expanded"], true);
@@ -164,7 +208,7 @@ fn lark_card_collapses_thinking_and_expands_running_progress() {
     );
     assert_eq!(
         progress.pointer("/header/title/content").unwrap(),
-        "**Progress**  <font color='grey'>·</font> <font color='blue'>●</font> <font color='grey'>1 running</font>"
+        "**执行进度**  <font color='grey'>·</font> <font color='blue'>●</font> <font color='grey'>1 项进行中</font>"
     );
 }
 
@@ -185,7 +229,7 @@ fn lark_card_collapses_progress_after_completion() {
     assert_eq!(progress["expanded"], false);
     assert_eq!(
         progress.pointer("/header/title/content").unwrap(),
-        "**Progress**  <font color='grey'>·</font> <font color='green'>✓</font> <font color='grey'>1 completed</font>"
+        "**执行进度**  <font color='grey'>·</font> <font color='green'>✓</font> <font color='grey'>1 项已完成</font>"
     );
 }
 
@@ -211,7 +255,7 @@ fn lark_card_progress_summary_shows_completed_and_failed_statuses() {
 
     assert_eq!(
         progress.pointer("/header/title/content").unwrap(),
-        "**Progress**  <font color='grey'>·</font> <font color='green'>✓</font> <font color='grey'>2 completed</font> · <font color='red'>×</font> <font color='grey'>1 failed</font>"
+        "**执行进度**  <font color='grey'>·</font> <font color='green'>✓</font> <font color='grey'>2 项已完成</font> · <font color='red'>×</font> <font color='grey'>1 项失败</font>"
     );
 }
 
@@ -227,9 +271,9 @@ fn lark_card_failure_shows_safe_summary_and_collapsed_details() {
     assert_eq!(
         card.pointer("/header/text_tag_list/0/text/content")
             .and_then(serde_json::Value::as_str),
-        Some("Failed")
+        Some("失败")
     );
-    assert!(rendered.contains("<font color='red'>▌</font> **Run failed**"));
+    assert!(rendered.contains("<font color='red'>▌</font> **任务失败**"));
     assert!(rendered.contains("Agent 进程在完成任务前退出。"));
     assert!(rendered.contains("建议：请重试"));
     assert!(!rendered.contains("Authorization"));
@@ -238,7 +282,7 @@ fn lark_card_failure_shows_safe_summary_and_collapsed_details() {
     assert_eq!(details["expanded"], false);
     assert_eq!(
         details.pointer("/header/title/content").unwrap(),
-        "**Technical details**  <font color='grey'>· Process exit</font>"
+        "**技术详情**  <font color='grey'>· 进程退出</font>"
     );
     assert_eq!(
         details.pointer("/elements/0/content").unwrap(),
@@ -255,12 +299,12 @@ fn lark_card_labels_an_answer_as_partial_when_the_run_fails() {
     content.fail("agent process exited with code 1".to_string());
 
     let rendered = serde_json::to_string(&content.build_card()).unwrap();
-    let failure_index = rendered.find("**Run failed**").unwrap();
-    let answer_index = rendered.find("**Partial answer**").unwrap();
+    let failure_index = rendered.find("**任务失败**").unwrap();
+    let answer_index = rendered.find("**部分回答**").unwrap();
 
     assert!(failure_index < answer_index);
-    assert!(rendered.contains("<font color='blue'>▌</font> **Partial answer**"));
-    assert!(!rendered.contains("**Final answer**"));
+    assert!(rendered.contains("<font color='blue'>▌</font> **部分回答**"));
+    assert!(!rendered.contains("**最终回答**"));
     assert!(rendered.contains("Work completed before the error."));
 }
 
@@ -286,7 +330,7 @@ fn lark_card_preserves_output_and_marks_the_run_as_stopped() {
     assert_eq!(
         card.pointer("/header/text_tag_list/0/text/content")
             .and_then(serde_json::Value::as_str),
-        Some("Stopped")
+        Some("已停止")
     );
     assert_eq!(
         card.pointer("/header/template")
@@ -294,10 +338,10 @@ fn lark_card_preserves_output_and_marks_the_run_as_stopped() {
         Some("grey")
     );
     assert!(rendered.contains("<font color='grey'>■</font>  Run `cargo test`"));
-    assert!(rendered.contains("<font color='grey'>1 stopped</font>"));
-    assert!(rendered.contains("<font color='grey'>▌</font> **Run stopped**"));
-    assert!(rendered.contains("Stopped by request. Existing output is retained."));
-    assert!(rendered.contains("<font color='blue'>▌</font> **Partial answer**"));
+    assert!(rendered.contains("<font color='grey'>1 项已停止</font>"));
+    assert!(rendered.contains("<font color='grey'>▌</font> **任务已停止**"));
+    assert!(rendered.contains("已按请求停止任务，已有输出已保留。"));
+    assert!(rendered.contains("<font color='blue'>▌</font> **部分回答**"));
     assert!(rendered.contains("Work completed before the stop."));
 }
 
@@ -320,7 +364,7 @@ fn lark_card_preserves_output_and_marks_the_run_as_interrupted() {
     assert_eq!(
         card.pointer("/header/text_tag_list/0/text/content")
             .and_then(serde_json::Value::as_str),
-        Some("Interrupted")
+        Some("已中断")
     );
     assert_eq!(
         card.pointer("/header/template")
@@ -328,10 +372,10 @@ fn lark_card_preserves_output_and_marks_the_run_as_interrupted() {
         Some("orange")
     );
     assert!(rendered.contains("<font color='grey'>■</font>  Run `cargo test`"));
-    assert!(rendered.contains("<font color='orange'>▌</font> **Run interrupted**"));
+    assert!(rendered.contains("<font color='orange'>▌</font> **任务已中断**"));
     assert!(rendered.contains("Agora Node 即将退出，本次任务已中断，当前输出已保留。"));
     assert!(rendered.contains("Node 恢复后，请重新发送消息继续。"));
-    assert!(rendered.contains("<font color='blue'>▌</font> **Partial answer**"));
+    assert!(rendered.contains("<font color='blue'>▌</font> **部分回答**"));
     assert!(rendered.contains("Work completed before shutdown."));
 }
 
@@ -365,15 +409,15 @@ fn lark_card_separates_thinking_progress_and_final_answer() {
     assert_eq!(
         card.pointer("/header/text_tag_list/0/text/content")
             .and_then(|v| v.as_str()),
-        Some("Completed")
+        Some("已完成")
     );
     let rendered = serde_json::to_string(&card).unwrap();
-    assert!(rendered.contains("**Thinking**"));
+    assert!(rendered.contains("**思考过程**"));
     assert!(rendered.contains("> • Inspecting the channel"));
     assert!(rendered.contains("> • Checking reply delivery"));
-    assert!(rendered.contains("**Progress**"));
+    assert!(rendered.contains("**执行进度**"));
     assert!(rendered.contains("<font color='green'>✓</font>  Run `cargo test`"));
-    assert!(rendered.contains("<font color='blue'>▌</font> **Final answer**"));
+    assert!(rendered.contains("<font color='blue'>▌</font> **最终回答**"));
     assert!(rendered.contains("The Lark path is ready."));
     assert!(!rendered.contains("正在等待 Agent 输出"));
     assert_eq!(rendered.matches("Run `cargo test`").count(), 1);
@@ -439,7 +483,7 @@ fn lark_card_shows_queued_state_until_the_agent_starts() {
         queued
             .pointer("/header/text_tag_list/0/text/content")
             .and_then(serde_json::Value::as_str),
-        Some("Queued")
+        Some("排队中")
     );
     assert_eq!(
         queued
@@ -470,7 +514,7 @@ fn lark_card_shows_queued_state_until_the_agent_starts() {
         running
             .pointer("/header/text_tag_list/0/text/content")
             .and_then(serde_json::Value::as_str),
-        Some("Running")
+        Some("运行中")
     );
     assert_eq!(
         running
@@ -551,19 +595,19 @@ fn lark_card_renders_token_usage_without_a_heading() {
     assert_eq!(columns.len(), 4);
     assert_eq!(
         columns[0].pointer("/elements/0/content").unwrap(),
-        "<font color='grey'>Total</font>\n**46.0K**\n<font color='grey'>tokens</font>"
+        "<font color='grey'>总计</font>\n**46.0K**\n<font color='grey'>Token</font>"
     );
     assert_eq!(
         columns[1].pointer("/elements/0/content").unwrap(),
-        "<font color='grey'>Input</font>\n**42.8K**\n<font color='grey'>31.6K cached</font>"
+        "<font color='grey'>输入</font>\n**42.8K**\n<font color='grey'>31.6K 缓存</font>"
     );
     assert_eq!(
         columns[2].pointer("/elements/0/content").unwrap(),
-        "<font color='grey'>Output</font>\n**3.2K**\n<font color='grey'>tokens</font>"
+        "<font color='grey'>输出</font>\n**3.2K**\n<font color='grey'>Token</font>"
     );
     assert_eq!(
         columns[3].pointer("/elements/0/content").unwrap(),
-        "<font color='grey'>Reasoning</font>\n**1.9K**\n<font color='grey'>of output</font>"
+        "<font color='grey'>推理</font>\n**1.9K**\n<font color='grey'>输出中的推理</font>"
     );
 }
 
@@ -629,7 +673,7 @@ async fn lark_card_coalesces_intermediate_updates_and_flushes_completion() {
         final_card
             .pointer("/header/text_tag_list/0/text/content")
             .and_then(serde_json::Value::as_str),
-        Some("Completed")
+        Some("已完成")
     );
 }
 
@@ -760,7 +804,10 @@ async fn lark_ask_message_replies_with_a_threaded_interactive_card() {
     assert_eq!(body["msg_type"], "interactive");
     assert_eq!(body["reply_in_thread"], true);
     let card: serde_json::Value = serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
-    assert_eq!(card.pointer("/header/title/content").unwrap(), "Agent 状态");
+    assert_eq!(
+        card.pointer("/header/title/content").unwrap(),
+        "当前对话的 Agent 状态"
+    );
 }
 
 #[derive(Clone, Debug)]

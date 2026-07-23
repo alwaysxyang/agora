@@ -1,6 +1,7 @@
 use super::{Argument, CommandArguments, CommandContext, CommandHandler, CommandNode};
 use crate::channel::ChannelReply;
 use crate::daemon::ExecutionScheduler;
+use crate::i18n;
 
 #[derive(Clone)]
 pub(super) struct StopCommand {
@@ -14,18 +15,15 @@ impl StopCommand {
 
     pub(super) fn command(&self) -> CommandNode<CommandHandler> {
         let command = self.clone();
-        CommandNode::new(
-            "stop",
-            "Stop running or queued agent tasks in the current conversation.",
-        )
-        .argument(Argument::optional(
-            "agent_name",
-            "Configured agent name. Omit it to stop every agent.",
-        ))
-        .handler(CommandHandler::new(move |context, arguments| {
-            let command = command.clone();
-            async move { command.stop(context, arguments).await }
-        }))
+        CommandNode::new("stop", i18n::STOP_COMMAND_DESCRIPTION)
+            .argument(Argument::optional(
+                "agent_name",
+                i18n::STOP_AGENT_ARGUMENT_DESCRIPTION,
+            ))
+            .handler(CommandHandler::new(move |context, arguments| {
+                let command = command.clone();
+                async move { command.stop(context, arguments).await }
+            }))
     }
 
     async fn stop(
@@ -43,22 +41,10 @@ impl StopCommand {
     fn reply(agent_name: Option<&str>, stopped: &[String]) -> ChannelReply {
         if stopped.is_empty() {
             return match agent_name {
-                Some(agent_name) => ChannelReply::new(format!(
-                    "No running agent named {agent_name} in this conversation."
-                )),
-                None => ChannelReply::new("No running agents in this conversation."),
+                Some(agent_name) => ChannelReply::new(i18n::no_running_agent(agent_name)),
+                None => ChannelReply::new(i18n::no_running_agents()),
             };
         }
-
-        let suffix = if stopped.len() == 1 {
-            "agent"
-        } else {
-            "agents"
-        };
-        ChannelReply::new(format!(
-            "Stopped {} {suffix}: {}.",
-            stopped.len(),
-            stopped.join(", ")
-        ))
+        ChannelReply::new(i18n::stopped_agents(stopped))
     }
 }

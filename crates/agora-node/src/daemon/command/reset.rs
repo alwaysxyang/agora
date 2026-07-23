@@ -2,6 +2,7 @@ use super::{CommandArguments, CommandContext, CommandHandler, CommandNode};
 use crate::agent::{ConfiguredAgent, DeleteSessionOutcome};
 use crate::channel::ChannelReply;
 use crate::daemon::ExecutionScheduler;
+use crate::i18n;
 use crate::store::{SessionKey, SessionStore};
 use agora_core::logger;
 use anyhow::{Result, bail};
@@ -20,12 +21,12 @@ impl ResetCommand {
 
     pub(super) fn command(&self) -> CommandNode<CommandHandler> {
         let command = self.clone();
-        CommandNode::new("reset", "Stop tasks and reset backend agent sessions.").handler(
-            CommandHandler::new(move |context, arguments| {
+        CommandNode::new("reset", i18n::RESET_COMMAND_DESCRIPTION).handler(CommandHandler::new(
+            move |context, arguments| {
                 let command = command.clone();
                 async move { command.reset(context, arguments).await }
-            }),
-        )
+            },
+        ))
     }
 
     async fn reset(
@@ -41,9 +42,9 @@ impl ResetCommand {
             )
             .await;
         Ok(Some(if failed.is_empty() {
-            ChannelReply::new("Reset successful.")
+            ChannelReply::new(i18n::RESET_SUCCESSFUL)
         } else {
-            ChannelReply::new(format!("Reset failed for agents: {}.", failed.join(", ")))
+            ChannelReply::new(i18n::reset_failed(&failed))
         }))
     }
 

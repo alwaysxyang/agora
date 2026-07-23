@@ -7,6 +7,7 @@ use crate::channel::{
     ConfiguredChannel, InterruptCallback, RunEvent,
 };
 use crate::config::NodeConfig;
+use crate::i18n;
 use crate::store::{ChannelSessionKey, SessionKey, SessionStore};
 use crate::task::{OutputEvent, TaskContent};
 use agora_core::logger;
@@ -59,10 +60,7 @@ impl AgentDispatcher {
         let agents = self.enabled_agents(channel.name(), task.session_id(), &agents)?;
         if agents.is_empty() {
             return channel
-                .reply(
-                    &task,
-                    ChannelReply::new("No agents are enabled in this conversation."),
-                )
+                .reply(&task, ChannelReply::new(i18n::NO_ENABLED_AGENTS))
                 .await;
         }
         let content = task

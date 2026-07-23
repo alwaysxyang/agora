@@ -2,6 +2,7 @@ use super::rich_message::TelegramRichMessage;
 use super::telegram_api::TelegramApi;
 use crate::channel::{Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, RunEvent};
 use crate::config::TelegramChannelConfig;
+use crate::i18n;
 use crate::task::{ChannelTaskInput, TaskContent};
 use agora_core::logger;
 use anyhow::{Context, Result};
@@ -115,12 +116,12 @@ impl TelegramChannel {
         match reply {
             ChannelReply::Text(text) => text.clone(),
             ChannelReply::AgentList(agents) => {
-                let mut lines = vec!["Agent status (current conversation)".to_string()];
+                let mut lines = vec![i18n::AGENT_STATUS_TITLE.to_string()];
                 lines.extend(agents.iter().map(|agent| {
                     let (marker, state) = if agent.enabled() {
-                        ("✓", "Enabled")
+                        ("✓", i18n::AGENT_ENABLED)
                     } else {
-                        ("−", "Disabled")
+                        ("−", i18n::AGENT_DISABLED)
                     };
                     format!("{marker} {} — {state}", agent.name())
                 }));
@@ -128,12 +129,13 @@ impl TelegramChannel {
             }
             ChannelReply::AgentStatus(agent) => {
                 let (marker, state) = if agent.enabled() {
-                    ("✓", "Enabled")
+                    ("✓", i18n::AGENT_ENABLED)
                 } else {
-                    ("−", "Disabled")
+                    ("−", i18n::AGENT_DISABLED)
                 };
                 format!(
-                    "Agent status (current conversation)\n{marker} {} — {state}",
+                    "{}\n{marker} {} — {state}",
+                    i18n::AGENT_STATUS_TITLE,
                     agent.name()
                 )
             }

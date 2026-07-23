@@ -1,3 +1,4 @@
+use crate::i18n;
 use crate::task::CommandRequest;
 use anyhow::{Result, bail};
 use std::collections::HashSet;
@@ -53,9 +54,9 @@ impl Argument {
 
     fn help(&self) -> String {
         let requirement = if self.required {
-            "required"
+            i18n::REQUIRED
         } else {
-            "optional"
+            i18n::OPTIONAL
         };
         format!("{} ({requirement}) - {}", self.name, self.description)
     }
@@ -171,18 +172,18 @@ impl<H> CommandNode<H> {
 
         if self.handler.is_some() {
             lines.push(String::new());
-            lines.push("Usage:".to_string());
+            lines.push(i18n::USAGE_TITLE.to_string());
             lines.push(self.syntax(path));
             if !self.arguments.is_empty() {
                 lines.push(String::new());
-                lines.push("Arguments:".to_string());
+                lines.push(i18n::ARGUMENTS_TITLE.to_string());
                 lines.extend(self.arguments.iter().map(Argument::help));
             }
         }
 
         if !self.subcommands.is_empty() {
             lines.push(String::new());
-            lines.push("Subcommands:".to_string());
+            lines.push(i18n::SUBCOMMANDS_TITLE.to_string());
             for subcommand in &self.subcommands {
                 let mut subcommand_path = path.to_vec();
                 subcommand_path.push(subcommand.name);
@@ -196,9 +197,7 @@ impl<H> CommandNode<H> {
                 );
             }
             lines.push(String::new());
-            lines.push(format!(
-                "Use {command_path} {{subcommand}} help for details."
-            ));
+            lines.push(i18n::command_details_hint(&command_path));
         }
 
         lines.join("\n")
@@ -291,7 +290,7 @@ where
             return if remaining.is_empty() {
                 CommandResolution::Reply(self.help())
             } else {
-                CommandResolution::Reply("Usage: /help".to_string())
+                CommandResolution::Reply(i18n::usage("/help"))
             };
         }
 
@@ -300,9 +299,7 @@ where
             .iter()
             .find(|command| command.name == command_name)
         else {
-            return CommandResolution::Reply(format!(
-                "Unknown command: {token}\nUse /help to list commands."
-            ));
+            return CommandResolution::Reply(i18n::unknown_command(token));
         };
 
         let mut path = vec![command.name];
@@ -314,13 +311,13 @@ where
         request: &CommandRequest,
     ) -> CommandResolution<H> {
         let Some((root, remaining)) = request.path().split_first() else {
-            return CommandResolution::Reply("Unknown structured command.".to_string());
+            return CommandResolution::Reply(i18n::UNKNOWN_STRUCTURED_COMMAND.to_string());
         };
         let Some(mut command) = self.commands.iter().find(|command| command.name == root) else {
-            return CommandResolution::Reply(format!(
-                "Unknown command: /{}\nUse /help to list commands.",
+            return CommandResolution::Reply(i18n::unknown_command(&format!(
+                "/{}",
                 request.path().join(" ")
-            ));
+            )));
         };
         let mut path = vec![command.name];
         for name in remaining {
@@ -329,10 +326,10 @@ where
                 .iter()
                 .find(|subcommand| subcommand.name == name)
             else {
-                return CommandResolution::Reply(format!(
-                    "Unknown command: /{}\nUse /help to list commands.",
+                return CommandResolution::Reply(i18n::unknown_command(&format!(
+                    "/{}",
                     request.path().join(" ")
-                ));
+                )));
             };
             command = subcommand;
             path.push(command.name);
@@ -351,7 +348,7 @@ where
             .iter()
             .any(|argument| argument.required && request.argument(argument.name).is_none())
         {
-            return CommandResolution::Reply(format!("Usage: {}", command.syntax(&path)));
+            return CommandResolution::Reply(i18n::usage(&command.syntax(&path)));
         }
 
         CommandResolution::Invocation(CommandInvocation {
@@ -383,7 +380,7 @@ where
                 return if remaining.len() == 1 {
                     CommandResolution::Reply(command.help(path))
                 } else {
-                    CommandResolution::Reply(format!("Usage: /{} help", path.join(" ")))
+                    CommandResolution::Reply(i18n::usage(&format!("/{} help", path.join(" "))))
                 };
             }
             if let Some(subcommand) = command
@@ -401,10 +398,7 @@ where
                 CommandResolution::Reply(command.help(path))
             } else {
                 let command_path = format!("/{}", path.join(" "));
-                CommandResolution::Reply(format!(
-                    "Unknown subcommand: {command_path} {}\nUse {command_path} help for usage.",
-                    remaining[0]
-                ))
+                CommandResolution::Reply(i18n::unknown_subcommand(&command_path, remaining[0]))
             };
         };
 
@@ -424,7 +418,7 @@ where
         if remaining.len() < required
             || (!consume_remaining && remaining.len() > command.arguments.len())
         {
-            return CommandResolution::Reply(format!("Usage: {}", command.syntax(path)));
+            return CommandResolution::Reply(i18n::usage(&command.syntax(path)));
         }
 
         let arguments = CommandArguments {
@@ -452,15 +446,15 @@ where
     }
 
     fn help(&self) -> String {
-        let mut lines = vec!["Agora commands:".to_string()];
+        let mut lines = vec![i18n::COMMANDS_TITLE.to_string()];
         lines.extend(
             self.commands
                 .iter()
                 .map(|command| format!("/{} - {}", command.name, command.description)),
         );
-        lines.push("/help - Show all commands.".to_string());
+        lines.push(format!("/help - {}", i18n::HELP_DESCRIPTION));
         lines.push(String::new());
-        lines.push("Use /{command} help for details.".to_string());
+        lines.push(i18n::root_command_details_hint().to_string());
         lines.join("\n")
     }
 }

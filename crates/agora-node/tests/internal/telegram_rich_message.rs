@@ -12,6 +12,40 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 
 #[test]
+fn telegram_rich_message_uses_chinese_system_labels() {
+    let mut content = TelegramRichContent::new("codex-dev".to_string());
+    content.apply(RunEvent::Output(OutputEvent::Thinking {
+        text: "Inspecting the project".to_string(),
+    }));
+    content.apply(RunEvent::Output(OutputEvent::Progress {
+        id: "command-1".to_string(),
+        text: "Run `cargo test`".to_string(),
+        status: ProgressStatus::Completed,
+    }));
+    content.apply(RunEvent::Output(OutputEvent::Answer {
+        text: "All checks passed.".to_string(),
+    }));
+    content.apply(RunEvent::Output(OutputEvent::Usage(TokenUsage {
+        input_tokens: 42_800,
+        cached_input_tokens: 31_600,
+        output_tokens: 3_200,
+        reasoning_output_tokens: 1_900,
+    })));
+    content.apply(RunEvent::Completed { exit_code: 0 });
+
+    let rendered = content.render(false);
+
+    assert!(rendered.starts_with("## codex-dev · 已完成"));
+    assert!(rendered.contains("<summary>思考过程 · 1 条</summary>"));
+    assert!(rendered.contains("<summary>执行进度 · ✓ 1 项已完成</summary>"));
+    assert!(rendered.contains("## 最终回答"));
+    assert!(rendered.contains("总计 **46.0K**"));
+    assert!(rendered.contains("输入 **42.8K** · 31.6K 缓存"));
+    assert!(rendered.contains("输出 **3.2K**"));
+    assert!(rendered.contains("推理 **1.9K**"));
+}
+
+#[test]
 fn telegram_rich_message_separates_process_answer_and_usage() {
     let mut content = TelegramRichContent::new("codex-dev".to_string());
     content.apply(RunEvent::Started {
@@ -47,22 +81,22 @@ fn telegram_rich_message_separates_process_answer_and_usage() {
     content.apply(RunEvent::Completed { exit_code: 0 });
     let rendered = content.render(false);
 
-    assert!(rendered.starts_with("## codex-dev · Completed"));
-    assert!(rendered.contains("<details><summary>Thinking · 2 updates</summary>"));
+    assert!(rendered.starts_with("## codex-dev · 已完成"));
+    assert!(rendered.contains("<details><summary>思考过程 · 2 条</summary>"));
     assert!(
         rendered.find("Checking tests").unwrap() < rendered.find("Inspecting the project").unwrap()
     );
     assert!(
-        rendered.contains("<details><summary>Progress · ✓ 1 completed · ● 1 running</summary>")
+        rendered.contains("<details><summary>执行进度 · ✓ 1 项已完成 · ● 1 项进行中</summary>")
     );
     assert!(
         rendered.find("Run `cargo clippy`").unwrap() < rendered.find("Run `cargo test`").unwrap()
     );
-    assert!(rendered.contains("## Final answer\n\n**Ready.**\n\n- tests pass"));
-    assert!(rendered.contains("Total **46.0K**"));
-    assert!(rendered.contains("Input **42.8K** · 31.6K cached"));
-    assert!(rendered.contains("Output **3.2K**"));
-    assert!(rendered.contains("Reasoning **1.9K**"));
+    assert!(rendered.contains("## 最终回答\n\n**Ready.**\n\n- tests pass"));
+    assert!(rendered.contains("总计 **46.0K**"));
+    assert!(rendered.contains("输入 **42.8K** · 31.6K 缓存"));
+    assert!(rendered.contains("输出 **3.2K**"));
+    assert!(rendered.contains("推理 **1.9K**"));
 }
 
 #[test]
@@ -91,7 +125,7 @@ fn telegram_rich_message_replaces_progress_by_id_and_keeps_latest_first() {
         rendered.find("× Run `cargo test`").unwrap()
             < rendered.find("✓ Read `Cargo.toml`").unwrap()
     );
-    assert!(rendered.contains("✓ 1 completed · × 1 failed"));
+    assert!(rendered.contains("✓ 1 项已完成 · × 1 项失败"));
 }
 
 #[test]
@@ -105,7 +139,7 @@ fn telegram_rich_message_keeps_all_thinking_updates_with_latest_first() {
 
     let rendered = content.render(false);
 
-    assert!(rendered.contains("Thinking · 8 updates"));
+    assert!(rendered.contains("思考过程 · 8 条"));
     for index in 0..8 {
         assert_eq!(rendered.matches(&format!("Thinking {index}")).count(), 1);
     }
@@ -134,8 +168,8 @@ fn telegram_rich_message_uses_native_thinking_only_for_active_drafts() {
 fn telegram_rich_message_renders_queue_stop_and_interruption_states() {
     let mut queued = TelegramRichContent::new("codex-dev".to_string());
     queued.apply(RunEvent::Queued { ahead: 2 });
-    assert!(queued.render(false).contains("## codex-dev · Queued"));
-    assert!(queued.render(false).contains("2 tasks ahead"));
+    assert!(queued.render(false).contains("## codex-dev · 排队中"));
+    assert!(queued.render(false).contains("前面还有 2 个任务"));
 
     let mut stopped = TelegramRichContent::new("codex-dev".to_string());
     stopped.apply(RunEvent::Output(OutputEvent::Progress {
@@ -148,15 +182,15 @@ fn telegram_rich_message_renders_queue_stop_and_interruption_states() {
     }));
     stopped.apply(RunEvent::Stopped);
     let stopped = stopped.render(false);
-    assert!(stopped.contains("## codex-dev · Stopped"));
+    assert!(stopped.contains("## codex-dev · 已停止"));
     assert!(stopped.contains("■ Run tests"));
-    assert!(stopped.contains("## Partial answer\n\nPartial work"));
+    assert!(stopped.contains("## 部分回答\n\nPartial work"));
 
     let mut interrupted = TelegramRichContent::new("codex-dev".to_string());
     interrupted.apply(RunEvent::Interrupted);
     let interrupted = interrupted.render(false);
-    assert!(interrupted.contains("## codex-dev · Interrupted"));
-    assert!(interrupted.contains("Agora Node is shutting down"));
+    assert!(interrupted.contains("## codex-dev · 已中断"));
+    assert!(interrupted.contains("Agora Node 即将退出"));
 }
 
 #[test]
@@ -168,9 +202,9 @@ fn telegram_rich_message_hides_raw_failure_details() {
 
     let rendered = content.render(false);
 
-    assert!(rendered.contains("## codex-dev · Failed"));
-    assert!(rendered.contains("## Run failed"));
-    assert!(rendered.contains("Agent process exited before completing the task."));
+    assert!(rendered.contains("## codex-dev · 失败"));
+    assert!(rendered.contains("## 任务失败"));
+    assert!(rendered.contains("Agent 进程在完成任务前退出。"));
     assert!(!rendered.contains("token=abc"));
 }
 
@@ -239,7 +273,7 @@ async fn private_run_streams_a_draft_and_persists_one_final_reply() {
         final_body["rich_message"]["markdown"]
             .as_str()
             .unwrap()
-            .contains("## codex-dev · Completed")
+            .contains("## codex-dev · 已完成")
     );
 }
 

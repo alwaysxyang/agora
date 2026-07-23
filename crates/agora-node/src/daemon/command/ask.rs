@@ -3,12 +3,11 @@ use super::{
     CommandNode,
 };
 use crate::channel::{ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply};
+use crate::i18n;
 use crate::store::{ChannelSessionKey, SessionStore};
 use crate::task::{CommandRequest, TaskContent};
 use anyhow::{Result, bail};
 use std::collections::HashSet;
-
-const AGENT_NAME_DESCRIPTION: &str = "Configured agent name in this conversation.";
 
 #[derive(Clone)]
 pub(super) struct AskCommand {
@@ -22,32 +21,23 @@ impl AskCommand {
 
     pub(super) fn command(&self) -> CommandNode<CommandHandler> {
         let command = self.clone();
-        CommandNode::new("ask", "Ask one agent or control agent message delivery.")
-            .argument(Argument::required("agent_name", AGENT_NAME_DESCRIPTION))
+        CommandNode::new("ask", i18n::ASK_COMMAND_DESCRIPTION)
+            .argument(Argument::required(
+                "agent_name",
+                i18n::AGENT_NAME_ARGUMENT_DESCRIPTION,
+            ))
             .argument(Argument::required_remaining(
                 "prompt",
-                "Prompt sent only to the selected agent.",
+                i18n::ASK_PROMPT_ARGUMENT_DESCRIPTION,
             ))
             .handler(CommandHandler::new(move |context, arguments| {
                 let command = command.clone();
                 async move { command.ask(context, arguments) }
             }))
             .subcommand(self.list_command())
-            .subcommand(self.agent_command(
-                "status",
-                "Show one agent's current status.",
-                Self::status,
-            ))
-            .subcommand(self.agent_command(
-                "disable",
-                "Disable an agent for subsequent messages.",
-                Self::disable,
-            ))
-            .subcommand(self.agent_command(
-                "enable",
-                "Enable an agent for subsequent messages.",
-                Self::enable,
-            ))
+            .subcommand(self.agent_command("status", i18n::ASK_STATUS_DESCRIPTION, Self::status))
+            .subcommand(self.agent_command("disable", i18n::ASK_DISABLE_DESCRIPTION, Self::disable))
+            .subcommand(self.agent_command("enable", i18n::ASK_ENABLE_DESCRIPTION, Self::enable))
     }
 
     fn ask(
@@ -81,14 +71,12 @@ impl AskCommand {
 
     fn list_command(&self) -> CommandNode<CommandHandler> {
         let command = self.clone();
-        CommandNode::new(
-            "list",
-            "List all subscribed agents and their current status.",
-        )
-        .handler(CommandHandler::new(move |context, arguments| {
-            let command = command.clone();
-            async move { command.list(context, arguments).await }
-        }))
+        CommandNode::new("list", i18n::ASK_LIST_DESCRIPTION).handler(CommandHandler::new(
+            move |context, arguments| {
+                let command = command.clone();
+                async move { command.list(context, arguments).await }
+            },
+        ))
     }
 
     fn agent_command(
@@ -99,7 +87,10 @@ impl AskCommand {
     ) -> CommandNode<CommandHandler> {
         let command = self.clone();
         CommandNode::new(name, description)
-            .argument(Argument::required("agent_name", AGENT_NAME_DESCRIPTION))
+            .argument(Argument::required(
+                "agent_name",
+                i18n::AGENT_NAME_ARGUMENT_DESCRIPTION,
+            ))
             .handler(CommandHandler::new(move |context, arguments| {
                 let command = command.clone();
                 async move { handler(&command, context, arguments) }
@@ -228,9 +219,9 @@ impl AskCommand {
 
     fn agent_button(agent_name: &str, enabled: bool) -> ChannelButton {
         let (text, style, command) = if enabled {
-            ("Disable", ChannelButtonStyle::Default, "disable")
+            (i18n::DISABLE_AGENT, ChannelButtonStyle::Default, "disable")
         } else {
-            ("Enable", ChannelButtonStyle::Primary, "enable")
+            (i18n::ENABLE_AGENT, ChannelButtonStyle::Primary, "enable")
         };
         ChannelButton::new(
             text,
@@ -247,6 +238,6 @@ impl AskCommand {
     }
 
     fn unknown_agent_reply(agent_name: &str) -> ChannelReply {
-        ChannelReply::new(format!("Unknown agent in this conversation: {agent_name}."))
+        ChannelReply::new(i18n::unknown_agent(agent_name))
     }
 }

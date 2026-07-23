@@ -185,31 +185,31 @@ fn command_registry_generates_root_and_command_help() {
     assert_eq!(
         registry.route("/help"),
         CommandResolution::Reply(
-            "Agora commands:\n\
-/stop - Stop running or queued agent tasks in the current conversation.\n\
-/reset - Stop tasks and reset backend agent sessions.\n\
-/ask - Ask one agent or control agent message delivery.\n\
-/help - Show all commands.\n\n\
-Use /{command} help for details."
+            "Agora 命令：\n\
+/stop - 停止当前对话中正在运行或排队的 Agent 任务。\n\
+/reset - 停止任务并重置后端 Agent 会话。\n\
+/ask - 向指定 Agent 提问或控制 Agent 的消息接收状态。\n\
+/help - 显示所有命令。\n\n\
+使用 /{command} help 查看详情。"
                 .to_string()
         )
     );
     assert_eq!(
         registry.route("/stop help"),
         CommandResolution::Reply(
-            "/stop - Stop running or queued agent tasks in the current conversation.\n\n\
-Usage:\n\
+            "/stop - 停止当前对话中正在运行或排队的 Agent 任务。\n\n\
+用法：\n\
 /stop [{agent_name}]\n\
-\nArguments:\n\
-agent_name (optional) - Configured agent name. Omit it to stop every agent."
+\n参数：\n\
+agent_name (可选) - 已配置的 Agent 名称；省略时停止全部 Agent。"
                 .to_string()
         )
     );
     assert_eq!(
         registry.route("/reset help"),
         CommandResolution::Reply(
-            "/reset - Stop tasks and reset backend agent sessions.\n\n\
-Usage:\n\
+            "/reset - 停止任务并重置后端 Agent 会话。\n\n\
+用法：\n\
 /reset"
                 .to_string()
         )
@@ -221,25 +221,25 @@ fn command_registry_generates_subcommand_and_argument_help() {
     let runtime = isolated_command_runtime();
     let registry = runtime.registry();
     let expected = concat!(
-        "/ask - Ask one agent or control agent message delivery.\n\n",
-        "Usage:\n",
+        "/ask - 向指定 Agent 提问或控制 Agent 的消息接收状态。\n\n",
+        "用法：\n",
         "/ask {agent_name} {prompt}\n\n",
-        "Arguments:\n",
-        "agent_name (required) - Configured agent name in this conversation.\n",
-        "prompt (required) - Prompt sent only to the selected agent.\n\n",
-        "Subcommands:\n",
+        "参数：\n",
+        "agent_name (必填) - 当前对话中已配置的 Agent 名称。\n",
+        "prompt (必填) - 仅发送给指定 Agent 的提示词。\n\n",
+        "子命令：\n",
         "/ask list\n",
-        "  List all subscribed agents and their current status.\n",
+        "  列出所有已订阅 Agent 及其当前状态。\n",
         "/ask status {agent_name}\n",
-        "  Show one agent's current status.\n",
-        "  agent_name (required) - Configured agent name in this conversation.\n",
+        "  查看指定 Agent 的当前状态。\n",
+        "  agent_name (必填) - 当前对话中已配置的 Agent 名称。\n",
         "/ask disable {agent_name}\n",
-        "  Disable an agent for subsequent messages.\n",
-        "  agent_name (required) - Configured agent name in this conversation.\n",
+        "  禁止指定 Agent 接收后续消息。\n",
+        "  agent_name (必填) - 当前对话中已配置的 Agent 名称。\n",
         "/ask enable {agent_name}\n",
-        "  Enable an agent for subsequent messages.\n",
-        "  agent_name (required) - Configured agent name in this conversation.\n\n",
-        "Use /ask {subcommand} help for details.",
+        "  允许指定 Agent 接收后续消息。\n",
+        "  agent_name (必填) - 当前对话中已配置的 Agent 名称。\n\n",
+        "使用 /ask {子命令} help 查看详情。",
     );
 
     assert_eq!(
@@ -253,11 +253,11 @@ fn command_registry_generates_subcommand_and_argument_help() {
     assert_eq!(
         registry.route("/ask enable help"),
         CommandResolution::Reply(
-            "/ask enable - Enable an agent for subsequent messages.\n\n\
-Usage:\n\
+            "/ask enable - 允许指定 Agent 接收后续消息。\n\n\
+用法：\n\
 /ask enable {agent_name}\n\n\
-Arguments:\n\
-agent_name (required) - Configured agent name in this conversation."
+参数：\n\
+agent_name (必填) - 当前对话中已配置的 Agent 名称。"
                 .to_string()
         )
     );
@@ -274,21 +274,19 @@ fn command_registry_generates_validation_errors_from_registered_arguments() {
     );
     assert_eq!(
         registry.route("/stop codex-dev reviewer"),
-        CommandResolution::Reply("Usage: /stop [{agent_name}]".to_string())
+        CommandResolution::Reply("用法：/stop [{agent_name}]".to_string())
     );
     assert_eq!(
         registry.route("/ask disable"),
-        CommandResolution::Reply("Usage: /ask disable {agent_name}".to_string())
+        CommandResolution::Reply("用法：/ask disable {agent_name}".to_string())
     );
     assert_eq!(
         registry.route("/ask unknown"),
-        CommandResolution::Reply("Usage: /ask {agent_name} {prompt}".to_string())
+        CommandResolution::Reply("用法：/ask {agent_name} {prompt}".to_string())
     );
     assert_eq!(
         registry.route("/unknown"),
-        CommandResolution::Reply(
-            "Unknown command: /unknown\nUse /help to list commands.".to_string()
-        )
+        CommandResolution::Reply("未知命令：/unknown\n使用 /help 查看全部命令。".to_string())
     );
 }
 
@@ -349,7 +347,7 @@ fn command_registry_validates_structured_arguments() {
 
     assert_eq!(
         registry.route_structured(&CommandRequest::new(["ask", "enable"])),
-        CommandResolution::Reply("Usage: /ask enable {agent_name}".to_string())
+        CommandResolution::Reply("用法：/ask enable {agent_name}".to_string())
     );
 }
 
@@ -791,7 +789,7 @@ async fn channel_loop_routes_stop_without_sending_it_to_the_agent() {
     assert_eq!(contexts.lock().unwrap().as_slice(), ["codex-dev"]);
     assert_eq!(
         replies.lock().unwrap().as_slice(),
-        [ChannelReply::new("Stopped 1 agent: codex-dev.")]
+        [ChannelReply::new("已停止 1 个 Agent：codex-dev。")]
     );
     daemon.abort();
 }
@@ -882,7 +880,7 @@ async fn reset_stops_the_scope_deletes_the_session_and_starts_fresh_next_time() 
     assert_eq!(store.get(&key).unwrap(), None);
     assert_eq!(
         replies.lock().unwrap().as_slice(),
-        [ChannelReply::new("Reset successful.")]
+        [ChannelReply::new("重置成功。")]
     );
 
     let mut output = IgnoreAgentOutput;
@@ -961,7 +959,7 @@ async fn reset_preserves_the_mapping_when_backend_deletion_fails() {
     assert_eq!(store.get(&key).unwrap().as_deref(), Some("old-session"));
     assert_eq!(
         replies.lock().unwrap().as_slice(),
-        [ChannelReply::new("Reset failed for agents: codex-dev.")]
+        [ChannelReply::new("以下 Agent 重置失败：codex-dev。")]
     );
 }
 
@@ -1003,7 +1001,7 @@ async fn reset_removes_the_mapping_when_backend_deletion_is_unsupported() {
     assert_eq!(store.get(&key).unwrap(), None);
     assert_eq!(
         replies.lock().unwrap().as_slice(),
-        [ChannelReply::new("Reset successful.")]
+        [ChannelReply::new("重置成功。")]
     );
 }
 
@@ -1238,9 +1236,7 @@ async fn targeted_ask_rejects_an_agent_that_is_not_subscribed() {
     assert!(contexts.lock().unwrap().is_empty());
     assert_eq!(
         replies.lock().unwrap().as_slice(),
-        [ChannelReply::new(
-            "Unknown agent in this conversation: reviewer."
-        )]
+        [ChannelReply::new("当前对话中不存在 Agent：reviewer。")]
     );
 }
 
@@ -1269,9 +1265,7 @@ async fn agent_input_gets_a_reply_when_every_agent_is_disabled() {
 
     assert_eq!(
         replies.lock().unwrap().as_slice(),
-        [ChannelReply::new(
-            "No agents are enabled in this conversation."
-        )]
+        [ChannelReply::new("当前对话没有启用的 Agent。")]
     );
 }
 
@@ -1293,9 +1287,9 @@ fn command_test_agent(name: &str, workspace: &std::path::Path) -> ConfiguredAgen
 
 fn agent_status_with_button(name: &str, enabled: bool) -> ChannelAgentStatus {
     let (text, style, command) = if enabled {
-        ("Disable", ChannelButtonStyle::Default, "disable")
+        ("禁用", ChannelButtonStyle::Default, "disable")
     } else {
-        ("Enable", ChannelButtonStyle::Primary, "enable")
+        ("启用", ChannelButtonStyle::Primary, "enable")
     };
     ChannelAgentStatus::new(name, enabled).with_button(ChannelButton::new(
         text,

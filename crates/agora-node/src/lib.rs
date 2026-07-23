@@ -2,5 +2,6 @@ pub mod agent;
 pub mod channel;
 pub mod config;
 pub mod daemon;
+mod i18n;
 pub mod store;
 pub mod task;
