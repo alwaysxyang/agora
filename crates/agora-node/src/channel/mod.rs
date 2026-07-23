@@ -10,6 +10,10 @@ use std::sync::Arc;
 pub mod lark;
 mod telegram;
 
+#[cfg(test)]
+#[path = "../../tests/internal/http_mock.rs"]
+pub(crate) mod test_http;
+
 pub trait Channel {
     type Task: ChannelTask;
     type Run: ChannelRun;

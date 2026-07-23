@@ -229,15 +229,16 @@ impl TelegramApi {
     }
 
     fn http_client() -> Result<Client> {
-        Client::builder()
+        let builder = Client::builder()
             .pool_max_idle_per_host(TELEGRAM_HTTP_MAX_IDLE_CONNECTIONS_PER_HOST)
             .pool_idle_timeout(Some(Duration::from_secs(
                 TELEGRAM_HTTP_IDLE_TIMEOUT_SECONDS,
             )))
             .connect_timeout(Duration::from_secs(TELEGRAM_HTTP_CONNECT_TIMEOUT_SECONDS))
-            .timeout(Duration::from_secs(TELEGRAM_HTTP_REQUEST_TIMEOUT_SECONDS))
-            .build()
-            .context("build telegram http client failed")
+            .timeout(Duration::from_secs(TELEGRAM_HTTP_REQUEST_TIMEOUT_SECONDS));
+        #[cfg(test)]
+        let builder = builder.no_proxy();
+        builder.build().context("build telegram http client failed")
     }
 }
 
