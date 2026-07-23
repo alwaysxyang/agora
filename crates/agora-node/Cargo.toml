@@ -7,7 +7,7 @@ edition = { workspace = true }
 agora-core = { path = "../agora-core" }
 anyhow = { workspace = true }
 clap = { workspace = true }
-futures-util = "0.3.32"
+futures-util = "0.3.33"
 prost = "0.14.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "rustls"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
