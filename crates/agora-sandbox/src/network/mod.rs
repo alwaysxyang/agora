@@ -1,8 +1,6 @@
 mod config;
-mod control;
 mod inspection;
 mod proxy;
-mod route;
 
 pub use config::{NetworkConfig, NetworkEnforcement, TlsMode};
 
@@ -12,17 +10,15 @@ use crate::audit::{
     ProcessAudit,
 };
 use crate::protocol::{
-    ControlRequest, ControlResponse, CoverageFallback, CoverageGap, PROTOCOL_VERSION, RouteOutcome,
-    RouteRegistration,
+    CoverageFallback, CoverageGap, PROTOCOL_VERSION, ProtocolError, ProxyRequest, RouteRegistration,
 };
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use inspection::DomainObservation;
-use route::RouteRegistry;
+use std::io;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream, UnixListener};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -52,17 +48,12 @@ impl NetworkRunContext {
 
 #[derive(Clone, Debug)]
 pub struct NetworkRuntime {
-    control_socket: PathBuf,
     token: String,
     proxy_ipv4: SocketAddr,
     proxy_ipv6: SocketAddr,
 }
 
 impl NetworkRuntime {
-    pub fn control_socket(&self) -> &Path {
-        &self.control_socket
-    }
-
     pub fn token(&self) -> &str {
         &self.token
     }
@@ -98,19 +89,6 @@ where
         config.validate()?;
 
         let token = Uuid::new_v4().simple().to_string();
-        let control_socket = std::env::temp_dir().join(format!(
-            "agora-sbx-{}-{}.sock",
-            std::process::id(),
-            &token[..12]
-        ));
-        let control_listener = UnixListener::bind(&control_socket).with_context(|| {
-            format!(
-                "failed to bind sandbox control socket {}",
-                control_socket.display()
-            )
-        })?;
-        Self::restrict_control_socket(&control_socket)?;
-
         let ipv4_listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .context("failed to bind IPv4 sandbox proxy")?;
@@ -124,22 +102,18 @@ where
             config,
             context,
             token: token.clone(),
-            routes: RouteRegistry::new(config.route_ttl),
             callback,
         });
         let (shutdown, shutdown_receiver) = watch::channel(false);
-        let control = control::ControlServer::new(control_listener, Arc::clone(&state));
         let ipv4 = proxy::ProxyServer::new(ipv4_listener, Arc::clone(&state));
         let ipv6 = proxy::ProxyServer::new(ipv6_listener, state);
         let tasks = vec![
-            tokio::spawn(control.run(shutdown_receiver.clone())),
             tokio::spawn(ipv4.run(shutdown_receiver.clone())),
             tokio::spawn(ipv6.run(shutdown_receiver)),
         ];
 
         Ok(Self {
             runtime: NetworkRuntime {
-                control_socket,
                 token,
                 proxy_ipv4,
                 proxy_ipv6,
@@ -165,35 +139,9 @@ where
                 _ => {}
             }
         }
-        self.remove_control_socket();
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
-        }
-    }
-
-    #[cfg(unix)]
-    fn restrict_control_socket(path: &Path) -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(|| {
-            format!(
-                "failed to restrict sandbox control socket {}",
-                path.display()
-            )
-        })
-    }
-
-    #[cfg(not(unix))]
-    fn restrict_control_socket(_path: &Path) -> Result<()> {
-        Ok(())
-    }
-
-    fn remove_control_socket(&self) {
-        match std::fs::remove_file(&self.runtime.control_socket) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => {}
         }
     }
 }
@@ -207,7 +155,6 @@ where
         for task in &self.tasks {
             task.abort();
         }
-        self.remove_control_socket();
     }
 }
 
@@ -218,7 +165,6 @@ where
     config: NetworkConfig,
     context: NetworkRunContext,
     token: String,
-    routes: RouteRegistry,
     callback: C,
 }
 
@@ -226,48 +172,31 @@ impl<C> NetworkState<C>
 where
     C: AuditCallback,
 {
-    fn validate_request(&self, request: &ControlRequest) -> Result<(), String> {
+    pub(super) fn validate_request(&self, request: &ProxyRequest) -> Result<(), ProtocolError> {
         if request.protocol_version() != PROTOCOL_VERSION {
-            return Err(format!(
-                "unsupported control protocol version {}",
-                request.protocol_version()
-            ));
+            return Err(ProtocolError::version_not_supported(format!(
+                "unsupported proxy protocol version {}",
+                request.protocol_version(),
+            )));
         }
         if request.token() != self.token {
-            return Err("invalid control token".to_string());
+            return Err(ProtocolError::unauthorized("invalid proxy bearer token"));
+        }
+        let (sandbox_id, run_id) = request.run();
+        if !self.matches_run(sandbox_id, run_id) {
+            return Err(ProtocolError::forbidden(
+                "proxy request does not belong to this run",
+            ));
         }
         Ok(())
     }
 
-    async fn handle_request(&self, request: ControlRequest) -> ControlResponse {
-        if let Err(message) = self.validate_request(&request) {
-            return ControlResponse::ProtocolRejected { message };
-        }
-
-        match request {
-            ControlRequest::RegisterRoute(registration) => {
-                if !self.matches_run(&registration.sandbox_id, &registration.run_id) {
-                    return ControlResponse::ProtocolRejected {
-                        message: "route registration does not belong to this run".to_string(),
-                    };
-                }
-                self.register_route(registration).await
-            }
-            ControlRequest::CoverageGap(gap) => {
-                if !self.matches_run(&gap.sandbox_id, &gap.run_id) {
-                    return ControlResponse::ProtocolRejected {
-                        message: "coverage gap does not belong to this run".to_string(),
-                    };
-                }
-                self.publish_coverage_gap(&gap);
-                ControlResponse::CoverageGapRecorded
-            }
-        }
-    }
-
-    async fn register_route(&self, registration: RouteRegistration) -> ControlResponse {
+    pub(super) async fn connect_upstream(
+        &self,
+        registration: &RouteRegistration,
+    ) -> io::Result<TcpStream> {
         self.publish_route_event(
-            &registration,
+            registration,
             AuditEventType::NetworkConnectAttempt,
             0,
             AuditDecision::Observed,
@@ -284,18 +213,17 @@ where
         )
         .await;
         let result = match upstream {
-            Ok(Ok(stream)) => self.routes.insert(registration.clone(), stream),
-            Ok(Err(error)) => Err(error),
+            Ok(result) => result,
             Err(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "upstream connection timed out",
             )),
         };
 
-        match result {
-            Ok(()) => {
+        match &result {
+            Ok(_) => {
                 self.publish_route_event(
-                    &registration,
+                    registration,
                     AuditEventType::NetworkConnectEstablished,
                     1,
                     AuditDecision::Allowed,
@@ -305,18 +233,12 @@ where
                         error_message: None,
                     },
                 );
-                ControlResponse::Route {
-                    connection_id: registration.connection_id,
-                    outcome: RouteOutcome::Accepted,
-                    errno: None,
-                    message: None,
-                }
             }
             Err(error) => {
                 let errno = error.raw_os_error();
                 let message = error.to_string();
                 self.publish_route_event(
-                    &registration,
+                    registration,
                     AuditEventType::NetworkConnectFailed,
                     1,
                     AuditDecision::Denied,
@@ -326,14 +248,9 @@ where
                         error_message: Some(message.clone()),
                     },
                 );
-                ControlResponse::Route {
-                    connection_id: registration.connection_id,
-                    outcome: RouteOutcome::Rejected,
-                    errno,
-                    message: Some(message),
-                }
             }
         }
+        result
     }
 
     fn matches_run(&self, sandbox_id: &str, run_id: &str) -> bool {
@@ -367,7 +284,7 @@ where
         });
     }
 
-    fn publish_domain_observed(
+    pub(super) fn publish_domain_observed(
         &self,
         registration: &RouteRegistration,
         observation: &DomainObservation,
@@ -395,7 +312,7 @@ where
         });
     }
 
-    fn publish_closed(
+    pub(super) fn publish_closed(
         &self,
         registration: &RouteRegistration,
         result: std::io::Result<(u64, u64)>,
@@ -447,7 +364,7 @@ where
         });
     }
 
-    fn publish_coverage_gap(&self, gap: &CoverageGap) {
+    pub(super) fn publish_coverage_gap(&self, gap: &CoverageGap) {
         let network = gap.destination.map(|destination| NetworkAudit {
             protocol: NetworkProtocol::Tcp,
             source_ip: None,
@@ -521,7 +438,5 @@ where
 
 #[cfg(test)]
 mod inspection_tests;
-#[cfg(test)]
-mod integration_tests;
 #[cfg(test)]
 mod tests;

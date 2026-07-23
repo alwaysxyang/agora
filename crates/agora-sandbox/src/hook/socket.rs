@@ -1,5 +1,5 @@
 use std::mem::{self, MaybeUninit};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 pub(super) struct RawSocketAddress {
     storage: libc::sockaddr_storage,
@@ -82,13 +82,6 @@ pub(super) unsafe fn socket_addr_from_raw(
             )))
         }
         _ => None,
-    }
-}
-
-pub(super) fn loopback_for(address: SocketAddr, port: u16) -> SocketAddr {
-    match address {
-        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
-        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
     }
 }
 

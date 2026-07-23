@@ -26,7 +26,6 @@ fn ipv6_socket_address_round_trips_scope_and_flow_information() {
 #[test]
 fn hook_configuration_requires_all_runtime_values() {
     let values = HashMap::from([
-        ("AGORA_SANDBOX_CONTROL_SOCKET", "/tmp/control.sock"),
         ("AGORA_SANDBOX_TOKEN", "token"),
         ("AGORA_SANDBOX_ID", "sandbox-1"),
         ("AGORA_SANDBOX_RUN_ID", "run-1"),

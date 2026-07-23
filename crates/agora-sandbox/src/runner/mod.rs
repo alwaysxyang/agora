@@ -8,7 +8,6 @@ use std::process::{ExitStatus, Stdio};
 use tokio::process::Command;
 use uuid::Uuid;
 
-const CONTROL_SOCKET: &str = "AGORA_SANDBOX_CONTROL_SOCKET";
 const TOKEN: &str = "AGORA_SANDBOX_TOKEN";
 const SANDBOX_ID: &str = "AGORA_SANDBOX_ID";
 const RUN_ID: &str = "AGORA_SANDBOX_RUN_ID";
@@ -140,7 +139,6 @@ where
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
-            .env(CONTROL_SOCKET, runtime.control_socket())
             .env(TOKEN, runtime.token())
             .env(SANDBOX_ID, &sandbox_id)
             .env(RUN_ID, &run_id)

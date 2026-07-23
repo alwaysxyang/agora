@@ -1,7 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
 
-const CONTROL_SOCKET: &str = "AGORA_SANDBOX_CONTROL_SOCKET";
 const TOKEN: &str = "AGORA_SANDBOX_TOKEN";
 const SANDBOX_ID: &str = "AGORA_SANDBOX_ID";
 const RUN_ID: &str = "AGORA_SANDBOX_RUN_ID";
@@ -11,7 +9,6 @@ const FAIL_OPEN: &str = "AGORA_SANDBOX_FAIL_OPEN";
 
 #[derive(Clone, Debug)]
 pub(super) struct HookConfig {
-    control_socket: PathBuf,
     token: String,
     sandbox_id: String,
     run_id: String,
@@ -26,7 +23,6 @@ impl HookConfig {
     }
 
     pub(super) fn from_getter(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self, String> {
-        let control_socket = PathBuf::from(Self::required(&mut get, CONTROL_SOCKET)?);
         let token = Self::required(&mut get, TOKEN)?;
         let sandbox_id = Self::required(&mut get, SANDBOX_ID)?;
         let run_id = Self::required(&mut get, RUN_ID)?;
@@ -49,7 +45,6 @@ impl HookConfig {
         };
 
         Ok(Self {
-            control_socket,
             token,
             sandbox_id,
             run_id,
@@ -57,10 +52,6 @@ impl HookConfig {
             proxy_ipv6,
             fail_open,
         })
-    }
-
-    pub(super) fn control_socket(&self) -> &Path {
-        &self.control_socket
     }
 
     pub(super) fn token(&self) -> &str {

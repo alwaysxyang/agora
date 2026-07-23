@@ -20,7 +20,6 @@ pub enum TlsMode {
 pub struct NetworkConfig {
     pub enforcement: NetworkEnforcement,
     pub tls: TlsMode,
-    pub route_ttl: Duration,
     pub upstream_connect_timeout: Duration,
 }
 
@@ -29,7 +28,6 @@ impl Default for NetworkConfig {
         Self {
             enforcement: NetworkEnforcement::Audit,
             tls: TlsMode::Off,
-            route_ttl: Duration::from_secs(30),
             upstream_connect_timeout: Duration::from_secs(10),
         }
     }
@@ -42,9 +40,6 @@ impl NetworkConfig {
         }
         if self.tls != TlsMode::Off {
             bail!("TLS termination is not implemented; use tls=off");
-        }
-        if self.route_ttl.is_zero() {
-            bail!("route_ttl must be greater than zero");
         }
         if self.upstream_connect_timeout.is_zero() {
             bail!("upstream_connect_timeout must be greater than zero");

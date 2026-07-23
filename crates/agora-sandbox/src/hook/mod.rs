@@ -1,6 +1,6 @@
 mod config;
-mod control;
 mod interpose;
+mod proxy;
 mod socket;
 
 #[cfg(test)]

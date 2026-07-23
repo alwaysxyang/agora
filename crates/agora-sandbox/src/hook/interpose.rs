@@ -1,11 +1,11 @@
 #![cfg(target_os = "macos")]
 
 use super::config::HookConfig;
-use super::control::{ControlClient, RouteDecision};
-use super::socket::{RawSocketAddress, loopback_for, set_errno, socket_addr_from_raw};
+use super::proxy::{BlockingSocket, ProxyClient, ProxyDecision};
+use super::socket::{RawSocketAddress, set_errno, socket_addr_from_raw};
 use crate::protocol::{
-    CoverageFallback, CoverageGap, HookOperation, PROTOCOL_VERSION, ProcessIdentity,
-    RouteRegistration,
+    ConnectRequest, CoverageFallback, CoverageGap, HookOperation, PROTOCOL_VERSION,
+    ProcessIdentity, encode_connect_request,
 };
 use std::cell::Cell;
 use std::mem;
@@ -121,40 +121,36 @@ impl HookRuntime {
             self.process.pid,
             self.next_connection.fetch_add(1, Ordering::Relaxed)
         );
-        let source = match unsafe { Self::prepare_source(socket, destination) } {
-            Ok(source) => source,
-            Err(reason) => {
-                return unsafe {
-                    self.coverage_fallback(
-                        socket,
-                        destination_address,
-                        destination_length,
-                        Some(destination),
-                        connection_id,
-                        operation,
-                        reason,
-                        original,
-                    )
-                };
-            }
-        };
-        let registration = RouteRegistration {
+        let request = ConnectRequest {
             protocol_version: PROTOCOL_VERSION,
             token: self.config.token().to_string(),
             sandbox_id: self.config.sandbox_id().to_string(),
             run_id: self.config.run_id().to_string(),
             connection_id: connection_id.clone(),
-            source,
             destination,
             process: self.process.clone(),
             operation,
         };
-        match ControlClient::new(&self.config).register_route(registration) {
-            Ok(RouteDecision::Accepted) => {}
-            Ok(RouteDecision::Rejected { errno }) => {
-                unsafe { set_errno(errno.unwrap_or(libc::ECONNREFUSED)) };
-                return -1;
+        let request = match encode_connect_request(&request) {
+            Ok(request) => request,
+            Err(error) => {
+                return unsafe {
+                    self.coverage_fallback(
+                        socket,
+                        destination_address,
+                        destination_length,
+                        Some(destination),
+                        connection_id,
+                        operation,
+                        format!("failed to encode proxy CONNECT request: {error}"),
+                        original,
+                    )
+                };
             }
+        };
+
+        let blocking = match unsafe { BlockingSocket::new(socket) } {
+            Ok(blocking) => blocking,
             Err(reason) => {
                 return unsafe {
                     self.coverage_fallback(
@@ -169,10 +165,48 @@ impl HookRuntime {
                     )
                 };
             }
-        }
+        };
 
         let proxy = RawSocketAddress::new(self.config.proxy_for(destination));
-        unsafe { original(socket, proxy.as_ptr(), proxy.len()) }
+        if unsafe { original(socket, proxy.as_ptr(), proxy.len()) } != 0 {
+            let reason = format!(
+                "failed to connect intercepted socket to sandbox proxy: {}",
+                std::io::Error::last_os_error()
+            );
+            drop(blocking);
+            return unsafe {
+                self.coverage_fallback(
+                    socket,
+                    destination_address,
+                    destination_length,
+                    Some(destination),
+                    connection_id,
+                    operation,
+                    reason,
+                    original,
+                )
+            };
+        }
+
+        let decision = unsafe { ProxyClient::new(&self.config).handshake(socket, &request) };
+        drop(blocking);
+        match decision {
+            Ok(ProxyDecision::Accepted) => 0,
+            Ok(ProxyDecision::Rejected { errno }) => {
+                unsafe { set_errno(errno) };
+                -1
+            }
+            Err(reason) => {
+                self.report_connected_proxy_gap(
+                    Some(destination),
+                    connection_id,
+                    operation,
+                    reason,
+                );
+                unsafe { set_errno(libc::EPROTO) };
+                -1
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -192,7 +226,7 @@ impl HookRuntime {
         } else {
             CoverageFallback::FailClosed
         };
-        let _ = ControlClient::new(&self.config).report_coverage_gap(CoverageGap {
+        let _ = ProxyClient::new(&self.config).report_coverage_gap(&CoverageGap {
             protocol_version: PROTOCOL_VERSION,
             token: self.config.token().to_string(),
             sandbox_id: self.config.sandbox_id().to_string(),
@@ -223,7 +257,7 @@ impl HookRuntime {
             self.process.pid,
             self.next_connection.fetch_add(1, Ordering::Relaxed)
         );
-        let _ = ControlClient::new(&self.config).report_coverage_gap(CoverageGap {
+        let _ = ProxyClient::new(&self.config).report_coverage_gap(&CoverageGap {
             protocol_version: PROTOCOL_VERSION,
             token: self.config.token().to_string(),
             sandbox_id: self.config.sandbox_id().to_string(),
@@ -236,6 +270,27 @@ impl HookRuntime {
             fallback,
         });
         self.config.fail_open()
+    }
+
+    fn report_connected_proxy_gap(
+        &self,
+        destination: Option<SocketAddr>,
+        connection_id: String,
+        operation: HookOperation,
+        reason: String,
+    ) {
+        let _ = ProxyClient::new(&self.config).report_coverage_gap(&CoverageGap {
+            protocol_version: PROTOCOL_VERSION,
+            token: self.config.token().to_string(),
+            sandbox_id: self.config.sandbox_id().to_string(),
+            run_id: self.config.run_id().to_string(),
+            connection_id: Some(connection_id),
+            destination,
+            process: self.process.clone(),
+            operation,
+            reason,
+            fallback: CoverageFallback::FailClosed,
+        });
     }
 
     unsafe fn is_stream_socket(socket: libc::c_int) -> bool {
@@ -251,51 +306,6 @@ impl HookRuntime {
             ) == 0
                 && socket_type == libc::SOCK_STREAM
         }
-    }
-
-    unsafe fn prepare_source(
-        socket: libc::c_int,
-        destination: SocketAddr,
-    ) -> Result<SocketAddr, String> {
-        let mut source = unsafe { Self::socket_name(socket) }
-            .ok_or_else(|| "getsockname failed before route registration".to_string())?;
-        if source.port() == 0 {
-            let loopback = RawSocketAddress::new(loopback_for(destination, 0));
-            if unsafe { libc::bind(socket, loopback.as_ptr(), loopback.len()) } != 0 {
-                return Err(format!(
-                    "failed to bind intercepted socket to loopback: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            source = unsafe { Self::socket_name(socket) }
-                .ok_or_else(|| "getsockname failed after loopback bind".to_string())?;
-        }
-        if source.ip().is_unspecified() {
-            source = loopback_for(destination, source.port());
-        }
-        if !source.ip().is_loopback() {
-            return Err(format!(
-                "socket is pre-bound to non-loopback source {}",
-                source.ip()
-            ));
-        }
-        Ok(source)
-    }
-
-    unsafe fn socket_name(socket: libc::c_int) -> Option<SocketAddr> {
-        let mut storage = mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
-        let mut length = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        if unsafe {
-            libc::getsockname(
-                socket,
-                storage.as_mut_ptr().cast(),
-                std::ptr::addr_of_mut!(length),
-            )
-        } != 0
-        {
-            return None;
-        }
-        unsafe { socket_addr_from_raw(storage.as_ptr().cast(), length) }
     }
 }
 
@@ -324,7 +334,10 @@ pub unsafe extern "C" fn agora_sandbox_connect(
     catch_unwind(AssertUnwindSafe(|| unsafe {
         runtime.intercept_connect(socket, address, length, HookOperation::Connect, original)
     }))
-    .unwrap_or_else(|_| unsafe { original(socket, address, length) })
+    .unwrap_or_else(|_| {
+        unsafe { set_errno(libc::EIO) };
+        -1
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -417,7 +430,10 @@ pub unsafe extern "C" fn agora_sandbox_connectx(
                 connect,
             )
         }))
-        .unwrap_or(-1);
+        .unwrap_or_else(|_| {
+            unsafe { set_errno(libc::EIO) };
+            -1
+        });
         if result == 0 {
             if !bytes_written.is_null() {
                 unsafe { *bytes_written = 0 };
