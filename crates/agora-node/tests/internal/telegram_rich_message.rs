@@ -39,10 +39,10 @@ fn telegram_rich_message_uses_chinese_system_labels() {
     assert!(rendered.contains("<summary>思考过程 · 1 条</summary>"));
     assert!(rendered.contains("<summary>执行进度 · ✓ 1 项已完成</summary>"));
     assert!(rendered.contains("## 最终回答"));
-    assert!(rendered.contains("总计 **46.0K**"));
-    assert!(rendered.contains("输入 **42.8K** · 31.6K 缓存"));
-    assert!(rendered.contains("输出 **3.2K**"));
-    assert!(rendered.contains("推理 **1.9K**"));
+    assert!(rendered.contains("Total **46.0K**"));
+    assert!(rendered.contains("Input **42.8K** · 31.6K cached"));
+    assert!(rendered.contains("Output **3.2K**"));
+    assert!(rendered.contains("Reasoning **1.9K**"));
 }
 
 #[test]
@@ -93,10 +93,10 @@ fn telegram_rich_message_separates_process_answer_and_usage() {
         rendered.find("Run `cargo clippy`").unwrap() < rendered.find("Run `cargo test`").unwrap()
     );
     assert!(rendered.contains("## 最终回答\n\n**Ready.**\n\n- tests pass"));
-    assert!(rendered.contains("总计 **46.0K**"));
-    assert!(rendered.contains("输入 **42.8K** · 31.6K 缓存"));
-    assert!(rendered.contains("输出 **3.2K**"));
-    assert!(rendered.contains("推理 **1.9K**"));
+    assert!(rendered.contains("Total **46.0K**"));
+    assert!(rendered.contains("Input **42.8K** · 31.6K cached"));
+    assert!(rendered.contains("Output **3.2K**"));
+    assert!(rendered.contains("Reasoning **1.9K**"));
 }
 
 #[test]

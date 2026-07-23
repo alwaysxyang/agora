@@ -160,10 +160,10 @@ fn lark_card_uses_chinese_system_labels() {
     assert!(rendered.contains("**执行进度**"));
     assert!(rendered.contains("1 项已完成"));
     assert!(rendered.contains("**最终回答**"));
-    assert!(rendered.contains("<font color='grey'>总计</font>"));
-    assert!(rendered.contains("<font color='grey'>输入</font>"));
-    assert!(rendered.contains("<font color='grey'>输出</font>"));
-    assert!(rendered.contains("<font color='grey'>推理</font>"));
+    assert!(rendered.contains("<font color='grey'>Total</font>"));
+    assert!(rendered.contains("<font color='grey'>Input</font>"));
+    assert!(rendered.contains("<font color='grey'>Output</font>"));
+    assert!(rendered.contains("<font color='grey'>Reasoning</font>"));
 }
 
 #[test]
@@ -595,19 +595,19 @@ fn lark_card_renders_token_usage_without_a_heading() {
     assert_eq!(columns.len(), 4);
     assert_eq!(
         columns[0].pointer("/elements/0/content").unwrap(),
-        "<font color='grey'>总计</font>\n**46.0K**\n<font color='grey'>Token</font>"
+        "<font color='grey'>Total</font>\n**46.0K**\n<font color='grey'>tokens</font>"
     );
     assert_eq!(
         columns[1].pointer("/elements/0/content").unwrap(),
-        "<font color='grey'>输入</font>\n**42.8K**\n<font color='grey'>31.6K 缓存</font>"
+        "<font color='grey'>Input</font>\n**42.8K**\n<font color='grey'>31.6K cached</font>"
     );
     assert_eq!(
         columns[2].pointer("/elements/0/content").unwrap(),
-        "<font color='grey'>输出</font>\n**3.2K**\n<font color='grey'>Token</font>"
+        "<font color='grey'>Output</font>\n**3.2K**\n<font color='grey'>tokens</font>"
     );
     assert_eq!(
         columns[3].pointer("/elements/0/content").unwrap(),
-        "<font color='grey'>推理</font>\n**1.9K**\n<font color='grey'>输出中的推理</font>"
+        "<font color='grey'>Reasoning</font>\n**1.9K**\n<font color='grey'>of output</font>"
     );
 }
 
