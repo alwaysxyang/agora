@@ -9,9 +9,7 @@ use crate::audit::{
     AuditResult, AuditResultStatus, AuditSubsystem, DomainSource, NetworkAudit, NetworkProtocol,
     ProcessAudit,
 };
-use crate::protocol::{
-    CoverageFallback, CoverageGap, PROTOCOL_VERSION, ProtocolError, ProxyRequest, RouteRegistration,
-};
+use crate::protocol::{ConnectRequest, PROTOCOL_VERSION, ProtocolError, RouteRegistration};
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use inspection::DomainObservation;
@@ -19,73 +17,61 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NetworkRunContext {
+pub(crate) struct NetworkRunContext {
     sandbox_id: String,
     run_id: String,
 }
 
 impl NetworkRunContext {
-    pub fn new(sandbox_id: impl Into<String>, run_id: impl Into<String>) -> Self {
+    pub(crate) fn new(sandbox_id: impl Into<String>, run_id: impl Into<String>) -> Self {
         Self {
             sandbox_id: sandbox_id.into(),
             run_id: run_id.into(),
         }
     }
-
-    pub fn sandbox_id(&self) -> &str {
-        &self.sandbox_id
-    }
-
-    pub fn run_id(&self) -> &str {
-        &self.run_id
-    }
 }
 
 #[derive(Clone, Debug)]
-pub struct NetworkRuntime {
+pub(crate) struct NetworkRuntime {
     token: String,
     proxy_ipv4: SocketAddr,
     proxy_ipv6: SocketAddr,
 }
 
 impl NetworkRuntime {
-    pub fn token(&self) -> &str {
+    pub(crate) fn token(&self) -> &str {
         &self.token
     }
 
-    pub fn proxy_ipv4(&self) -> SocketAddr {
+    pub(crate) fn proxy_ipv4(&self) -> SocketAddr {
         self.proxy_ipv4
     }
 
-    pub fn proxy_ipv6(&self) -> SocketAddr {
+    pub(crate) fn proxy_ipv6(&self) -> SocketAddr {
         self.proxy_ipv6
     }
 }
 
-pub struct NetworkController<C>
-where
-    C: AuditCallback,
-{
+pub(crate) struct NetworkController {
     runtime: NetworkRuntime,
     shutdown: watch::Sender<bool>,
-    tasks: Vec<JoinHandle<Result<()>>>,
-    marker: std::marker::PhantomData<C>,
+    tasks: JoinSet<Result<()>>,
 }
 
-impl<C> NetworkController<C>
-where
-    C: AuditCallback,
-{
-    pub async fn start(
+impl NetworkController {
+    pub(crate) async fn start<C>(
         config: NetworkConfig,
         context: NetworkRunContext,
         callback: C,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        C: AuditCallback,
+    {
         config.validate()?;
 
         let token = Uuid::new_v4().simple().to_string();
@@ -97,20 +83,20 @@ where
             .context("failed to bind IPv6 sandbox proxy")?;
         let proxy_ipv4 = ipv4_listener.local_addr()?;
         let proxy_ipv6 = ipv6_listener.local_addr()?;
-
+        let max_connections = config.max_connections;
         let state = Arc::new(NetworkState {
             config,
             context,
             token: token.clone(),
             callback,
+            connections: Arc::new(Semaphore::new(max_connections)),
         });
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let ipv4 = proxy::ProxyServer::new(ipv4_listener, Arc::clone(&state));
         let ipv6 = proxy::ProxyServer::new(ipv6_listener, state);
-        let tasks = vec![
-            tokio::spawn(ipv4.run(shutdown_receiver.clone())),
-            tokio::spawn(ipv6.run(shutdown_receiver)),
-        ];
+        let mut tasks = JoinSet::new();
+        tasks.spawn(ipv4.run(shutdown_receiver.clone()));
+        tasks.spawn(ipv6.run(shutdown_receiver));
 
         Ok(Self {
             runtime: NetworkRuntime {
@@ -120,19 +106,29 @@ where
             },
             shutdown,
             tasks,
-            marker: std::marker::PhantomData,
         })
     }
 
-    pub fn runtime(&self) -> &NetworkRuntime {
+    pub(crate) fn runtime(&self) -> &NetworkRuntime {
         &self.runtime
     }
 
-    pub async fn shutdown(mut self) -> Result<()> {
+    pub(crate) async fn wait_failure(&mut self) -> anyhow::Error {
+        match self.tasks.join_next().await {
+            Some(Ok(Ok(()))) => anyhow::anyhow!("sandbox proxy listener stopped unexpectedly"),
+            Some(Ok(Err(error))) => error.context("sandbox proxy listener failed"),
+            Some(Err(error)) => {
+                anyhow::Error::from(error).context("sandbox proxy listener task failed")
+            }
+            None => anyhow::anyhow!("sandbox proxy has no active listener tasks"),
+        }
+    }
+
+    pub(crate) async fn shutdown(mut self) -> Result<()> {
         let _ = self.shutdown.send(true);
         let mut first_error = None;
-        while let Some(task) = self.tasks.pop() {
-            match task.await {
+        while let Some(task) = self.tasks.join_next().await {
+            match task {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
                 Err(error) if first_error.is_none() => first_error = Some(error.into()),
@@ -144,17 +140,19 @@ where
             None => Ok(()),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn abort_listener_for_test(&mut self) {
+        self.tasks.spawn(async {
+            anyhow::bail!("injected proxy listener failure");
+        });
+    }
 }
 
-impl<C> Drop for NetworkController<C>
-where
-    C: AuditCallback,
-{
+impl Drop for NetworkController {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
-        for task in &self.tasks {
-            task.abort();
-        }
+        self.tasks.abort_all();
     }
 }
 
@@ -166,27 +164,22 @@ where
     context: NetworkRunContext,
     token: String,
     callback: C,
+    connections: Arc<Semaphore>,
 }
 
 impl<C> NetworkState<C>
 where
     C: AuditCallback,
 {
-    pub(super) fn validate_request(&self, request: &ProxyRequest) -> Result<(), ProtocolError> {
-        if request.protocol_version() != PROTOCOL_VERSION {
+    pub(super) fn validate_request(&self, request: &ConnectRequest) -> Result<(), ProtocolError> {
+        if request.protocol_version != PROTOCOL_VERSION {
             return Err(ProtocolError::version_not_supported(format!(
                 "unsupported proxy protocol version {}",
-                request.protocol_version(),
+                request.protocol_version,
             )));
         }
-        if request.token() != self.token {
+        if request.token != self.token {
             return Err(ProtocolError::unauthorized("invalid proxy bearer token"));
-        }
-        let (sandbox_id, run_id) = request.run();
-        if !self.matches_run(sandbox_id, run_id) {
-            return Err(ProtocolError::forbidden(
-                "proxy request does not belong to this run",
-            ));
         }
         Ok(())
     }
@@ -251,10 +244,6 @@ where
             }
         }
         result
-    }
-
-    fn matches_run(&self, sandbox_id: &str, run_id: &str) -> bool {
-        sandbox_id == self.context.sandbox_id && run_id == self.context.run_id
     }
 
     fn publish_route_event(
@@ -364,44 +353,6 @@ where
         });
     }
 
-    pub(super) fn publish_coverage_gap(&self, gap: &CoverageGap) {
-        let network = gap.destination.map(|destination| NetworkAudit {
-            protocol: NetworkProtocol::Tcp,
-            source_ip: None,
-            source_port: None,
-            destination_ip: destination.ip(),
-            destination_port: destination.port(),
-            http_host: None,
-            tls_sni: None,
-            domain: None,
-            domain_source: None,
-        });
-        self.callback.on_event(AuditEvent {
-            schema_version: AUDIT_SCHEMA_VERSION,
-            event_id: Uuid::new_v4().to_string(),
-            occurred_at: Self::now(),
-            subsystem: AuditSubsystem::Network,
-            event_type: AuditEventType::NetworkCoverageGap,
-            sandbox_id: self.context.sandbox_id.clone(),
-            run_id: self.context.run_id.clone(),
-            connection_id: gap.connection_id.clone(),
-            sequence: gap.connection_id.as_ref().map(|_| 0),
-            process: Self::process_audit(&gap.process),
-            network,
-            tls: None,
-            decision: match gap.fallback {
-                CoverageFallback::FailOpen => AuditDecision::FailedOpen,
-                CoverageFallback::FailClosed => AuditDecision::Denied,
-            },
-            result: AuditResult {
-                status: AuditResultStatus::Failed,
-                error_code: Some("interception_coverage_gap".to_string()),
-                error_message: Some(gap.reason.clone()),
-            },
-            metrics: None,
-        });
-    }
-
     fn process_audit(process: &crate::protocol::ProcessIdentity) -> ProcessAudit {
         ProcessAudit {
             pid: process.pid,
@@ -416,8 +367,6 @@ where
     ) -> NetworkAudit {
         NetworkAudit {
             protocol: NetworkProtocol::Tcp,
-            source_ip: Some(registration.source.ip()),
-            source_port: Some(registration.source.port()),
             destination_ip: registration.destination.ip(),
             destination_port: registration.destination.port(),
             http_host: observation

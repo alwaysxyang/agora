@@ -1,15 +1,14 @@
-use super::NetworkState;
+mod proxy;
+
 use super::inspection::DomainObservation;
+use super::{NetworkConfig, NetworkController, NetworkRunContext, NetworkState};
 use crate::audit::{DomainSource, NoopAuditCallback};
 use crate::protocol::{HookOperation, ProcessIdentity, RouteRegistration};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 fn registration() -> RouteRegistration {
     RouteRegistration {
-        sandbox_id: "sandbox".to_string(),
-        run_id: "run".to_string(),
         connection_id: "connection-1".to_string(),
-        source: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49155),
         destination: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
         process: ProcessIdentity {
             pid: 1,
@@ -18,6 +17,37 @@ fn registration() -> RouteRegistration {
         },
         operation: HookOperation::Connect,
     }
+}
+
+#[test]
+fn network_config_requires_a_positive_connection_limit() {
+    let mut config = NetworkConfig::default();
+    assert!(config.max_connections > 0);
+
+    config.max_connections = 0;
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_connections")
+    );
+}
+
+#[tokio::test]
+async fn controller_reports_an_unexpected_listener_exit() {
+    let mut controller = NetworkController::start(
+        NetworkConfig::default(),
+        NetworkRunContext::new("sandbox", "run"),
+        NoopAuditCallback,
+    )
+    .await
+    .unwrap();
+    controller.abort_listener_for_test();
+
+    let error = controller.wait_failure().await;
+
+    assert!(error.to_string().contains("proxy listener"));
 }
 
 #[test]

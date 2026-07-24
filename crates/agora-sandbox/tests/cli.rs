@@ -41,7 +41,7 @@ fn hook_library() -> PathBuf {
 }
 
 #[test]
-fn sandbox_cli_documents_command_and_network_options() {
+fn sandbox_cli_documents_only_available_options() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
         .arg("--help")
         .output()
@@ -51,10 +51,8 @@ fn sandbox_cli_documents_command_and_network_options() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("-c, --command <COMMAND>"));
     assert!(stdout.contains("--hook-library <HOOK_LIBRARY>"));
-    assert!(stdout.contains("--network-enforcement <NETWORK_ENFORCEMENT>"));
-    assert!(stdout.contains("--tls <TLS>"));
-    assert!(stdout.contains("audit"));
-    assert!(stdout.contains("strict"));
+    assert!(!stdout.contains("--network-enforcement"));
+    assert!(!stdout.contains("--tls"));
 }
 
 #[test]

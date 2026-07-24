@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 use std::time::Duration;
 
+const DEFAULT_MAX_CONNECTIONS: usize = 256;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NetworkEnforcement {
     #[default]
@@ -21,6 +23,7 @@ pub struct NetworkConfig {
     pub enforcement: NetworkEnforcement,
     pub tls: TlsMode,
     pub upstream_connect_timeout: Duration,
+    pub max_connections: usize,
 }
 
 impl Default for NetworkConfig {
@@ -29,6 +32,7 @@ impl Default for NetworkConfig {
             enforcement: NetworkEnforcement::Audit,
             tls: TlsMode::Off,
             upstream_connect_timeout: Duration::from_secs(10),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 }
@@ -43,6 +47,9 @@ impl NetworkConfig {
         }
         if self.upstream_connect_timeout.is_zero() {
             bail!("upstream_connect_timeout must be greater than zero");
+        }
+        if self.max_connections == 0 {
+            bail!("max_connections must be greater than zero");
         }
         Ok(())
     }

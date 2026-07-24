@@ -1,5 +1,5 @@
 use crate::audit::AuditCallback;
-use crate::network::{NetworkConfig, NetworkController, NetworkEnforcement, NetworkRunContext};
+use crate::network::{NetworkConfig, NetworkController, NetworkRunContext};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -9,11 +9,8 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 const TOKEN: &str = "AGORA_SANDBOX_TOKEN";
-const SANDBOX_ID: &str = "AGORA_SANDBOX_ID";
-const RUN_ID: &str = "AGORA_SANDBOX_RUN_ID";
 const PROXY_IPV4: &str = "AGORA_SANDBOX_PROXY_IPV4";
 const PROXY_IPV6: &str = "AGORA_SANDBOX_PROXY_IPV6";
-const FAIL_OPEN: &str = "AGORA_SANDBOX_FAIL_OPEN";
 
 #[derive(Clone, Debug)]
 pub struct SandboxConfig {
@@ -126,7 +123,7 @@ where
         })?;
         let sandbox_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
-        let controller = NetworkController::start(
+        let mut controller = NetworkController::start(
             self.config.network,
             NetworkRunContext::new(&sandbox_id, &run_id),
             self.callback,
@@ -140,27 +137,21 @@ where
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .env(TOKEN, runtime.token())
-            .env(SANDBOX_ID, &sandbox_id)
-            .env(RUN_ID, &run_id)
             .env(PROXY_IPV4, runtime.proxy_ipv4().to_string())
             .env(PROXY_IPV6, runtime.proxy_ipv6().to_string())
-            .env(
-                FAIL_OPEN,
-                if self.config.network.enforcement == NetworkEnforcement::Audit {
-                    "1"
-                } else {
-                    "0"
-                },
-            )
             .env(
                 "DYLD_INSERT_LIBRARIES",
                 Self::injected_libraries(&hook_library)?,
             );
 
-        let status = match child.spawn() {
-            Ok(mut child) => child.wait().await.context("sandbox child wait failed"),
-            Err(error) => Err(error).context("failed to start sandbox child"),
+        let mut child = match child.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                controller.shutdown().await?;
+                return Err(error).context("failed to start sandbox child");
+            }
         };
+        let status = wait_for_child_or_proxy(&mut child, &mut controller).await;
         let shutdown = controller.shutdown().await;
         let status = status?;
         shutdown?;
@@ -178,6 +169,29 @@ where
             libraries.extend(std::env::split_paths(&existing));
         }
         std::env::join_paths(libraries).context("invalid DYLD_INSERT_LIBRARIES path")
+    }
+}
+
+async fn wait_for_child_or_proxy(
+    child: &mut tokio::process::Child,
+    controller: &mut NetworkController,
+) -> Result<ExitStatus> {
+    enum Completion {
+        Child(std::io::Result<ExitStatus>),
+        Proxy(anyhow::Error),
+    }
+
+    let completion = tokio::select! {
+        status = child.wait() => Completion::Child(status),
+        error = controller.wait_failure() => Completion::Proxy(error),
+    };
+    match completion {
+        Completion::Child(status) => status.context("sandbox child wait failed"),
+        Completion::Proxy(error) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(error).context("sandbox network proxy failed")
+        }
     }
 }
 
@@ -207,3 +221,6 @@ impl From<&OsStr> for SandboxCommand {
         Self::new(program)
     }
 }
+
+#[cfg(test)]
+mod tests;

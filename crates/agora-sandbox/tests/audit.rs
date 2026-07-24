@@ -24,8 +24,6 @@ fn network_event() -> AuditEvent {
         },
         network: Some(NetworkAudit {
             protocol: NetworkProtocol::Tcp,
-            source_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            source_port: Some(49152),
             destination_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
             destination_port: 443,
             http_host: Some("example.com".to_string()),
@@ -52,11 +50,13 @@ fn network_event() -> AuditEvent {
 fn audit_event_uses_stable_versioned_json_fields() {
     let value = serde_json::to_value(network_event()).unwrap();
 
-    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["schema_version"], 3);
     assert_eq!(value["subsystem"], "network");
     assert_eq!(value["event_type"], "network.domain.observed");
     assert_eq!(value["network"]["protocol"], "tcp");
     assert_eq!(value["network"]["destination_ip"], "203.0.113.10");
+    assert!(value["network"].get("source_ip").is_none());
+    assert!(value["network"].get("source_port").is_none());
     assert_eq!(value["network"]["domain_source"], "http_host");
     assert_eq!(value["decision"], "observed");
     assert_eq!(value["result"]["status"], "started");

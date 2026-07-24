@@ -7,11 +7,10 @@ use agora_core::{
 };
 use agora_sandbox::{
     audit::{AuditCallback, AuditEvent},
-    network::{NetworkEnforcement, TlsMode},
     runner::{Sandbox, SandboxCommand, SandboxConfig},
 };
 use anyhow::{Context, Result};
-use clap::{ColorChoice, Parser, ValueEnum};
+use clap::{ColorChoice, Parser};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{ExitCode, ExitStatus};
@@ -31,46 +30,6 @@ struct Arguments {
     /// Path to the injectable libagora_sandbox.dylib
     #[arg(long)]
     hook_library: Option<PathBuf>,
-
-    /// Network enforcement mode
-    #[arg(long, value_enum, default_value_t = NetworkEnforcementArgument::Audit)]
-    network_enforcement: NetworkEnforcementArgument,
-
-    /// TLS termination mode
-    #[arg(long, value_enum, default_value_t = TlsArgument::Off)]
-    tls: TlsArgument,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum NetworkEnforcementArgument {
-    Audit,
-    Strict,
-}
-
-impl From<NetworkEnforcementArgument> for NetworkEnforcement {
-    fn from(value: NetworkEnforcementArgument) -> Self {
-        match value {
-            NetworkEnforcementArgument::Audit => Self::Audit,
-            NetworkEnforcementArgument::Strict => Self::Strict,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum TlsArgument {
-    Off,
-    Auto,
-    Require,
-}
-
-impl From<TlsArgument> for TlsMode {
-    fn from(value: TlsArgument) -> Self {
-        match value {
-            TlsArgument::Off => Self::Off,
-            TlsArgument::Auto => Self::Auto,
-            TlsArgument::Require => Self::Require,
-        }
-    }
 }
 
 struct JsonAuditCallback {
@@ -105,9 +64,7 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
         Some(path) => path,
         None => default_hook_library()?,
     };
-    let mut config = SandboxConfig::new(hook_library);
-    config.network.enforcement = arguments.network_enforcement.into();
-    config.network.tls = arguments.tls.into();
+    let config = SandboxConfig::new(hook_library);
     let command = parse_command(&arguments.command)?;
 
     let status = Arc::new(Mutex::new(None::<ExitStatus>));

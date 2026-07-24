@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
-pub const AUDIT_SCHEMA_VERSION: u16 = 2;
+pub const AUDIT_SCHEMA_VERSION: u16 = 3;
 
 pub trait AuditCallback: Send + Sync + 'static {
     fn on_event(&self, event: AuditEvent);
@@ -62,8 +62,6 @@ pub enum AuditEventType {
     NetworkConnectFailed,
     #[serde(rename = "network.connection.closed")]
     NetworkConnectionClosed,
-    #[serde(rename = "network.coverage.gap")]
-    NetworkCoverageGap,
     #[serde(rename = "filesystem.read")]
     FilesystemRead,
     #[serde(rename = "filesystem.write")]
@@ -84,8 +82,6 @@ pub struct ProcessAudit {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkAudit {
     pub protocol: NetworkProtocol,
-    pub source_ip: Option<IpAddr>,
-    pub source_port: Option<u16>,
     pub destination_ip: IpAddr,
     pub destination_port: u16,
     pub http_host: Option<String>,
@@ -137,7 +133,6 @@ pub enum AuditDecision {
     Observed,
     Allowed,
     Denied,
-    FailedOpen,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -2,8 +2,8 @@ use super::NetworkState;
 use super::inspection::{DomainObservation, ProtocolInspector};
 use crate::audit::AuditCallback;
 use crate::protocol::{
-    HANDSHAKE_TIMEOUT, MAX_FRAME_SIZE, ProtocolError, ProxyRequest, RouteRegistration,
-    encode_proxy_response, parse_proxy_request, request_body_length,
+    ConnectRequest, HANDSHAKE_TIMEOUT, MAX_FRAME_SIZE, ProtocolError, RouteRegistration,
+    parse_connect_request_prefix,
 };
 use anyhow::{Context, Result};
 use std::io;
@@ -40,10 +40,15 @@ where
                     }
                 }
                 accepted = self.listener.accept() => {
-                    let (client, source) = accepted.context("sandbox proxy accept failed")?;
+                    let (client, _) = accepted.context("sandbox proxy accept failed")?;
+                    let Ok(permit) = Arc::clone(&self.state.connections).try_acquire_owned() else {
+                        drop(client);
+                        continue;
+                    };
                     let state = Arc::clone(&self.state);
                     connections.spawn(async move {
-                        Self::handle_connection(state, client, source).await;
+                        let _permit = permit;
+                        Self::handle_connection(state, client).await;
                     });
                 }
                 Some(_) = connections.join_next(), if !connections.is_empty() => {}
@@ -59,58 +64,32 @@ where
         Ok(())
     }
 
-    async fn handle_connection(
-        state: Arc<NetworkState<C>>,
-        mut client: TcpStream,
-        source: std::net::SocketAddr,
-    ) {
-        let request =
+    async fn handle_connection(state: Arc<NetworkState<C>>, mut client: TcpStream) {
+        let (request, initial_data) =
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, Self::read_request(&mut client)).await {
                 Ok(Ok(request)) => request,
-                Ok(Err(error)) => {
-                    Self::reject(&mut client, error.status(), None).await;
-                    return;
-                }
-                Err(_) => {
-                    Self::reject(&mut client, 408, Some(libc::ETIMEDOUT)).await;
-                    return;
-                }
+                Ok(Err(_)) | Err(_) => return,
             };
 
-        if let Err(error) = state.validate_request(&request) {
-            Self::reject(&mut client, error.status(), None).await;
+        if state.validate_request(&request).is_err() {
             return;
         }
 
-        match request {
-            ProxyRequest::CoverageGap(gap) => {
-                state.publish_coverage_gap(&gap);
-                let _ = client.write_all(&encode_proxy_response(204, None)).await;
-                let _ = client.shutdown().await;
-            }
-            ProxyRequest::Connect(request) => {
-                let registration = request.into_registration(source);
-                match state.connect_upstream(&registration).await {
-                    Ok(upstream) => Self::relay(state, client, upstream, registration).await,
-                    Err(error) => {
-                        let status = if error.kind() == io::ErrorKind::TimedOut {
-                            504
-                        } else {
-                            502
-                        };
-                        Self::reject(&mut client, status, error.raw_os_error()).await;
-                    }
-                }
-            }
+        let registration = request.into_registration();
+        if let Ok(upstream) = state.connect_upstream(&registration).await {
+            Self::relay(state, client, upstream, registration, initial_data).await;
         }
     }
 
-    async fn read_request(client: &mut TcpStream) -> Result<ProxyRequest, ProtocolError> {
-        let mut head = Vec::with_capacity(1024);
-        while head.len() < MAX_FRAME_SIZE {
-            let mut byte = 0_u8;
+    async fn read_request(
+        client: &mut TcpStream,
+    ) -> Result<(ConnectRequest, Vec<u8>), ProtocolError> {
+        let mut bytes = Vec::with_capacity(4096);
+        let mut buffer = [0_u8; 4096];
+        while bytes.len() < MAX_FRAME_SIZE {
+            let available = (MAX_FRAME_SIZE - bytes.len()).min(buffer.len());
             let read = client
-                .read(std::slice::from_mut(&mut byte))
+                .read(&mut buffer[..available])
                 .await
                 .map_err(|error| {
                     ProtocolError::bad_request(format!("failed to read HTTP request: {error}"))
@@ -120,49 +99,27 @@ where
                     "proxy connection closed before the HTTP request was complete",
                 ));
             }
-            head.push(byte);
-            if head.ends_with(b"\r\n\r\n") {
-                break;
+            bytes.extend_from_slice(&buffer[..read]);
+            if let Some((request, consumed)) = parse_connect_request_prefix(&bytes)? {
+                let initial_data = bytes.split_off(consumed);
+                return Ok((request, initial_data));
             }
         }
-        if !head.ends_with(b"\r\n\r\n") {
-            return Err(ProtocolError::bad_request(format!(
-                "HTTP request head exceeds {MAX_FRAME_SIZE} bytes",
-            )));
-        }
-
-        let body_length = request_body_length(&head)?;
-        if head.len().saturating_add(body_length) > MAX_FRAME_SIZE {
-            return Err(ProtocolError::bad_request(format!(
-                "HTTP request exceeds {MAX_FRAME_SIZE} bytes",
-            )));
-        }
-        let mut body = vec![0_u8; body_length];
-        client.read_exact(&mut body).await.map_err(|error| {
-            ProtocolError::bad_request(format!("failed to read HTTP request body: {error}"))
-        })?;
-        parse_proxy_request(&head, &body)
-    }
-
-    async fn reject(client: &mut TcpStream, status: u16, errno: Option<i32>) {
-        let _ = client
-            .write_all(&encode_proxy_response(status, errno))
-            .await;
-        let _ = client.shutdown().await;
+        Err(ProtocolError::bad_request(format!(
+            "HTTP request head exceeds {MAX_FRAME_SIZE} bytes",
+        )))
     }
 
     async fn relay(
         state: Arc<NetworkState<C>>,
-        mut client: TcpStream,
+        client: TcpStream,
         upstream: TcpStream,
         registration: RouteRegistration,
+        initial_data: Vec<u8>,
     ) {
         let started = Instant::now();
-        if let Err(error) = client.write_all(&encode_proxy_response(200, None)).await {
-            state.publish_closed(&registration, Err(error), 0, None);
-            return;
-        }
-        let outcome = Self::copy_with_inspection(&state, &registration, client, upstream).await;
+        let outcome =
+            Self::copy_with_inspection(&state, &registration, client, upstream, initial_data).await;
         let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         state.publish_closed(
             &registration,
@@ -177,6 +134,7 @@ where
         registration: &RouteRegistration,
         client: TcpStream,
         upstream: TcpStream,
+        initial_data: Vec<u8>,
     ) -> RelayOutcome {
         let (mut client_reader, mut client_writer) = client.into_split();
         let (mut upstream_reader, mut upstream_writer) = upstream.into_split();
@@ -185,6 +143,16 @@ where
         let client_to_upstream = async {
             let mut inspector = ProtocolInspector::new();
             let mut bytes_sent = 0_u64;
+            if !initial_data.is_empty() {
+                if let Some(domain) = inspector.inspect(&initial_data) {
+                    state.publish_domain_observed(registration, &domain);
+                    *client_domain
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(domain);
+                }
+                upstream_writer.write_all(&initial_data).await?;
+                bytes_sent = initial_data.len() as u64;
+            }
             let mut buffer = [0_u8; 16 * 1024];
             loop {
                 let read = client_reader.read(&mut buffer).await?;
