@@ -1,18 +1,18 @@
-use agora_core::{
-    lifecycle::{
-        shutdown::{ShutdownGuard, ShutdownReason},
-        signal::{Signal, SignalHandlers},
-    },
-    logger,
+use agora_core::lifecycle::{
+    shutdown::{ShutdownGuard, ShutdownReason},
+    signal::{Signal, SignalHandlers},
 };
 use agora_sandbox::{
-    audit::{AuditCallback, AuditEvent},
+    audit::{AuditCallback, AuditEvent, AuditEventType},
     runner::{Sandbox, SandboxCommand, SandboxConfig},
 };
 use anyhow::{Context, Result};
 use clap::{ColorChoice, Parser};
+use serde::Serialize;
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -30,33 +30,149 @@ struct Arguments {
     /// Path to the injectable libagora_sandbox.dylib
     #[arg(long)]
     hook_library: Option<PathBuf>,
+
+    /// Path for JSON Lines audit records; defaults to stdout
+    #[arg(long)]
+    audit_file: Option<PathBuf>,
 }
 
 struct JsonAuditCallback {
-    writer: Mutex<io::Stderr>,
+    state: Mutex<AuditState>,
 }
 
 impl JsonAuditCallback {
-    fn new() -> Self {
-        Self {
-            writer: Mutex::new(io::stderr()),
-        }
-    }
-
-    fn writer(&self) -> MutexGuard<'_, io::Stderr> {
-        self.writer
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn new(path: Option<&Path>) -> Result<Self> {
+        Ok(Self {
+            state: Mutex::new(AuditState::new(path)?),
+        })
     }
 }
 
 impl AuditCallback for JsonAuditCallback {
     fn on_event(&self, event: AuditEvent) {
-        let Ok(event) = serde_json::to_string(&event) else {
-            return;
-        };
-        let _ = writeln!(self.writer(), "{event}");
+        if let Err(error) = lock(&self.state).on_event(&event) {
+            eprintln!("failed to write sandbox audit record: {error:#}");
+        }
     }
+}
+
+struct AuditState {
+    output: AuditOutput,
+    pending: HashMap<String, AuditRecord>,
+}
+
+impl AuditState {
+    fn new(path: Option<&Path>) -> Result<Self> {
+        Ok(Self {
+            output: AuditOutput::new(path)?,
+            pending: HashMap::new(),
+        })
+    }
+
+    fn on_event(&mut self, event: &AuditEvent) -> Result<()> {
+        match event.event_type {
+            AuditEventType::NetworkConnectAttempt => {
+                let (Some(connection_id), Some(network)) =
+                    (event.connection_id.as_ref(), event.network.as_ref())
+                else {
+                    return Ok(());
+                };
+                self.pending.insert(
+                    connection_id.clone(),
+                    AuditRecord {
+                        access_time: event.occurred_at.clone(),
+                        pid: event.process.pid,
+                        destination_ip: network.destination_ip,
+                        destination_port: network.destination_port,
+                        domain: network.domain.clone(),
+                    },
+                );
+            }
+            AuditEventType::NetworkDomainObserved => {
+                let (Some(connection_id), Some(network)) =
+                    (event.connection_id.as_ref(), event.network.as_ref())
+                else {
+                    return Ok(());
+                };
+                if let Some(record) = self.pending.get_mut(connection_id) {
+                    record.domain.clone_from(&network.domain);
+                }
+            }
+            AuditEventType::NetworkConnectFailed | AuditEventType::NetworkConnectionClosed => {
+                let Some(network) = event.network.as_ref() else {
+                    return Ok(());
+                };
+                let mut record = event
+                    .connection_id
+                    .as_ref()
+                    .and_then(|connection_id| self.pending.remove(connection_id))
+                    .unwrap_or_else(|| AuditRecord {
+                        access_time: event.occurred_at.clone(),
+                        pid: event.process.pid,
+                        destination_ip: network.destination_ip,
+                        destination_port: network.destination_port,
+                        domain: None,
+                    });
+                if network.domain.is_some() {
+                    record.domain.clone_from(&network.domain);
+                }
+                self.output.write_record(&record)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+enum AuditOutput {
+    Stdout(io::Stdout),
+    File(File),
+}
+
+impl AuditOutput {
+    fn new(path: Option<&Path>) -> Result<Self> {
+        let Some(path) = path else {
+            return Ok(Self::Stdout(io::stdout()));
+        };
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create audit directory {}", parent.display())
+            })?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed to open audit file {}", path.display()))?;
+        Ok(Self::File(file))
+    }
+
+    fn write_record(&mut self, record: &AuditRecord) -> Result<()> {
+        match self {
+            Self::Stdout(writer) => Self::write_json_line(writer, record),
+            Self::File(writer) => Self::write_json_line(writer, record),
+        }
+    }
+
+    fn write_json_line(writer: &mut impl Write, record: &AuditRecord) -> Result<()> {
+        serde_json::to_writer(&mut *writer, record).context("failed to serialize audit record")?;
+        writer
+            .write_all(b"\n")
+            .context("failed to write audit record")?;
+        writer.flush().context("failed to flush audit record")
+    }
+}
+
+#[derive(Serialize)]
+struct AuditRecord {
+    access_time: String,
+    pid: u32,
+    destination_ip: std::net::IpAddr,
+    destination_port: u16,
+    domain: Option<String>,
 }
 
 async fn async_main(arguments: Arguments) -> Result<u8> {
@@ -66,6 +182,7 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
     };
     let config = SandboxConfig::new(hook_library);
     let command = parse_command(&arguments.command)?;
+    let audit = JsonAuditCallback::new(arguments.audit_file.as_deref())?;
 
     let status = Arc::new(Mutex::new(None::<ExitStatus>));
     let reason = Arc::new(Mutex::new(None::<ShutdownReason>));
@@ -74,9 +191,7 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
     let guard = ShutdownGuard::get();
     let signals = shutdown_signals(&guard)?;
     let process = async move {
-        let outcome = Sandbox::new(config, JsonAuditCallback::new())
-            .run(command)
-            .await?;
+        let outcome = Sandbox::new(config, audit).run(command).await?;
         *lock(&process_status) = Some(outcome.status());
         Ok(())
     };
@@ -153,10 +268,6 @@ fn shutdown_signals(_guard: &Arc<ShutdownGuard>) -> Result<SignalHandlers<Arc<Sh
 }
 
 fn main() -> ExitCode {
-    if let Err(error) = logger::init(io::stderr(), logger::LevelFilter::Info) {
-        eprintln!("failed to initialize logger: {error}");
-        return ExitCode::FAILURE;
-    }
     let arguments = Arguments::parse();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -164,7 +275,7 @@ fn main() -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            logger::error!("failed to initialize Tokio runtime: {}", error);
+            eprintln!("failed to initialize Tokio runtime: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -172,7 +283,7 @@ fn main() -> ExitCode {
     match runtime.block_on(async_main(arguments)) {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
-            logger::error!("{}", error);
+            eprintln!("{error:#}");
             ExitCode::FAILURE
         }
     }
