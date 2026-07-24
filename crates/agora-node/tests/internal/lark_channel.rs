@@ -6,7 +6,6 @@ use crate::channel::{ChannelTask, InterruptCallback};
 use crate::config::LarkChannelConfig;
 use crate::task::{CommandRequest, TaskAttachmentKind};
 use serde_json::Value;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;

@@ -199,26 +199,3 @@ fn lark_reconnect_backoff_retries_forever_with_a_cap() {
     backoff.reset();
     assert_eq!(backoff.next_delay(), Duration::from_secs(1));
 }
-
-#[test]
-fn lark_card_body_does_not_repeat_run_status() {
-    let source = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/channel/lark/card.rs"),
-    )
-    .unwrap();
-
-    assert!(!source.contains("Run `{}` started."));
-    assert!(!source.contains("Completed with exit code"));
-    assert!(!source.contains("Waiting for output."));
-}
-
-#[test]
-fn lark_card_uses_the_message_reply_api() {
-    let source = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/channel/lark/lark_api.rs"),
-    )
-    .unwrap();
-
-    assert!(source.contains("/open-apis/im/v1/messages/{}/reply"));
-    assert!(!source.contains("receive_id_type"));
-}

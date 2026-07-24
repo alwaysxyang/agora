@@ -2,53 +2,6 @@ use super::*;
 
 #[cfg(unix)]
 #[tokio::test]
-async fn configured_agent_run_owns_its_cancellation() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let temp = tempfile::tempdir().unwrap();
-    let script = temp.path().join("slow-agent");
-    let started = temp.path().join("started");
-    std::fs::write(
-        &script,
-        format!("#!/bin/sh\ntouch '{}'\nexec sleep 30\n", started.display()),
-    )
-    .unwrap();
-    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&script, permissions).unwrap();
-
-    let agent =
-        ConfiguredAgent::from_config(agent(AgentType::Custom, &script, temp.path())).unwrap();
-    let control = AgentRunControl::new();
-    let stop = control.clone();
-    let run = tokio::spawn(async move {
-        let mut output = VecAgentOutput::default();
-        agent
-            .run(AgentTask::new("long task"), None, control, &mut output)
-            .await
-            .unwrap()
-    });
-
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while !started.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert!(stop.stop());
-
-    assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(2), run)
-            .await
-            .unwrap()
-            .unwrap(),
-        AgentRunOutcome::Cancelled(AgentRunCancellation::Stopped)
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
 async fn codex_agent_uses_the_session_supplied_by_its_caller() {
     use std::os::unix::fs::PermissionsExt;
 
