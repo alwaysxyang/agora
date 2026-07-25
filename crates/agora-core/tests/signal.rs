@@ -27,6 +27,16 @@ async fn registered_handler_receives_the_matching_signal() {
             },
         )
         .unwrap();
+    let duplicate = signals.register(
+        Signal::new(signal_number),
+        RecordingHandler {
+            received: Arc::clone(&received),
+        },
+    );
+    assert_eq!(
+        duplicate.err().unwrap().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
 
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -39,6 +49,8 @@ async fn registered_handler_receives_the_matching_signal() {
     });
 
     let expected = Signal::new(signal_number);
+    assert_eq!(expected.number(), signal_number);
+    assert_eq!(expected.to_string(), format!("signal({signal_number})"));
     assert_eq!(signals.run().await.unwrap(), expected);
     assert_eq!(*received.lock().unwrap(), Some(expected));
 }

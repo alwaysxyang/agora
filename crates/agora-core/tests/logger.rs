@@ -68,6 +68,21 @@ fn logger_macros_are_available_from_logger_module() {
     let entry = agora_core::logger::LoggerEntry::new().with_entry("bad", BrokenValue);
     agora_core::logger::info!(entry = entry, "bad entry");
 
+    let entry = agora_core::logger::LoggerEntry::default()
+        .with_entry("first", 1_u32)
+        .with_entry("second", "two");
+    assert!(!entry.is_error());
+    assert_eq!(
+        serde_json::to_value(entry.clone()).unwrap(),
+        serde_json::json!({"first": 1, "second": "two"})
+    );
+    agora_core::logger::output!(entry = entry, "structured output");
+
+    let error_entry = agora_core::logger::LoggerEntry::new().with_error("broken");
+    assert!(error_entry.is_error());
+    agora_core::logger::output!(entry = error_entry, "failed output");
+    agora_core::logger::log::logger().flush();
+
     let content = writer.content();
     assert!(content.contains("\"level\":\"INFO\""));
     assert!(content.contains("\"message\":\"node started\""));
@@ -76,6 +91,11 @@ fn logger_macros_are_available_from_logger_module() {
     assert!(content.contains("\"message\":\"still debug\""));
     assert!(content.contains("\"message\":\"bad entry\""));
     assert!(content.contains("\"logger_error\""));
+    assert!(content.contains("\"first\":1"));
+    assert!(content.contains("\"second\":\"two\""));
+    assert!(content.contains("\"message\":\"structured output\""));
+    assert!(content.contains("\"message\":\"failed output\""));
+    assert!(content.contains("\"error\":\"broken\""));
     assert!(!content.contains("\n\n"));
     assert_eq!(second_writer.content(), "");
 }

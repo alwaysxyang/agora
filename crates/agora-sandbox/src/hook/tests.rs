@@ -67,3 +67,77 @@ fn process_context_uses_the_current_process_for_each_connection() {
     assert_eq!(child.executable, "/tmp/client");
     assert_ne!(parent_id, child_id);
 }
+
+#[test]
+fn hook_configuration_rejects_invalid_or_non_loopback_proxy_addresses() {
+    let valid = HashMap::from([
+        ("AGORA_SANDBOX_TOKEN", "token"),
+        ("AGORA_SANDBOX_PROXY_IPV4", "127.0.0.1:41000"),
+        ("AGORA_SANDBOX_PROXY_IPV6", "[::1]:41001"),
+    ]);
+    let parse = |overrides: &[(&str, &str)]| {
+        HookConfig::from_getter(|key| {
+            overrides
+                .iter()
+                .find_map(|(name, value)| (*name == key).then(|| (*value).to_string()))
+                .or_else(|| valid.get(key).map(ToString::to_string))
+        })
+    };
+
+    assert!(
+        parse(&[("AGORA_SANDBOX_TOKEN", "")])
+            .unwrap_err()
+            .contains("TOKEN")
+    );
+    assert!(
+        parse(&[("AGORA_SANDBOX_PROXY_IPV4", "invalid")])
+            .unwrap_err()
+            .contains("invalid AGORA_SANDBOX_PROXY_IPV4")
+    );
+    assert!(
+        parse(&[("AGORA_SANDBOX_PROXY_IPV6", "invalid")])
+            .unwrap_err()
+            .contains("invalid AGORA_SANDBOX_PROXY_IPV6")
+    );
+    assert!(
+        parse(&[("AGORA_SANDBOX_PROXY_IPV4", "203.0.113.1:80")])
+            .unwrap_err()
+            .contains("IPv4 loopback")
+    );
+    assert!(
+        parse(&[("AGORA_SANDBOX_PROXY_IPV4", "[::1]:80")])
+            .unwrap_err()
+            .contains("IPv4 loopback")
+    );
+    assert!(
+        parse(&[("AGORA_SANDBOX_PROXY_IPV6", "[2001:db8::1]:80")])
+            .unwrap_err()
+            .contains("IPv6 loopback")
+    );
+    assert!(
+        parse(&[("AGORA_SANDBOX_PROXY_IPV6", "127.0.0.1:80")])
+            .unwrap_err()
+            .contains("IPv6 loopback")
+    );
+}
+
+#[test]
+fn raw_socket_decoder_rejects_null_short_and_unknown_addresses() {
+    assert_eq!(unsafe { socket_addr_from_raw(std::ptr::null(), 0) }, None);
+
+    let mut unknown: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let address = std::ptr::addr_of_mut!(unknown).cast::<libc::sockaddr>();
+    unsafe {
+        (*address).sa_family = libc::AF_UNIX as libc::sa_family_t;
+    }
+    assert_eq!(unsafe { socket_addr_from_raw(address, 1) }, None);
+    assert_eq!(
+        unsafe {
+            socket_addr_from_raw(
+                address,
+                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+            )
+        },
+        None
+    );
+}

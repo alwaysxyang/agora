@@ -381,3 +381,166 @@ async fn codex_agent_deletes_its_backend_session() {
         "configured"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_agent_maps_all_supported_json_events_and_stream_boundaries() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("codex");
+    std::fs::write(
+        &script,
+        concat!(
+            "#!/bin/sh\n",
+            "cat >/dev/null\n",
+            "printf 'plain output\\r\\n'\n",
+            "printf '%s\\n' '",
+            r#"{"type":"thread.started","thread_id":"thread-events"}"#,
+            "'\n",
+            "printf '%s\\n' '",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"intermediate answer"}}"#,
+            "'\n",
+            "printf '%s\\n' '",
+            r#"{"type":"item.completed","item":{"id":"reason-1","type":"reasoning","text":"  compact   reasoning  "}}"#,
+            "'\n",
+            "printf '%s\\n' '",
+            r#"{"type":"item.started","item":{"type":"command_execution","command":"echo `unsafe`","status":"declined"}}"#,
+            "'\n",
+            "printf '%s\\n' '",
+            r#"{"type":"item.updated","item":{"id":"files-1","type":"file_change","changes":[{},{}],"status":"in_progress"}}"#,
+            "'\n",
+            "printf '%s\\n' '",
+            r#"{"type":"item.completed","item":{"id":"todo-1","type":"todo_list","items":[{"completed":true},{"completed":false}]}}"#,
+            "'\n",
+            "printf '%s\\n' '",
+            r#"{"type":"item.started","item":{"id":"mcp-1","type":"mcp_tool_call","server":"docs","tool":"search"}}"#,
+            "'\n",
+            "printf '%s\\n' '",
+            r#"{"type":"item.completed","item":{"id":"search-1","type":"web_search","query":"find `docs`"}}"#,
+            "'\n",
+            "printf '%s\\n' '",
+            r#"{"type":"item.completed","item":{"type":"error"}}"#,
+            "'\n",
+            "printf '%s\\n' '",
+            r#"{"type":"turn.failed","error":{"message":"turn failed detail"}}"#,
+            "'\n",
+            "printf '%s\\n' '",
+            r#"{"type":"error"}"#,
+            "'\n",
+            "printf '%s\\n' '",
+            r#"{"type":"turn.completed","usage":{"input_tokens":9,"output_tokens":4}}"#,
+            "'\n",
+            "printf '%s' '",
+            r#"{"type":"item.completed","item":{"id":"final-1","type":"agent_message","text":"final without newline"}}"#,
+            "'\n",
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let agent =
+        ConfiguredAgent::from_config(agent(AgentType::Codex, &script, temp.path())).unwrap();
+    let mut output = VecAgentOutput::default();
+
+    let outcome = completed(
+        agent
+            .run(
+                AgentTask::new("exercise event mapping"),
+                None,
+                AgentRunControl::new(),
+                &mut output,
+            )
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(
+        outcome.session_update(),
+        &AgentSessionUpdate::Set("thread-events".to_string())
+    );
+    assert!(output.events.contains(&OutputEvent::Answer {
+        text: "plain output\n".to_string(),
+    }));
+    assert!(output.events.contains(&OutputEvent::Progress {
+        id: "agent-message".to_string(),
+        text: "intermediate answer".to_string(),
+        status: ProgressStatus::Completed,
+    }));
+    assert!(output.events.contains(&OutputEvent::Thinking {
+        text: "compact reasoning".to_string(),
+    }));
+    assert!(output.events.contains(&OutputEvent::Progress {
+        id: "codex-progress".to_string(),
+        text: "Run `echo 'unsafe'`".to_string(),
+        status: ProgressStatus::Failed,
+    }));
+    assert!(output.events.contains(&OutputEvent::Progress {
+        id: "files-1".to_string(),
+        text: "Changed 2 file(s)".to_string(),
+        status: ProgressStatus::Running,
+    }));
+    assert!(output.events.contains(&OutputEvent::Progress {
+        id: "todo-1".to_string(),
+        text: "Plan progress: 1/2".to_string(),
+        status: ProgressStatus::Completed,
+    }));
+    assert!(output.events.contains(&OutputEvent::Progress {
+        id: "mcp-1".to_string(),
+        text: "Call `docs/search`".to_string(),
+        status: ProgressStatus::Running,
+    }));
+    assert!(output.events.contains(&OutputEvent::Progress {
+        id: "search-1".to_string(),
+        text: "Search `find 'docs'`".to_string(),
+        status: ProgressStatus::Completed,
+    }));
+    assert!(output.events.contains(&OutputEvent::Progress {
+        id: "codex-progress".to_string(),
+        text: "codex item failed".to_string(),
+        status: ProgressStatus::Failed,
+    }));
+    assert!(output.events.contains(&OutputEvent::Answer {
+        text: "turn failed detail".to_string(),
+    }));
+    assert!(output.events.contains(&OutputEvent::Answer {
+        text: "codex execution failed".to_string(),
+    }));
+    assert!(output.events.contains(&OutputEvent::Usage(TokenUsage {
+        input_tokens: 9,
+        cached_input_tokens: 0,
+        output_tokens: 4,
+        reasoning_output_tokens: 0,
+    })));
+    assert!(output.events.contains(&OutputEvent::Answer {
+        text: "final without newline".to_string(),
+    }));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_agent_reports_delete_failures_with_stdout_and_stderr() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("codex");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'stdout detail\\n'\nprintf 'stderr detail\\n' >&2\nexit 7\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let agent =
+        ConfiguredAgent::from_config(agent(AgentType::Codex, &script, temp.path())).unwrap();
+    let error = agent.delete_session("broken-session").await.unwrap_err();
+    let message = error.to_string();
+
+    assert!(message.contains("exit_code=7"));
+    assert!(message.contains("stdout detail"));
+    assert!(message.contains("stderr detail"));
+}

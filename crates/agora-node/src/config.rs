@@ -172,3 +172,27 @@ impl AgentSandbox {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn isolation_scope_and_sandbox_strings_cover_all_variants() {
+        assert_eq!(IsolationScope::Shared.channel_name(), None);
+        assert_eq!(IsolationScope::Shared.session_id(), None);
+        assert_eq!(IsolationScope::Shared.as_str(), "shared");
+
+        let session = IsolationScope::session("telegram", "chat-1");
+        assert_eq!(session.channel_name(), Some("telegram"));
+        assert_eq!(session.session_id(), Some("chat-1"));
+        assert_eq!(session.as_str(), "session");
+
+        assert_eq!(AgentSandbox::ReadOnly.as_str(), "read-only");
+        assert_eq!(AgentSandbox::WorkspaceWrite.as_str(), "workspace-write");
+        assert_eq!(
+            AgentSandbox::DangerFullAccess.as_str(),
+            "danger-full-access"
+        );
+    }
+}

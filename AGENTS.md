@@ -76,6 +76,7 @@ After editing:
 
 - Run formatting.
 - Run the narrowest relevant tests first.
+- Run workspace test coverage when Rust code or tests changed.
 - Run clippy when Rust code changed.
 - Check whether the code change affects any document under `spec/`.
 - Update relevant `spec/` documents when behavior, architecture, module responsibility, protocol, config, public API, error behavior, or runtime assumption changes.
@@ -83,10 +84,23 @@ After editing:
 - Report commands run and any failures honestly.
 - Report spec consistency status in the final response.
 
+## Test Coverage
+
+- Maintain at least 90% line coverage across the Rust workspace.
+- Use the project's configured coverage command when one exists. Otherwise run:
+
+```bash
+cargo llvm-cov --workspace --all-targets --fail-under-lines 90
+```
+
+- Do not lower the threshold, exclude production code, or mark code as uncovered solely to make the coverage check pass.
+- Treat a coverage result below 90%, or an inability to run the required coverage check, as incomplete validation.
+
 ## Exit Criteria
 
 - Do not report work as complete while any warning or error remains.
 - All required validation commands must finish with zero warnings and zero errors.
+- Workspace line coverage must be at least 90% when Rust code or tests changed.
 
 ## Specification Consistency Requirement
 

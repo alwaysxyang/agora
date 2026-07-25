@@ -15,6 +15,8 @@ fn registered_callbacks_receive_the_first_shutdown_reason_once() {
         })
         .unwrap();
     }
+    on_shutdown(|_| Err(anyhow::anyhow!("cleanup failed"))).unwrap();
+    on_shutdown(|_| panic!("cleanup panicked")).unwrap();
 
     let guard = ShutdownGuard::get();
     assert!(request_shutdown("requested by test"));
@@ -32,4 +34,8 @@ fn registered_callbacks_receive_the_first_shutdown_reason_once() {
             },
         ]
     );
+    assert!(on_shutdown(|_| Ok(())).is_err());
+    let finished_guard = ShutdownGuard::get();
+    assert!(!finished_guard.shutdown(ShutdownReason::Normal));
+    drop(finished_guard);
 }

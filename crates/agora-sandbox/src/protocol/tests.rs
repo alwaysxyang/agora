@@ -99,3 +99,166 @@ fn connect_host_must_match_the_target() {
 
     assert!(error.to_string().contains("Host does not match"));
 }
+
+#[test]
+fn connectx_request_round_trips_and_becomes_a_route_registration() {
+    let mut request = connect_request();
+    request.operation = HookOperation::Connectx;
+    request.process.executable = "/tmp/客户端".to_string();
+
+    let encoded = encode_connect_request(&request).unwrap();
+    let (parsed, _) = parse_connect_request_prefix(&encoded).unwrap().unwrap();
+    assert_eq!(parsed, request);
+
+    let registration = parsed.into_registration();
+    assert_eq!(registration.connection_id, "connection-1");
+    assert_eq!(registration.destination, request.destination);
+    assert_eq!(registration.process, request.process);
+    assert_eq!(registration.operation, HookOperation::Connectx);
+}
+
+#[test]
+fn encoder_rejects_values_that_cannot_be_safe_http_headers() {
+    let mut request = connect_request();
+    request.token.clear();
+    assert_eq!(
+        encode_connect_request(&request).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+
+    request.token = "bad token".to_string();
+    assert!(encode_connect_request(&request).is_err());
+    request.token = "token+/=".to_string();
+    request.connection_id = "line\nbreak".to_string();
+    assert!(encode_connect_request(&request).is_err());
+
+    request.connection_id = "connection-1".to_string();
+    request.process.executable = "x".repeat(super::MAX_FRAME_SIZE);
+    assert_eq!(
+        encode_connect_request(&request).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+}
+
+#[test]
+fn parser_rejects_invalid_request_lines_and_body_headers() {
+    assert!(
+        parse_connect_request_prefix(b"CONNECT 127.0.0.1:80 HTTP/1.1\r\n")
+            .unwrap()
+            .is_none()
+    );
+
+    let valid = String::from_utf8(encode_connect_request(&connect_request()).unwrap()).unwrap();
+    let cases = [
+        (valid.replacen("HTTP/1.1", "HTTP/1.0", 1), "HTTP/1.1"),
+        (
+            valid.replacen("CONNECT", "GET", 1),
+            "unsupported proxy request",
+        ),
+        (
+            valid.replacen("203.0.113.10:443", "example.com:443", 2),
+            "CONNECT target",
+        ),
+        (
+            valid.replace("\r\n\r\n", "\r\nContent-Length: 1\r\n\r\n"),
+            "bodies are not supported",
+        ),
+        (
+            valid.replace("\r\n\r\n", "\r\nTransfer-Encoding: chunked\r\n\r\n"),
+            "Transfer-Encoding",
+        ),
+        (
+            valid.replace("\r\n\r\n", "\r\nContent-Length: invalid\r\n\r\n"),
+            "invalid Content-Length",
+        ),
+        (
+            valid.replace(
+                "\r\n\r\n",
+                &format!("\r\nContent-Length: {}\r\n\r\n", super::MAX_FRAME_SIZE + 1),
+            ),
+            "request body exceeds",
+        ),
+    ];
+
+    for (message, expected) in cases {
+        let error = parse_connect_request_prefix(message.as_bytes()).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?} in {error}"
+        );
+    }
+
+    let error = parse_connect_request_prefix(b"not http\r\n\r\n").unwrap_err();
+    assert!(error.to_string().contains("invalid HTTP request"));
+}
+
+#[test]
+fn parser_rejects_missing_duplicate_and_malformed_agora_headers() {
+    let valid = String::from_utf8(encode_connect_request(&connect_request()).unwrap()).unwrap();
+    let cases = [
+        (
+            valid.replace("Host: 203.0.113.10:443\r\n", ""),
+            "missing Host",
+        ),
+        (
+            valid.replace(
+                "Host: 203.0.113.10:443\r\n",
+                "Host: 203.0.113.10:443\r\nHost: 203.0.113.10:443\r\n",
+            ),
+            "duplicate Host",
+        ),
+        (
+            valid.replace("Bearer token-1", "Bearer"),
+            "Proxy-Authorization",
+        ),
+        (
+            valid.replace("Agora-Operation: connect", "Agora-Operation: unknown"),
+            "Agora-Operation",
+        ),
+        (
+            valid.replace("Agora-Version: 5", "Agora-Version: invalid"),
+            "Agora-Version",
+        ),
+        (
+            valid.replace("Agora-Pid: 101", "Agora-Pid: invalid"),
+            "Agora-Pid",
+        ),
+        (
+            valid.replace("Agora-Ppid: 100", "Agora-Ppid: invalid"),
+            "Agora-Ppid",
+        ),
+        (
+            valid.replace("Agora-Executable-Hex: 2f", "Agora-Executable-Hex: f"),
+            "executable encoding",
+        ),
+        (
+            valid.replace("Agora-Executable-Hex: 2f", "Agora-Executable-Hex: gg"),
+            "executable encoding",
+        ),
+        (
+            valid.replace("Agora-Executable-Hex: 2f", "Agora-Executable-Hex: FF"),
+            "executable encoding",
+        ),
+    ];
+
+    for (message, expected) in cases {
+        let error = parse_connect_request_prefix(message.as_bytes()).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?} in {error}"
+        );
+    }
+}
+
+#[test]
+fn protocol_error_constructors_preserve_their_messages() {
+    assert_eq!(super::ProtocolError::bad_request("bad").to_string(), "bad");
+    assert_eq!(
+        super::ProtocolError::unauthorized("unauthorized").to_string(),
+        "unauthorized"
+    );
+    assert_eq!(
+        super::ProtocolError::version_not_supported("version").to_string(),
+        "version"
+    );
+}

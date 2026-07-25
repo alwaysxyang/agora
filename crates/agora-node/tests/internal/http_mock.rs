@@ -38,6 +38,19 @@ impl MockResponse {
             content_type: "application/json",
         }
     }
+
+    pub(super) fn with_status(mut self, status: u16) -> Self {
+        self.status = status;
+        self
+    }
+
+    pub(super) fn bytes(body: impl Into<Vec<u8>>, content_type: &'static str) -> Self {
+        Self {
+            status: 200,
+            body: body.into(),
+            content_type,
+        }
+    }
 }
 
 type ResponseHandler = dyn Fn(&RecordedRequest) -> MockResponse + Send + Sync;
