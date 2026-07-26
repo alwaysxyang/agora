@@ -588,6 +588,7 @@ mod tests {
                 name: "lark-channel-test".to_string(),
                 app_id: "app-id".to_string(),
                 secret: "secret".to_string(),
+                proxy: None,
             },
             "http://127.0.0.1:1".to_string(),
         )

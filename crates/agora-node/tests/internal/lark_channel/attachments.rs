@@ -41,6 +41,7 @@ async fn downloads_a_lark_message_image_resource() {
             name: "lark-test".to_string(),
             app_id: "app-id".to_string(),
             secret: "secret".to_string(),
+            proxy: None,
         },
         base_url,
     )
@@ -119,6 +120,7 @@ async fn resolves_lark_post_images_into_task_attachments() {
             name: "lark-test".to_string(),
             app_id: "app-id".to_string(),
             secret: "secret".to_string(),
+            proxy: None,
         },
         base_url,
     )

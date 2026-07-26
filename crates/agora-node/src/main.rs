@@ -10,51 +10,7 @@ use clap::{ColorChoice, Parser};
 use std::io::stdout;
 use std::sync::Arc;
 
-const CONFIG_HELP: &str = r#"CONFIGURATION FILE (JSON)
-  Top-level fields:
-    channels                 Reusable channel definitions.
-    agents                   Local agent definitions.
-
-  Lark channel fields:
-    type                     Channel type; use "lark".
-    name                     Unique channel name referenced by subscriptions.
-    app_id                   Lark application ID.
-    secret                   Lark application secret; do not commit it.
-
-  Telegram channel fields:
-    type                     Channel type; use "telegram".
-    name                     Unique channel name referenced by subscriptions.
-    token                    Telegram bot token; do not commit it.
-
-  Reserved channel types:
-    type                     "local" or "http"; not active yet.
-    name                     Unique channel name.
-
-  Agent fields:
-    name                     Unique local agent name.
-    isolate                  Backend session and queue isolation: "none" or "session".
-    workspace                Optional agent workdir. Defaults to ~/.agora/workspace.
-    type                     Backend type: "codex", "coco", "claude_code", or "custom".
-    path                     Backend executable path.
-    model                    Optional Codex model override.
-    effort                   Optional Codex reasoning effort override.
-    agent_sandbox            Optional backend sandbox: "read-only", "workspace-write",
-                             or "danger-full-access". This is separate from session isolation.
-    env                      Optional string environment variables for the agent process.
-                             Configured keys override inherited daemon environment values.
-    subscribe                Channel subscriptions for this agent.
-    subscribe[].channel      Name of a configured channel.
-    subscribe[].filter       Optional reserved channel filter; currently ignored.
-
-  Example:
-    {"channels":[{"type":"lark","name":"lark1","app_id":"xxx","secret":"xxx"},
-     {"type":"telegram","name":"telegram1","token":"xxx"}],
-     "agents":[{"name":"codex","isolate":"none","type":"codex",
-     "path":"/opt/homebrew/bin/codex","agent_sandbox":"danger-full-access",
-     "env":{"HTTP_PROXY":"http://127.0.0.1:7890"},
-     "subscribe":[{"channel":"lark1","filter":{}},
-     {"channel":"telegram1","filter":{}}]}]}
-"#;
+const CONFIG_HELP: &str = include_str!("usage.txt");
 
 #[derive(Parser)]
 #[command(

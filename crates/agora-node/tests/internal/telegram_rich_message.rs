@@ -4,6 +4,7 @@ use super::telegram_api::TelegramApi;
 use crate::channel::test_http::{HttpMockServer, MockResponse};
 use crate::channel::{ChannelRun, RunEvent};
 use crate::config::TelegramChannelConfig;
+use crate::i18n;
 use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -18,6 +19,7 @@ fn telegram_api(server: &HttpMockServer) -> TelegramApi {
         TelegramChannelConfig {
             name: "telegram-test".to_string(),
             token: "123456:secret".to_string(),
+            proxy: None,
         },
         server.base_url(),
     )

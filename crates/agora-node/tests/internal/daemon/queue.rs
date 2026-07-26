@@ -39,7 +39,7 @@ async fn updates_queue_depth_before_starting_serialized_agent_runs() {
         model: None,
         effort: None,
         agent_sandbox: None,
-        env: Default::default(),
+        proxy: None,
         subscribe: Vec::new(),
     })
     .unwrap();

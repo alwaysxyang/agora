@@ -1,6 +1,8 @@
 use super::LarkReplyTarget;
 use super::channel::LarkEvent;
+use super::proxy;
 use crate::config::LarkChannelConfig;
+use crate::http;
 use agora_core::logger;
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
@@ -12,8 +14,8 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
+use tokio_tungstenite::{client_async_tls, connect_async};
 
 const LARK_OPENAPI: &str = "https://open.feishu.cn";
 const LARK_WS_ENDPOINT_PATH: &str = "/callback/ws/endpoint";
@@ -36,6 +38,7 @@ pub(super) struct LarkApi {
     secret: String,
     client: Client,
     base_url: String,
+    proxy: Option<crate::config::HttpProxy>,
 }
 
 pub(super) struct LarkImageResource {
@@ -49,12 +52,14 @@ impl LarkApi {
     }
 
     pub(super) fn with_base_url(config: LarkChannelConfig, base_url: String) -> Result<Self> {
+        let client = Self::http_client(config.proxy.as_ref())?;
         Ok(Self {
             name: config.name,
             app_id: config.app_id,
             secret: config.secret,
-            client: Self::http_client()?,
+            client,
             base_url,
+            proxy: config.proxy,
         })
     }
 
@@ -122,9 +127,14 @@ impl LarkApi {
             DEFAULT_WS_PING_INTERVAL_SECONDS
         };
 
-        let (mut socket, _) = connect_async(endpoint_url.as_str())
-            .await
-            .context("connect lark websocket failed")?;
+        let (mut socket, _) = match &self.proxy {
+            Some(proxy) => {
+                let stream = proxy::connect_tunnel(proxy, &endpoint_url).await?;
+                client_async_tls(endpoint_url.as_str(), stream).await
+            }
+            None => connect_async(endpoint_url.as_str()).await,
+        }
+        .context("connect lark websocket failed")?;
         *connected = true;
         logger::info!("lark websocket connected channel={}", self.name);
         let mut ping_interval = tokio::time::interval(Duration::from_secs(ping_interval_seconds));
@@ -199,15 +209,13 @@ impl LarkApi {
         Ok((data.url, data.client_config.unwrap_or_default()))
     }
 
-    fn http_client() -> Result<Client> {
+    fn http_client(proxy: Option<&crate::config::HttpProxy>) -> Result<Client> {
         let builder = Client::builder()
             .pool_max_idle_per_host(LARK_HTTP_MAX_IDLE_CONNECTIONS_PER_HOST)
             .pool_idle_timeout(Some(Duration::from_secs(LARK_HTTP_IDLE_TIMEOUT_SECONDS)))
             .connect_timeout(Duration::from_secs(LARK_HTTP_CONNECT_TIMEOUT_SECONDS))
             .timeout(Duration::from_secs(LARK_HTTP_REQUEST_TIMEOUT_SECONDS));
-        #[cfg(test)]
-        let builder = builder.no_proxy();
-        builder.build().context("build lark http client failed")
+        http::client(builder, proxy).context("build lark http client failed")
     }
 
     fn query_param(url: &str, key: &str) -> Option<String> {
@@ -620,6 +628,7 @@ impl LarkEmptyResponse {
 mod tests {
     use super::*;
     use crate::channel::test_http::{HttpMockServer, MockResponse};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
 
@@ -628,6 +637,7 @@ mod tests {
             name: "lark-api-test".to_string(),
             app_id: "app-id".to_string(),
             secret: "secret".to_string(),
+            proxy: None,
         }
     }
 
@@ -647,6 +657,35 @@ mod tests {
 
     fn message_event_payload() -> Vec<u8> {
         br#"{"schema":"2.0","header":{"event_id":"evt_1","event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_1"}},"message":{"message_id":"om_1","chat_id":"oc_1","chat_type":"group","message_type":"text","content":"{\"text\":\"hello\"}"}}}"#.to_vec()
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        loop {
+            let mut buffer = [0_u8; 1024];
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert_ne!(read, 0);
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+            else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or_default();
+            if request.len() >= header_end + content_length {
+                return String::from_utf8(request).unwrap();
+            }
+        }
     }
 
     #[tokio::test]
@@ -713,6 +752,63 @@ mod tests {
             receiver.recv().await.unwrap().unwrap(),
             LarkEvent::Message(_)
         ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_once_uses_the_configured_proxy_for_http_and_websocket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut endpoint_stream, _) = listener.accept().await.unwrap();
+            let endpoint_request = read_http_request(&mut endpoint_stream).await;
+            assert!(
+                endpoint_request
+                    .starts_with("POST http://lark.openapi.test/callback/ws/endpoint HTTP/1.1\r\n")
+            );
+            assert!(
+                endpoint_request
+                    .to_ascii_lowercase()
+                    .contains("proxy-authorization: basic dxnlcjpwyxnzd29yza==\r\n")
+            );
+            let body = r#"{"code":0,"msg":"ok","data":{"URL":"ws://lark.websocket.test/?service_id=1001","ClientConfig":{"PingInterval":3600}}}"#;
+            endpoint_stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let (mut websocket_stream, _) = listener.accept().await.unwrap();
+            let connect_request = read_http_request(&mut websocket_stream).await;
+            assert!(connect_request.starts_with("CONNECT lark.websocket.test:80 HTTP/1.1\r\n"));
+            assert!(
+                connect_request
+                    .to_ascii_lowercase()
+                    .contains("proxy-authorization: basic dxnlcjpwyxnzd29yza==\r\n")
+            );
+            websocket_stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut socket = accept_async(websocket_stream).await.unwrap();
+            socket.send(WebSocketMessage::Close(None)).await.unwrap();
+        });
+        let mut config = config();
+        config.proxy = Some(format!("user:password@{proxy_address}").parse().unwrap());
+        let api = LarkApi::with_base_url(config, "http://lark.openapi.test".to_string()).unwrap();
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut connected = false;
+
+        api.run_websocket_once(sender, &mut connected)
+            .await
+            .unwrap();
+
+        assert!(connected);
         server.await.unwrap();
     }
 

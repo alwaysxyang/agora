@@ -12,7 +12,8 @@ async fn reset_stops_the_scope_deletes_the_session_and_starts_fresh_next_time() 
         &script,
         concat!(
             "#!/bin/sh\n",
-            "printf '%s\\n' \"$*\" >> \"$INVOCATIONS\"\n",
+            "script_dir=${0%/*}\n",
+            "printf '%s\\n' \"$*\" >> \"$script_dir/invocations\"\n",
             "if [ \"$1\" = delete ]; then exit 0; fi\n",
             "cat >/dev/null\n",
             "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"new-session\"}'\n",
@@ -23,11 +24,6 @@ async fn reset_stops_the_scope_deletes_the_session_and_starts_fresh_next_time() 
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script, permissions).unwrap();
 
-    let mut env = std::collections::HashMap::new();
-    env.insert(
-        "INVOCATIONS".to_string(),
-        invocations.to_string_lossy().into_owned(),
-    );
     let agent = ConfiguredAgent::from_config(AgentConfig {
         name: "codex-dev".to_string(),
         isolate: IsolateMode::None,
@@ -37,7 +33,7 @@ async fn reset_stops_the_scope_deletes_the_session_and_starts_fresh_next_time() 
         model: None,
         effort: None,
         agent_sandbox: None,
-        env,
+        proxy: None,
         subscribe: Vec::new(),
     })
     .unwrap();
@@ -133,7 +129,7 @@ async fn reset_preserves_the_mapping_when_backend_deletion_fails() {
         model: None,
         effort: None,
         agent_sandbox: None,
-        env: Default::default(),
+        proxy: None,
         subscribe: Vec::new(),
     })
     .unwrap();
@@ -181,7 +177,7 @@ async fn reset_removes_the_mapping_when_backend_deletion_is_unsupported() {
         model: None,
         effort: None,
         agent_sandbox: None,
-        env: Default::default(),
+        proxy: None,
         subscribe: Vec::new(),
     })
     .unwrap();

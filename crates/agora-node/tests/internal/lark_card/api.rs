@@ -8,6 +8,7 @@ async fn lark_card_coalesces_intermediate_updates_and_flushes_completion() {
             name: "lark-test".to_string(),
             app_id: "app-id".to_string(),
             secret: "secret".to_string(),
+            proxy: None,
         },
         server.base_url(),
     )
@@ -74,6 +75,7 @@ async fn lark_api_replies_to_commands_with_threaded_text() {
             name: "lark-test".to_string(),
             app_id: "app-id".to_string(),
             secret: "secret".to_string(),
+            proxy: None,
         },
         server.base_url(),
     )
@@ -113,6 +115,7 @@ async fn lark_agent_toggle_action_patches_the_original_status_card() {
             name: "lark-test".to_string(),
             app_id: "app-id".to_string(),
             secret: "secret".to_string(),
+            proxy: None,
         },
         server.base_url(),
     )
@@ -157,6 +160,7 @@ async fn lark_ask_message_replies_with_a_threaded_interactive_card() {
             name: "lark-test".to_string(),
             app_id: "app-id".to_string(),
             secret: "secret".to_string(),
+            proxy: None,
         },
         server.base_url(),
     )

@@ -1,6 +1,7 @@
 mod card;
 mod channel;
 mod lark_api;
+mod proxy;
 
 pub use channel::{LarkChannel, LarkRun, LarkTask};
 

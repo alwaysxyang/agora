@@ -12,7 +12,7 @@ async fn codex_agent_uses_the_session_supplied_by_its_caller() {
         concat!(
             "#!/bin/sh\n",
             "printf '%s\\n' \"$*\" >> invocations\n",
-            "printf '%s' \"$AGORA_AGENT_ENV\" > configured-env\n",
+            "printf '%s\\n' \"$HTTP_PROXY\" \"$HTTPS_PROXY\" \"$http_proxy\" \"$https_proxy\" > configured-proxy\n",
             "cat >/dev/null\n",
             "printf '%s\\n' ",
             "'{\"type\":\"thread.started\",\"thread_id\":\"thread-123\"}'\n",
@@ -29,9 +29,7 @@ async fn codex_agent_uses_the_session_supplied_by_its_caller() {
     config.model = Some("gpt-5.4".to_string());
     config.effort = Some("xhigh".to_string());
     config.agent_sandbox = Some(AgentSandbox::DangerFullAccess);
-    config
-        .env
-        .insert("AGORA_AGENT_ENV".to_string(), "configured".to_string());
+    config.proxy = Some("user:password@127.0.0.1:7890".parse().unwrap());
     let agent = ConfiguredAgent::from_config(config).unwrap();
     let mut first_output = VecAgentOutput::default();
     let mut second_output = VecAgentOutput::default();
@@ -77,8 +75,8 @@ async fn codex_agent_uses_the_session_supplied_by_its_caller() {
         ]
     );
     assert_eq!(
-        std::fs::read_to_string(temp.path().join("configured-env")).unwrap(),
-        "configured"
+        std::fs::read_to_string(temp.path().join("configured-proxy")).unwrap(),
+        "http://user:password@127.0.0.1:7890\n".repeat(4)
     );
     assert!(first_output.events.iter().any(
         |event| matches!(event, OutputEvent::Answer { text } if text.contains("hello from codex"))
@@ -336,8 +334,9 @@ async fn codex_agent_deletes_its_backend_session() {
         &script,
         concat!(
             "#!/bin/sh\n",
-            "printf '%s\\n' \"$*\" > \"$DELETE_INVOCATION\"\n",
-            "printf '%s' \"$AGORA_AGENT_ENV\" > \"$DELETE_ENV\"\n",
+            "script_dir=${0%/*}\n",
+            "printf '%s\\n' \"$*\" > \"$script_dir/delete-invocation\"\n",
+            "printf '%s' \"$HTTP_PROXY\" > \"$script_dir/delete-proxy\"\n",
         ),
     )
     .unwrap();
@@ -346,23 +345,7 @@ async fn codex_agent_deletes_its_backend_session() {
     std::fs::set_permissions(&script, permissions).unwrap();
 
     let mut config = agent(AgentType::Codex, &script, temp.path());
-    config
-        .env
-        .insert("AGORA_AGENT_ENV".to_string(), "configured".to_string());
-    config.env.insert(
-        "DELETE_INVOCATION".to_string(),
-        temp.path()
-            .join("delete-invocation")
-            .to_string_lossy()
-            .into_owned(),
-    );
-    config.env.insert(
-        "DELETE_ENV".to_string(),
-        temp.path()
-            .join("delete-env")
-            .to_string_lossy()
-            .into_owned(),
-    );
+    config.proxy = Some(":password@127.0.0.1:7890".parse().unwrap());
     let agent = ConfiguredAgent::from_config(config).unwrap();
 
     assert_eq!(
@@ -377,8 +360,8 @@ async fn codex_agent_deletes_its_backend_session() {
         "delete --force 019f5eb1-cf97-7c71-bf16-b7cff731724a\n"
     );
     assert_eq!(
-        std::fs::read_to_string(temp.path().join("delete-env")).unwrap(),
-        "configured"
+        std::fs::read_to_string(temp.path().join("delete-proxy")).unwrap(),
+        "http://:password@127.0.0.1:7890"
     );
 }
 

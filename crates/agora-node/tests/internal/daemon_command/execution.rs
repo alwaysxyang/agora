@@ -150,7 +150,7 @@ async fn stopping_a_card_run_advances_the_next_queued_task() {
         model: None,
         effort: None,
         agent_sandbox: None,
-        env: Default::default(),
+        proxy: None,
         subscribe: Vec::new(),
     })
     .unwrap();

@@ -40,7 +40,7 @@ async fn persists_and_serializes_session_by_channel_and_agent() {
         model: None,
         effort: None,
         agent_sandbox: None,
-        env: Default::default(),
+        proxy: None,
         subscribe: Vec::new(),
     };
     let agent = ConfiguredAgent::from_config(agent).unwrap();
@@ -105,7 +105,7 @@ async fn none_isolation_queues_and_resumes_across_channels() {
         model: None,
         effort: None,
         agent_sandbox: None,
-        env: Default::default(),
+        proxy: None,
         subscribe: Vec::new(),
     })
     .unwrap();
@@ -209,9 +209,11 @@ async fn session_isolation_separates_backend_sessions_and_reuses_workspace() {
         &script,
         concat!(
             "#!/bin/sh\n",
-            "printf '%s\\n' \"$*\" >> \"$INVOCATIONS\"\n",
-            "pwd >> \"$WORKDIRS\"\n",
-            "count=$(wc -l < \"$INVOCATIONS\" | tr -d ' ')\n",
+            "script_dir=${0%/*}\n",
+            "invocations=\"$script_dir/invocations\"\n",
+            "printf '%s\\n' \"$*\" >> \"$invocations\"\n",
+            "pwd >> \"$script_dir/workdirs\"\n",
+            "count=$(wc -l < \"$invocations\" | tr -d ' ')\n",
             "cat >/dev/null\n",
             "printf '{\"type\":\"thread.started\",\"thread_id\":\"thread-%s\"}\\n' \"$count\"\n",
             "printf '%s\\n' ",
@@ -227,15 +229,6 @@ async fn session_isolation_separates_backend_sessions_and_reuses_workspace() {
     let workdirs = temp.path().join("workdirs");
     let store = SessionStore::open(temp.path().join("store.db")).unwrap();
     let dispatcher = AgentDispatcher::new(store.clone());
-    let mut env = std::collections::HashMap::new();
-    env.insert(
-        "INVOCATIONS".to_string(),
-        invocations.to_string_lossy().into_owned(),
-    );
-    env.insert(
-        "WORKDIRS".to_string(),
-        workdirs.to_string_lossy().into_owned(),
-    );
     let agent = ConfiguredAgent::from_config(AgentConfig {
         name: "codex-dev".to_string(),
         isolate: IsolateMode::Session,
@@ -245,7 +238,7 @@ async fn session_isolation_separates_backend_sessions_and_reuses_workspace() {
         model: None,
         effort: None,
         agent_sandbox: None,
-        env,
+        proxy: None,
         subscribe: Vec::new(),
     })
     .unwrap();
@@ -349,7 +342,7 @@ async fn replaces_a_missing_agent_session_with_a_new_session() {
         model: None,
         effort: None,
         agent_sandbox: None,
-        env: Default::default(),
+        proxy: None,
         subscribe: Vec::new(),
     })
     .unwrap();

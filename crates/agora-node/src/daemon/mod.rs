@@ -246,7 +246,8 @@ impl DaemonShutdown {
 }
 
 impl Daemon {
-    pub fn new(config: NodeConfig) -> Result<Self> {
+    pub fn new(mut config: NodeConfig) -> Result<Self> {
+        config.apply_proxy_defaults();
         let store = SessionStore::open_default()?;
         let scheduler = ExecutionScheduler::default();
         Ok(Self {
@@ -268,7 +269,11 @@ impl Daemon {
             dispatcher,
             commands,
         } = self;
-        let NodeConfig { channels, agents } = config;
+        let NodeConfig {
+            proxy: _,
+            channels,
+            agents,
+        } = config;
         let agents = AgentRegistry::from_configs(agents)?;
         let shutdown = DaemonShutdown {
             scheduler: dispatcher.scheduler.clone(),

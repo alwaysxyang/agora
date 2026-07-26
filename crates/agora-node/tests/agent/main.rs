@@ -55,7 +55,7 @@ fn agent(
         model: None,
         effort: None,
         agent_sandbox: None,
-        env: Default::default(),
+        proxy: None,
         subscribe: Vec::new(),
     }
 }

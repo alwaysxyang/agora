@@ -15,11 +15,21 @@ pub(super) struct RecordedRequest {
     pub(super) method: String,
     pub(super) path: String,
     pub(super) body: String,
+    headers: String,
 }
 
 impl RecordedRequest {
     pub(super) fn endpoint(&self) -> &str {
         self.path.rsplit('/').next().unwrap_or_default()
+    }
+
+    pub(super) fn header(&self, name: &str) -> Option<&str> {
+        self.headers.lines().skip(1).find_map(|line| {
+            let (header_name, value) = line.split_once(':')?;
+            header_name
+                .eq_ignore_ascii_case(name)
+                .then_some(value.trim())
+        })
     }
 }
 
@@ -28,6 +38,7 @@ pub(super) struct MockResponse {
     status: u16,
     body: Vec<u8>,
     content_type: &'static str,
+    delay: Duration,
 }
 
 impl MockResponse {
@@ -36,6 +47,7 @@ impl MockResponse {
             status: 200,
             body: body.into().into_bytes(),
             content_type: "application/json",
+            delay: Duration::ZERO,
         }
     }
 
@@ -44,11 +56,17 @@ impl MockResponse {
         self
     }
 
+    pub(super) fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
     pub(super) fn bytes(body: impl Into<Vec<u8>>, content_type: &'static str) -> Self {
         Self {
             status: 200,
             body: body.into(),
             content_type,
+            delay: Duration::ZERO,
         }
     }
 }
@@ -270,10 +288,16 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<RecordedRequest> {
     }
     let body = String::from_utf8(received[header_end..header_end + content_length].to_vec())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    Ok(RecordedRequest { method, path, body })
+    Ok(RecordedRequest {
+        method,
+        path,
+        body,
+        headers,
+    })
 }
 
 async fn write_response(stream: &mut TcpStream, response: MockResponse) -> io::Result<()> {
+    tokio::time::sleep(response.delay).await;
     let reason = if response.status == 200 {
         "OK"
     } else {

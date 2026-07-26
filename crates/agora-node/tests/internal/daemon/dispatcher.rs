@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn selects_all_agents_subscribed_to_channel() {
     let config = NodeConfig {
+        proxy: None,
         channels: Vec::new(),
         agents: vec![
             agent("codex-dev", "lark1"),
@@ -26,6 +27,7 @@ fn wraps_configured_channel_behind_channel_trait() {
         name: "lark1".to_string(),
         app_id: "cli_xxx".to_string(),
         secret: "sec_xxx".to_string(),
+        proxy: None,
     }))
     .unwrap()
     .unwrap();

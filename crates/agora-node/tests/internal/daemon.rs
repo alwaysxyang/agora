@@ -57,7 +57,7 @@ fn agent(name: &str, channel: &str) -> AgentConfig {
         model: None,
         effort: None,
         agent_sandbox: None,
-        env: Default::default(),
+        proxy: None,
         subscribe: vec![AgentSubscription {
             channel: channel.to_string(),
             filter: None,
@@ -75,7 +75,7 @@ fn custom_agent(name: &str) -> AgentConfig {
         model: None,
         effort: None,
         agent_sandbox: None,
-        env: Default::default(),
+        proxy: None,
         subscribe: Vec::new(),
     }
 }

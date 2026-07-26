@@ -1,6 +1,74 @@
 use super::*;
 
 #[tokio::test]
+async fn default_rich_message_timing_persists_a_complete_private_run() {
+    let server = rich_message_server().await;
+    let message = TelegramRichMessage::new(
+        private_target(),
+        "codex-dev".to_string(),
+        None,
+        telegram_api(&server),
+    );
+
+    message
+        .publish(RunEvent::Started {
+            run_id: "run-1".to_string(),
+        })
+        .await
+        .unwrap();
+    message
+        .publish(RunEvent::Completed { exit_code: 0 })
+        .await
+        .unwrap();
+    drop(message);
+
+    server.wait_for_endpoint_count("sendRichMessage", 1).await;
+    assert_eq!(server.endpoint_count("sendRichMessage").await, 1);
+}
+
+#[tokio::test]
+async fn run_events_do_not_wait_for_telegram_delivery() {
+    let server = HttpMockServer::start(|request| {
+        let result = match request.endpoint() {
+            "sendRichMessageDraft" => "true",
+            "sendRichMessage" => r#"{"message_id":100}"#,
+            method => panic!("unexpected Telegram method {method}"),
+        };
+        MockResponse::json(format!(r#"{{"ok":true,"result":{result}}}"#))
+            .with_delay(Duration::from_millis(200))
+    })
+    .await;
+    let message = TelegramRichMessage::with_timing(
+        private_target(),
+        "codex-dev".to_string(),
+        telegram_api(&server),
+        TelegramRichTiming::new(Duration::from_millis(5), Duration::from_secs(5)),
+    );
+
+    tokio::time::timeout(
+        Duration::from_millis(50),
+        message.publish(RunEvent::Started {
+            run_id: "run-1".to_string(),
+        }),
+    )
+    .await
+    .expect("started event should only schedule delivery")
+    .unwrap();
+    server
+        .wait_for_endpoint_count("sendRichMessageDraft", 1)
+        .await;
+    tokio::time::timeout(
+        Duration::from_millis(50),
+        message.publish(RunEvent::Completed { exit_code: 0 }),
+    )
+    .await
+    .expect("completed event should only schedule delivery")
+    .unwrap();
+
+    server.wait_for_endpoint_count("sendRichMessage", 1).await;
+}
+
+#[tokio::test]
 async fn private_run_streams_a_draft_and_persists_one_final_reply() {
     let server = rich_message_server().await;
     let message = TelegramRichMessage::with_timing(
@@ -16,6 +84,9 @@ async fn private_run_streams_a_draft_and_persists_one_final_reply() {
         })
         .await
         .unwrap();
+    server
+        .wait_for_endpoint_count("sendRichMessageDraft", 1)
+        .await;
     for index in 0..3 {
         message
             .publish(RunEvent::Output(OutputEvent::Thinking {
@@ -35,6 +106,7 @@ async fn private_run_streams_a_draft_and_persists_one_final_reply() {
         .publish(RunEvent::Completed { exit_code: 0 })
         .await
         .unwrap();
+    server.wait_for_endpoint_count("sendRichMessage", 1).await;
 
     let requests = server.requests().await;
     let drafts = requests
@@ -61,12 +133,148 @@ async fn private_run_streams_a_draft_and_persists_one_final_reply() {
     assert_eq!(final_body["chat_id"], 1);
     assert_eq!(final_body["reply_parameters"]["message_id"], 7);
     assert_eq!(final_body["message_thread_id"], 44);
+    let final_markdown = final_body["rich_message"]["markdown"].as_str().unwrap();
+    assert!(final_markdown.starts_with("**✦ 思考过程 · 3 条**"));
     assert!(
-        final_body["rich_message"]["markdown"]
-            .as_str()
-            .unwrap()
-            .contains("## codex-dev · 已完成")
+        final_markdown
+            .contains("<details><summary>◈ 推理节点 · 01</summary>\n\nThinking 0\n\n</details>")
     );
+    assert!(
+        final_markdown
+            .contains("<details><summary>◈ 推理节点 · 03</summary>\n\nThinking 2\n\n</details>")
+    );
+    assert!(final_markdown.ends_with("**已完成**"));
+}
+
+#[tokio::test]
+async fn completed_run_sends_as_many_bounded_messages_as_needed() {
+    let server = rich_message_server().await;
+    let message = TelegramRichMessage::with_timing(
+        private_target(),
+        "codex-dev".to_string(),
+        telegram_api(&server),
+        TelegramRichTiming::new(Duration::from_millis(5), Duration::from_secs(5)),
+    );
+    let answer = "long output\n".repeat(800);
+    let mut expected = TelegramRichContent::new("codex-dev".to_string());
+    expected.apply(RunEvent::Output(OutputEvent::Answer {
+        text: answer.clone(),
+    }));
+    expected.apply(RunEvent::Completed { exit_code: 0 });
+    let expected = expected.render_messages(false);
+    assert!(expected.len() > 2);
+
+    message
+        .publish(RunEvent::Started {
+            run_id: "run-1".to_string(),
+        })
+        .await
+        .unwrap();
+    server
+        .wait_for_endpoint_count("sendRichMessageDraft", 1)
+        .await;
+    message
+        .publish(RunEvent::Output(OutputEvent::Answer { text: answer }))
+        .await
+        .unwrap();
+    server
+        .wait_for_endpoint_count("sendRichMessageDraft", 2)
+        .await;
+    message
+        .publish(RunEvent::Completed { exit_code: 0 })
+        .await
+        .unwrap();
+    server
+        .wait_for_endpoint_count("sendRichMessage", expected.len())
+        .await;
+
+    let requests = server.requests().await;
+    let delivered = requests
+        .iter()
+        .filter(|request| request.endpoint() == "sendRichMessage")
+        .map(|request| {
+            serde_json::from_str::<serde_json::Value>(&request.body).unwrap()["rich_message"]
+                ["markdown"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(delivered, expected);
+}
+
+#[tokio::test]
+async fn multipart_retry_reuses_messages_that_were_already_sent() {
+    let server = HttpMockServer::start_json_queue([
+        r#"{"ok":true,"result":true}"#,
+        r#"{"ok":true,"result":true}"#,
+        r#"{"ok":true,"result":{"message_id":100}}"#,
+        r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#,
+        r#"{"ok":false,"error_code":502,"description":"Bad Gateway"}"#,
+        r#"{"ok":false,"error_code":503,"description":"Service Unavailable"}"#,
+        r#"{"ok":true,"result":{"message_id":100}}"#,
+        r#"{"ok":true,"result":{"message_id":101}}"#,
+    ])
+    .await;
+    let message = TelegramRichMessage::with_timing(
+        private_target(),
+        "codex-dev".to_string(),
+        telegram_api(&server),
+        TelegramRichTiming::new(Duration::from_millis(5), Duration::from_secs(5)),
+    );
+    let answer = "x".repeat(40_000);
+    let mut expected = TelegramRichContent::new("codex-dev".to_string());
+    expected.apply(RunEvent::Output(OutputEvent::Answer {
+        text: answer.clone(),
+    }));
+    expected.apply(RunEvent::Completed { exit_code: 0 });
+    let expected = expected.render_messages(false);
+    assert_eq!(expected.len(), 2);
+
+    message
+        .publish(RunEvent::Started {
+            run_id: "run-1".to_string(),
+        })
+        .await
+        .unwrap();
+    server
+        .wait_for_endpoint_count("sendRichMessageDraft", 1)
+        .await;
+    message
+        .publish(RunEvent::Output(OutputEvent::Answer { text: answer }))
+        .await
+        .unwrap();
+    server
+        .wait_for_endpoint_count("sendRichMessageDraft", 2)
+        .await;
+    message
+        .publish(RunEvent::Completed { exit_code: 0 })
+        .await
+        .unwrap();
+    server.wait_for_endpoint_count("sendRichMessage", 5).await;
+    server.wait_for_endpoint_count("editMessageText", 1).await;
+
+    let requests = server.requests().await;
+    let primary_sends = requests
+        .iter()
+        .filter(|request| request.endpoint() == "sendRichMessage")
+        .filter(|request| {
+            serde_json::from_str::<serde_json::Value>(&request.body).unwrap()["rich_message"]
+                ["markdown"]
+                == expected[0]
+        })
+        .count();
+    let primary_edits = requests
+        .iter()
+        .filter(|request| request.endpoint() == "editMessageText")
+        .filter(|request| {
+            serde_json::from_str::<serde_json::Value>(&request.body).unwrap()["rich_message"]
+                ["markdown"]
+                == expected[0]
+        })
+        .count();
+    assert_eq!(primary_sends, 1);
+    assert_eq!(primary_edits, 1);
 }
 
 #[tokio::test]
@@ -89,6 +297,7 @@ async fn private_run_refreshes_the_draft_until_terminal_state() {
         .wait_for_endpoint_count("sendRichMessageDraft", 2)
         .await;
     message.publish(RunEvent::Stopped).await.unwrap();
+    server.wait_for_endpoint_count("sendRichMessage", 1).await;
     let draft_count = server.endpoint_count("sendRichMessageDraft").await;
 
     tokio::time::sleep(Duration::from_millis(70)).await;
@@ -98,6 +307,42 @@ async fn private_run_refreshes_the_draft_until_terminal_state() {
         draft_count
     );
     assert_eq!(server.endpoint_count("sendRichMessage").await, 1);
+}
+
+#[tokio::test]
+async fn private_run_retries_a_failed_final_reply_after_the_run_ends() {
+    let server = HttpMockServer::start_json_queue([
+        r#"{"ok":true,"result":true}"#,
+        r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#,
+        r#"{"ok":false,"error_code":502,"description":"Bad Gateway"}"#,
+        r#"{"ok":false,"error_code":503,"description":"Service Unavailable"}"#,
+        r#"{"ok":true,"result":{"message_id":100}}"#,
+    ])
+    .await;
+    let message = TelegramRichMessage::with_timing(
+        private_target(),
+        "codex-dev".to_string(),
+        telegram_api(&server),
+        TelegramRichTiming::new(Duration::from_millis(5), Duration::from_secs(5)),
+    );
+
+    message
+        .publish(RunEvent::Started {
+            run_id: "run-1".to_string(),
+        })
+        .await
+        .unwrap();
+    server
+        .wait_for_endpoint_count("sendRichMessageDraft", 1)
+        .await;
+    message
+        .publish(RunEvent::Completed { exit_code: 0 })
+        .await
+        .unwrap();
+    drop(message);
+
+    server.wait_for_endpoint_count("sendRichMessage", 4).await;
+    assert_eq!(server.endpoint_count("sendRichMessage").await, 4);
 }
 
 #[tokio::test]
@@ -116,6 +361,7 @@ async fn group_run_sends_once_and_edits_the_same_topic_message() {
         })
         .await
         .unwrap();
+    server.wait_for_endpoint_count("sendRichMessage", 1).await;
     message
         .publish(RunEvent::Output(OutputEvent::Thinking {
             text: "Inspecting".to_string(),
@@ -127,6 +373,7 @@ async fn group_run_sends_once_and_edits_the_same_topic_message() {
         .publish(RunEvent::Completed { exit_code: 0 })
         .await
         .unwrap();
+    server.wait_for_endpoint_count("editMessageText", 2).await;
 
     let requests = server.requests().await;
     let sends = requests
@@ -172,20 +419,24 @@ async fn subscribed_agents_keep_independent_telegram_messages() {
         })
         .await
         .unwrap();
+    server.wait_for_endpoint_count("sendRichMessage", 1).await;
     second
         .publish(RunEvent::Started {
             run_id: "run-b".to_string(),
         })
         .await
         .unwrap();
+    server.wait_for_endpoint_count("sendRichMessage", 2).await;
     first
         .publish(RunEvent::Completed { exit_code: 0 })
         .await
         .unwrap();
+    server.wait_for_endpoint_count("editMessageText", 1).await;
     second
         .publish(RunEvent::Completed { exit_code: 0 })
         .await
         .unwrap();
+    server.wait_for_endpoint_count("editMessageText", 2).await;
 
     let requests = server.requests().await;
     let edited_ids = requests

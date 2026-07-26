@@ -347,6 +347,7 @@ mod tests {
         assert!(
             ConfiguredChannel::from_config(ChannelConfig::Local(NamedChannelConfig {
                 name: "local".to_string(),
+                proxy: None,
             }))
             .unwrap()
             .is_none()
@@ -354,6 +355,7 @@ mod tests {
         assert!(
             ConfiguredChannel::from_config(ChannelConfig::Http(NamedChannelConfig {
                 name: "http".to_string(),
+                proxy: None,
             }))
             .unwrap()
             .is_none()
@@ -363,6 +365,7 @@ mod tests {
             name: "lark".to_string(),
             app_id: "app-id".to_string(),
             secret: "secret".to_string(),
+            proxy: None,
         }))
         .unwrap()
         .unwrap();
@@ -372,6 +375,7 @@ mod tests {
             ConfiguredChannel::from_config(ChannelConfig::Telegram(TelegramChannelConfig {
                 name: "telegram".to_string(),
                 token: "123:secret".to_string(),
+                proxy: None,
             }))
             .unwrap()
             .unwrap();

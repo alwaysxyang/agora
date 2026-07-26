@@ -1,6 +1,7 @@
-use crate::config::{AgentConfig, AgentType, IsolationScope};
+use crate::config::{AgentConfig, AgentType, HttpProxy, IsolationScope};
 use crate::task::{OutputEvent, TaskContent};
 use anyhow::{Result, anyhow};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 
@@ -142,6 +143,7 @@ pub struct ConfiguredAgent {
 
 impl ConfiguredAgent {
     pub fn from_config(config: AgentConfig) -> Result<Self> {
+        let env = Self::proxy_environment(config.proxy.as_ref());
         let backend = match config.agent_type {
             AgentType::Codex => AgentBackend::Codex(CodexAgent::new(
                 config.name.clone(),
@@ -149,11 +151,9 @@ impl ConfiguredAgent {
                 config.model.clone(),
                 config.effort.clone(),
                 config.agent_sandbox,
-                config.env.clone(),
+                env,
             )),
-            AgentType::Custom => {
-                AgentBackend::Custom(CustomAgent::new(config.path.clone(), config.env.clone()))
-            }
+            AgentType::Custom => AgentBackend::Custom(CustomAgent::new(config.path.clone(), env)),
             AgentType::Coco => {
                 return Err(anyhow!("one-shot coco agent execution is not implemented"));
             }
@@ -164,6 +164,17 @@ impl ConfiguredAgent {
             }
         };
         Ok(Self { config, backend })
+    }
+
+    fn proxy_environment(proxy: Option<&HttpProxy>) -> HashMap<String, String> {
+        let Some(proxy) = proxy else {
+            return HashMap::new();
+        };
+        let value = proxy.environment_value();
+        ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]
+            .into_iter()
+            .map(|name| (name.to_string(), value.clone()))
+            .collect()
     }
 
     pub fn name(&self) -> &str {

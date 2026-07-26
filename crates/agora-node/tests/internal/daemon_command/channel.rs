@@ -33,7 +33,7 @@ async fn channel_loop_routes_stop_without_sending_it_to_the_agent() {
         model: None,
         effort: None,
         agent_sandbox: None,
-        env: Default::default(),
+        proxy: None,
         subscribe: Vec::new(),
     })
     .unwrap();

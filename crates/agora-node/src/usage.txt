@@ -1,0 +1,52 @@
+CONFIGURATION FILE (JSON)
+  Top-level fields:
+    proxy                    Optional default HTTP proxy for all agents and channels.
+    channels                 Reusable channel definitions.
+    agents                   Local agent definitions.
+
+  Proxy format:
+    proxy                    address:port or user:password@address:port. An optional
+                             http:// prefix is accepted. User and password may be empty.
+                             Agent/channel proxy values override the top-level default.
+
+  Lark channel fields:
+    type                     Channel type; use "lark".
+    name                     Unique channel name referenced by subscriptions.
+    app_id                   Lark application ID.
+    secret                   Lark application secret; do not commit it.
+    proxy                    Optional channel-specific HTTP proxy.
+
+  Telegram channel fields:
+    type                     Channel type; use "telegram".
+    name                     Unique channel name referenced by subscriptions.
+    token                    Telegram bot token; do not commit it.
+    proxy                    Optional channel-specific HTTP proxy.
+
+  Reserved channel types:
+    type                     "local" or "http"; not active yet.
+    name                     Unique channel name.
+
+  Agent fields:
+    name                     Unique local agent name.
+    isolate                  Backend session and queue isolation: "none" or "session".
+    workspace                Optional agent workdir. Defaults to ~/.agora/workspace.
+    type                     Backend type: "codex", "coco", "claude_code", or "custom".
+    path                     Backend executable path.
+    model                    Optional Codex model override.
+    effort                   Optional Codex reasoning effort override.
+    agent_sandbox            Optional backend sandbox: "read-only", "workspace-write",
+                             or "danger-full-access". This is separate from session isolation.
+    proxy                    Optional agent-specific HTTP proxy. Injected into the agent
+                             process as HTTP_PROXY/HTTPS_PROXY (upper and lower case).
+    subscribe                Channel subscriptions for this agent.
+    subscribe[].channel      Name of a configured channel.
+    subscribe[].filter       Optional reserved channel filter; currently ignored.
+
+  Example:
+    {"proxy":"127.0.0.1:7890",
+     "channels":[{"type":"lark","name":"lark1","app_id":"xxx","secret":"xxx"},
+     {"type":"telegram","name":"telegram1","token":"xxx"}],
+     "agents":[{"name":"codex","isolate":"none","type":"codex",
+     "path":"/opt/homebrew/bin/codex","agent_sandbox":"danger-full-access",
+     "subscribe":[{"channel":"lark1","filter":{}},
+     {"channel":"telegram1","filter":{}}]}]}

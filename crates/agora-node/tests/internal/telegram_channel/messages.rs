@@ -8,13 +8,16 @@ fn telegram_renders_agent_status_replies_without_interactive_controls() {
     ]);
     assert_eq!(
         TelegramChannel::render_reply(&list),
-        "当前对话的 Agent 状态\n✓ codex-dev — 已启用\n− reviewer — 已禁用"
+        "**当前对话的 Agent 状态**\n> 配置仅对当前对话生效\n\n\
+         🟢 **codex-dev** · 已启用\n接收后续消息\n\n\
+         ⚪ **reviewer** · 已禁用\n不接收后续消息"
     );
 
     let status = ChannelReply::agent_status(ChannelAgentStatus::new("reviewer", false));
     assert_eq!(
         TelegramChannel::render_reply(&status),
-        "当前对话的 Agent 状态\n− reviewer — 已禁用"
+        "**当前对话的 Agent 状态**\n> 配置仅对当前对话生效\n\n\
+         ⚪ **reviewer** · 已禁用\n不接收后续消息"
     );
 }
 
@@ -72,16 +75,50 @@ fn normalizes_forum_topic_session_and_reply_target() {
 }
 
 #[test]
-fn ignores_messages_without_non_empty_text() {
-    for payload in [
+fn normalizes_photo_caption() {
+    let update = TelegramUpdate::from_json(
         r#"{
             "update_id": 103,
             "message": {
                 "message_id": 9,
                 "chat": {"id": 1, "type": "private"},
+                "caption": "analyze this image",
+                "photo": [
+                    {"file_id": "photo-small"},
+                    {"file_id": "photo-large"}
+                ]
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let task = update.into_task("agora_bot").unwrap();
+
+    assert_eq!(task.input().message().unwrap().text(), "analyze this image");
+}
+
+#[test]
+fn accepts_a_photo_without_a_caption() {
+    let update = TelegramUpdate::from_json(
+        r#"{
+            "update_id": 104,
+            "message": {
+                "message_id": 10,
+                "chat": {"id": 1, "type": "private"},
                 "photo": [{"file_id": "photo-1"}]
             }
         }"#,
+    )
+    .unwrap();
+
+    let task = update.into_task("agora_bot").unwrap();
+
+    assert_eq!(task.input().message().unwrap().text(), "");
+}
+
+#[test]
+fn ignores_messages_without_text_or_photos() {
+    let update = TelegramUpdate::from_json(
         r#"{
             "update_id": 104,
             "message": {
@@ -90,10 +127,10 @@ fn ignores_messages_without_non_empty_text() {
                 "text": "   "
             }
         }"#,
-    ] {
-        let update = TelegramUpdate::from_json(payload).unwrap();
-        assert!(update.into_task("agora_bot").is_none());
-    }
+    )
+    .unwrap();
+
+    assert!(update.into_task("agora_bot").is_none());
 }
 
 #[test]

@@ -5,12 +5,14 @@ use agora_node::config::{
 #[test]
 fn parses_channels_and_agents_config() {
     let content = r#"{
+        "proxy": "global:8080",
         "channels": [
             {
                 "type": "lark",
                 "name": "lark1",
                 "app_id": "cli_xxx",
-                "secret": "sec_xxx"
+                "secret": "sec_xxx",
+                "proxy": ":channel-password@channel-proxy:8081"
             }
         ],
         "agents": [
@@ -23,9 +25,7 @@ fn parses_channels_and_agents_config() {
                 "model": "gpt-5.4",
                 "effort": "high",
                 "agent_sandbox": "danger-full-access",
-                "env": {
-                    "AGORA_AGENT_ENV": "configured"
-                },
+                "proxy": "agent-user:@agent-proxy:8082",
                 "subscribe": [
                     {
                         "channel": "lark1",
@@ -38,6 +38,10 @@ fn parses_channels_and_agents_config() {
 
     let config: NodeConfig = serde_json::from_str(content).unwrap();
 
+    assert_eq!(
+        config.proxy.as_ref().map(|proxy| proxy.environment_value()),
+        Some("http://global:8080".to_string())
+    );
     assert_eq!(config.channels.len(), 1);
     assert_eq!(config.channels[0].name(), "lark1");
     assert_eq!(config.agents.len(), 1);
@@ -52,10 +56,10 @@ fn parses_channels_and_agents_config() {
     );
     assert_eq!(
         config.agents[0]
-            .env
-            .get("AGORA_AGENT_ENV")
-            .map(String::as_str),
-        Some("configured")
+            .proxy
+            .as_ref()
+            .map(|proxy| proxy.environment_value()),
+        Some("http://agent-user:@agent-proxy:8082".to_string())
     );
     assert_eq!(config.agents[0].subscribe.len(), 1);
     assert_eq!(config.agents[0].subscribe[0].channel, "lark1");
@@ -102,6 +106,23 @@ fn rejects_removed_task_isolation_mode() {
             "isolate": "task",
             "type": "codex",
             "path": "/opt/homebrew/bin/codex",
+            "subscribe": []
+        }]
+    }"#;
+
+    assert!(serde_json::from_str::<NodeConfig>(content).is_err());
+}
+
+#[test]
+fn rejects_removed_agent_env_field() {
+    let content = r#"{
+        "channels": [],
+        "agents": [{
+            "name": "agent-1",
+            "isolate": "none",
+            "type": "codex",
+            "path": "/opt/homebrew/bin/codex",
+            "env": {"HTTP_PROXY": "http://proxy:8080"},
             "subscribe": []
         }]
     }"#;
@@ -166,7 +187,7 @@ fn defaults_workspace_to_agora_directory_under_home() {
     assert_eq!(config.agents[0].model, None);
     assert_eq!(config.agents[0].effort, None);
     assert_eq!(config.agents[0].agent_sandbox, None);
-    assert!(config.agents[0].env.is_empty());
+    assert_eq!(config.agents[0].proxy, None);
 }
 
 fn example_config() -> AgentConfig {
@@ -179,7 +200,7 @@ fn example_config() -> AgentConfig {
         model: None,
         effort: None,
         agent_sandbox: None,
-        env: Default::default(),
+        proxy: None,
         subscribe: vec![agora_node::config::AgentSubscription {
             channel: "lark1".to_string(),
             filter: None,
