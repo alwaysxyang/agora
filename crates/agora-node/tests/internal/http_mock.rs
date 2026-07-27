@@ -56,11 +56,6 @@ impl MockResponse {
         self
     }
 
-    pub(super) fn with_delay(mut self, delay: Duration) -> Self {
-        self.delay = delay;
-        self
-    }
-
     pub(super) fn bytes(body: impl Into<Vec<u8>>, content_type: &'static str) -> Self {
         Self {
             status: 200,

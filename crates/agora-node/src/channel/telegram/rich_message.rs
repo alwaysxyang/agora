@@ -5,6 +5,7 @@ use crate::i18n::{self, RunStatus};
 use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
 use agora_core::logger;
 use anyhow::Result;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -160,18 +161,9 @@ impl TelegramRichMessage {
         };
 
         if flush_now {
-            self.schedule_immediate_flush();
+            self.flush_latest(false).await?;
         }
         Ok(())
-    }
-
-    fn schedule_immediate_flush(&self) {
-        let message = self.clone();
-        tokio::spawn(async move {
-            if let Err(err) = message.flush_latest(false).await {
-                message.handle_flush_failure("publish", err).await;
-            }
-        });
     }
 
     fn schedule_flush(&self, delay: Duration) {
@@ -370,7 +362,10 @@ impl TelegramRichMessage {
             } else {
                 state.version != state.sent_version
             };
-            if !pending {
+            let retryable = !state.content.is_terminal()
+                && ((self.inner.target.is_private && self.inner.interrupt.is_none())
+                    || !state.message_ids.is_empty());
+            if !pending || !retryable {
                 None
             } else if !state.retry_scheduled {
                 state.delivery_failures = state.delivery_failures.saturating_add(1);
@@ -435,7 +430,7 @@ impl ChannelRun for TelegramRichMessage {
 pub(super) struct TelegramRichContent {
     agent_name: String,
     thinking: Vec<String>,
-    latest_progress: Option<String>,
+    progress: VecDeque<TelegramProgressEntry>,
     answer: String,
     usage: Option<TokenUsage>,
     state: TelegramRunState,
@@ -450,12 +445,18 @@ enum TelegramRunState {
     Interrupted,
 }
 
+struct TelegramProgressEntry {
+    id: String,
+    text: String,
+    status: ProgressStatus,
+}
+
 impl TelegramRichContent {
     pub(super) fn new(agent_name: String) -> Self {
         Self {
             agent_name,
             thinking: Vec::new(),
-            latest_progress: None,
+            progress: VecDeque::new(),
             answer: String::new(),
             usage: None,
             state: TelegramRunState::Running,
@@ -472,8 +473,14 @@ impl TelegramRichContent {
             RunEvent::Output(output) => self.apply_output(output),
             RunEvent::Completed { .. } => self.state = TelegramRunState::Completed,
             RunEvent::Failed { message } => self.state = TelegramRunState::Failed(message),
-            RunEvent::Stopped => self.state = TelegramRunState::Stopped,
-            RunEvent::Interrupted => self.state = TelegramRunState::Interrupted,
+            RunEvent::Stopped => {
+                self.stop_running_progress();
+                self.state = TelegramRunState::Stopped;
+            }
+            RunEvent::Interrupted => {
+                self.stop_running_progress();
+                self.state = TelegramRunState::Interrupted;
+            }
         }
     }
 
@@ -508,6 +515,9 @@ impl TelegramRichContent {
         let mut sections = Vec::new();
         if !draft || self.is_terminal() {
             sections.extend(self.thinking_sections());
+        }
+        if !self.progress.is_empty() && (!draft || self.is_terminal()) {
+            sections.push(self.progress_section());
         }
         if let Some(section) = self.terminal_state_section() {
             sections.push(section);
@@ -663,13 +673,9 @@ impl TelegramRichContent {
                 if draft {
                     let activity = self.draft_activity(cumulative_thinking);
                     Some(format!("<tg-thinking>{activity}</tg-thinking>"))
-                } else if let Some(progress) = &self.latest_progress {
-                    Some(format!(
-                        "> **{}** · {}",
-                        Self::escape_structural_text(&self.agent_name),
-                        Self::escape_structural_text(progress)
-                    ))
-                } else if cumulative_thinking && !self.thinking.is_empty() {
+                } else if !self.progress.is_empty()
+                    || (cumulative_thinking && !self.thinking.is_empty())
+                {
                     None
                 } else {
                     let activity = self
@@ -735,14 +741,25 @@ impl TelegramRichContent {
             OutputEvent::Thinking { text } => {
                 if !text.trim().is_empty() {
                     self.thinking.push(text);
-                    self.latest_progress = None;
                 }
             }
-            OutputEvent::Progress { text, status, .. } => {
-                self.latest_progress = Some(format!("{} {text}", Self::progress_marker(status)));
+            OutputEvent::Progress { id, text, status } => {
+                if let Some(index) = self.progress.iter().position(|entry| entry.id == id) {
+                    self.progress.remove(index);
+                }
+                self.progress
+                    .push_front(TelegramProgressEntry { id, text, status });
             }
             OutputEvent::Answer { text } => self.answer.push_str(&text),
             OutputEvent::Usage(usage) => self.usage = Some(usage),
+        }
+    }
+
+    fn stop_running_progress(&mut self) {
+        for entry in &mut self.progress {
+            if entry.status == ProgressStatus::Running {
+                entry.status = ProgressStatus::Stopped;
+            }
         }
     }
 
@@ -759,6 +776,7 @@ impl TelegramRichContent {
         let mut activity = if cumulative_thinking {
             self.thinking
                 .iter()
+                .rev()
                 .map(|text| Self::escape_structural_text(text))
                 .collect::<Vec<_>>()
         } else {
@@ -767,8 +785,12 @@ impl TelegramRichContent {
                 .map(|text| vec![Self::escape_structural_text(text)])
                 .unwrap_or_default()
         };
-        if let Some(progress) = &self.latest_progress {
-            activity.push(Self::escape_structural_text(progress));
+        if let Some(progress) = self.progress.front() {
+            activity.push(format!(
+                "{} {}",
+                Self::progress_marker(progress.status),
+                Self::escape_structural_text(&progress.text)
+            ));
         }
         if activity.is_empty() {
             Self::escape_structural_text(i18n::WAITING_FOR_AGENT)
@@ -786,7 +808,7 @@ impl TelegramRichContent {
             i18n::THINKING_TITLE,
             i18n::update_count(self.thinking.len())
         )];
-        sections.extend(self.thinking.iter().enumerate().map(|(index, text)| {
+        sections.extend(self.thinking.iter().enumerate().rev().map(|(index, text)| {
             format!(
                 "<details><summary>◈ 推理节点 · {:02}</summary>\n\n{}\n\n</details>",
                 index + 1,
@@ -794,6 +816,55 @@ impl TelegramRichContent {
             )
         }));
         sections
+    }
+
+    fn progress_section(&self) -> String {
+        let body = self
+            .progress
+            .iter()
+            .map(|entry| {
+                format!(
+                    "- {} {}",
+                    Self::progress_marker(entry.status),
+                    Self::escape_structural_text(&entry.text)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let opening = if self.is_terminal() {
+            "<details>"
+        } else {
+            "<details open>"
+        };
+        format!(
+            "{opening}<summary>◇ {} · {}</summary>\n\n{body}\n\n</details>",
+            i18n::PROGRESS_TITLE,
+            self.progress_summary()
+        )
+    }
+
+    fn progress_summary(&self) -> String {
+        let mut counts = [0_usize; 4];
+        for entry in &self.progress {
+            let index = match entry.status {
+                ProgressStatus::Running => 0,
+                ProgressStatus::Completed => 1,
+                ProgressStatus::Failed => 2,
+                ProgressStatus::Stopped => 3,
+            };
+            counts[index] += 1;
+        }
+        [
+            (ProgressStatus::Completed, "✓", counts[1]),
+            (ProgressStatus::Running, "●", counts[0]),
+            (ProgressStatus::Failed, "×", counts[2]),
+            (ProgressStatus::Stopped, "■", counts[3]),
+        ]
+        .into_iter()
+        .filter(|(_, _, count)| *count > 0)
+        .map(|(status, marker, count)| format!("{marker} {}", i18n::progress_count(status, count)))
+        .collect::<Vec<_>>()
+        .join(" · ")
     }
 
     fn usage_section(usage: TokenUsage) -> String {

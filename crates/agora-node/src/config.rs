@@ -28,7 +28,6 @@ impl NodeConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub name: String,
     pub isolate: IsolateMode,
@@ -294,116 +293,5 @@ impl AgentSandbox {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn http_proxy_accepts_optional_credentials_and_rejects_invalid_addresses() {
-        for (value, expected) in [
-            ("proxy.local:8080", "http://proxy.local:8080"),
-            (
-                "http://user:password@proxy.local:8080",
-                "http://user:password@proxy.local:8080",
-            ),
-            (
-                ":password@proxy.local:8080",
-                "http://:password@proxy.local:8080",
-            ),
-            ("user:@proxy.local:8080", "http://user:@proxy.local:8080"),
-            (":@proxy.local:8080", "http://:@proxy.local:8080"),
-            ("[::1]:8080", "http://[::1]:8080"),
-        ] {
-            assert_eq!(
-                value.parse::<HttpProxy>().unwrap().environment_value(),
-                expected
-            );
-        }
-
-        for invalid in [
-            "https://proxy.local:8080",
-            "proxy.local",
-            "proxy.local:0",
-            "proxy.local:invalid",
-            "user@proxy.local:8080",
-            "bad host:8080",
-            "::1:8080",
-            "[::1:8080",
-        ] {
-            assert!(invalid.parse::<HttpProxy>().is_err(), "accepted {invalid}");
-        }
-    }
-
-    #[test]
-    fn component_proxies_override_the_global_default() {
-        let mut config: NodeConfig = serde_json::from_str(
-            r#"{
-                "proxy":"global:8000",
-                "channels":[
-                    {"type":"lark","name":"lark","app_id":"id","secret":"secret"},
-                    {"type":"telegram","name":"telegram","token":"token","proxy":"tg:8001"},
-                    {"type":"local","name":"local"},
-                    {"type":"http","name":"http","proxy":"http:8002"}
-                ],
-                "agents":[
-                    {"name":"global","isolate":"none","type":"custom","path":"agent","subscribe":[]},
-                    {"name":"own","isolate":"none","type":"custom","path":"agent","proxy":"agent:8003","subscribe":[]}
-                ]
-            }"#,
-        )
-        .unwrap();
-
-        config.apply_proxy_defaults();
-
-        assert_eq!(
-            config.agents[0].proxy.as_ref().unwrap().environment_value(),
-            "http://global:8000"
-        );
-        assert_eq!(
-            config.agents[1].proxy.as_ref().unwrap().environment_value(),
-            "http://agent:8003"
-        );
-        let channel_proxies = config
-            .channels
-            .iter_mut()
-            .map(|channel| channel.proxy_mut().as_ref().unwrap().environment_value())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            channel_proxies,
-            [
-                "http://global:8000",
-                "http://tg:8001",
-                "http://global:8000",
-                "http://http:8002",
-            ]
-        );
-    }
-
-    #[test]
-    fn absent_global_proxy_leaves_components_unconfigured() {
-        let mut config: NodeConfig =
-            serde_json::from_str(r#"{"channels":[],"agents":[]}"#).unwrap();
-
-        config.apply_proxy_defaults();
-
-        assert_eq!(config.proxy, None);
-    }
-
-    #[test]
-    fn isolation_scope_and_sandbox_strings_cover_all_variants() {
-        assert_eq!(IsolationScope::Shared.channel_name(), None);
-        assert_eq!(IsolationScope::Shared.session_id(), None);
-        assert_eq!(IsolationScope::Shared.as_str(), "shared");
-
-        let session = IsolationScope::session("telegram", "chat-1");
-        assert_eq!(session.channel_name(), Some("telegram"));
-        assert_eq!(session.session_id(), Some("chat-1"));
-        assert_eq!(session.as_str(), "session");
-
-        assert_eq!(AgentSandbox::ReadOnly.as_str(), "read-only");
-        assert_eq!(AgentSandbox::WorkspaceWrite.as_str(), "workspace-write");
-        assert_eq!(
-            AgentSandbox::DangerFullAccess.as_str(),
-            "danger-full-access"
-        );
-    }
-}
+#[path = "../tests/internal/config.rs"]
+mod tests;

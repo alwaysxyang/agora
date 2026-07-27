@@ -178,7 +178,7 @@ impl TelegramApi {
         callback_data: Option<&str>,
     ) -> Result<i64> {
         let message: TelegramSentMessage = self
-            .request(
+            .request_once(
                 "sendRichMessage",
                 &SendRichMessageRequest {
                     chat_id: target.chat_id,
@@ -220,6 +220,28 @@ impl TelegramApi {
         B: Serialize + ?Sized,
         T: DeserializeOwned,
     {
+        self.request_with_attempts(method, body, TELEGRAM_REQUEST_MAX_ATTEMPTS)
+            .await
+    }
+
+    async fn request_once<B, T>(&self, method: &str, body: &B) -> Result<T>
+    where
+        B: Serialize + ?Sized,
+        T: DeserializeOwned,
+    {
+        self.request_with_attempts(method, body, 1).await
+    }
+
+    async fn request_with_attempts<B, T>(
+        &self,
+        method: &str,
+        body: &B,
+        max_attempts: usize,
+    ) -> Result<T>
+    where
+        B: Serialize + ?Sized,
+        T: DeserializeOwned,
+    {
         let mut attempt = 1;
         loop {
             let response = match self
@@ -230,7 +252,7 @@ impl TelegramApi {
                 .await
             {
                 Ok(response) => response,
-                Err(_) if attempt < TELEGRAM_REQUEST_MAX_ATTEMPTS => {
+                Err(_) if attempt < max_attempts => {
                     Self::wait_before_retry(attempt, None).await;
                     attempt += 1;
                     continue;
@@ -240,7 +262,7 @@ impl TelegramApi {
             let status = response.status();
             let envelope = match response.json::<TelegramResponse<T>>().await {
                 Ok(envelope) => envelope,
-                Err(_) if status.is_server_error() && attempt < TELEGRAM_REQUEST_MAX_ATTEMPTS => {
+                Err(_) if status.is_server_error() && attempt < max_attempts => {
                     Self::wait_before_retry(attempt, None).await;
                     attempt += 1;
                     continue;
@@ -262,7 +284,7 @@ impl TelegramApi {
                 || status.is_server_error()
                 || error_code == Some(429)
                 || error_code.is_some_and(|code| (500..600).contains(&code));
-            if retryable && attempt < TELEGRAM_REQUEST_MAX_ATTEMPTS {
+            if retryable && attempt < max_attempts {
                 Self::wait_before_retry(attempt, retry_after).await;
                 attempt += 1;
                 continue;

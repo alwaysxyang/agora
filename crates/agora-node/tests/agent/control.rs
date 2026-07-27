@@ -73,3 +73,17 @@ async fn agent_run_control_keeps_the_first_cancellation_reason() {
     assert!(!control.interrupt());
     assert_eq!(control.cancelled().await, AgentRunCancellation::Stopped);
 }
+
+#[tokio::test]
+async fn agent_run_control_defaults_to_running_and_can_be_interrupted() {
+    let control = AgentRunControl::default();
+
+    assert_eq!(format!("{control:?}"), "AgentRunControl { state: Running }");
+    assert!(control.interrupt());
+    assert!(!control.stop());
+    assert_eq!(
+        format!("{control:?}"),
+        "AgentRunControl { state: Cancelled(Interrupted) }"
+    );
+    assert_eq!(control.cancelled().await, AgentRunCancellation::Interrupted);
+}

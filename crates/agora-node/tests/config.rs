@@ -114,7 +114,7 @@ fn rejects_removed_task_isolation_mode() {
 }
 
 #[test]
-fn rejects_removed_agent_env_field() {
+fn ignores_removed_agent_env_field() {
     let content = r#"{
         "channels": [],
         "agents": [{
@@ -122,12 +122,15 @@ fn rejects_removed_agent_env_field() {
             "isolate": "none",
             "type": "codex",
             "path": "/opt/homebrew/bin/codex",
-            "env": {"HTTP_PROXY": "http://proxy:8080"},
+            "env": {"HTTP_PROXY": "http://legacy-proxy:8080"},
             "subscribe": []
         }]
     }"#;
 
-    assert!(serde_json::from_str::<NodeConfig>(content).is_err());
+    let config = serde_json::from_str::<NodeConfig>(content).unwrap();
+
+    assert_eq!(config.agents.len(), 1);
+    assert_eq!(config.agents[0].proxy, None);
 }
 
 #[test]

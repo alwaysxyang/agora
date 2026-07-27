@@ -28,11 +28,14 @@ fn telegram_rich_message_puts_all_thinking_before_the_answer_and_usage() {
     assert_eq!(
         content.render(false),
         "**✦ 思考过程 · 2 条**\n\n\
+         <details><summary>◈ 推理节点 · 02</summary>\n\n\
+         Checking the tests\n\n\
+         </details>\n\n\
          <details><summary>◈ 推理节点 · 01</summary>\n\n\
          Inspecting &lt;the project&gt;\n\n\
          </details>\n\n\
-         <details><summary>◈ 推理节点 · 02</summary>\n\n\
-         Checking the tests\n\n\
+         <details><summary>◇ 执行进度 · ✓ 1 项已完成</summary>\n\n\
+         - ✓ Run `cargo test`\n\n\
          </details>\n\n\
          **All checks passed.**\n\n- tests\n- clippy\n\n\
          > **◈ TOKEN USAGE** · 46.0K tokens · Input 42.8K · 31.6K cached · Output 3.2K · Reasoning 1.9K"
@@ -57,18 +60,20 @@ fn telegram_rich_message_shows_all_thinking_while_running() {
     assert_eq!(
         content.render(false),
         "**✦ 思考过程 · 2 条**\n\n\
-         <details><summary>◈ 推理节点 · 01</summary>\n\n\
-         Inspecting the project\n\n\
-         </details>\n\n\
          <details><summary>◈ 推理节点 · 02</summary>\n\n\
          Checking the tests\n\n\
          </details>\n\n\
-         > **codex-dev** · ● Run `cargo test`"
+         <details><summary>◈ 推理节点 · 01</summary>\n\n\
+         Inspecting the project\n\n\
+         </details>\n\n\
+         <details open><summary>◇ 执行进度 · ● 1 项进行中</summary>\n\n\
+         - ● Run `cargo test`\n\n\
+         </details>"
     );
     assert_eq!(
         content.render(true),
-        "<tg-thinking>Inspecting the project\n\n\
-         Checking the tests\n\n\
+        "<tg-thinking>Checking the tests\n\n\
+         Inspecting the project\n\n\
          ● Run `cargo test`</tg-thinking>"
     );
 }
@@ -92,6 +97,64 @@ fn telegram_rich_message_updates_the_latest_progress_marker() {
                 .contains(&format!("{marker} Run tests"))
         );
     }
+}
+
+#[test]
+fn telegram_rich_message_keeps_all_progress_after_completion_with_latest_first() {
+    let mut content = TelegramRichContent::new("codex-dev".to_string());
+    content.apply(RunEvent::Output(OutputEvent::Progress {
+        id: "command-1".to_string(),
+        text: "Run tests".to_string(),
+        status: ProgressStatus::Running,
+    }));
+    content.apply(RunEvent::Output(OutputEvent::Progress {
+        id: "command-2".to_string(),
+        text: "Check formatting".to_string(),
+        status: ProgressStatus::Completed,
+    }));
+    content.apply(RunEvent::Output(OutputEvent::Progress {
+        id: "command-1".to_string(),
+        text: "Run tests".to_string(),
+        status: ProgressStatus::Failed,
+    }));
+    content.apply(RunEvent::Completed { exit_code: 0 });
+
+    let rendered = content.render(false);
+
+    assert_eq!(rendered.matches("Run tests").count(), 1);
+    assert_eq!(rendered.matches("Check formatting").count(), 1);
+    assert!(rendered.contains("× Run tests"));
+    assert!(rendered.contains("✓ Check formatting"));
+    assert!(rendered.find("Run tests") < rendered.find("Check formatting"));
+}
+
+#[test]
+fn telegram_rich_message_renders_latest_thinking_first() {
+    let mut content = TelegramRichContent::new("codex-dev".to_string());
+    content.apply(RunEvent::Output(OutputEvent::Thinking {
+        text: "First update".to_string(),
+    }));
+    content.apply(RunEvent::Output(OutputEvent::Thinking {
+        text: "Latest update".to_string(),
+    }));
+
+    let rendered = content.render(false);
+
+    assert!(rendered.find("Latest update") < rendered.find("First update"));
+}
+
+#[test]
+fn telegram_rich_message_marks_running_progress_stopped_when_the_run_stops() {
+    let mut content = TelegramRichContent::new("codex-dev".to_string());
+    content.apply(RunEvent::Output(OutputEvent::Progress {
+        id: "command-1".to_string(),
+        text: "Run tests".to_string(),
+        status: ProgressStatus::Running,
+    }));
+
+    content.apply(RunEvent::Stopped);
+
+    assert!(content.render(false).contains("■ Run tests"));
 }
 
 #[test]

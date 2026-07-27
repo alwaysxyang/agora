@@ -1,3 +1,4 @@
+use super::super::channel::TelegramReplyTarget;
 use super::*;
 
 #[tokio::test]
@@ -124,6 +125,30 @@ async fn telegram_api_retries_server_errors() {
 }
 
 #[tokio::test]
+async fn telegram_api_does_not_retry_non_idempotent_message_sends() {
+    let server = HttpMockServer::start_json_queue([
+        r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#,
+        r#"{"ok":true,"result":{"message_id":88}}"#,
+    ])
+    .await;
+    let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
+    let target = TelegramReplyTarget {
+        chat_id: 1,
+        message_id: 31,
+        message_thread_id: None,
+        is_private: true,
+    };
+
+    let error = api
+        .send_rich_message(&target, "reply", None)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("sendRichMessage"));
+    assert_eq!(server.endpoint_count("sendRichMessage").await, 1);
+}
+
+#[tokio::test]
 async fn telegram_api_errors_do_not_expose_the_bot_token() {
     let server = HttpMockServer::start_json_queue([
         r#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#,
@@ -237,12 +262,55 @@ async fn telegram_channel_downloads_the_largest_photo_as_an_attachment() {
 }
 
 #[tokio::test]
-async fn telegram_channel_enqueues_command_replies_without_waiting_for_delivery() {
-    let server = HttpMockServer::start(|request| {
-        assert_eq!(request.endpoint(), "sendRichMessage");
-        MockResponse::json(r#"{"ok":true,"result":{"message_id":88}}"#)
-            .with_delay(std::time::Duration::from_millis(200))
+async fn telegram_channel_retries_an_image_update_without_advancing_its_offset() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let get_file_attempts = Arc::new(AtomicUsize::new(0));
+    let attempts = Arc::clone(&get_file_attempts);
+    let server = HttpMockServer::start(move |request| match request.endpoint() {
+        "getMe" => MockResponse::json(
+            r#"{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}}"#,
+        ),
+        "setMyCommands" => MockResponse::json(r#"{"ok":true,"result":true}"#),
+        "getUpdates" => MockResponse::json(
+            r#"{"ok":true,"result":[{"update_id":305,"message":{"message_id":25,"chat":{"id":1,"type":"private"},"caption":"inspect","photo":[{"file_id":"large"}]}}]}"#,
+        ),
+        "getFile" if attempts.fetch_add(1, Ordering::Relaxed) < 3 => MockResponse::json(
+            r#"{"ok":false,"error_code":500,"description":"temporary failure"}"#,
+        )
+        .with_status(500),
+        "getFile" => MockResponse::json(
+            r#"{"ok":true,"result":{"file_id":"large","file_unique_id":"unique","file_path":"photos/image.jpg"}}"#,
+        ),
+        "image.jpg" => MockResponse::bytes(b"image-bytes".to_vec(), "image/jpeg"),
+        endpoint => panic!("unexpected Telegram endpoint {endpoint}"),
     })
+    .await;
+    let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
+    let mut channel = TelegramChannel::with_api(api);
+
+    assert!(channel.next_task().await.is_err());
+    let task = channel.next_task().await.unwrap();
+
+    assert_eq!(task.task_id(), "305");
+    let polls = server
+        .requests()
+        .await
+        .into_iter()
+        .filter(|request| request.endpoint() == "getUpdates")
+        .collect::<Vec<_>>();
+    assert_eq!(polls.len(), 2);
+    let retry: serde_json::Value = serde_json::from_str(&polls[1].body).unwrap();
+    assert_eq!(retry.get("offset"), None);
+}
+
+#[tokio::test]
+async fn telegram_channel_reports_command_reply_delivery_failures() {
+    let server = HttpMockServer::start_json_queue([
+        r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#,
+        r#"{"ok":true,"result":{"message_id":88}}"#,
+    ])
     .await;
     let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
     let channel = TelegramChannel::with_api(api);
@@ -260,19 +328,13 @@ async fn telegram_channel_enqueues_command_replies_without_waiting_for_delivery(
     .into_task("agora_bot")
     .unwrap();
 
-    tokio::time::timeout(
-        std::time::Duration::from_millis(50),
-        channel.reply(&task, ChannelReply::new("**Agora 命令**")),
-    )
-    .await
-    .expect("reply should only enqueue delivery")
-    .unwrap();
+    let error = channel
+        .reply(&task, ChannelReply::new("**Agora 命令**"))
+        .await
+        .unwrap_err();
 
-    server.wait_for_endpoint_count("sendRichMessage", 1).await;
-    let requests = server.requests().await;
-    let body: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
-    assert_eq!(body["rich_message"]["markdown"], "**Agora 命令**");
-    assert_eq!(body["reply_parameters"]["message_id"], 31);
+    assert!(error.to_string().contains("sendRichMessage"));
+    assert_eq!(server.endpoint_count("sendRichMessage").await, 1);
 }
 
 #[tokio::test]

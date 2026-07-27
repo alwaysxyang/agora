@@ -27,15 +27,14 @@ async fn default_rich_message_timing_persists_a_complete_private_run() {
 }
 
 #[tokio::test]
-async fn run_events_do_not_wait_for_telegram_delivery() {
-    let server = HttpMockServer::start(|request| {
-        let result = match request.endpoint() {
-            "sendRichMessageDraft" => "true",
-            "sendRichMessage" => r#"{"message_id":100}"#,
-            method => panic!("unexpected Telegram method {method}"),
-        };
-        MockResponse::json(format!(r#"{{"ok":true,"result":{result}}}"#))
-            .with_delay(Duration::from_millis(200))
+async fn terminal_events_wait_for_delivery_and_return_failures() {
+    let server = HttpMockServer::start(|request| match request.endpoint() {
+        "sendRichMessageDraft" => MockResponse::json(r#"{"ok":true,"result":true}"#),
+        "sendRichMessage" => MockResponse::json(
+            r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#,
+        )
+        .with_status(500),
+        method => panic!("unexpected Telegram method {method}"),
     })
     .await;
     let message = TelegramRichMessage::with_timing(
@@ -45,27 +44,50 @@ async fn run_events_do_not_wait_for_telegram_delivery() {
         TelegramRichTiming::new(Duration::from_millis(5), Duration::from_secs(5)),
     );
 
-    tokio::time::timeout(
-        Duration::from_millis(50),
-        message.publish(RunEvent::Started {
+    message
+        .publish(RunEvent::Started {
             run_id: "run-1".to_string(),
-        }),
-    )
-    .await
-    .expect("started event should only schedule delivery")
-    .unwrap();
+        })
+        .await
+        .unwrap();
     server
         .wait_for_endpoint_count("sendRichMessageDraft", 1)
         .await;
-    tokio::time::timeout(
-        Duration::from_millis(50),
-        message.publish(RunEvent::Completed { exit_code: 0 }),
-    )
-    .await
-    .expect("completed event should only schedule delivery")
-    .unwrap();
+    let error = message
+        .publish(RunEvent::Completed { exit_code: 0 })
+        .await
+        .unwrap_err();
 
+    assert!(error.to_string().contains("sendRichMessage"));
+    assert_eq!(server.endpoint_count("sendRichMessage").await, 1);
+}
+
+#[tokio::test]
+async fn background_flush_does_not_retry_a_non_idempotent_initial_send() {
+    let server = HttpMockServer::start_json_queue([
+        r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#,
+        r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#,
+        r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#,
+        r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#,
+    ])
+    .await;
+    let message = TelegramRichMessage::with_timing(
+        group_target(),
+        "codex-dev".to_string(),
+        telegram_api(&server),
+        TelegramRichTiming::new(Duration::from_millis(5), Duration::from_secs(5)),
+    );
+
+    message
+        .publish(RunEvent::Output(OutputEvent::Thinking {
+            text: "Inspecting".to_string(),
+        }))
+        .await
+        .unwrap();
     server.wait_for_endpoint_count("sendRichMessage", 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(server.endpoint_count("sendRichMessage").await, 1);
 }
 
 #[tokio::test]
@@ -204,14 +226,12 @@ async fn completed_run_sends_as_many_bounded_messages_as_needed() {
 }
 
 #[tokio::test]
-async fn multipart_retry_reuses_messages_that_were_already_sent() {
+async fn caller_retry_reuses_multipart_messages_that_were_already_sent() {
     let server = HttpMockServer::start_json_queue([
         r#"{"ok":true,"result":true}"#,
         r#"{"ok":true,"result":true}"#,
         r#"{"ok":true,"result":{"message_id":100}}"#,
         r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#,
-        r#"{"ok":false,"error_code":502,"description":"Bad Gateway"}"#,
-        r#"{"ok":false,"error_code":503,"description":"Service Unavailable"}"#,
         r#"{"ok":true,"result":{"message_id":100}}"#,
         r#"{"ok":true,"result":{"message_id":101}}"#,
     ])
@@ -247,11 +267,16 @@ async fn multipart_retry_reuses_messages_that_were_already_sent() {
     server
         .wait_for_endpoint_count("sendRichMessageDraft", 2)
         .await;
+    let error = message
+        .publish(RunEvent::Completed { exit_code: 0 })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Internal Server Error"));
     message
         .publish(RunEvent::Completed { exit_code: 0 })
         .await
         .unwrap();
-    server.wait_for_endpoint_count("sendRichMessage", 5).await;
+    server.wait_for_endpoint_count("sendRichMessage", 3).await;
     server.wait_for_endpoint_count("editMessageText", 1).await;
 
     let requests = server.requests().await;
@@ -310,12 +335,10 @@ async fn private_run_refreshes_the_draft_until_terminal_state() {
 }
 
 #[tokio::test]
-async fn private_run_retries_a_failed_final_reply_after_the_run_ends() {
+async fn private_run_reports_a_failed_final_reply_without_background_retry() {
     let server = HttpMockServer::start_json_queue([
         r#"{"ok":true,"result":true}"#,
         r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#,
-        r#"{"ok":false,"error_code":502,"description":"Bad Gateway"}"#,
-        r#"{"ok":false,"error_code":503,"description":"Service Unavailable"}"#,
         r#"{"ok":true,"result":{"message_id":100}}"#,
     ])
     .await;
@@ -335,14 +358,19 @@ async fn private_run_retries_a_failed_final_reply_after_the_run_ends() {
     server
         .wait_for_endpoint_count("sendRichMessageDraft", 1)
         .await;
+    let error = message
+        .publish(RunEvent::Completed { exit_code: 0 })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Internal Server Error"));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(server.endpoint_count("sendRichMessage").await, 1);
+
     message
         .publish(RunEvent::Completed { exit_code: 0 })
         .await
         .unwrap();
-    drop(message);
-
-    server.wait_for_endpoint_count("sendRichMessage", 4).await;
-    assert_eq!(server.endpoint_count("sendRichMessage").await, 4);
+    assert_eq!(server.endpoint_count("sendRichMessage").await, 2);
 }
 
 #[tokio::test]

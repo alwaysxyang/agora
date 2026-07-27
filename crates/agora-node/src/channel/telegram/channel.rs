@@ -13,9 +13,7 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{Mutex, mpsc};
 
-const TELEGRAM_REPLY_QUEUE_CAPACITY: usize = 64;
 const TELEGRAM_INTERRUPT_PREFIX: &str = "agora_interrupt:";
 const TELEGRAM_COMMANDS: &[TelegramBotCommand<'static>] = &[
     TelegramBotCommand::new("stop", i18n::STOP_COMMAND_DESCRIPTION),
@@ -27,7 +25,6 @@ const TELEGRAM_COMMANDS: &[TelegramBotCommand<'static>] = &[
 pub struct TelegramChannel {
     api: TelegramApi,
     interrupts: TelegramInterruptCallbacks,
-    reply_sender: Mutex<Option<mpsc::Sender<TelegramPendingReply>>>,
     pending: VecDeque<TelegramTask>,
     next_offset: Option<i64>,
     bot_username: Option<String>,
@@ -36,11 +33,6 @@ pub struct TelegramChannel {
 #[derive(Clone)]
 pub struct TelegramRun {
     message: TelegramRichMessage,
-}
-
-struct TelegramPendingReply {
-    target: TelegramReplyTarget,
-    markdown: String,
 }
 
 struct TelegramInterruptCallbacksInner {
@@ -127,7 +119,6 @@ impl TelegramChannel {
         Self {
             api,
             interrupts: TelegramInterruptCallbacks::default(),
-            reply_sender: Mutex::new(None),
             pending: VecDeque::new(),
             next_offset: None,
             bot_username: None,
@@ -155,7 +146,6 @@ impl TelegramChannel {
                     );
                     continue;
                 };
-                self.advance_offset(update_id);
                 match TelegramUpdate::from_value(value) {
                     Ok(update) => {
                         debug_assert_eq!(update.update_id(), update_id);
@@ -173,9 +163,7 @@ impl TelegramChannel {
                                 triggered
                             );
                             self.answer_callback_query(callback.id.clone());
-                            continue;
-                        }
-                        if let Some(task) = update.into_task(&bot_username) {
+                        } else if let Some(task) = update.into_task(&bot_username) {
                             let task = self.resolve_task_image(task).await?;
                             logger::info!(
                                 "telegram message received channel={} session={} message_id={} input={} attachments={}",
@@ -201,6 +189,7 @@ impl TelegramChannel {
                         err
                     ),
                 }
+                self.advance_offset(update_id);
             }
         }
     }
@@ -302,36 +291,6 @@ impl TelegramChannel {
             .replace('<', "&lt;")
             .replace('>', "&gt;")
     }
-
-    async fn enqueue_reply(&self, reply: TelegramPendingReply) -> Result<()> {
-        let mut sender = self.reply_sender.lock().await;
-        if sender.as_ref().is_none_or(mpsc::Sender::is_closed) {
-            let (new_sender, mut replies) =
-                mpsc::channel::<TelegramPendingReply>(TELEGRAM_REPLY_QUEUE_CAPACITY);
-            let api = self.api.clone();
-            tokio::spawn(async move {
-                while let Some(reply) = replies.recv().await {
-                    if let Err(err) = api
-                        .send_rich_message(&reply.target, &reply.markdown, None)
-                        .await
-                    {
-                        logger::error!(
-                            "telegram reply delivery failed channel={} chat_id={} error={}",
-                            api.name(),
-                            reply.target.chat_id,
-                            err
-                        );
-                    }
-                }
-            });
-            *sender = Some(new_sender);
-        }
-        sender
-            .as_ref()
-            .expect("telegram reply sender initialized")
-            .try_send(reply)
-            .context("telegram reply queue is full")
-    }
 }
 
 impl Channel for TelegramChannel {
@@ -361,11 +320,10 @@ impl Channel for TelegramChannel {
     }
 
     async fn reply(&self, task: &Self::Task, reply: ChannelReply) -> Result<()> {
-        self.enqueue_reply(TelegramPendingReply {
-            target: task.reply_target().clone(),
-            markdown: Self::render_reply(&reply),
-        })
-        .await
+        self.api
+            .send_rich_message(task.reply_target(), &Self::render_reply(&reply), None)
+            .await?;
+        Ok(())
     }
 }
 
