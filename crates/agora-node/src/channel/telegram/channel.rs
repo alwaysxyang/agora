@@ -485,3 +485,6 @@ impl TelegramChat {
         matches!(self.kind.as_str(), "private" | "group" | "supergroup")
     }
 }
+
+#[cfg(test)]
+mod tests;

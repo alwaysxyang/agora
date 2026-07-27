@@ -24,11 +24,6 @@ use command::{CommandOutcome, CommandRuntime};
 use execution::{ExecutionScheduler, ExecutionScope};
 
 #[cfg(test)]
-#[path = "../../tests/internal/daemon_command.rs"]
-mod command_tests;
-
-#[cfg(test)]
-#[path = "../../tests/internal/daemon.rs"]
 mod tests;
 
 const CHANNEL_RETRY_DELAY: Duration = Duration::from_secs(1);

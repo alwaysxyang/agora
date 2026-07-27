@@ -19,5 +19,4 @@ pub(crate) struct FailureCopy {
 }
 
 #[cfg(test)]
-#[path = "../../tests/internal/i18n.rs"]
 mod tests;

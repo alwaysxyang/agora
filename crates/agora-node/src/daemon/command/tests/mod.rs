@@ -1,9 +1,9 @@
-use super::command::{
+use super::super::execution::{ExecutionScheduler, ExecutionScope, ExecutionTicket};
+use super::super::{AgentDispatcher, Daemon};
+use super::{
     Argument, CommandContext, CommandExecution, CommandHandler, CommandNode, CommandRegistry,
     CommandResolution, CommandRuntime,
 };
-use super::execution::{ExecutionScheduler, ExecutionScope, ExecutionTicket};
-use super::{AgentDispatcher, Daemon};
 use crate::agent::{
     AgentOutput, AgentRunCancellation, AgentRunControl, AgentTask, ConfiguredAgent,
 };
@@ -20,15 +20,10 @@ use std::future::pending;
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, timeout};
 
-#[path = "daemon_command/ask.rs"]
 mod ask;
-#[path = "daemon_command/channel.rs"]
 mod channel;
-#[path = "daemon_command/execution.rs"]
 mod execution;
-#[path = "daemon_command/registry.rs"]
 mod registry;
-#[path = "daemon_command/reset.rs"]
 mod reset;
 
 fn run_scope(channel_name: &str, session_id: &str, agent_name: &str) -> ExecutionScope {

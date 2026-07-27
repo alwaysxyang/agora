@@ -293,5 +293,4 @@ impl AgentSandbox {
 }
 
 #[cfg(test)]
-#[path = "../tests/internal/config.rs"]
 mod tests;

@@ -11,7 +11,6 @@ pub mod lark;
 mod telegram;
 
 #[cfg(test)]
-#[path = "../../tests/internal/http_mock.rs"]
 pub(crate) mod test_http;
 
 pub trait Channel {
@@ -301,5 +300,4 @@ pub enum RunEvent {
 }
 
 #[cfg(test)]
-#[path = "../../tests/internal/channel.rs"]
 mod tests;

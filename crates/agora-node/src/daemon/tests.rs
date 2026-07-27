@@ -40,11 +40,8 @@ impl AgentDispatcher {
     }
 }
 
-#[path = "daemon/dispatcher.rs"]
 mod dispatcher;
-#[path = "daemon/queue.rs"]
 mod queue;
-#[path = "daemon/sessions.rs"]
 mod sessions;
 
 fn agent(name: &str, channel: &str) -> AgentConfig {

@@ -85,5 +85,4 @@ async fn connect_tunnel_inner(proxy: &HttpProxy, target_url: &str) -> Result<Tcp
 }
 
 #[cfg(test)]
-#[path = "../../../tests/internal/lark_channel/proxy.rs"]
 mod tests;

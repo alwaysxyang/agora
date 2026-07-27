@@ -396,5 +396,4 @@ dyld_interpose!(INTERPOSE_CONNECT, agora_sandbox_connect, libc::connect);
 dyld_interpose!(INTERPOSE_CONNECTX, agora_sandbox_connectx, system_connectx);
 
 #[cfg(test)]
-#[path = "../../tests/internal/hook/interpose.rs"]
 mod tests;

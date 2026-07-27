@@ -1,4 +1,4 @@
-use super::super::channel::TelegramReplyTarget;
+use super::super::TelegramReplyTarget;
 use super::*;
 
 #[tokio::test]

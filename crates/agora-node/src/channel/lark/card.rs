@@ -839,3 +839,6 @@ impl ChannelRun for LarkAgentCard {
         self.publish_event(event).await
     }
 }
+
+#[cfg(test)]
+mod tests;

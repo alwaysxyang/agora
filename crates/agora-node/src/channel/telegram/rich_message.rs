@@ -928,3 +928,6 @@ impl TelegramRichContent {
         Self::escape_structural_text(&text[start..])
     }
 }
+
+#[cfg(test)]
+mod tests;

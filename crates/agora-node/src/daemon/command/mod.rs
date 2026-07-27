@@ -77,3 +77,6 @@ impl CommandRuntime {
         &self.registry
     }
 }
+
+#[cfg(test)]
+mod tests;

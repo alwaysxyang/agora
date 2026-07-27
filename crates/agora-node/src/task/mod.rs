@@ -166,5 +166,4 @@ impl From<&str> for TaskContent {
 }
 
 #[cfg(test)]
-#[path = "../../tests/internal/task.rs"]
 mod tests;

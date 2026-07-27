@@ -578,5 +578,4 @@ impl LarkWebSocketReceiver {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/internal/lark_channel/channel.rs"]
 mod tests;

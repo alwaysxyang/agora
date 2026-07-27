@@ -1,5 +1,5 @@
-use super::channel::{TelegramChannel, TelegramUpdate};
-use super::telegram_api::{TelegramApi, TelegramBotCommand};
+use super::super::telegram_api::{TelegramApi, TelegramBotCommand};
+use super::{TelegramChannel, TelegramUpdate};
 use crate::channel::test_http::{HttpMockServer, MockResponse};
 use crate::channel::{
     Channel, ChannelAgent, ChannelAgentStatus, ChannelReply, ChannelRun, ChannelRunContext,
@@ -7,9 +7,7 @@ use crate::channel::{
 };
 use crate::config::{ChannelConfig, TelegramChannelConfig};
 
-#[path = "telegram_channel/api.rs"]
 mod api;
-#[path = "telegram_channel/messages.rs"]
 mod messages;
 
 fn telegram_config() -> TelegramChannelConfig {

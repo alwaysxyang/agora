@@ -1,7 +1,7 @@
-use super::channel::{LarkChannel, LarkEvent, LarkInterruptCallbacks};
-use super::lark_api::{
+use super::super::lark_api::{
     LarkApi, LarkFrame, LarkFrameHeader, LarkReconnectBackoff, LarkWebSocketEndpointResponse,
 };
+use super::*;
 use crate::channel::{ChannelTask, InterruptCallback};
 use crate::config::LarkChannelConfig;
 use crate::task::{CommandRequest, TaskAttachmentKind};
@@ -12,9 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-#[path = "lark_channel/attachments.rs"]
 mod attachments;
-#[path = "lark_channel/messages.rs"]
+mod channel;
 mod messages;
-#[path = "lark_channel/protocol.rs"]
 mod protocol;

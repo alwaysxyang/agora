@@ -206,14 +206,14 @@ timeout so a healthy empty poll is not mistaken for a network timeout.
 
 ## Testing
 
-Tests remain outside production files under `tests/internal/` and are attached
-to the corresponding production modules with test-only `#[path]` declarations:
+White-box tests live beside the production modules and are attached with the
+standard test-only `#[cfg(test)] mod tests;` declaration:
 
-- `tests/internal/telegram_channel.rs` covers update parsing, unsupported update
+- `src/channel/telegram/channel/tests/` covers update parsing, unsupported update
   filtering, offset advancement, command suffix normalization, chat/topic
   session identity, photo download/redelivery, reply targets, and
   configured-channel delegation.
-- `tests/internal/telegram_rich_message.rs` covers event accumulation, newest-
+- `src/channel/telegram/rich_message/tests/` covers event accumulation, newest-
   first thinking/progress order, status summaries, original answer Markdown,
   private draft/final behavior, group send/edit behavior, update coalescing,
   independent agent runs, delivery failures, non-idempotent retry boundaries,

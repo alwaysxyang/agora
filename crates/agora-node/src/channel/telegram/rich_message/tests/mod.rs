@@ -1,6 +1,6 @@
-use super::channel::TelegramReplyTarget;
-use super::rich_message::{TelegramRichContent, TelegramRichMessage, TelegramRichTiming};
-use super::telegram_api::TelegramApi;
+use super::super::channel::TelegramReplyTarget;
+use super::super::telegram_api::TelegramApi;
+use super::{TelegramRichContent, TelegramRichMessage, TelegramRichTiming};
 use crate::channel::test_http::{HttpMockServer, MockResponse};
 use crate::channel::{ChannelRun, RunEvent};
 use crate::config::TelegramChannelConfig;
@@ -9,9 +9,7 @@ use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-#[path = "telegram_rich_message/api.rs"]
 mod api;
-#[path = "telegram_rich_message/content.rs"]
 mod content;
 
 fn telegram_api(server: &HttpMockServer) -> TelegramApi {

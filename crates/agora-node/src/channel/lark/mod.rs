@@ -9,11 +9,3 @@ pub use channel::{LarkChannel, LarkRun, LarkTask};
 struct LarkReplyTarget {
     message_id: String,
 }
-
-#[cfg(test)]
-#[path = "../../../tests/internal/lark_card.rs"]
-mod lark_card_tests;
-
-#[cfg(test)]
-#[path = "../../../tests/internal/lark_channel.rs"]
-mod lark_channel_tests;

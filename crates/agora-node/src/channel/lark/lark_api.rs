@@ -625,5 +625,4 @@ impl LarkEmptyResponse {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/internal/lark_channel/lark_api.rs"]
 mod tests;

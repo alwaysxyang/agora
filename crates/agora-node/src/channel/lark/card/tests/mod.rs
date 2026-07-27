@@ -1,7 +1,7 @@
-use super::LarkReplyTarget;
-use super::card::{LarkAgentCard, LarkCardContent, LarkReplyCard};
-use super::channel::{LarkCardActionEvent, LarkChannel, LarkMessageEvent, LarkTask};
-use super::lark_api::LarkApi;
+use super::super::LarkReplyTarget;
+use super::super::channel::{LarkCardActionEvent, LarkChannel, LarkMessageEvent, LarkTask};
+use super::super::lark_api::LarkApi;
+use super::{LarkAgentCard, LarkCardContent, LarkReplyCard};
 use crate::channel::test_http::{HttpMockServer, MockResponse};
 use crate::channel::{
     Channel, ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun,
@@ -23,9 +23,7 @@ fn agent_status_with_button(name: &str, enabled: bool) -> ChannelAgentStatus {
     ))
 }
 
-#[path = "lark_card/api.rs"]
 mod api;
-#[path = "lark_card/content.rs"]
 mod content;
 
 async fn lark_http_server() -> HttpMockServer {
