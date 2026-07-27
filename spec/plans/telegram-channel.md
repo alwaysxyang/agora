@@ -192,6 +192,9 @@ description, but never the token or complete request URL.
   failures. HTTP 429 responses honor Telegram's `retry_after` value.
 - Non-idempotent sends are attempted once. Their errors are returned to the
   caller, and background flush logic does not blindly repeat an initial send.
+- If a terminal multipart flush fails after at least one message id is known,
+  bounded background retry edits the confirmed parts and resumes the missing
+  parts. An initial send with no confirmed message id is still not retried.
 - A malformed individual update is logged and skipped without discarding valid
   siblings in the same response.
 - Command-reply and terminal run-output failures are returned synchronously

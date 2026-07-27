@@ -190,13 +190,40 @@ An agent can subscribe to multiple channel names. A channel implementation shoul
 
 ## CLI Entry
 
-The first node binary starts from one config file containing named channels and flat agent configs:
+The node CLI separates daemon execution from configuration management. The
+`daemon` subcommand starts from one config file containing named channels and
+flat agent configs:
 
 ```text
-agora-node --config agent.json
+agora-node daemon --config agent.json
 ```
 
-`--config` loads one JSON object with `channels` and `agents`.
+`daemon --config` loads one JSON object with `channels` and `agents`. The `-c`
+short form remains available.
+
+`config -g <path>` and `config --generate <path>` run an interactive setup and
+write the generated JSON to the selected path. A relative path is resolved
+from the process's current directory; an absolute path is used directly.
+Generation replaces an existing file at the selected path. On Unix, a new file
+is created with mode `0600` because channel credentials are stored directly in
+it. In a terminal, choices use a colored selector navigated with the up and down
+arrow keys and confirmed with Enter. Numbered input remains available when
+stdin is not a terminal. A generation failure is logged with both its operation
+context and the underlying error cause.
+
+The setup first selects one active channel implementation. Lark prompts for an
+App ID followed by an App Secret, while Telegram prompts for a bot token; these
+credential strings are not validated. The generated channel name is `lark` or
+`telegram`, matching its type.
+
+The setup then selects an agent type. The only current choice is Codex. It
+searches `PATH` for `codex` and always prompts for the executable path, using
+the matched `PATH` entry as the default without resolving symbolic links.
+Model is a required free-form value. Reasoning effort is a free-form value
+defaulting to `high`.
+The generated agent is named `agent`, uses `session` isolation, subscribes to
+the generated channel, and uses the process's current directory as its
+workspace.
 
 Task content, including text and neutral attachments, session identity, and reply targets should come from channel intake. The daemon CLI should not expose temporary task submission or channel-specific reply-target flags.
 

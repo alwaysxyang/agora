@@ -161,7 +161,11 @@ impl TelegramRichMessage {
         };
 
         if flush_now {
-            self.flush_latest(false).await?;
+            let result = self.flush_latest(false).await;
+            if let Err(err) = &result {
+                self.handle_flush_failure("publish", err).await;
+            }
+            result?;
         }
         Ok(())
     }
@@ -179,7 +183,7 @@ impl TelegramRichMessage {
                 state.flush_scheduled = false;
             }
             if let Err(err) = message.flush_latest(false).await {
-                message.handle_flush_failure("update", err).await;
+                message.handle_flush_failure("update", &err).await;
             }
         });
     }
@@ -202,7 +206,7 @@ impl TelegramRichMessage {
                     return;
                 }
                 if let Err(err) = message.flush_latest(true).await {
-                    message.handle_flush_failure("draft refresh", err).await;
+                    message.handle_flush_failure("draft refresh", &err).await;
                 }
             }
         });
@@ -354,17 +358,17 @@ impl TelegramRichMessage {
         }
     }
 
-    async fn handle_flush_failure(&self, operation: &str, err: anyhow::Error) {
+    async fn handle_flush_failure(&self, operation: &str, err: &anyhow::Error) {
         let retry = {
             let mut state = self.inner.state.lock().await;
-            let pending = if state.content.is_terminal() {
+            let terminal = state.content.is_terminal();
+            let pending = if terminal {
                 !state.terminal_sent
             } else {
                 state.version != state.sent_version
             };
-            let retryable = !state.content.is_terminal()
-                && ((self.inner.target.is_private && self.inner.interrupt.is_none())
-                    || !state.message_ids.is_empty());
+            let retryable = !state.message_ids.is_empty()
+                || (!terminal && self.inner.target.is_private && self.inner.interrupt.is_none());
             if !pending || !retryable {
                 None
             } else if !state.retry_scheduled {
@@ -401,7 +405,7 @@ impl TelegramRichMessage {
                 state.retry_scheduled = false;
             }
             if let Err(err) = message.flush_latest(false).await {
-                message.handle_flush_failure("retry", err).await;
+                message.handle_flush_failure("retry", &err).await;
             }
         });
     }

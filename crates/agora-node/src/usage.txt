@@ -1,4 +1,11 @@
 CONFIGURATION FILE (JSON)
+  Generate a minimal config:
+    agora-node config --generate config.json
+                             Interactively selects Lark or Telegram, configures
+                             one Codex agent, and writes the selected path.
+                             Relative paths use the current directory; absolute
+                             paths are accepted. Existing files are not overwritten.
+
   Top-level fields:
     proxy                    Optional default HTTP proxy for all agents and channels.
     channels                 Reusable channel definitions.

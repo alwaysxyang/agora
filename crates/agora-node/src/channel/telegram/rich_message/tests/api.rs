@@ -226,7 +226,7 @@ async fn completed_run_sends_as_many_bounded_messages_as_needed() {
 }
 
 #[tokio::test]
-async fn caller_retry_reuses_multipart_messages_that_were_already_sent() {
+async fn terminal_retry_reuses_multipart_messages_that_were_already_sent() {
     let server = HttpMockServer::start_json_queue([
         r#"{"ok":true,"result":true}"#,
         r#"{"ok":true,"result":true}"#,
@@ -272,10 +272,7 @@ async fn caller_retry_reuses_multipart_messages_that_were_already_sent() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("Internal Server Error"));
-    message
-        .publish(RunEvent::Completed { exit_code: 0 })
-        .await
-        .unwrap();
+    drop(message);
     server.wait_for_endpoint_count("sendRichMessage", 3).await;
     server.wait_for_endpoint_count("editMessageText", 1).await;
 

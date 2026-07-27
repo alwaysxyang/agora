@@ -6,8 +6,9 @@ use agora_core::{
     logger,
 };
 use agora_node::{config, daemon::Daemon};
-use clap::{ColorChoice, Parser};
+use clap::{Args, ColorChoice, Parser, Subcommand};
 use std::io::stdout;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 const CONFIG_HELP: &str = include_str!("usage.txt");
@@ -20,6 +21,27 @@ const CONFIG_HELP: &str = include_str!("usage.txt");
     after_long_help = CONFIG_HELP
 )]
 struct Opts {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Manage node configuration
+    Config(ConfigOpts),
+    /// Run the local agent daemon
+    Daemon(DaemonOpts),
+}
+
+#[derive(Args)]
+struct ConfigOpts {
+    /// Generate a configuration file
+    #[arg(short = 'g', long, value_name = "PATH")]
+    generate: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct DaemonOpts {
     /// config file path
     #[arg(long, short)]
     config: String,
@@ -32,6 +54,18 @@ fn load_config(path: &str) -> anyhow::Result<config::NodeConfig> {
 }
 
 async fn async_main(opts: Opts) -> anyhow::Result<()> {
+    match opts.command {
+        Command::Config(ConfigOpts { generate }) => {
+            if let Some(path) = generate {
+                config::generate::run(&path)?;
+            }
+            Ok(())
+        }
+        Command::Daemon(opts) => run_daemon(opts).await,
+    }
+}
+
+async fn run_daemon(opts: DaemonOpts) -> anyhow::Result<()> {
     let config_path = opts.config.clone();
     let config = load_config(&config_path)?;
     logger::info!(
@@ -93,7 +127,7 @@ fn main() {
         }
     };
     if let Err(err) = runtime.block_on(async_main(opts)) {
-        logger::error!("{}", err);
+        logger::error!("{:#}", err);
         std::process::exit(1);
     }
 }

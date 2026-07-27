@@ -5,6 +5,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+pub mod generate;
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct NodeConfig {
     #[serde(default)]

@@ -1,5 +1,8 @@
+use agora_node::config::{AgentType, ChannelConfig, IsolateMode, NodeConfig};
+use std::io::Write as _;
+
 #[test]
-fn node_has_library_and_binary_and_requires_config() {
+fn node_has_library_and_binary_and_requires_a_subcommand() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(manifest_dir.join("src/lib.rs").exists());
     assert!(manifest_dir.join("src/main.rs").exists());
@@ -10,7 +13,7 @@ fn node_has_library_and_binary_and_requires_config() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--config"));
+    assert!(stderr.contains("<COMMAND>"));
 }
 
 #[test]
@@ -33,6 +36,7 @@ fn node_accepts_empty_config_without_starting_channel() {
     std::fs::write(&config_path, r#"{"channels":[],"agents":[]}"#).unwrap();
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_agora-node"))
+        .arg("daemon")
         .arg("--config")
         .arg(config_path)
         .env("HOME", temp.path())
@@ -52,6 +56,240 @@ fn node_accepts_empty_config_without_starting_channel() {
 }
 
 #[test]
+fn node_config_generate_builds_a_telegram_config_without_detected_codex() {
+    let temp = tempfile::tempdir().unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+    let output = run_config_generate(
+        temp.path(),
+        empty_path.path(),
+        "-g",
+        std::path::Path::new("config2.json"),
+        "9\n2\nbot-token\n\n/custom/bin/codex\n\ngpt-5.6\n\n",
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let generated = std::fs::read(temp.path().join("config2.json")).unwrap();
+    let generated_text = String::from_utf8_lossy(&generated);
+    assert!(generated_text.find("\"channels\"") < generated_text.find("\"agents\""));
+    let config: NodeConfig = serde_json::from_slice(&generated).unwrap();
+    let ChannelConfig::Telegram(channel) = &config.channels[0] else {
+        panic!("generated channel should be Telegram");
+    };
+    assert_eq!(channel.name, "telegram");
+    assert_eq!(channel.token, "bot-token");
+    assert_generated_agent(
+        &config,
+        temp.path(),
+        "telegram",
+        "/custom/bin/codex",
+        "gpt-5.6",
+        "high",
+    );
+}
+
+#[test]
+fn node_config_generate_builds_a_lark_config_with_detected_codex_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let output_dir = tempfile::tempdir().unwrap();
+    let executable_dir = tempfile::tempdir().unwrap();
+    let codex = executable_dir.path().join("codex");
+    #[cfg(unix)]
+    let executable = {
+        let executable = executable_dir.path().join("codex.js");
+        std::fs::write(&executable, "stub").unwrap();
+        std::os::unix::fs::symlink(&executable, &codex).unwrap();
+        executable
+    };
+    #[cfg(not(unix))]
+    let executable = {
+        std::fs::write(&codex, "stub").unwrap();
+        codex.clone()
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+    }
+
+    let config_path = output_dir.path().join("lark-config.json");
+    let output = run_config_generate(
+        temp.path(),
+        executable_dir.path(),
+        "--generate",
+        &config_path,
+        "\napp-id\napp-secret\n\n\ngpt-5.6-codex\nxhigh\n",
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&format!("Codex path [{}]", codex.display())));
+    let config: NodeConfig = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    let ChannelConfig::Lark(channel) = &config.channels[0] else {
+        panic!("generated channel should be Lark");
+    };
+    assert_eq!(channel.name, "lark");
+    assert_eq!(channel.app_id, "app-id");
+    assert_eq!(channel.secret, "app-secret");
+    assert_generated_agent(
+        &config,
+        temp.path(),
+        "lark",
+        &codex.to_string_lossy(),
+        "gpt-5.6-codex",
+        "xhigh",
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(config_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+#[test]
+fn node_config_generate_overwrites_an_existing_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.json");
+    std::fs::write(&config_path, "original").unwrap();
+
+    let output = run_config_generate(
+        temp.path(),
+        empty_path.path(),
+        "-g",
+        &config_path,
+        "2\nreplacement-token\n\n/custom/bin/codex\ngpt-5.6\n\n",
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config: NodeConfig = serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    let ChannelConfig::Telegram(channel) = &config.channels[0] else {
+        panic!("generated channel should be Telegram");
+    };
+    assert_eq!(channel.token, "replacement-token");
+}
+
+#[test]
+fn node_config_generate_reports_the_underlying_write_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+    let output = run_config_generate(
+        temp.path(),
+        empty_path.path(),
+        "-g",
+        temp.path(),
+        "2\nbot-token\n\n/custom/bin/codex\ngpt-5.6\n\n",
+    );
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("open configuration file"));
+    assert!(stdout.contains("os error"));
+}
+
+#[test]
+fn node_config_generate_requires_an_output_path() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_agora-node"))
+        .args(["config", "-g"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("<PATH>"));
+}
+
+fn run_config_generate(
+    current_dir: &std::path::Path,
+    path: &std::path::Path,
+    flag: &str,
+    output_path: &std::path::Path,
+    input: &str,
+) -> std::process::Output {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_agora-node"))
+        .args(["config", flag])
+        .arg(output_path)
+        .current_dir(current_dir)
+        .env("PATH", path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn assert_generated_agent(
+    config: &NodeConfig,
+    workspace: &std::path::Path,
+    channel: &str,
+    path: &str,
+    model: &str,
+    effort: &str,
+) {
+    assert_eq!(config.agents.len(), 1);
+    let agent = &config.agents[0];
+    assert_eq!(agent.name, "agent");
+    assert_eq!(agent.isolate, IsolateMode::Session);
+    assert_eq!(
+        agent.workspace,
+        std::fs::canonicalize(workspace).unwrap().to_string_lossy()
+    );
+    assert_eq!(agent.agent_type, AgentType::Codex);
+    assert_eq!(agent.path, path);
+    assert_eq!(agent.model.as_deref(), Some(model));
+    assert_eq!(agent.effort.as_deref(), Some(effort));
+    assert_eq!(agent.subscribe.len(), 1);
+    assert_eq!(agent.subscribe[0].channel, channel);
+}
+
+#[test]
+fn node_subcommand_help_describes_daemon_and_config_options() {
+    let daemon = std::process::Command::new(env!("CARGO_BIN_EXE_agora-node"))
+        .args(["daemon", "--help"])
+        .output()
+        .unwrap();
+    assert!(daemon.status.success());
+    let daemon_help = String::from_utf8_lossy(&daemon.stdout);
+    assert!(daemon_help.contains("-c"));
+    assert!(daemon_help.contains("--config"));
+    assert!(daemon_help.contains("<CONFIG>"));
+
+    let config = std::process::Command::new(env!("CARGO_BIN_EXE_agora-node"))
+        .args(["config", "--help"])
+        .output()
+        .unwrap();
+    assert!(config.status.success());
+    let config_help = String::from_utf8_lossy(&config.stdout);
+    assert!(config_help.contains("-g"));
+    assert!(config_help.contains("--generate"));
+    assert!(config_help.contains("<PATH>"));
+}
+
+#[test]
 fn node_help_describes_the_config_fields() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_agora-node"))
         .arg("--help")
@@ -60,6 +298,8 @@ fn node_help_describes_the_config_fields() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("config"));
+    assert!(stdout.contains("daemon"));
     for expected in [
         "CONFIGURATION FILE",
         "channels",
