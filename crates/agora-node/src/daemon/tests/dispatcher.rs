@@ -27,6 +27,7 @@ fn wraps_configured_channel_behind_channel_trait() {
         name: "lark1".to_string(),
         app_id: "cli_xxx".to_string(),
         secret: "sec_xxx".to_string(),
+        permission: Default::default(),
         proxy: None,
     }))
     .unwrap()

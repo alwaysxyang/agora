@@ -9,6 +9,7 @@ fn config() -> LarkChannelConfig {
         name: "lark-api-test".to_string(),
         app_id: "app-id".to_string(),
         secret: "secret".to_string(),
+        permission: Default::default(),
         proxy: None,
     }
 }
@@ -381,4 +382,22 @@ async fn lark_http_results_cover_missing_fields_errors_and_binary_defaults() {
             .to_string()
             .contains("404")
     );
+}
+
+#[tokio::test]
+async fn lark_api_reads_the_current_bot_open_id() {
+    let server = HttpMockServer::start(|request| {
+        if request.path.ends_with("tenant_access_token/internal") {
+            MockResponse::json(r#"{"code":0,"msg":"ok","tenant_access_token":"token"}"#)
+        } else {
+            assert_eq!(request.path, "/open-apis/bot/v3/info");
+            MockResponse::json(
+                r#"{"code":0,"msg":"ok","bot":{"open_id":"ou_bot","app_name":"Agora"}}"#,
+            )
+        }
+    })
+    .await;
+    let api = LarkApi::with_base_url(config(), server.base_url()).unwrap();
+
+    assert_eq!(api.bot_open_id().await.unwrap(), "ou_bot");
 }

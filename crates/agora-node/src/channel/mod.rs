@@ -8,6 +8,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 pub mod lark;
+mod permission;
 mod telegram;
 
 #[cfg(test)]

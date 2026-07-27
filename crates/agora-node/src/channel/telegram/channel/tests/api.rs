@@ -1,5 +1,7 @@
 use super::super::TelegramReplyTarget;
 use super::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[tokio::test]
 async fn telegram_api_uses_an_authenticated_http_proxy() {
@@ -338,10 +340,111 @@ async fn telegram_channel_reports_command_reply_delivery_failures() {
 }
 
 #[tokio::test]
-async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+async fn telegram_channel_replies_to_denied_messages_and_returns_the_next_allowed_task() {
+    let server = HttpMockServer::start(|request| {
+        let result = match request.endpoint() {
+            "getMe" => r#"{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}"#,
+            "setMyCommands" => "true",
+            "getUpdates" => {
+                r#"[
+                    {
+                        "update_id":601,
+                        "message":{
+                            "message_id":41,
+                            "from":{"id":7,"is_bot":false},
+                            "chat":{"id":-1001,"type":"group"},
+                            "text":"denied @agora_bot"
+                        }
+                    },
+                    {
+                        "update_id":602,
+                        "message":{
+                            "message_id":42,
+                            "from":{"id":42,"is_bot":false},
+                            "chat":{"id":-1001,"type":"group"},
+                            "text":"allowed"
+                        }
+                    }
+                ]"#
+            }
+            "sendRichMessage" => r#"{"message_id":88}"#,
+            method => panic!("unexpected Telegram method {method}"),
+        };
+        MockResponse::json(format!(r#"{{"ok":true,"result":{result}}}"#))
+    })
+    .await;
+    let access = permission(&["42"], &[("-1001", false)]);
+    let mut config = telegram_config();
+    config.permission = access.clone();
+    let api = TelegramApi::with_base_url(config, server.base_url()).unwrap();
+    let mut channel = TelegramChannel::with_api_and_permission(api, access);
 
+    let task = channel.next_task().await.unwrap();
+
+    assert_eq!(task.input().message().unwrap().text(), "allowed");
+    let requests = server.requests().await;
+    let denial = requests
+        .iter()
+        .find(|request| request.endpoint() == "sendRichMessage")
+        .unwrap();
+    assert!(denial.body.contains("Channel：`telegram-test`"));
+    assert!(denial.body.contains("User ID：`7`"));
+    assert!(denial.body.contains("Group ID：`-1001`"));
+}
+
+#[tokio::test]
+async fn telegram_group_mention_requirement_matches_only_the_current_bot() {
+    let server = HttpMockServer::start(|request| {
+        let result = match request.endpoint() {
+            "getMe" => r#"{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}"#,
+            "setMyCommands" => "true",
+            "getUpdates" => {
+                r#"[
+                    {
+                        "update_id":611,
+                        "message":{
+                            "message_id":51,
+                            "from":{"id":42,"is_bot":false},
+                            "chat":{"id":-1001,"type":"group"},
+                            "text":"hello @other_bot"
+                        }
+                    },
+                    {
+                        "update_id":612,
+                        "message":{
+                            "message_id":52,
+                            "from":{"id":42,"is_bot":false},
+                            "chat":{"id":-1001,"type":"group"},
+                            "text":"hello @Agora_Bot"
+                        }
+                    }
+                ]"#
+            }
+            "sendRichMessage" => r#"{"message_id":89}"#,
+            method => panic!("unexpected Telegram method {method}"),
+        };
+        MockResponse::json(format!(r#"{{"ok":true,"result":{result}}}"#))
+    })
+    .await;
+    let access = permission(&["42"], &[("-1001", true)]);
+    let mut config = telegram_config();
+    config.permission = access.clone();
+    let api = TelegramApi::with_base_url(config, server.base_url()).unwrap();
+    let mut channel = TelegramChannel::with_api_and_permission(api, access);
+
+    let task = channel.next_task().await.unwrap();
+
+    assert_eq!(task.reply_target().message_id, 52);
+    let requests = server.requests().await;
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.endpoint() == "sendRichMessage")
+    );
+}
+
+#[tokio::test]
+async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
     let server = HttpMockServer::start(|request| {
         let result = match request.endpoint() {
             "getMe" => r#"{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}"#,
@@ -353,6 +456,11 @@ async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
                         "update_id":501,
                         "callback_query":{
                             "id":"callback-1",
+                            "from":{"id":42,"is_bot":false},
+                            "message":{
+                                "message_id":88,
+                                "chat":{"id":1,"type":"private"}
+                            },
                             "data":"agora_interrupt:interrupt-1"
                         }
                     },
@@ -492,5 +600,73 @@ async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
     assert_eq!(
         terminal["reply_markup"]["inline_keyboard"],
         serde_json::json!([])
+    );
+}
+
+#[tokio::test]
+async fn telegram_callbacks_check_the_actor_without_requiring_a_new_mention() {
+    let server = HttpMockServer::start(|request| {
+        let result = match request.endpoint() {
+            "getMe" => r#"{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}"#,
+            "setMyCommands" | "answerCallbackQuery" => "true",
+            "getUpdates" => {
+                r#"[
+                    {
+                        "update_id":621,
+                        "callback_query":{
+                            "id":"callback-denied",
+                            "from":{"id":7,"is_bot":false},
+                            "message":{
+                                "message_id":91,
+                                "message_thread_id":44,
+                                "chat":{"id":-1001,"type":"group"}
+                            },
+                            "data":"agora_interrupt:interrupt-1"
+                        }
+                    },
+                    {
+                        "update_id":622,
+                        "message":{
+                            "message_id":92,
+                            "from":{"id":42,"is_bot":false},
+                            "chat":{"id":-1001,"type":"group"},
+                            "text":"@agora_bot continue"
+                        }
+                    }
+                ]"#
+            }
+            "sendRichMessage" => r#"{"message_id":93}"#,
+            method => panic!("unexpected Telegram method {method}"),
+        };
+        MockResponse::json(format!(r#"{{"ok":true,"result":{result}}}"#))
+    })
+    .await;
+    let access = permission(&["42"], &[("-1001", true)]);
+    let mut config = telegram_config();
+    config.permission = access.clone();
+    let api = TelegramApi::with_base_url(config, server.base_url()).unwrap();
+    let mut channel = TelegramChannel::with_api_and_permission(api, access);
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let callback_interrupted = Arc::clone(&interrupted);
+    let _registration = channel.interrupts.register(InterruptCallback::new(move || {
+        callback_interrupted.store(true, Ordering::Relaxed);
+        true
+    }));
+
+    let task = channel.next_task().await.unwrap();
+
+    assert_eq!(task.reply_target().message_id, 92);
+    assert!(!interrupted.load(Ordering::Relaxed));
+    server
+        .wait_for_endpoint_count("answerCallbackQuery", 1)
+        .await;
+    let requests = server.requests().await;
+    assert!(requests.iter().any(|request| {
+        request.endpoint() == "sendRichMessage" && request.body.contains("User ID：`7`")
+    }));
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.endpoint() == "answerCallbackQuery")
     );
 }

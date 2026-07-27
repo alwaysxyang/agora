@@ -23,7 +23,19 @@ fn parses_lark_message_receive_event_payload() {
                     "chat_id": "oc_123",
                     "chat_type": "group",
                     "message_type": "text",
-                    "content": "{\"text\":\"run tests\"}"
+                    "content": "{\"text\":\"@_user_1 run tests\"}",
+                    "mentions": [
+                        {
+                            "key": "@_user_1",
+                            "id": {"open_id": "ou_bot"},
+                            "name": "Agora"
+                        },
+                        {
+                            "key": "@_user_2",
+                            "id": {"open_id": "ou_other"},
+                            "name": "Other"
+                        }
+                    ]
                 }
             }
         }"#,
@@ -35,7 +47,8 @@ fn parses_lark_message_receive_event_payload() {
     assert_eq!(event.id, "evt_1");
     assert_eq!(event.message_id, "om_123");
     assert_eq!(event.session_id(), "oc_123");
-    assert_eq!(event.input(), "run tests");
+    assert_eq!(event.input(), "@_user_1 run tests");
+    assert_eq!(event.mention_ids(), &["ou_bot", "ou_other"]);
     assert_eq!(event.reply_target().message_id, "om_123");
 }
 

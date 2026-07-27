@@ -2,6 +2,7 @@ use super::super::LarkReplyTarget;
 use super::super::channel::{LarkCardActionEvent, LarkChannel, LarkMessageEvent, LarkTask};
 use super::super::lark_api::LarkApi;
 use super::{LarkAgentCard, LarkCardContent, LarkReplyCard};
+use crate::channel::permission::PermissionDenial;
 use crate::channel::test_http::{HttpMockServer, MockResponse};
 use crate::channel::{
     Channel, ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun,

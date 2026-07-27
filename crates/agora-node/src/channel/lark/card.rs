@@ -1,6 +1,7 @@
 use super::LarkReplyTarget;
 use super::channel::LarkInterruptRegistration;
 use super::lark_api::LarkApi;
+use crate::channel::permission::PermissionDenial;
 use crate::channel::{
     ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun, RunEvent,
 };
@@ -74,6 +75,37 @@ struct LarkProgressEntry {
 pub(super) struct LarkReplyCard;
 
 impl LarkReplyCard {
+    pub(super) fn permission_denied(denial: &PermissionDenial) -> Value {
+        Self::card(
+            i18n::PERMISSION_DENIED_HEADER_TITLE,
+            i18n::PERMISSION_DENIED_SUBTITLE.to_string(),
+            vec![json!({
+                "tag": "markdown",
+                "content": Self::permission_denied_markdown(denial)
+            })],
+        )
+    }
+
+    fn permission_denied_markdown(denial: &PermissionDenial) -> String {
+        let mut identifiers = vec![
+            format!("- Channel：`{}`", denial.channel_name()),
+            format!("- User ID：`{}`", denial.user_id()),
+        ];
+        if let Some(group_id) = denial.group_id() {
+            identifiers.push(format!("- Group ID：`{group_id}`"));
+        }
+        let configuration = denial.configuration_example();
+        format!(
+            "**{}**\n\n> {}\n\n**{}**\n{}\n\n**{}**\n```jsonc\n{}\n```",
+            i18n::PERMISSION_DENIED_TITLE,
+            denial.reason(),
+            i18n::PERMISSION_IDENTIFIERS_TITLE,
+            identifiers.join("\n"),
+            i18n::PERMISSION_CONFIG_EXAMPLE_TITLE,
+            configuration
+        )
+    }
+
     pub(super) fn build(reply: &ChannelReply) -> Value {
         match reply {
             ChannelReply::Text(text) => Self::card(

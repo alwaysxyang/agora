@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn lark_permission_denial_card_owns_its_markdown_layout() {
+    let denial = PermissionDenial::new(
+        "lark1",
+        "ou_user_1",
+        Some("oc_group_1"),
+        "当前用户未在允许列表中。",
+    );
+
+    let card = LarkReplyCard::permission_denied(&denial);
+    let markdown = card
+        .pointer("/body/elements/0/content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
+
+    assert_eq!(card["schema"], "2.0");
+    assert_eq!(card["header"]["title"]["content"], "访问受限");
+    assert!(markdown.starts_with("**无权访问此 Channel**"));
+    assert!(markdown.contains("> 当前用户未在允许列表中。"));
+    assert!(markdown.contains("- Channel：`lark1`"));
+    assert!(markdown.contains("- Group ID：`oc_group_1`"));
+    assert!(markdown.contains("```jsonc"));
+    assert!(markdown.contains(r#""channels": ["#));
+    assert!(markdown.contains("// ..."));
+    assert!(!markdown.contains(r#""name": "lark1""#));
+}
+
+#[test]
 fn lark_card_uses_json_v2_for_standard_markdown() {
     let mut content = LarkCardContent::new("codex-dev".to_string());
     content.apply_output(OutputEvent::Thinking {

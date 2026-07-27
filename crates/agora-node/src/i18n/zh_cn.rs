@@ -24,6 +24,13 @@ pub(crate) const REASONING: &str = "Reasoning";
 pub(crate) const TOKENS: &str = "tokens";
 pub(crate) const REASONING_DETAIL: &str = "of output";
 pub(crate) const OUTPUT_TRUNCATED: &str = "[输出已截断]\n\n";
+pub(crate) const PERMISSION_DENIED_TITLE: &str = "无权访问此 Channel";
+pub(crate) const PERMISSION_DENIED_HEADER_TITLE: &str = "访问受限";
+pub(crate) const PERMISSION_DENIED_SUBTITLE: &str = "请更新 Channel 权限配置";
+pub(crate) const PERMISSION_IDENTIFIERS_TITLE: &str = "访问标识";
+pub(crate) const PERMISSION_CONFIG_EXAMPLE_TITLE: &str = "配置示例";
+pub(crate) const PERMISSION_USER_NOT_ALLOWED: &str = "当前用户未在允许列表中。";
+pub(crate) const PERMISSION_GROUP_NOT_ALLOWED: &str = "当前群聊未在允许列表中。";
 
 pub(crate) const AGENT_STATUS_TITLE: &str = "当前对话的 Agent 状态";
 pub(crate) const CURRENT_CONVERSATION: &str = "当前对话";

@@ -8,6 +8,7 @@ async fn lark_card_coalesces_intermediate_updates_and_flushes_completion() {
             name: "lark-test".to_string(),
             app_id: "app-id".to_string(),
             secret: "secret".to_string(),
+            permission: Default::default(),
             proxy: None,
         },
         server.base_url(),
@@ -75,6 +76,7 @@ async fn lark_api_replies_to_commands_with_threaded_text() {
             name: "lark-test".to_string(),
             app_id: "app-id".to_string(),
             secret: "secret".to_string(),
+            permission: Default::default(),
             proxy: None,
         },
         server.base_url(),
@@ -115,6 +117,7 @@ async fn lark_agent_toggle_action_patches_the_original_status_card() {
             name: "lark-test".to_string(),
             app_id: "app-id".to_string(),
             secret: "secret".to_string(),
+            permission: Default::default(),
             proxy: None,
         },
         server.base_url(),
@@ -123,6 +126,7 @@ async fn lark_agent_toggle_action_patches_the_original_status_card() {
     let channel = LarkChannel::with_api(api);
     let task = LarkTask::from_card_action(LarkCardActionEvent {
         id: "evt_action".to_string(),
+        user_id: "ou_user".to_string(),
         session_id: "oc_chat".to_string(),
         message_id: "om_status_card".to_string(),
         command: CommandRequest::new(["ask", "enable"]).with_argument("agent_name", "reviewer"),
@@ -160,6 +164,7 @@ async fn lark_ask_message_replies_with_a_threaded_interactive_card() {
             name: "lark-test".to_string(),
             app_id: "app-id".to_string(),
             secret: "secret".to_string(),
+            permission: Default::default(),
             proxy: None,
         },
         server.base_url(),
@@ -176,6 +181,7 @@ async fn lark_ask_message_replies_with_a_threaded_interactive_card() {
             message_type: "text".to_string(),
             content: "/ask list".to_string(),
             image_keys: Vec::new(),
+            mention_ids: Vec::new(),
         },
         crate::task::TaskContent::new("/ask list"),
     );

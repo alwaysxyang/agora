@@ -160,6 +160,45 @@ fn parses_telegram_channel_token() {
     };
     assert_eq!(telegram.name, "telegram1");
     assert_eq!(telegram.token, "123456:bot-token");
+    assert!(telegram.permission.users.is_empty());
+    assert!(telegram.permission.groups.is_empty());
+}
+
+#[test]
+fn parses_channel_permissions_and_defaults_group_mentions_to_false() {
+    let content = r#"{
+        "channels": [
+            {
+                "type": "lark",
+                "name": "lark1",
+                "app_id": "cli_xxx",
+                "secret": "sec_xxx",
+                "permission": {
+                    "users": [
+                        {"id": "ou_user_1"},
+                        {"id": "*"}
+                    ],
+                    "groups": [
+                        {"id": "oc_group_1", "require_mention": true},
+                        {"id": "*"}
+                    ]
+                }
+            }
+        ],
+        "agents": []
+    }"#;
+
+    let config = serde_json::from_str::<NodeConfig>(content).unwrap();
+    let ChannelConfig::Lark(lark) = &config.channels[0] else {
+        panic!("channel should be lark");
+    };
+
+    assert_eq!(lark.permission.users[0].id, "ou_user_1");
+    assert_eq!(lark.permission.users[1].id, "*");
+    assert_eq!(lark.permission.groups[0].id, "oc_group_1");
+    assert!(lark.permission.groups[0].require_mention);
+    assert_eq!(lark.permission.groups[1].id, "*");
+    assert!(!lark.permission.groups[1].require_mention);
 }
 
 #[test]

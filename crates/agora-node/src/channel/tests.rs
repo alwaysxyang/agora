@@ -42,6 +42,7 @@ fn configured_channels_ignore_unimplemented_types_and_keep_configured_names() {
     assert!(
         ConfiguredChannel::from_config(ChannelConfig::Local(NamedChannelConfig {
             name: "local".to_string(),
+            permission: Default::default(),
             proxy: None,
         }))
         .unwrap()
@@ -50,6 +51,7 @@ fn configured_channels_ignore_unimplemented_types_and_keep_configured_names() {
     assert!(
         ConfiguredChannel::from_config(ChannelConfig::Http(NamedChannelConfig {
             name: "http".to_string(),
+            permission: Default::default(),
             proxy: None,
         }))
         .unwrap()
@@ -60,6 +62,7 @@ fn configured_channels_ignore_unimplemented_types_and_keep_configured_names() {
         name: "lark".to_string(),
         app_id: "app-id".to_string(),
         secret: "secret".to_string(),
+        permission: Default::default(),
         proxy: None,
     }))
     .unwrap()
@@ -69,6 +72,7 @@ fn configured_channels_ignore_unimplemented_types_and_keep_configured_names() {
     let telegram = ConfiguredChannel::from_config(ChannelConfig::Telegram(TelegramChannelConfig {
         name: "telegram".to_string(),
         token: "123:secret".to_string(),
+        permission: Default::default(),
         proxy: None,
     }))
     .unwrap()

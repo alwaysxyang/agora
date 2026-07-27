@@ -17,6 +17,7 @@ fn telegram_api(server: &HttpMockServer) -> TelegramApi {
         TelegramChannelConfig {
             name: "telegram-test".to_string(),
             token: "123456:secret".to_string(),
+            permission: Default::default(),
             proxy: None,
         },
         server.base_url(),

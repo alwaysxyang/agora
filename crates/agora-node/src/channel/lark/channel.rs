@@ -1,9 +1,12 @@
 use super::LarkReplyTarget;
 use super::card::{LarkAgentCard, LarkReplyCard};
 use super::lark_api::LarkApi;
+use crate::channel::permission::{AccessContext, PermissionGate};
 use crate::channel::{
     Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, InterruptCallback, RunEvent,
 };
+#[cfg(test)]
+use crate::config::ChannelPermissionConfig;
 use crate::config::LarkChannelConfig;
 use crate::task::{ChannelTaskInput, CommandRequest, TaskAttachment, TaskContent};
 use agora_core::logger;
@@ -27,6 +30,7 @@ pub(super) struct LarkMessageEvent {
     pub(super) message_type: String,
     pub(super) content: String,
     pub(super) image_keys: Vec<String>,
+    pub(super) mention_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +44,7 @@ pub(super) enum LarkEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct LarkCardActionEvent {
     pub(super) id: String,
+    pub(super) user_id: String,
     pub(super) session_id: String,
     pub(super) message_id: String,
     pub(super) command: CommandRequest,
@@ -48,6 +53,9 @@ pub(super) struct LarkCardActionEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct LarkInterruptEvent {
     pub(super) id: String,
+    pub(super) user_id: String,
+    pub(super) session_id: String,
+    pub(super) message_id: String,
     pub(super) callback_id: String,
 }
 
@@ -93,6 +101,12 @@ impl LarkInterruptEvent {
         };
         Ok(Self {
             id: required("/header/event_id", "header.event_id")?,
+            user_id: required("/event/operator/open_id", "event.operator.open_id")?,
+            session_id: required("/event/context/open_chat_id", "event.context.open_chat_id")?,
+            message_id: required(
+                "/event/context/open_message_id",
+                "event.context.open_message_id",
+            )?,
             callback_id: required(
                 "/event/action/value/agora_interrupt",
                 "event.action.value.agora_interrupt",
@@ -184,6 +198,7 @@ impl LarkCardActionEvent {
             .ok_or_else(|| anyhow!("lark card action missing event.action.value.agora_command"))?;
         Ok(Self {
             id: required("/header/event_id", "header.event_id")?,
+            user_id: required("/event/operator/open_id", "event.operator.open_id")?,
             session_id: required("/event/context/open_chat_id", "event.context.open_chat_id")?,
             message_id: required(
                 "/event/context/open_message_id",
@@ -215,6 +230,20 @@ impl LarkMessageEvent {
         let message_type = Self::required_str(message, "message_type")?.to_string();
         let raw_content = Self::required_str(message, "content")?;
         let (content, image_keys) = Self::normalize_content(&message_type, raw_content);
+        let mention_ids = message
+            .get("mentions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|mention| {
+                mention
+                    .pointer("/id/open_id")
+                    .or_else(|| mention.pointer("/id/user_id"))
+                    .or_else(|| mention.pointer("/id/union_id"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_string)
+            .collect();
         Ok(Self {
             id,
             message_id: Self::required_str(message, "message_id")?.to_string(),
@@ -223,6 +252,7 @@ impl LarkMessageEvent {
             sender_id,
             content,
             image_keys,
+            mention_ids,
             message_type,
         })
     }
@@ -237,6 +267,10 @@ impl LarkMessageEvent {
 
     pub(super) fn image_keys(&self) -> &[String] {
         &self.image_keys
+    }
+
+    pub(super) fn mention_ids(&self) -> &[String] {
+        &self.mention_ids
     }
 
     pub(super) fn reply_target(&self) -> LarkReplyTarget {
@@ -382,14 +416,21 @@ impl ChannelRun for LarkRun {
 
 pub struct LarkChannel {
     api: LarkApi,
+    permission: PermissionGate,
+    bot_open_id: Option<String>,
+    group_sessions: HashMap<String, bool>,
     interrupts: LarkInterruptCallbacks,
     receiver: Option<LarkWebSocketReceiver>,
 }
 
 impl LarkChannel {
     pub fn new(config: LarkChannelConfig) -> Result<Self> {
+        let permission = PermissionGate::new(config.permission.clone());
         Ok(Self {
             api: LarkApi::new(config)?,
+            permission,
+            bot_open_id: None,
+            group_sessions: HashMap::new(),
             interrupts: LarkInterruptCallbacks::default(),
             receiver: None,
         })
@@ -397,8 +438,30 @@ impl LarkChannel {
 
     #[cfg(test)]
     pub(super) fn with_api(api: LarkApi) -> Self {
+        Self::with_api_and_permission(
+            api,
+            ChannelPermissionConfig {
+                users: vec![crate::config::ChannelUserPermissionConfig {
+                    id: "*".to_string(),
+                }],
+                groups: vec![crate::config::ChannelGroupPermissionConfig {
+                    id: "*".to_string(),
+                    require_mention: false,
+                }],
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_api_and_permission(
+        api: LarkApi,
+        permission: ChannelPermissionConfig,
+    ) -> Self {
         Self {
             api,
+            permission: PermissionGate::new(permission),
+            bot_open_id: None,
+            group_sessions: HashMap::new(),
             interrupts: LarkInterruptCallbacks::default(),
             receiver: None,
         }
@@ -407,6 +470,42 @@ impl LarkChannel {
     fn receiver(&mut self) -> &mut LarkWebSocketReceiver {
         self.receiver
             .get_or_insert_with(|| LarkWebSocketReceiver::spawn(self.api.clone()))
+    }
+
+    async fn message_mentions_bot(&mut self, event: &LarkMessageEvent) -> Result<bool> {
+        if event.chat_type == "p2p" || event.mention_ids().is_empty() {
+            return Ok(false);
+        }
+        let mentioned = {
+            let bot_open_id = match self.bot_open_id.as_deref() {
+                Some(open_id) => open_id,
+                None => {
+                    self.bot_open_id = Some(self.api.bot_open_id().await?);
+                    self.bot_open_id.as_deref().unwrap_or_default()
+                }
+            };
+            event.mention_ids().iter().any(|id| id == bot_open_id)
+        };
+        Ok(mentioned)
+    }
+
+    async fn admit_action(&self, user_id: &str, session_id: &str, message_id: &str) -> bool {
+        let context = match self.group_sessions.get(session_id).copied() {
+            Some(false) => AccessContext::private(user_id),
+            Some(true) => AccessContext::group_action(user_id, session_id),
+            None => AccessContext::unresolved_group(user_id, session_id),
+        };
+        let target = LarkReplyTarget {
+            message_id: message_id.to_string(),
+        };
+        let api = self.api.clone();
+        self.permission
+            .admit(self.name(), &context, move |denial| async move {
+                let token = api.tenant_access_token().await?;
+                api.reply_card(&token, &target, &LarkReplyCard::permission_denied(&denial))
+                    .await
+            })
+            .await
     }
 
     pub(super) async fn task_from_event(&self, event: LarkMessageEvent) -> Result<LarkTask> {
@@ -467,6 +566,31 @@ impl Channel for LarkChannel {
             };
             match event {
                 LarkEvent::Message(event) if event.is_supported_message() => {
+                    let mentioned = self.message_mentions_bot(&event).await?;
+                    let context = if event.chat_type == "p2p" {
+                        AccessContext::private(&event.sender_id)
+                    } else {
+                        AccessContext::group(&event.sender_id, &event.chat_id, mentioned)
+                    };
+                    let target = event.reply_target();
+                    let api = self.api.clone();
+                    if !self
+                        .permission
+                        .admit(self.name(), &context, move |denial| async move {
+                            let token = api.tenant_access_token().await?;
+                            api.reply_card(
+                                &token,
+                                &target,
+                                &LarkReplyCard::permission_denied(&denial),
+                            )
+                            .await
+                        })
+                        .await
+                    {
+                        continue;
+                    }
+                    self.group_sessions
+                        .insert(event.chat_id.clone(), event.chat_type != "p2p");
                     let session_id = event.session_id().to_string();
                     let sender_id = event.sender_id.clone();
                     let message_id = event.message_id.clone();
@@ -489,6 +613,12 @@ impl Channel for LarkChannel {
                     return Ok(Some(task));
                 }
                 LarkEvent::CardAction(event) => {
+                    if !self
+                        .admit_action(&event.user_id, &event.session_id, &event.message_id)
+                        .await
+                    {
+                        continue;
+                    }
                     logger::info!(
                         "lark card action received channel={} session={} event_id={}",
                         self.name(),
@@ -498,6 +628,12 @@ impl Channel for LarkChannel {
                     return Ok(Some(LarkTask::from_card_action(event)));
                 }
                 LarkEvent::Interrupt(event) => {
+                    if !self
+                        .admit_action(&event.user_id, &event.session_id, &event.message_id)
+                        .await
+                    {
+                        continue;
+                    }
                     let triggered = self.interrupts.trigger(&event.callback_id);
                     logger::info!(
                         "lark interrupt action received channel={} event_id={} triggered={}",

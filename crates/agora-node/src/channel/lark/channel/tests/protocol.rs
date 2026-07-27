@@ -59,6 +59,9 @@ fn parses_lark_interrupt_card_action() {
 
     assert_eq!(event.id, "evt_action_1");
     assert_eq!(event.callback_id, "interrupt-42");
+    assert_eq!(event.user_id, "ou_123");
+    assert_eq!(event.session_id, "oc_123");
+    assert_eq!(event.message_id, "om_card_1");
 }
 
 #[test]
@@ -116,6 +119,8 @@ fn parses_lark_agent_enabled_card_action() {
     };
 
     assert_eq!(event.message_id, "om_card_2");
+    assert_eq!(event.user_id, "ou_123");
+    assert_eq!(event.session_id, "oc_123");
     assert_eq!(
         event.command,
         CommandRequest::new(["ask", "enable"]).with_argument("agent_name", "reviewer")

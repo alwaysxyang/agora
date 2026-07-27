@@ -96,6 +96,8 @@ pub struct LarkChannelConfig {
     pub app_id: String,
     pub secret: String,
     #[serde(default)]
+    pub permission: ChannelPermissionConfig,
+    #[serde(default)]
     pub proxy: Option<HttpProxy>,
 }
 
@@ -104,7 +106,29 @@ pub struct TelegramChannelConfig {
     pub name: String,
     pub token: String,
     #[serde(default)]
+    pub permission: ChannelPermissionConfig,
+    #[serde(default)]
     pub proxy: Option<HttpProxy>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct ChannelPermissionConfig {
+    #[serde(default)]
+    pub users: Vec<ChannelUserPermissionConfig>,
+    #[serde(default)]
+    pub groups: Vec<ChannelGroupPermissionConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ChannelUserPermissionConfig {
+    pub id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ChannelGroupPermissionConfig {
+    pub id: String,
+    #[serde(default)]
+    pub require_mention: bool,
 }
 
 impl ChannelConfig {
@@ -128,6 +152,8 @@ impl ChannelConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct NamedChannelConfig {
     pub name: String,
+    #[serde(default)]
+    pub permission: ChannelPermissionConfig,
     #[serde(default)]
     pub proxy: Option<HttpProxy>,
 }

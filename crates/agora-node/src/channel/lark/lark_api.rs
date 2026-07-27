@@ -296,6 +296,19 @@ impl LarkApi {
         response.into_result()
     }
 
+    pub(super) async fn bot_open_id(&self) -> Result<String> {
+        let token = self.tenant_access_token().await?;
+        let response = self
+            .client
+            .get(format!("{}/open-apis/bot/v3/info", self.base_url))
+            .bearer_auth(token)
+            .send()
+            .await?
+            .json::<LarkBotInfoResponse>()
+            .await?;
+        response.into_result()
+    }
+
     pub(super) async fn download_message_image(
         &self,
         token: &str,
@@ -568,6 +581,31 @@ impl TenantTokenResponse {
                 .ok_or_else(|| anyhow!("lark response missing tenant_access_token"))
         } else {
             Err(anyhow!("lark tenant token failed: {}", self.msg))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LarkBotInfoResponse {
+    code: i32,
+    msg: String,
+    bot: Option<LarkBotInfo>,
+}
+
+#[derive(Deserialize)]
+struct LarkBotInfo {
+    open_id: String,
+}
+
+impl LarkBotInfoResponse {
+    fn into_result(self) -> Result<String> {
+        if self.code == 0 {
+            self.bot
+                .map(|bot| bot.open_id)
+                .filter(|open_id| !open_id.is_empty())
+                .ok_or_else(|| anyhow!("lark bot info response missing open_id"))
+        } else {
+            Err(anyhow!("lark bot info failed: {}", self.msg))
         }
     }
 }

@@ -1,8 +1,11 @@
 use super::rich_message::TelegramRichMessage;
 use super::telegram_api::{TelegramApi, TelegramBotCommand};
+use crate::channel::permission::{AccessContext, PermissionDenial, PermissionGate};
 use crate::channel::{
     Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, InterruptCallback, RunEvent,
 };
+#[cfg(test)]
+use crate::config::ChannelPermissionConfig;
 use crate::config::TelegramChannelConfig;
 use crate::i18n;
 use crate::task::{ChannelTaskInput, TaskAttachment, TaskContent};
@@ -24,6 +27,7 @@ const TELEGRAM_COMMANDS: &[TelegramBotCommand<'static>] = &[
 
 pub struct TelegramChannel {
     api: TelegramApi,
+    permission: PermissionGate,
     interrupts: TelegramInterruptCallbacks,
     pending: VecDeque<TelegramTask>,
     next_offset: Option<i64>,
@@ -112,12 +116,14 @@ impl ChannelRun for TelegramRun {
 
 impl TelegramChannel {
     pub fn new(config: TelegramChannelConfig) -> Result<Self> {
-        Ok(Self::with_api_inner(TelegramApi::new(config)?))
+        let permission = PermissionGate::new(config.permission.clone());
+        Ok(Self::with_api_inner(TelegramApi::new(config)?, permission))
     }
 
-    fn with_api_inner(api: TelegramApi) -> Self {
+    fn with_api_inner(api: TelegramApi, permission: PermissionGate) -> Self {
         Self {
             api,
+            permission,
             interrupts: TelegramInterruptCallbacks::default(),
             pending: VecDeque::new(),
             next_offset: None,
@@ -127,7 +133,26 @@ impl TelegramChannel {
 
     #[cfg(test)]
     pub(super) fn with_api(api: TelegramApi) -> Self {
-        Self::with_api_inner(api)
+        Self::with_api_and_permission(
+            api,
+            ChannelPermissionConfig {
+                users: vec![crate::config::ChannelUserPermissionConfig {
+                    id: "*".to_string(),
+                }],
+                groups: vec![crate::config::ChannelGroupPermissionConfig {
+                    id: "*".to_string(),
+                    require_mention: false,
+                }],
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_api_and_permission(
+        api: TelegramApi,
+        permission: ChannelPermissionConfig,
+    ) -> Self {
+        Self::with_api_inner(api, PermissionGate::new(permission))
     }
 
     pub(super) async fn next_task(&mut self) -> Result<TelegramTask> {
@@ -150,20 +175,57 @@ impl TelegramChannel {
                     Ok(update) => {
                         debug_assert_eq!(update.update_id(), update_id);
                         if let Some(callback) = update.callback_query() {
+                            let access = callback.access();
+                            let admitted = if let Some(access) = access.as_ref() {
+                                let context = access.context();
+                                let target = access.target.clone();
+                                let api = self.api.clone();
+                                self.permission
+                                    .admit(self.api.name(), &context, move |denial| async move {
+                                        let markdown =
+                                            TelegramChannel::render_permission_denial(&denial);
+                                        api.send_rich_message(&target, &markdown, None).await
+                                    })
+                                    .await
+                            } else {
+                                false
+                            };
                             let interrupt_id = callback
                                 .data
                                 .as_deref()
                                 .and_then(|data| data.strip_prefix(TELEGRAM_INTERRUPT_PREFIX));
-                            let triggered =
-                                interrupt_id.is_some_and(|id| self.interrupts.trigger(id));
+                            let triggered = admitted
+                                && interrupt_id.is_some_and(|id| self.interrupts.trigger(id));
                             logger::info!(
                                 "telegram callback received channel={} update_id={} triggered={}",
                                 self.api.name(),
                                 update_id,
                                 triggered
                             );
+                            if access.is_none() {
+                                logger::error!(
+                                    "telegram callback ignored channel={} update_id={} reason=missing_access_identity",
+                                    self.api.name(),
+                                    update_id
+                                );
+                            }
                             self.answer_callback_query(callback.id.clone());
                         } else if let Some(task) = update.into_task(&bot_username) {
+                            let context = task.access_context();
+                            let target = task.reply_target().clone();
+                            let api = self.api.clone();
+                            if !self
+                                .permission
+                                .admit(self.api.name(), &context, move |denial| async move {
+                                    let markdown =
+                                        TelegramChannel::render_permission_denial(&denial);
+                                    api.send_rich_message(&target, &markdown, None).await
+                                })
+                                .await
+                            {
+                                self.advance_offset(update_id);
+                                continue;
+                            }
                             let task = self.resolve_task_image(task).await?;
                             logger::info!(
                                 "telegram message received channel={} session={} message_id={} input={} attachments={}",
@@ -274,6 +336,26 @@ impl TelegramChannel {
         }
     }
 
+    pub(super) fn render_permission_denial(denial: &PermissionDenial) -> String {
+        let mut identifiers = vec![
+            format!("- Channel：`{}`", denial.channel_name()),
+            format!("- User ID：`{}`", denial.user_id()),
+        ];
+        if let Some(group_id) = denial.group_id() {
+            identifiers.push(format!("- Group ID：`{group_id}`"));
+        }
+        let configuration = denial.configuration_example();
+        format!(
+            "**{}**\n\n> {}\n\n**{}**\n{}\n\n**{}**\n```jsonc\n{}\n```",
+            i18n::PERMISSION_DENIED_TITLE,
+            denial.reason(),
+            i18n::PERMISSION_IDENTIFIERS_TITLE,
+            identifiers.join("\n"),
+            i18n::PERMISSION_CONFIG_EXAMPLE_TITLE,
+            configuration
+        )
+    }
+
     fn render_agent_status(agent: &crate::channel::ChannelAgentStatus) -> String {
         let (marker, state, description) = if agent.enabled() {
             ("🟢", i18n::AGENT_ENABLED, i18n::AGENT_ENABLED_DESCRIPTION)
@@ -342,11 +424,21 @@ pub struct TelegramTask {
     input: ChannelTaskInput,
     reply_target: TelegramReplyTarget,
     image_file_id: Option<String>,
+    sender_id: String,
+    group_id: Option<String>,
+    mentioned_bot: bool,
 }
 
 impl TelegramTask {
     pub(super) fn reply_target(&self) -> &TelegramReplyTarget {
         &self.reply_target
+    }
+
+    fn access_context(&self) -> AccessContext<'_> {
+        match self.group_id.as_deref() {
+            Some(group_id) => AccessContext::group(&self.sender_id, group_id, self.mentioned_bot),
+            None => AccessContext::private(&self.sender_id),
+        }
     }
 }
 
@@ -396,8 +488,15 @@ impl TelegramUpdate {
         if !message.chat.is_supported() {
             return None;
         }
+        let mentioned_bot = message.mentions_bot(bot_username);
         let text = message.normalized_text(bot_username)?;
         let image_file_id = message.photo.last().map(|photo| photo.file_id.clone());
+        let sender_id = message
+            .from
+            .as_ref()
+            .map(|sender| sender.id.to_string())
+            .unwrap_or_default();
+        let group_id = (!message.chat.is_private()).then(|| message.chat.id.to_string());
         let session_id = match message.message_thread_id {
             Some(thread_id) => {
                 format!("chat:{}:topic:{thread_id}", message.chat.id)
@@ -416,6 +515,9 @@ impl TelegramUpdate {
             input: ChannelTaskInput::Message(TaskContent::new(text)),
             reply_target,
             image_file_id,
+            sender_id,
+            group_id,
+            mentioned_bot,
         })
     }
 }
@@ -424,12 +526,59 @@ impl TelegramUpdate {
 struct TelegramCallbackQuery {
     id: String,
     #[serde(default)]
+    from: Option<TelegramSender>,
+    #[serde(default)]
+    message: Option<TelegramCallbackMessage>,
+    #[serde(default)]
     data: Option<String>,
+}
+
+impl TelegramCallbackQuery {
+    fn access(&self) -> Option<TelegramCallbackAccess> {
+        let sender_id = self.from.as_ref()?.id.to_string();
+        let message = self.message.as_ref()?;
+        let group_id = (!message.chat.is_private()).then(|| message.chat.id.to_string());
+        Some(TelegramCallbackAccess {
+            sender_id,
+            group_id,
+            target: TelegramReplyTarget {
+                chat_id: message.chat.id,
+                message_id: message.message_id,
+                message_thread_id: message.message_thread_id,
+                is_private: message.chat.is_private(),
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct TelegramCallbackMessage {
+    message_id: i64,
+    #[serde(default)]
+    message_thread_id: Option<i64>,
+    chat: TelegramChat,
+}
+
+struct TelegramCallbackAccess {
+    sender_id: String,
+    group_id: Option<String>,
+    target: TelegramReplyTarget,
+}
+
+impl TelegramCallbackAccess {
+    fn context(&self) -> AccessContext<'_> {
+        match self.group_id.as_deref() {
+            Some(group_id) => AccessContext::group_action(&self.sender_id, group_id),
+            None => AccessContext::private(&self.sender_id),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct TelegramMessage {
     message_id: i64,
+    #[serde(default)]
+    from: Option<TelegramSender>,
     #[serde(default)]
     message_thread_id: Option<i64>,
     chat: TelegramChat,
@@ -442,6 +591,26 @@ struct TelegramMessage {
 }
 
 impl TelegramMessage {
+    fn mentions_bot(&self, bot_username: &str) -> bool {
+        self.text
+            .as_deref()
+            .or(self.caption.as_deref())
+            .is_some_and(|text| Self::contains_mention(text, bot_username))
+    }
+
+    fn contains_mention(text: &str, bot_username: &str) -> bool {
+        let expected = bot_username.trim_start_matches('@');
+        text.char_indices()
+            .filter(|(_, character)| *character == '@')
+            .any(|(index, _)| {
+                let username = text[index + 1..]
+                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                    .next()
+                    .unwrap_or_default();
+                !username.is_empty() && username.eq_ignore_ascii_case(expected)
+            })
+    }
+
     fn normalized_text(&self, bot_username: &str) -> Option<String> {
         let Some(text) = self.text.as_ref().or(self.caption.as_ref()) else {
             return (!self.photo.is_empty()).then(String::new);
@@ -462,6 +631,11 @@ impl TelegramMessage {
         }
         Some(format!("{command}{suffix}"))
     }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct TelegramSender {
+    id: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

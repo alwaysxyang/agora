@@ -21,7 +21,20 @@ Daemon process settings such as pid files, state directory, log level, foregroun
       "type": "lark",
       "name": "lark1",
       "app_id": "xxx",
-      "secret": "xxx"
+      "secret": "xxx",
+      "permission": {
+        "users": [
+          {
+            "id": "ou_user_1"
+          }
+        ],
+        "groups": [
+          {
+            "id": "oc_group_1",
+            "require_mention": true
+          }
+        ]
+      }
     }
   ],
   "agents": [
@@ -87,6 +100,12 @@ Supported initial agent `type` values:
 
 `proxy` is an optional HTTP proxy in `host:port`, `http://host:port`, or `http://user:password@host:port` form. A component-level proxy overrides the top-level default. Agent processes receive the selected proxy through `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and `https_proxy`. Lark and Telegram use the selected proxy for their HTTP transport; Lark also uses HTTP CONNECT for its WebSocket connection.
 
+`permission` is an optional channel access policy. Omitting it is equivalent to an empty policy and denies every incoming user and group by default. `permission.users` is a list of user policies containing a channel-native user `id`; `permission.groups` is a list of group policies containing a channel-native group `id` and an optional `require_mention` flag, which defaults to `false`. The value `"*"` is accepted as the `id` in both user and group policies as an explicit wildcard.
+
+Private messages require the sender id to match `permission.users`. Group messages require both the sender id to match `permission.users` and the group id to match `permission.groups`. An exact group id takes precedence over the wildcard group policy when both exist. If the selected group policy has `require_mention: true`, the message must mention the receiving bot. A denied group message that does not mention the bot is consumed silently; a denied group message that explicitly mentions the bot receives the configuration guidance. Structured channel actions are subject to the same user and group checks but do not require a mention.
+
+An unauthorized event is consumed by the channel and must not become a daemon `ChannelTask`. The shared channel-layer `PermissionGate` applies the policy, decides whether guidance should be delivered, invokes the channel-provided denial delivery callback when needed, and prevents rejected events from advancing. A concrete channel only extracts its native user, group, and mention identity and implements native denial delivery. The daemon and agents do not depend on channel permission details.
+
 The `model`, `effort`, and `agent_sandbox` fields are currently consumed only by `CodexAgent`. Other agent implementations remain responsible for defining and interpreting their own backend-specific execution options. Agent configuration has no arbitrary child-process `env` field. Unknown agent fields, including the removed legacy `env` field, are ignored during deserialization and have no effect.
 
 `subscribe` lists channel subscriptions this agent consumes. Each entry must include `channel`, the name of a configured channel. The same channel name may appear in multiple agents' `subscribe` lists.
@@ -111,7 +130,20 @@ Example Lark channel:
   "type": "lark",
   "name": "lark1",
   "app_id": "xxx",
-  "secret": "xxx"
+  "secret": "xxx",
+  "permission": {
+    "users": [
+      {
+        "id": "ou_user_1"
+      }
+    ],
+    "groups": [
+      {
+        "id": "oc_group_1",
+        "require_mention": true
+      }
+    ]
+  }
 }
 ```
 

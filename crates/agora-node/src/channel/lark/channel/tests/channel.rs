@@ -1,4 +1,8 @@
 use super::*;
+use crate::channel::test_http::{HttpMockServer, MockResponse};
+use crate::config::{
+    ChannelGroupPermissionConfig, ChannelPermissionConfig, ChannelUserPermissionConfig,
+};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 fn api() -> LarkApi {
@@ -7,6 +11,7 @@ fn api() -> LarkApi {
             name: "lark-channel-test".to_string(),
             app_id: "app-id".to_string(),
             secret: "secret".to_string(),
+            permission: Default::default(),
             proxy: None,
         },
         "http://127.0.0.1:1".to_string(),
@@ -24,7 +29,54 @@ fn message(message_type: &str) -> LarkMessageEvent {
         message_type: message_type.to_string(),
         content: "hello".to_string(),
         image_keys: Vec::new(),
+        mention_ids: Vec::new(),
     }
+}
+
+fn permission(users: &[&str], groups: &[(&str, bool)]) -> ChannelPermissionConfig {
+    ChannelPermissionConfig {
+        users: users
+            .iter()
+            .map(|id| ChannelUserPermissionConfig {
+                id: (*id).to_string(),
+            })
+            .collect(),
+        groups: groups
+            .iter()
+            .map(|(id, require_mention)| ChannelGroupPermissionConfig {
+                id: (*id).to_string(),
+                require_mention: *require_mention,
+            })
+            .collect(),
+    }
+}
+
+async fn permission_api() -> (LarkApi, HttpMockServer) {
+    let server = HttpMockServer::start(|request| {
+        let body = if request.path.ends_with("tenant_access_token/internal") {
+            r#"{"code":0,"msg":"ok","tenant_access_token":"token"}"#
+        } else if request.path == "/open-apis/bot/v3/info" {
+            r#"{"code":0,"msg":"ok","bot":{"open_id":"ou-bot"}}"#
+        } else if request.path.ends_with("/reply") {
+            r#"{"code":0,"msg":"ok","data":{"message_id":"om-reply"}}"#
+        } else {
+            panic!("unexpected Lark request {}", request.path);
+        };
+        MockResponse::json(body)
+    })
+    .await;
+    let api = LarkApi::with_base_url(
+        LarkChannelConfig {
+            name: "lark-permission-test".to_string(),
+            app_id: "app-id".to_string(),
+            secret: "secret".to_string(),
+            permission: Default::default(),
+            proxy: None,
+        },
+        server.base_url(),
+    )
+    .unwrap();
+    (api, server)
 }
 
 #[test]
@@ -45,12 +97,6 @@ fn image_extensions_cover_known_and_unknown_media_types() {
 #[tokio::test]
 async fn receiver_routes_ignored_interrupt_card_and_message_events() {
     let mut channel = LarkChannel::with_api(api());
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let callback_interrupted = Arc::clone(&interrupted);
-    let registration = channel.interrupts.register(InterruptCallback::new(move || {
-        callback_interrupted.store(true, AtomicOrdering::Relaxed);
-        true
-    }));
     let (sender, events) = mpsc::unbounded_channel();
     sender
         .send(Ok(LarkEvent::Ignore {
@@ -61,14 +107,32 @@ async fn receiver_routes_ignored_interrupt_card_and_message_events() {
         .send(Ok(LarkEvent::Message(message("file"))))
         .unwrap();
     sender
+        .send(Ok(LarkEvent::Message(message("text"))))
+        .unwrap();
+    channel.receiver = Some(LarkWebSocketReceiver { events, task: None });
+    let task = channel.recv().await.unwrap().unwrap();
+    assert_eq!(task.task_id(), "om-message");
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let callback_interrupted = Arc::clone(&interrupted);
+    let registration = channel.interrupts.register(InterruptCallback::new(move || {
+        callback_interrupted.store(true, AtomicOrdering::Relaxed);
+        true
+    }));
+    let (sender, events) = mpsc::unbounded_channel();
+    sender
         .send(Ok(LarkEvent::Interrupt(LarkInterruptEvent {
             id: "evt-interrupt".to_string(),
+            user_id: "ou-user".to_string(),
+            session_id: "oc-chat".to_string(),
+            message_id: "om-card".to_string(),
             callback_id: registration.id().to_string(),
         })))
         .unwrap();
     sender
         .send(Ok(LarkEvent::CardAction(LarkCardActionEvent {
             id: "evt-action".to_string(),
+            user_id: "ou-user".to_string(),
             session_id: "oc-chat".to_string(),
             message_id: "om-card".to_string(),
             command: CommandRequest::new(["ask", "list"]),
@@ -83,16 +147,151 @@ async fn receiver_routes_ignored_interrupt_card_and_message_events() {
     assert_eq!(task.input().command().unwrap().path(), &["ask", "list"]);
 
     let (sender, events) = mpsc::unbounded_channel();
-    sender
-        .send(Ok(LarkEvent::Message(message("text"))))
-        .unwrap();
     drop(sender);
     channel.receiver = Some(LarkWebSocketReceiver { events, task: None });
-    let task = channel.recv().await.unwrap().unwrap();
-    assert_eq!(task.task_id(), "om-message");
-    assert_eq!(task.session_id(), "oc-chat");
-    assert_eq!(task.input().message().unwrap().text(), "hello");
     assert_eq!(channel.recv().await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn receiver_silently_discards_unmentioned_denied_lark_messages() {
+    let (api, server) = permission_api().await;
+    let mut channel = LarkChannel::with_api_and_permission(
+        api,
+        permission(&["ou-allowed"], &[("oc-chat", false)]),
+    );
+    let mut denied = message("text");
+    denied.sender_id = "ou-denied".to_string();
+    let mut allowed = message("text");
+    allowed.sender_id = "ou-allowed".to_string();
+    let (sender, events) = mpsc::unbounded_channel();
+    sender.send(Ok(LarkEvent::Message(denied))).unwrap();
+    sender.send(Ok(LarkEvent::Message(allowed))).unwrap();
+    channel.receiver = Some(LarkWebSocketReceiver { events, task: None });
+
+    let task = channel.recv().await.unwrap().unwrap();
+
+    assert_eq!(task.task_id(), "om-message");
+    let requests = server.requests().await;
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.path.ends_with("/reply"))
+    );
+}
+
+#[tokio::test]
+async fn receiver_guides_a_denied_lark_user_who_mentions_the_bot() {
+    let (api, server) = permission_api().await;
+    let mut channel = LarkChannel::with_api_and_permission(
+        api,
+        permission(&["ou-allowed"], &[("oc-chat", false)]),
+    );
+    let mut denied = message("text");
+    denied.sender_id = "ou-denied".to_string();
+    denied.mention_ids = vec!["ou-bot".to_string()];
+    let mut allowed = message("text");
+    allowed.sender_id = "ou-allowed".to_string();
+    let (sender, events) = mpsc::unbounded_channel();
+    sender.send(Ok(LarkEvent::Message(denied))).unwrap();
+    sender.send(Ok(LarkEvent::Message(allowed))).unwrap();
+    channel.receiver = Some(LarkWebSocketReceiver { events, task: None });
+
+    assert!(channel.recv().await.unwrap().is_some());
+    let requests = server.requests().await;
+    let reply = requests
+        .iter()
+        .find(|request| request.path.ends_with("/reply"))
+        .unwrap();
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(body["msg_type"], "interactive");
+    let card: Value = serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
+    let markdown = card["body"]["elements"][0]["content"].as_str().unwrap();
+    assert!(markdown.contains("**无权访问此 Channel**"));
+    assert!(markdown.contains("- User ID：`ou-denied`"));
+    assert!(markdown.contains("```json"));
+}
+
+#[tokio::test]
+async fn lark_group_mention_requirement_matches_only_the_current_bot() {
+    let (api, server) = permission_api().await;
+    let mut channel =
+        LarkChannel::with_api_and_permission(api, permission(&["ou-user"], &[("oc-chat", true)]));
+    let mut without_bot = message("text");
+    without_bot.mention_ids = vec!["ou-other".to_string()];
+    let mut with_bot = message("text");
+    with_bot.mention_ids = vec!["ou-bot".to_string()];
+    let (sender, events) = mpsc::unbounded_channel();
+    sender.send(Ok(LarkEvent::Message(without_bot))).unwrap();
+    sender.send(Ok(LarkEvent::Message(with_bot))).unwrap();
+    channel.receiver = Some(LarkWebSocketReceiver { events, task: None });
+
+    assert!(channel.recv().await.unwrap().is_some());
+    let requests = server.requests().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/open-apis/bot/v3/info")
+            .count(),
+        1
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.path.ends_with("/reply"))
+    );
+}
+
+#[tokio::test]
+async fn lark_actions_check_the_actor_but_do_not_require_a_new_mention() {
+    let (api, server) = permission_api().await;
+    let mut channel = LarkChannel::with_api_and_permission(
+        api,
+        permission(&["ou-allowed"], &[("oc-chat", true)]),
+    );
+    let mut source = message("text");
+    source.sender_id = "ou-allowed".to_string();
+    source.mention_ids = vec!["ou-bot".to_string()];
+    let (sender, events) = mpsc::unbounded_channel();
+    sender.send(Ok(LarkEvent::Message(source))).unwrap();
+    channel.receiver = Some(LarkWebSocketReceiver { events, task: None });
+    assert!(channel.recv().await.unwrap().is_some());
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let callback_interrupted = Arc::clone(&interrupted);
+    let registration = channel.interrupts.register(InterruptCallback::new(move || {
+        callback_interrupted.store(true, AtomicOrdering::Relaxed);
+        true
+    }));
+    let (sender, events) = mpsc::unbounded_channel();
+    sender
+        .send(Ok(LarkEvent::Interrupt(LarkInterruptEvent {
+            id: "evt-denied".to_string(),
+            user_id: "ou-denied".to_string(),
+            session_id: "oc-chat".to_string(),
+            message_id: "om-card-denied".to_string(),
+            callback_id: registration.id().to_string(),
+        })))
+        .unwrap();
+    sender
+        .send(Ok(LarkEvent::CardAction(LarkCardActionEvent {
+            id: "evt-allowed".to_string(),
+            user_id: "ou-allowed".to_string(),
+            session_id: "oc-chat".to_string(),
+            message_id: "om-card-allowed".to_string(),
+            command: CommandRequest::new(["ask", "list"]),
+        })))
+        .unwrap();
+    channel.receiver = Some(LarkWebSocketReceiver { events, task: None });
+
+    let task = channel.recv().await.unwrap().unwrap();
+
+    assert_eq!(task.task_id(), "evt-allowed");
+    assert!(!interrupted.load(AtomicOrdering::Relaxed));
+    let requests = server.requests().await;
+    assert!(requests.iter().any(|request| {
+        request.path == "/open-apis/im/v1/messages/om-card-denied/reply"
+            && request.body.contains("User ID：`ou-denied`")
+    }));
 }
 
 #[tokio::test]
@@ -150,6 +349,7 @@ async fn card_action_tasks_cannot_open_agent_runs() {
     assert_eq!(channel.name(), "lark-channel-test");
     let task = LarkTask::from_card_action(LarkCardActionEvent {
         id: "evt-action".to_string(),
+        user_id: "ou-user".to_string(),
         session_id: "oc-chat".to_string(),
         message_id: "om-card".to_string(),
         command: CommandRequest::new(["ask", "list"]),
@@ -178,6 +378,7 @@ async fn configured_channel_rejects_a_task_from_another_channel_type() {
     let channel = ConfiguredChannel::from_config(ChannelConfig::Telegram(TelegramChannelConfig {
         name: "telegram".to_string(),
         token: "123:secret".to_string(),
+        permission: Default::default(),
         proxy: None,
     }))
     .unwrap()

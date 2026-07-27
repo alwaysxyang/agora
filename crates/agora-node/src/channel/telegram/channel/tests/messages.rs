@@ -1,6 +1,23 @@
 use super::*;
 
 #[test]
+fn telegram_permission_denial_owns_its_rich_markdown_layout() {
+    let denial =
+        PermissionDenial::new("telegram1", "42", Some("-1001"), "当前群聊未在允许列表中。");
+
+    let markdown = TelegramChannel::render_permission_denial(&denial);
+
+    assert!(markdown.starts_with("**无权访问此 Channel**"));
+    assert!(markdown.contains("> 当前群聊未在允许列表中。"));
+    assert!(markdown.contains("- Channel：`telegram1`"));
+    assert!(markdown.contains("- Group ID：`-1001`"));
+    assert!(markdown.contains("```jsonc"));
+    assert!(markdown.contains(r#""channels": ["#));
+    assert!(markdown.contains("// ..."));
+    assert!(!markdown.contains(r#""name": "telegram1""#));
+}
+
+#[test]
 fn telegram_renders_agent_status_replies_without_interactive_controls() {
     let list = ChannelReply::agent_list(vec![
         ChannelAgentStatus::new("codex-dev", true),
@@ -45,6 +62,9 @@ fn normalizes_private_text_message() {
     assert_eq!(task.reply_target().message_id, 7);
     assert_eq!(task.reply_target().message_thread_id, None);
     assert!(task.reply_target().is_private);
+    assert_eq!(task.sender_id, "1");
+    assert_eq!(task.group_id, None);
+    assert!(!task.mentioned_bot);
 }
 
 #[test]
@@ -150,6 +170,29 @@ fn normalizes_commands_addressed_to_this_bot() {
     let task = update.into_task("agora_bot").unwrap();
 
     assert_eq!(task.input().message().unwrap().text(), "/stop codex-dev");
+    assert!(task.mentioned_bot);
+}
+
+#[test]
+fn identifies_the_sender_group_and_current_bot_mention() {
+    let update = TelegramUpdate::from_json(
+        r#"{
+            "update_id": 107,
+            "message": {
+                "message_id": 13,
+                "from": {"id": 42, "is_bot": false},
+                "chat": {"id": -1001, "type": "group"},
+                "text": "hello @Agora_Bot"
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let task = update.into_task("agora_bot").unwrap();
+
+    assert_eq!(task.sender_id, "42");
+    assert_eq!(task.group_id.as_deref(), Some("-1001"));
+    assert!(task.mentioned_bot);
 }
 
 #[test]
