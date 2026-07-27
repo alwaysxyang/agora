@@ -1,9 +1,9 @@
-use crate::audit::DomainSource;
+use crate::callback::DomainSource;
 use rustls::server::Acceptor;
 use std::io::Cursor;
 use std::net::IpAddr;
 
-const MAX_INSPECTION_BYTES: usize = 64 * 1024;
+pub(super) const MAX_INSPECTION_BYTES: usize = 64 * 1024;
 const MAX_HTTP_HEADERS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,13 +25,16 @@ impl ProtocolInspector {
         }
     }
 
-    pub(super) fn inspect(&mut self, bytes: &[u8]) -> Option<DomainObservation> {
-        if self.protocol == Protocol::Done || bytes.is_empty() {
-            return None;
+    pub(super) fn inspect(&mut self, bytes: &[u8]) -> InspectionState {
+        if self.protocol == Protocol::Done {
+            return InspectionState::Complete(None);
+        }
+        if bytes.is_empty() {
+            return InspectionState::Pending;
         }
         if self.buffer.len().saturating_add(bytes.len()) > MAX_INSPECTION_BYTES {
             self.finish();
-            return None;
+            return InspectionState::Complete(None);
         }
         self.buffer.extend_from_slice(bytes);
         if self.protocol == Protocol::Unknown {
@@ -49,14 +52,14 @@ impl ProtocolInspector {
             Protocol::Unknown | Protocol::Done => InspectionResult::Complete(None),
         };
         match result {
-            InspectionResult::Pending => None,
+            InspectionResult::Pending => InspectionState::Pending,
             InspectionResult::Complete(observation) => {
                 self.finish();
-                observation
+                InspectionState::Complete(observation)
             }
             InspectionResult::Invalid => {
                 self.finish();
-                None
+                InspectionState::Complete(None)
             }
         }
     }
@@ -130,6 +133,12 @@ impl ProtocolInspector {
         self.protocol = Protocol::Done;
         self.buffer.clear();
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum InspectionState {
+    Pending,
+    Complete(Option<DomainObservation>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

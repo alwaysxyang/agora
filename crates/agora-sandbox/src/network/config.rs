@@ -2,11 +2,13 @@ use anyhow::{Result, bail};
 use std::time::Duration;
 
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
+const DEFAULT_DOMAIN_INSPECTION_TIMEOUT: Duration = Duration::from_millis(500);
+const DEFAULT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NetworkEnforcement {
     #[default]
-    Audit,
+    Intercept,
     Strict,
 }
 
@@ -22,6 +24,8 @@ pub enum TlsMode {
 pub struct NetworkConfig {
     pub enforcement: NetworkEnforcement,
     pub tls: TlsMode,
+    pub domain_inspection_timeout: Duration,
+    pub callback_timeout: Duration,
     pub upstream_connect_timeout: Duration,
     pub max_connections: usize,
 }
@@ -29,8 +33,10 @@ pub struct NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            enforcement: NetworkEnforcement::Audit,
+            enforcement: NetworkEnforcement::Intercept,
             tls: TlsMode::Off,
+            domain_inspection_timeout: DEFAULT_DOMAIN_INSPECTION_TIMEOUT,
+            callback_timeout: DEFAULT_CALLBACK_TIMEOUT,
             upstream_connect_timeout: Duration::from_secs(10),
             max_connections: DEFAULT_MAX_CONNECTIONS,
         }
@@ -47,6 +53,12 @@ impl NetworkConfig {
         }
         if self.upstream_connect_timeout.is_zero() {
             bail!("upstream_connect_timeout must be greater than zero");
+        }
+        if self.domain_inspection_timeout.is_zero() {
+            bail!("domain_inspection_timeout must be greater than zero");
+        }
+        if self.callback_timeout.is_zero() {
+            bail!("callback_timeout must be greater than zero");
         }
         if self.max_connections == 0 {
             bail!("max_connections must be greater than zero");

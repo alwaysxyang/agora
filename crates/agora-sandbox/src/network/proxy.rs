@@ -1,13 +1,15 @@
-use super::NetworkState;
-use super::inspection::{DomainObservation, ProtocolInspector};
-use crate::audit::AuditCallback;
+use super::inspection::{
+    DomainObservation, InspectionState, MAX_INSPECTION_BYTES, ProtocolInspector,
+};
+use super::{NetworkState, UpstreamConnection};
+use crate::callback::{Callback, Decision};
 use crate::protocol::{
     ConnectRequest, HANDSHAKE_TIMEOUT, MAX_FRAME_SIZE, ProtocolError, RouteRegistration,
     parse_connect_request_prefix,
 };
 use anyhow::{Context, Result};
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -16,7 +18,7 @@ use tokio::task::JoinSet;
 
 pub(super) struct ProxyServer<C>
 where
-    C: AuditCallback,
+    C: Callback,
 {
     listener: TcpListener,
     state: Arc<NetworkState<C>>,
@@ -24,7 +26,7 @@ where
 
 impl<C> ProxyServer<C>
 where
-    C: AuditCallback,
+    C: Callback,
 {
     pub(super) fn new(listener: TcpListener, state: Arc<NetworkState<C>>) -> Self {
         Self { listener, state }
@@ -76,9 +78,81 @@ where
         }
 
         let registration = request.into_registration();
-        if let Ok(upstream) = state.connect_upstream(&registration).await {
-            Self::relay(state, client, upstream, registration, initial_data).await;
+        let (initial_data, observation) = match Self::inspect_domain(
+            &mut client,
+            initial_data,
+            state.config.domain_inspection_timeout,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => return,
+        };
+        let decision = state.authorize(&registration, observation.as_ref()).await;
+        if matches!(decision, Decision::Deny { .. }) {
+            drop(client);
+            state
+                .publish_denied(&registration, observation.as_ref(), &decision)
+                .await;
+            return;
         }
+        if let Ok(upstream) = state
+            .connect_upstream(&registration, observation.as_ref(), &decision)
+            .await
+        {
+            Self::relay(
+                state,
+                client,
+                upstream,
+                registration,
+                initial_data,
+                observation,
+                decision,
+            )
+            .await;
+        }
+    }
+
+    async fn inspect_domain(
+        client: &mut TcpStream,
+        mut initial_data: Vec<u8>,
+        timeout: std::time::Duration,
+    ) -> io::Result<(Vec<u8>, Option<DomainObservation>)> {
+        let mut inspector = ProtocolInspector::new();
+        if !initial_data.is_empty() {
+            match inspector.inspect(&initial_data) {
+                InspectionState::Pending => {}
+                InspectionState::Complete(observation) => {
+                    return Ok((initial_data, observation));
+                }
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut buffer = [0_u8; 4096];
+        while initial_data.len() < MAX_INSPECTION_BYTES {
+            let available = (MAX_INSPECTION_BYTES - initial_data.len()).min(buffer.len());
+            let read = match tokio::time::timeout_at(
+                deadline,
+                client.read(&mut buffer[..available]),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => break,
+            };
+            if read == 0 {
+                break;
+            }
+            initial_data.extend_from_slice(&buffer[..read]);
+            match inspector.inspect(&buffer[..read]) {
+                InspectionState::Pending => {}
+                InspectionState::Complete(observation) => {
+                    return Ok((initial_data, observation));
+                }
+            }
+        }
+        Ok((initial_data, None))
     }
 
     async fn read_request(
@@ -113,45 +187,45 @@ where
     async fn relay(
         state: Arc<NetworkState<C>>,
         client: TcpStream,
-        upstream: TcpStream,
+        upstream: UpstreamConnection,
         registration: RouteRegistration,
-        initial_data: Vec<u8>,
+        initial_client_data: Vec<u8>,
+        observation: Option<DomainObservation>,
+        decision: Decision,
     ) {
         let started = Instant::now();
-        let outcome =
-            Self::copy_with_inspection(&state, &registration, client, upstream, initial_data).await;
+        let result = Self::copy_bidirectional(
+            client,
+            upstream.stream,
+            initial_client_data,
+            upstream.initial_data,
+        )
+        .await;
         let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        state.publish_closed(
-            &registration,
-            outcome.result,
-            duration_ms,
-            outcome.domain.as_ref(),
-        );
+        state
+            .publish_closed(
+                &registration,
+                result,
+                duration_ms,
+                observation.as_ref(),
+                &decision,
+            )
+            .await;
     }
 
-    async fn copy_with_inspection(
-        state: &NetworkState<C>,
-        registration: &RouteRegistration,
+    async fn copy_bidirectional(
         client: TcpStream,
         upstream: TcpStream,
-        initial_data: Vec<u8>,
-    ) -> RelayOutcome {
+        initial_client_data: Vec<u8>,
+        initial_upstream_data: Vec<u8>,
+    ) -> io::Result<(u64, u64)> {
         let (mut client_reader, mut client_writer) = client.into_split();
         let (mut upstream_reader, mut upstream_writer) = upstream.into_split();
-        let observed_domain = Arc::new(Mutex::new(None));
-        let client_domain = Arc::clone(&observed_domain);
         let client_to_upstream = async {
-            let mut inspector = ProtocolInspector::new();
             let mut bytes_sent = 0_u64;
-            if !initial_data.is_empty() {
-                if let Some(domain) = inspector.inspect(&initial_data) {
-                    state.publish_domain_observed(registration, &domain);
-                    *client_domain
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(domain);
-                }
-                upstream_writer.write_all(&initial_data).await?;
-                bytes_sent = initial_data.len() as u64;
+            if !initial_client_data.is_empty() {
+                upstream_writer.write_all(&initial_client_data).await?;
+                bytes_sent = initial_client_data.len() as u64;
             }
             let mut buffer = [0_u8; 16 * 1024];
             loop {
@@ -160,32 +234,22 @@ where
                     upstream_writer.shutdown().await?;
                     break;
                 }
-                if let Some(domain) = inspector.inspect(&buffer[..read]) {
-                    state.publish_domain_observed(registration, &domain);
-                    *client_domain
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(domain);
-                }
                 upstream_writer.write_all(&buffer[..read]).await?;
                 bytes_sent = bytes_sent.saturating_add(read as u64);
             }
             Ok::<_, io::Error>(bytes_sent)
         };
         let upstream_to_client = async {
-            let bytes_received = tokio::io::copy(&mut upstream_reader, &mut client_writer).await?;
+            let mut bytes_received = 0_u64;
+            if !initial_upstream_data.is_empty() {
+                client_writer.write_all(&initial_upstream_data).await?;
+                bytes_received = initial_upstream_data.len() as u64;
+            }
+            bytes_received = bytes_received
+                .saturating_add(tokio::io::copy(&mut upstream_reader, &mut client_writer).await?);
             client_writer.shutdown().await?;
             Ok::<_, io::Error>(bytes_received)
         };
-        let result = tokio::try_join!(client_to_upstream, upstream_to_client);
-        let domain = observed_domain
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        RelayOutcome { result, domain }
+        tokio::try_join!(client_to_upstream, upstream_to_client)
     }
-}
-
-struct RelayOutcome {
-    result: io::Result<(u64, u64)>,
-    domain: Option<DomainObservation>,
 }

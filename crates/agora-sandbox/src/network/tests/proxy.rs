@@ -1,24 +1,29 @@
 use super::super::{NetworkConfig, NetworkController, NetworkRunContext, NetworkRuntime};
-use crate::audit::{AuditCallback, AuditEvent, AuditEventType, DomainSource};
+use crate::callback::{
+    BasicAuth, Callback, Decision, DomainSource, EventType, HttpProxy, NetworkEvent, Proxy,
+};
 use crate::protocol::{
     ConnectRequest, HookOperation, PROTOCOL_VERSION, ProcessIdentity, encode_connect_request,
 };
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Clone, Default)]
-struct EventLog(Arc<Mutex<Vec<AuditEvent>>>);
+struct EventLog(Arc<Mutex<Vec<NetworkEvent>>>);
 
-impl AuditCallback for EventLog {
-    fn on_event(&self, event: AuditEvent) {
+impl Callback for EventLog {
+    fn on_event(&self, event: NetworkEvent) -> impl Future<Output = Decision> + Send {
         self.0.lock().unwrap().push(event);
+        std::future::ready(Decision::Allow)
     }
 }
 
 impl EventLog {
-    fn snapshot(&self) -> Vec<AuditEvent> {
+    fn snapshot(&self) -> Vec<NetworkEvent> {
         self.0.lock().unwrap().clone()
     }
 
@@ -112,6 +117,10 @@ async fn open_tunnel(
 
 async fn assert_rejected(runtime: &NetworkRuntime, request: &ConnectRequest) {
     let mut client = open_tunnel(runtime, request, &[]).await;
+    assert_stream_rejected(&mut client).await;
+}
+
+async fn assert_stream_rejected(client: &mut TcpStream) {
     let mut byte = [0_u8; 1];
     let read = tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut byte))
         .await
@@ -120,6 +129,19 @@ async fn assert_rejected(runtime: &NetworkRuntime, request: &ConnectRequest) {
         Ok(0) => {}
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
         other => panic!("rejected tunnel remained usable: {other:?}"),
+    }
+}
+
+async fn read_http_head(stream: &mut TcpStream) -> String {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 256];
+    loop {
+        let read = stream.read(&mut buffer).await.unwrap();
+        assert_ne!(read, 0, "HTTP connection closed before the head completed");
+        bytes.extend_from_slice(&buffer[..read]);
+        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            return String::from_utf8(bytes).unwrap();
+        }
     }
 }
 
@@ -144,9 +166,9 @@ async fn connect_request_relays_bytes_and_emits_ordered_audit_events() {
             .map(|event| event.event_type)
             .collect::<Vec<_>>(),
         vec![
-            AuditEventType::NetworkConnectAttempt,
-            AuditEventType::NetworkConnectEstablished,
-            AuditEventType::NetworkConnectionClosed,
+            EventType::NetworkConnectAttempt,
+            EventType::NetworkConnectEstablished,
+            EventType::NetworkConnectionClosed,
         ]
     );
     let network = events[0].network.as_ref().unwrap();
@@ -186,11 +208,11 @@ async fn initial_payload_is_relayed_and_audited() {
     assert_eq!(echoed, request);
     client.shutdown().await.unwrap();
 
-    fixture.events.wait_for_len(4).await;
+    fixture.events.wait_for_len(3).await;
     let events = fixture.events.snapshot();
     let observed = events
         .iter()
-        .find(|event| event.event_type == AuditEventType::NetworkDomainObserved)
+        .find(|event| event.event_type == EventType::NetworkConnectAttempt)
         .unwrap();
     assert_eq!(
         observed.network.as_ref().unwrap().domain.as_deref(),
@@ -235,11 +257,11 @@ async fn http_host_is_audited_from_relayed_payload() {
     assert_eq!(echoed, request);
     client.shutdown().await.unwrap();
 
-    fixture.events.wait_for_len(4).await;
+    fixture.events.wait_for_len(3).await;
     let events = fixture.events.snapshot();
     let event = events
         .iter()
-        .find(|event| event.event_type == AuditEventType::NetworkDomainObserved)
+        .find(|event| event.event_type == EventType::NetworkConnectAttempt)
         .unwrap();
     let network = event.network.as_ref().unwrap();
     assert_eq!(network.http_host.as_deref(), Some("audit.example"));
@@ -248,9 +270,9 @@ async fn http_host_is_audited_from_relayed_payload() {
     assert_eq!(network.domain_source, Some(DomainSource::HttpHost));
     let closed = events
         .iter()
-        .find(|event| event.event_type == AuditEventType::NetworkConnectionClosed)
+        .find(|event| event.event_type == EventType::NetworkConnectionClosed)
         .unwrap();
-    assert_eq!(closed.sequence, Some(3));
+    assert_eq!(closed.sequence, Some(2));
     assert_eq!(closed.network.as_ref().unwrap(), network);
 
     fixture.controller.shutdown().await.unwrap();
@@ -293,12 +315,318 @@ async fn upstream_failure_closes_the_tunnel_and_is_audited() {
             .map(|event| event.event_type)
             .collect::<Vec<_>>(),
         vec![
-            AuditEventType::NetworkConnectAttempt,
-            AuditEventType::NetworkConnectFailed,
+            EventType::NetworkConnectAttempt,
+            EventType::NetworkConnectFailed,
         ]
     );
 
     fixture.controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn denied_http_domain_never_connects_to_upstream() {
+    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let destination = upstream.local_addr().unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let callback = {
+        let events = Arc::clone(&events);
+        move |event: NetworkEvent| {
+            let denied = event.event_type == EventType::NetworkConnectAttempt
+                && event
+                    .network
+                    .as_ref()
+                    .and_then(|network| network.domain.as_deref())
+                    == Some("blocked.example");
+            events.lock().unwrap().push(event);
+            std::future::ready(if denied {
+                Decision::Deny {
+                    reason: Some("domain is blocked".to_string()),
+                }
+            } else {
+                Decision::Allow
+            })
+        }
+    };
+    let controller = NetworkController::start(
+        NetworkConfig::default(),
+        NetworkRunContext::new("sandbox-1", "run-1"),
+        callback,
+    )
+    .await
+    .unwrap();
+    let runtime = controller.runtime().clone();
+    let request = connect_request(&runtime, destination, "connection-denied-domain");
+    let mut client = open_tunnel(
+        &runtime,
+        &request,
+        b"GET / HTTP/1.1\r\nHost: blocked.example\r\n\r\n",
+    )
+    .await;
+
+    assert_stream_rejected(&mut client).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), upstream.accept())
+            .await
+            .is_err()
+    );
+    {
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type)
+                .collect::<Vec<_>>(),
+            vec![
+                EventType::NetworkConnectAttempt,
+                EventType::NetworkConnectDenied,
+            ]
+        );
+        assert_eq!(
+            events[1].decision,
+            Some(Decision::Deny {
+                reason: Some("domain is blocked".to_string()),
+            })
+        );
+    }
+
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn denied_tls_sni_never_connects_to_upstream() {
+    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let destination = upstream.local_addr().unwrap();
+    let callback = |event: NetworkEvent| async move {
+        let denied = event.event_type == EventType::NetworkConnectAttempt
+            && event
+                .network
+                .as_ref()
+                .and_then(|network| network.tls_sni.as_deref())
+                == Some("blocked.example");
+        if denied {
+            Decision::Deny {
+                reason: Some("TLS SNI is blocked".to_string()),
+            }
+        } else {
+            Decision::Allow
+        }
+    };
+    let controller = NetworkController::start(
+        NetworkConfig::default(),
+        NetworkRunContext::new("sandbox-1", "run-1"),
+        callback,
+    )
+    .await
+    .unwrap();
+    let runtime = controller.runtime().clone();
+    let request = connect_request(&runtime, destination, "connection-denied-sni");
+    let hello = tls_client_hello("blocked.example");
+    let mut client = open_tunnel(&runtime, &request, &hello).await;
+
+    assert_stream_rejected(&mut client).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), upstream.accept())
+            .await
+            .is_err()
+    );
+
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn callback_timeout_denies_before_connecting_to_upstream() {
+    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let destination = upstream.local_addr().unwrap();
+    let callback = |event: NetworkEvent| async move {
+        if event.event_type == EventType::NetworkConnectAttempt {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        Decision::Allow
+    };
+    let config = NetworkConfig {
+        callback_timeout: std::time::Duration::from_millis(20),
+        ..NetworkConfig::default()
+    };
+    let controller = NetworkController::start(
+        config,
+        NetworkRunContext::new("sandbox-1", "run-1"),
+        callback,
+    )
+    .await
+    .unwrap();
+    let runtime = controller.runtime().clone();
+    let request = connect_request(&runtime, destination, "connection-callback-timeout");
+    let mut client = open_tunnel(
+        &runtime,
+        &request,
+        b"GET / HTTP/1.1\r\nHost: allowed.example\r\n\r\n",
+    )
+    .await;
+
+    assert_stream_rejected(&mut client).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), upstream.accept())
+            .await
+            .is_err()
+    );
+
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn proxy_decision_uses_http_connect_with_basic_auth() {
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let destination_address = destination.local_addr().unwrap();
+    let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let proxy_address = proxy.local_addr().unwrap();
+    let request_bytes = b"GET / HTTP/1.1\r\nHost: proxied.example\r\n\r\n";
+    let proxy_task = tokio::spawn(async move {
+        let (mut stream, _) = proxy.accept().await.unwrap();
+        let head = read_http_head(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nbanner")
+            .await
+            .unwrap();
+        let mut request = vec![0_u8; request_bytes.len()];
+        stream.read_exact(&mut request).await.unwrap();
+        stream.write_all(b"proxied").await.unwrap();
+        (head, request)
+    });
+    let decision = Decision::Proxy {
+        proxy: Proxy::Http(HttpProxy {
+            address: proxy_address.to_string(),
+            basic_auth: Some(BasicAuth {
+                username: "alice".to_string(),
+                password: "secret".to_string(),
+            }),
+        }),
+    };
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let callback = {
+        let decision = decision.clone();
+        let events = Arc::clone(&events);
+        move |event: NetworkEvent| {
+            let result = if event.event_type == EventType::NetworkConnectAttempt {
+                decision.clone()
+            } else {
+                Decision::Allow
+            };
+            events.lock().unwrap().push(event);
+            std::future::ready(result)
+        }
+    };
+    let controller = NetworkController::start(
+        NetworkConfig::default(),
+        NetworkRunContext::new("sandbox-1", "run-1"),
+        callback,
+    )
+    .await
+    .unwrap();
+    let runtime = controller.runtime().clone();
+    let request = connect_request(&runtime, destination_address, "connection-http-proxy");
+    let mut client = open_tunnel(&runtime, &request, request_bytes).await;
+
+    let mut response = [0_u8; 13];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        client.read_exact(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(&response, b"bannerproxied");
+    client.shutdown().await.unwrap();
+    let (head, relayed_request) = proxy_task.await.unwrap();
+    assert!(head.starts_with(&format!("CONNECT {destination_address} HTTP/1.1\r\n")));
+    assert!(head.contains(&format!("Host: {destination_address}\r\n")));
+    assert!(head.contains("Proxy-Authorization: Basic YWxpY2U6c2VjcmV0\r\n"));
+    assert_eq!(relayed_request, request_bytes);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), destination.accept())
+            .await
+            .is_err()
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if events.lock().unwrap().len() >= 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(events.lock().unwrap()[1].decision, Some(decision));
+
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn http_proxy_rejection_is_fail_closed_without_direct_fallback() {
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let destination_address = destination.local_addr().unwrap();
+    let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let proxy_address = proxy.local_addr().unwrap();
+    let proxy_task = tokio::spawn(async move {
+        let (mut stream, _) = proxy.accept().await.unwrap();
+        let _ = read_http_head(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let callback = move |event: NetworkEvent| {
+        std::future::ready(if event.event_type == EventType::NetworkConnectAttempt {
+            Decision::Proxy {
+                proxy: Proxy::Http(HttpProxy {
+                    address: proxy_address.to_string(),
+                    basic_auth: None,
+                }),
+            }
+        } else {
+            Decision::Allow
+        })
+    };
+    let controller = NetworkController::start(
+        NetworkConfig::default(),
+        NetworkRunContext::new("sandbox-1", "run-1"),
+        callback,
+    )
+    .await
+    .unwrap();
+    let runtime = controller.runtime().clone();
+    let request = connect_request(
+        &runtime,
+        destination_address,
+        "connection-http-proxy-rejected",
+    );
+    let mut client = open_tunnel(
+        &runtime,
+        &request,
+        b"GET / HTTP/1.1\r\nHost: rejected.example\r\n\r\n",
+    )
+    .await;
+
+    assert_stream_rejected(&mut client).await;
+    proxy_task.await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), destination.accept())
+            .await
+            .is_err()
+    );
+
+    controller.shutdown().await.unwrap();
+}
+
+fn tls_client_hello(server_name: &str) -> Vec<u8> {
+    let config = ClientConfig::builder()
+        .with_root_certificates(RootCertStore::empty())
+        .with_no_client_auth();
+    let server_name = ServerName::try_from(server_name.to_string()).unwrap();
+    let mut connection = ClientConnection::new(Arc::new(config), server_name).unwrap();
+    let mut hello = Vec::new();
+    connection.write_tls(&mut hello).unwrap();
+    hello
 }
 
 #[tokio::test]

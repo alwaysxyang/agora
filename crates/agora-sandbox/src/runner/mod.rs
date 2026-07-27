@@ -1,4 +1,4 @@
-use crate::audit::AuditCallback;
+use crate::callback::Callback;
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
@@ -99,7 +99,7 @@ impl SandboxCommand {
 
 pub struct Sandbox<C>
 where
-    C: AuditCallback,
+    C: Callback,
 {
     config: SandboxConfig,
     callback: C,
@@ -107,7 +107,7 @@ where
 
 impl<C> Sandbox<C>
 where
-    C: AuditCallback,
+    C: Callback,
 {
     pub fn new(config: SandboxConfig, callback: C) -> Self {
         Self { config, callback }

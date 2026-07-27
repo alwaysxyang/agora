@@ -3,7 +3,7 @@ use agora_core::lifecycle::{
     signal::{Signal, SignalHandlers},
 };
 use agora_sandbox::{
-    audit::{AuditCallback, AuditEvent, AuditEventType},
+    callback::{Callback, Decision, EventType, NetworkEvent},
     runner::{Sandbox, SandboxCommand, SandboxConfig},
 };
 use anyhow::{Context, Result};
@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 #[derive(Parser)]
 #[command(
     name = "agora-sandbox",
-    about = "Run a command with Agora sandbox network auditing",
+    about = "Run a command with Agora sandbox network interception and auditing",
     color = ColorChoice::Auto
 )]
 struct Arguments {
@@ -36,11 +36,11 @@ struct Arguments {
     audit_file: Option<PathBuf>,
 }
 
-struct JsonAuditCallback {
+struct JsonCallback {
     state: Mutex<AuditState>,
 }
 
-impl JsonAuditCallback {
+impl JsonCallback {
     fn new(path: Option<&Path>) -> Result<Self> {
         Ok(Self {
             state: Mutex::new(AuditState::new(path)?),
@@ -48,11 +48,12 @@ impl JsonAuditCallback {
     }
 }
 
-impl AuditCallback for JsonAuditCallback {
-    fn on_event(&self, event: AuditEvent) {
+impl Callback for JsonCallback {
+    fn on_event(&self, event: NetworkEvent) -> impl Future<Output = Decision> + Send {
         if let Err(error) = lock(&self.state).on_event(&event) {
             eprintln!("failed to write sandbox audit record: {error:#}");
         }
+        std::future::ready(Decision::Allow)
     }
 }
 
@@ -69,9 +70,9 @@ impl AuditState {
         })
     }
 
-    fn on_event(&mut self, event: &AuditEvent) -> Result<()> {
+    fn on_event(&mut self, event: &NetworkEvent) -> Result<()> {
         match event.event_type {
-            AuditEventType::NetworkConnectAttempt => {
+            EventType::NetworkConnectAttempt => {
                 let (Some(connection_id), Some(network)) =
                     (event.connection_id.as_ref(), event.network.as_ref())
                 else {
@@ -88,17 +89,9 @@ impl AuditState {
                     },
                 );
             }
-            AuditEventType::NetworkDomainObserved => {
-                let (Some(connection_id), Some(network)) =
-                    (event.connection_id.as_ref(), event.network.as_ref())
-                else {
-                    return Ok(());
-                };
-                if let Some(record) = self.pending.get_mut(connection_id) {
-                    record.domain.clone_from(&network.domain);
-                }
-            }
-            AuditEventType::NetworkConnectFailed | AuditEventType::NetworkConnectionClosed => {
+            EventType::NetworkConnectDenied
+            | EventType::NetworkConnectFailed
+            | EventType::NetworkConnectionClosed => {
                 let Some(network) = event.network.as_ref() else {
                     return Ok(());
                 };
@@ -182,7 +175,7 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
     };
     let config = SandboxConfig::new(hook_library);
     let command = parse_command(&arguments.command)?;
-    let audit = JsonAuditCallback::new(arguments.audit_file.as_deref())?;
+    let callback = JsonCallback::new(arguments.audit_file.as_deref())?;
 
     let status = Arc::new(Mutex::new(None::<ExitStatus>));
     let reason = Arc::new(Mutex::new(None::<ShutdownReason>));
@@ -191,7 +184,7 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
     let guard = ShutdownGuard::get();
     let signals = shutdown_signals(&guard)?;
     let process = async move {
-        let outcome = Sandbox::new(config, audit).run(command).await?;
+        let outcome = Sandbox::new(config, callback).run(command).await?;
         *lock(&process_status) = Some(outcome.status());
         Ok(())
     };

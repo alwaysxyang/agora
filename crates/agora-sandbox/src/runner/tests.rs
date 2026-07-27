@@ -1,5 +1,5 @@
 use super::wait_for_child_or_proxy;
-use crate::audit::NoopAuditCallback;
+use crate::callback::NoopCallback;
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext};
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ async fn proxy_failure_terminates_the_child_process() {
     let mut controller = NetworkController::start(
         NetworkConfig::default(),
         NetworkRunContext::new("sandbox", "run"),
-        NoopAuditCallback,
+        NoopCallback,
     )
     .await
     .unwrap();

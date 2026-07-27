@@ -1,17 +1,18 @@
 mod config;
+mod http_proxy;
 mod inspection;
 mod proxy;
 
 pub use config::{NetworkConfig, NetworkEnforcement, TlsMode};
 
-use crate::audit::{
-    AUDIT_SCHEMA_VERSION, AuditCallback, AuditDecision, AuditEvent, AuditEventType, AuditMetrics,
-    AuditResult, AuditResultStatus, AuditSubsystem, DomainSource, NetworkAudit, NetworkProtocol,
-    ProcessAudit,
+use crate::callback::{
+    Callback, Decision, DomainSource, EVENT_SCHEMA_VERSION, EventMetrics, EventResult, EventStatus,
+    EventType, NetworkContext, NetworkEvent, NetworkProtocol, ProcessContext, Proxy, Subsystem,
 };
 use crate::protocol::{ConnectRequest, PROTOCOL_VERSION, ProtocolError, RouteRegistration};
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
+use http_proxy::HttpProxyConnector;
 use inspection::DomainObservation;
 use std::io;
 use std::net::SocketAddr;
@@ -70,7 +71,7 @@ impl NetworkController {
         callback: C,
     ) -> Result<Self>
     where
-        C: AuditCallback,
+        C: Callback,
     {
         config.validate()?;
 
@@ -158,7 +159,7 @@ impl Drop for NetworkController {
 
 struct NetworkState<C>
 where
-    C: AuditCallback,
+    C: Callback,
 {
     config: NetworkConfig,
     context: NetworkRunContext,
@@ -167,9 +168,22 @@ where
     connections: Arc<Semaphore>,
 }
 
+struct EventPublication {
+    event_type: EventType,
+    sequence: u64,
+    decision: Option<Decision>,
+    result: EventResult,
+    metrics: Option<EventMetrics>,
+}
+
+struct UpstreamConnection {
+    stream: TcpStream,
+    initial_data: Vec<u8>,
+}
+
 impl<C> NetworkState<C>
 where
-    C: AuditCallback,
+    C: Callback,
 {
     pub(super) fn validate_request(&self, request: &ConnectRequest) -> Result<(), ProtocolError> {
         if request.protocol_version != PROTOCOL_VERSION {
@@ -184,25 +198,66 @@ where
         Ok(())
     }
 
+    pub(super) async fn authorize(
+        &self,
+        registration: &RouteRegistration,
+        observation: Option<&DomainObservation>,
+    ) -> Decision {
+        self.dispatch(self.network_event(
+            registration,
+            observation,
+            EventPublication {
+                event_type: EventType::NetworkConnectAttempt,
+                sequence: 0,
+                decision: None,
+                result: EventResult {
+                    status: EventStatus::Started,
+                    error_code: None,
+                    error_message: None,
+                },
+                metrics: None,
+            },
+        ))
+        .await
+    }
+
+    pub(super) async fn publish_denied(
+        &self,
+        registration: &RouteRegistration,
+        observation: Option<&DomainObservation>,
+        decision: &Decision,
+    ) {
+        let reason = match decision {
+            Decision::Deny { reason } => reason.clone(),
+            Decision::Allow | Decision::Proxy { .. } => None,
+        };
+        let event = self.network_event(
+            registration,
+            observation,
+            EventPublication {
+                event_type: EventType::NetworkConnectDenied,
+                sequence: 1,
+                decision: Some(decision.clone()),
+                result: EventResult {
+                    status: EventStatus::Denied,
+                    error_code: Some("policy_denied".to_string()),
+                    error_message: reason,
+                },
+                metrics: None,
+            },
+        );
+        let _ = self.dispatch(event).await;
+    }
+
     pub(super) async fn connect_upstream(
         &self,
         registration: &RouteRegistration,
-    ) -> io::Result<TcpStream> {
-        self.publish_route_event(
-            registration,
-            AuditEventType::NetworkConnectAttempt,
-            0,
-            AuditDecision::Observed,
-            AuditResult {
-                status: AuditResultStatus::Started,
-                error_code: None,
-                error_message: None,
-            },
-        );
-
+        observation: Option<&DomainObservation>,
+        decision: &Decision,
+    ) -> io::Result<UpstreamConnection> {
         let upstream = tokio::time::timeout(
             self.config.upstream_connect_timeout,
-            TcpStream::connect(registration.destination),
+            Self::open_upstream(registration.destination, decision),
         )
         .await;
         let result = match upstream {
@@ -217,155 +272,184 @@ where
             Ok(_) => {
                 self.publish_route_event(
                     registration,
-                    AuditEventType::NetworkConnectEstablished,
+                    EventType::NetworkConnectEstablished,
                     1,
-                    AuditDecision::Allowed,
-                    AuditResult {
-                        status: AuditResultStatus::Succeeded,
+                    observation,
+                    decision.clone(),
+                    EventResult {
+                        status: EventStatus::Succeeded,
                         error_code: None,
                         error_message: None,
                     },
-                );
+                )
+                .await;
             }
             Err(error) => {
                 let errno = error.raw_os_error();
                 let message = error.to_string();
                 self.publish_route_event(
                     registration,
-                    AuditEventType::NetworkConnectFailed,
+                    EventType::NetworkConnectFailed,
                     1,
-                    AuditDecision::Denied,
-                    AuditResult {
-                        status: AuditResultStatus::Failed,
+                    observation,
+                    decision.clone(),
+                    EventResult {
+                        status: EventStatus::Failed,
                         error_code: errno.map(|value| value.to_string()),
                         error_message: Some(message.clone()),
                     },
-                );
+                )
+                .await;
             }
         }
         result
     }
 
-    fn publish_route_event(
+    async fn open_upstream(
+        destination: SocketAddr,
+        decision: &Decision,
+    ) -> io::Result<UpstreamConnection> {
+        match decision {
+            Decision::Allow => Ok(UpstreamConnection {
+                stream: TcpStream::connect(destination).await?,
+                initial_data: Vec::new(),
+            }),
+            Decision::Deny { .. } => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "network connection was denied by policy",
+            )),
+            Decision::Proxy {
+                proxy: Proxy::Http(proxy),
+            } => {
+                let connection = HttpProxyConnector::connect(proxy, destination).await?;
+                Ok(UpstreamConnection {
+                    stream: connection.stream,
+                    initial_data: connection.initial_data,
+                })
+            }
+        }
+    }
+
+    async fn publish_route_event(
         &self,
         registration: &RouteRegistration,
-        event_type: AuditEventType,
+        event_type: EventType,
         sequence: u64,
-        decision: AuditDecision,
-        result: AuditResult,
+        observation: Option<&DomainObservation>,
+        decision: Decision,
+        result: EventResult,
     ) {
-        self.callback.on_event(AuditEvent {
-            schema_version: AUDIT_SCHEMA_VERSION,
-            event_id: Uuid::new_v4().to_string(),
-            occurred_at: Self::now(),
-            subsystem: AuditSubsystem::Network,
-            event_type,
-            sandbox_id: self.context.sandbox_id.clone(),
-            run_id: self.context.run_id.clone(),
-            connection_id: Some(registration.connection_id.clone()),
-            sequence: Some(sequence),
-            process: Self::process_audit(&registration.process),
-            network: Some(Self::network_audit(registration, None)),
-            tls: None,
-            decision,
-            result,
-            metrics: None,
-        });
-    }
-
-    pub(super) fn publish_domain_observed(
-        &self,
-        registration: &RouteRegistration,
-        observation: &DomainObservation,
-    ) {
-        self.callback.on_event(AuditEvent {
-            schema_version: AUDIT_SCHEMA_VERSION,
-            event_id: Uuid::new_v4().to_string(),
-            occurred_at: Self::now(),
-            subsystem: AuditSubsystem::Network,
-            event_type: AuditEventType::NetworkDomainObserved,
-            sandbox_id: self.context.sandbox_id.clone(),
-            run_id: self.context.run_id.clone(),
-            connection_id: Some(registration.connection_id.clone()),
-            sequence: Some(2),
-            process: Self::process_audit(&registration.process),
-            network: Some(Self::network_audit(registration, Some(observation))),
-            tls: None,
-            decision: AuditDecision::Observed,
-            result: AuditResult {
-                status: AuditResultStatus::Succeeded,
-                error_code: None,
-                error_message: None,
+        let event = self.network_event(
+            registration,
+            observation,
+            EventPublication {
+                event_type,
+                sequence,
+                decision: Some(decision),
+                result,
+                metrics: None,
             },
-            metrics: None,
-        });
+        );
+        let _ = self.dispatch(event).await;
     }
 
-    pub(super) fn publish_closed(
+    pub(super) async fn publish_closed(
         &self,
         registration: &RouteRegistration,
         result: std::io::Result<(u64, u64)>,
         duration_ms: u64,
         observation: Option<&DomainObservation>,
+        decision: &Decision,
     ) {
         let (status, error_code, error_message, metrics) = match result {
             Ok((bytes_sent, bytes_received)) => (
-                AuditResultStatus::Succeeded,
+                EventStatus::Succeeded,
                 None,
                 None,
-                AuditMetrics {
+                EventMetrics {
                     bytes_sent,
                     bytes_received,
                     duration_ms,
                 },
             ),
             Err(error) => (
-                AuditResultStatus::Failed,
+                EventStatus::Failed,
                 error.raw_os_error().map(|value| value.to_string()),
                 Some(error.to_string()),
-                AuditMetrics {
+                EventMetrics {
                     bytes_sent: 0,
                     bytes_received: 0,
                     duration_ms,
                 },
             ),
         };
-        self.callback.on_event(AuditEvent {
-            schema_version: AUDIT_SCHEMA_VERSION,
+        let event = self.network_event(
+            registration,
+            observation,
+            EventPublication {
+                event_type: EventType::NetworkConnectionClosed,
+                sequence: 2,
+                decision: Some(decision.clone()),
+                result: EventResult {
+                    status,
+                    error_code,
+                    error_message,
+                },
+                metrics: Some(metrics),
+            },
+        );
+        let _ = self.dispatch(event).await;
+    }
+
+    async fn dispatch(&self, event: NetworkEvent) -> Decision {
+        match tokio::time::timeout(self.config.callback_timeout, self.callback.on_event(event))
+            .await
+        {
+            Ok(decision) => decision,
+            Err(_) => Decision::Deny {
+                reason: Some("sandbox callback timed out".to_string()),
+            },
+        }
+    }
+
+    fn network_event(
+        &self,
+        registration: &RouteRegistration,
+        observation: Option<&DomainObservation>,
+        publication: EventPublication,
+    ) -> NetworkEvent {
+        NetworkEvent {
+            schema_version: EVENT_SCHEMA_VERSION,
             event_id: Uuid::new_v4().to_string(),
             occurred_at: Self::now(),
-            subsystem: AuditSubsystem::Network,
-            event_type: AuditEventType::NetworkConnectionClosed,
+            subsystem: Subsystem::Network,
+            event_type: publication.event_type,
             sandbox_id: self.context.sandbox_id.clone(),
             run_id: self.context.run_id.clone(),
             connection_id: Some(registration.connection_id.clone()),
-            sequence: Some(if observation.is_some() { 3 } else { 2 }),
-            process: Self::process_audit(&registration.process),
-            network: Some(Self::network_audit(registration, observation)),
+            sequence: Some(publication.sequence),
+            process: Self::process_context(&registration.process),
+            network: Some(Self::network_context(registration, observation)),
             tls: None,
-            decision: AuditDecision::Allowed,
-            result: AuditResult {
-                status,
-                error_code,
-                error_message,
-            },
-            metrics: Some(metrics),
-        });
+            decision: publication.decision,
+            result: publication.result,
+            metrics: publication.metrics,
+        }
     }
 
-    fn process_audit(process: &crate::protocol::ProcessIdentity) -> ProcessAudit {
-        ProcessAudit {
+    fn process_context(process: &crate::protocol::ProcessIdentity) -> ProcessContext {
+        ProcessContext {
             pid: process.pid,
             ppid: process.ppid,
             executable: process.executable.clone(),
         }
     }
 
-    fn network_audit(
+    fn network_context(
         registration: &RouteRegistration,
         observation: Option<&DomainObservation>,
-    ) -> NetworkAudit {
-        NetworkAudit {
+    ) -> NetworkContext {
+        NetworkContext {
             protocol: NetworkProtocol::Tcp,
             destination_ip: registration.destination.ip(),
             destination_port: registration.destination.port(),

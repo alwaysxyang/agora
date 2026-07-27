@@ -2,7 +2,7 @@ mod proxy;
 
 use super::inspection::DomainObservation;
 use super::{NetworkConfig, NetworkController, NetworkRunContext, NetworkState};
-use crate::audit::{DomainSource, NoopAuditCallback};
+use crate::callback::{DomainSource, NoopCallback};
 use crate::protocol::{HookOperation, ProcessIdentity, RouteRegistration};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -34,12 +34,39 @@ fn network_config_requires_a_positive_connection_limit() {
     );
 }
 
+#[test]
+fn network_config_requires_positive_inspection_and_callback_timeouts() {
+    let config = NetworkConfig {
+        domain_inspection_timeout: std::time::Duration::ZERO,
+        ..NetworkConfig::default()
+    };
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("domain_inspection_timeout")
+    );
+
+    let config = NetworkConfig {
+        callback_timeout: std::time::Duration::ZERO,
+        ..NetworkConfig::default()
+    };
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("callback_timeout")
+    );
+}
+
 #[tokio::test]
 async fn controller_reports_an_unexpected_listener_exit() {
     let mut controller = NetworkController::start(
         NetworkConfig::default(),
         NetworkRunContext::new("sandbox", "run"),
-        NoopAuditCallback,
+        NoopCallback,
     )
     .await
     .unwrap();
@@ -58,10 +85,10 @@ fn tls_sni_populates_only_the_tls_domain_fields() {
         source: DomainSource::TlsSni,
     };
 
-    let audit = NetworkState::<NoopAuditCallback>::network_audit(&registration, Some(&observation));
+    let context = NetworkState::<NoopCallback>::network_context(&registration, Some(&observation));
 
-    assert_eq!(audit.http_host, None);
-    assert_eq!(audit.tls_sni.as_deref(), Some("secure.example.com"));
-    assert_eq!(audit.domain.as_deref(), Some("secure.example.com"));
-    assert_eq!(audit.domain_source, Some(DomainSource::TlsSni));
+    assert_eq!(context.http_host, None);
+    assert_eq!(context.tls_sni.as_deref(), Some("secure.example.com"));
+    assert_eq!(context.domain.as_deref(), Some("secure.example.com"));
+    assert_eq!(context.domain_source, Some(DomainSource::TlsSni));
 }

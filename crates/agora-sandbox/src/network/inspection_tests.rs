@@ -1,5 +1,5 @@
-use super::inspection::{DomainObservation, ProtocolInspector};
-use crate::audit::DomainSource;
+use super::inspection::{DomainObservation, InspectionState, ProtocolInspector};
+use crate::callback::DomainSource;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 use std::sync::Arc;
@@ -10,14 +10,14 @@ fn http_host_is_detected_and_normalized() {
 
     assert_eq!(
         inspector.inspect(b"GET / HTTP/1.1\r\nHost: Example.COM:8080\r\n"),
-        None
+        InspectionState::Pending
     );
     assert_eq!(
         inspector.inspect(b"Connection: close\r\n\r\n"),
-        Some(DomainObservation {
+        InspectionState::Complete(Some(DomainObservation {
             domain: "example.com".to_string(),
             source: DomainSource::HttpHost,
-        })
+        }))
     );
 }
 
@@ -27,13 +27,13 @@ fn fragmented_tls_client_hello_sni_is_detected() {
     let split = hello.len() / 2;
     let mut inspector = ProtocolInspector::new();
 
-    assert_eq!(inspector.inspect(&hello[..split]), None);
+    assert_eq!(inspector.inspect(&hello[..split]), InspectionState::Pending);
     assert_eq!(
         inspector.inspect(&hello[split..]),
-        Some(DomainObservation {
+        InspectionState::Complete(Some(DomainObservation {
             domain: "secure.example.com".to_string(),
             source: DomainSource::TlsSni,
-        })
+        }))
     );
 }
 
@@ -41,8 +41,14 @@ fn fragmented_tls_client_hello_sni_is_detected() {
 fn non_http_and_non_tls_payload_has_no_domain() {
     let mut inspector = ProtocolInspector::new();
 
-    assert_eq!(inspector.inspect(b"SSH-2.0-OpenSSH_9.9\r\n"), None);
-    assert_eq!(inspector.inspect(b"Host: misleading.example\r\n\r\n"), None);
+    assert_eq!(
+        inspector.inspect(b"SSH-2.0-OpenSSH_9.9\r\n"),
+        InspectionState::Complete(None)
+    );
+    assert_eq!(
+        inspector.inspect(b"Host: misleading.example\r\n\r\n"),
+        InspectionState::Complete(None)
+    );
 }
 
 fn tls_client_hello(server_name: &str) -> Vec<u8> {

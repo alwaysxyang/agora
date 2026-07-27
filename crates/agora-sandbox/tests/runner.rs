@@ -1,4 +1,4 @@
-use agora_sandbox::audit::{AuditEvent, AuditEventType, NoopAuditCallback};
+use agora_sandbox::callback::{Decision, EventType, NetworkEvent, NoopCallback};
 use agora_sandbox::network::{NetworkEnforcement, TlsMode};
 use agora_sandbox::runner::{Sandbox, SandboxCommand, SandboxConfig};
 use std::io::{Read, Write};
@@ -82,7 +82,7 @@ fn unsupported_enforcement_and_tls_modes_fail_validation() {
     let error = config.validate().unwrap_err();
     assert!(error.to_string().contains("strict network enforcement"));
 
-    config.network.enforcement = NetworkEnforcement::Audit;
+    config.network.enforcement = NetworkEnforcement::Intercept;
     config.network.tls = TlsMode::Require;
     let error = config.validate().unwrap_err();
     assert!(error.to_string().contains("TLS termination"));
@@ -90,7 +90,7 @@ fn unsupported_enforcement_and_tls_modes_fail_validation() {
 
 #[tokio::test]
 async fn runner_propagates_child_exit_status() {
-    let sandbox = Sandbox::new(SandboxConfig::new(hook_library()), NoopAuditCallback);
+    let sandbox = Sandbox::new(SandboxConfig::new(hook_library()), NoopCallback);
     let command = SandboxCommand::new(std::env::current_exe().unwrap())
         .arg("exits_with_seven")
         .arg("--exact")
@@ -378,10 +378,13 @@ async fn injected_hook_routes_a_real_child_connection_through_the_proxy() {
             .await
             .unwrap();
     });
-    let events = Arc::new(Mutex::new(Vec::<AuditEvent>::new()));
+    let events = Arc::new(Mutex::new(Vec::<NetworkEvent>::new()));
     let callback = {
         let events = Arc::clone(&events);
-        move |event| events.lock().unwrap().push(event)
+        move |event| {
+            events.lock().unwrap().push(event);
+            std::future::ready(Decision::Allow)
+        }
     };
     let command = SandboxCommand::new(std::env::current_exe().unwrap())
         .arg("intercepted_child_process")
@@ -411,9 +414,9 @@ async fn injected_hook_routes_a_real_child_connection_through_the_proxy() {
     assert_eq!(
         event_types,
         vec![
-            AuditEventType::NetworkConnectAttempt,
-            AuditEventType::NetworkConnectEstablished,
-            AuditEventType::NetworkConnectionClosed,
+            EventType::NetworkConnectAttempt,
+            EventType::NetworkConnectEstablished,
+            EventType::NetworkConnectionClosed,
         ]
     );
 }
@@ -443,10 +446,13 @@ async fn injected_hook_refreshes_process_identity_after_fork() {
             connection.await.unwrap();
         }
     });
-    let events = Arc::new(Mutex::new(Vec::<AuditEvent>::new()));
+    let events = Arc::new(Mutex::new(Vec::<NetworkEvent>::new()));
     let callback = {
         let events = Arc::clone(&events);
-        move |event| events.lock().unwrap().push(event)
+        move |event| {
+            events.lock().unwrap().push(event);
+            std::future::ready(Decision::Allow)
+        }
     };
     let command = SandboxCommand::new(std::env::current_exe().unwrap())
         .arg("forked_intercepted_child_process")
@@ -468,7 +474,7 @@ async fn injected_hook_refreshes_process_identity_after_fork() {
     let events = events.lock().unwrap();
     let attempts = events
         .iter()
-        .filter(|event| event.event_type == AuditEventType::NetworkConnectAttempt)
+        .filter(|event| event.event_type == EventType::NetworkConnectAttempt)
         .collect::<Vec<_>>();
     assert_eq!(attempts.len(), 2);
     assert_ne!(attempts[0].process.pid, attempts[1].process.pid);
@@ -521,7 +527,7 @@ async fn injected_hook_blocks_unsupported_connectx_without_direct_fallback() {
         .arg("--nocapture")
         .env("AGORA_SANDBOX_TEST_UNSUPPORTED_CONNECTX_CHILD", "1")
         .env("AGORA_SANDBOX_TEST_DESTINATION", destination.to_string());
-    let outcome = Sandbox::new(SandboxConfig::new(hook_library()), NoopAuditCallback)
+    let outcome = Sandbox::new(SandboxConfig::new(hook_library()), NoopCallback)
         .run(command)
         .await
         .unwrap();
@@ -579,10 +585,11 @@ async fn assert_injected_nonblocking_connection(child_test: &str, child_environm
             .await
             .unwrap();
     });
-    let callback = |event: AuditEvent| {
-        if event.event_type == AuditEventType::NetworkConnectAttempt {
-            std::thread::sleep(Duration::from_millis(750));
+    let callback = |event: NetworkEvent| async move {
+        if event.event_type == EventType::NetworkConnectAttempt {
+            tokio::time::sleep(Duration::from_millis(750)).await;
         }
+        Decision::Allow
     };
     let command = SandboxCommand::new(std::env::current_exe().unwrap())
         .arg(child_test)
