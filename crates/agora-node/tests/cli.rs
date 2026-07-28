@@ -300,8 +300,20 @@ fn node_help_describes_the_config_fields() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("config"));
     assert!(stdout.contains("daemon"));
+    for section in [
+        "QUICK START",
+        "MINIMAL CONFIGURATION",
+        "CHANNEL PERMISSIONS",
+        "FIELD REFERENCE",
+    ] {
+        assert!(stdout.contains(section), "help is missing {section:?}");
+    }
+    assert!(stdout.contains("agora-node daemon --config config.json"));
+    assert!(stdout.contains("  \"channels\": ["));
+    assert!(!stdout.contains(r#"{"proxy":"127.0.0.1:7890""#));
     for expected in [
         "CONFIGURATION FILE",
+        "Existing files are overwritten",
         "channels",
         "app_id",
         "secret",

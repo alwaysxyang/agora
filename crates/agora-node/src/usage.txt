@@ -1,76 +1,99 @@
 CONFIGURATION FILE (JSON)
-  Generate a minimal config:
-    agora-node config --generate config.json
-                             Interactively selects Lark or Telegram, configures
-                             one Codex agent, and writes the selected path.
-                             Relative paths use the current directory; absolute
-                             paths are accepted. Existing files are not overwritten.
 
-  Top-level fields:
-    proxy                    Optional default HTTP proxy for all agents and channels.
+QUICK START
+  Generate a configuration:
+    agora-node config --generate config.json
+
+  Start the daemon:
+    agora-node daemon --config config.json
+
+  Relative paths use the current directory. Absolute paths are accepted.
+  Existing files are overwritten. Generated channels deny all incoming messages
+  until permission.users and, for groups, permission.groups are configured.
+
+MINIMAL CONFIGURATION
+  {
+    "channels": [
+      {
+        "type": "lark",
+        "name": "lark1",
+        "app_id": "xxx",
+        "secret": "xxx",
+        "permission": {
+          "users": [
+            { "id": "ou_user_1" }
+          ],
+          "groups": [
+            { "id": "oc_group_1", "require_mention": true }
+          ]
+        }
+      }
+    ],
+    "agents": [
+      {
+        "name": "codex",
+        "isolate": "session",
+        "type": "codex",
+        "path": "/opt/homebrew/bin/codex",
+        "subscribe": [
+          { "channel": "lark1" }
+        ]
+      }
+    ]
+  }
+
+CHANNEL PERMISSIONS
+  Private messages require the sender to match permission.users.
+  Group messages require both permission.users and permission.groups to match.
+  Empty or omitted permission lists deny all access.
+  Use "*" as an id to explicitly allow every user or group.
+  require_mention defaults to false. An exact group policy takes precedence over
+  the "*" group policy.
+
+FIELD REFERENCE
+  Top level
+    proxy                    Optional default HTTP proxy for agents and channels.
     channels                 Reusable channel definitions.
     agents                   Local agent definitions.
 
-  Proxy format:
-    proxy                    address:port or user:password@address:port. An optional
-                             http:// prefix is accepted. User and password may be empty.
-                             Agent/channel proxy values override the top-level default.
+  Channel fields
+    type                     Active types: "lark" and "telegram". "local" and
+                             "http" are reserved and not active yet.
+    name                     Unique name referenced by agent subscriptions.
+    permission               Optional access policy; omission means deny all.
+    proxy                    Optional channel-specific HTTP proxy.
 
-  Lark channel fields:
-    type                     Channel type; use "lark".
-    name                     Unique channel name referenced by subscriptions.
+  Lark fields
     app_id                   Lark application ID.
     secret                   Lark application secret; do not commit it.
-    permission.users         Allowed sender policies. Empty or omitted means deny all.
-    permission.users[].id    Channel-native sender ID; use "*" to allow every sender.
-    permission.groups        Allowed group policies. Group messages require both an
-                             allowed sender and a matching group. Empty means deny all.
-    permission.groups[].id   Channel-native group ID; use "*" to allow every group.
-    require_mention          Optional group policy flag; defaults to false. Exact group
-                             policies take precedence over the "*" group policy.
-    proxy                    Optional channel-specific HTTP proxy.
 
-  Telegram channel fields:
-    type                     Channel type; use "telegram".
-    name                     Unique channel name referenced by subscriptions.
+  Telegram fields
     token                    Telegram bot token; do not commit it.
-    permission.users         Allowed sender policies. Empty or omitted means deny all.
-    permission.users[].id    Channel-native sender ID; use "*" to allow every sender.
-    permission.groups        Allowed group policies. Group messages require both an
-                             allowed sender and a matching group. Empty means deny all.
-    permission.groups[].id   Channel-native group ID; use "*" to allow every group.
-    require_mention          Optional group policy flag; defaults to false. Exact group
-                             policies take precedence over the "*" group policy.
-    proxy                    Optional channel-specific HTTP proxy.
 
-  Reserved channel types:
-    type                     "local" or "http"; not active yet.
-    name                     Unique channel name.
+  Channel permission fields
+    permission.users         Allowed sender policies.
+    permission.users[].id    Channel-native sender ID, or "*" for every sender.
+    permission.groups        Allowed group policies.
+    permission.groups[].id   Channel-native group ID, or "*" for every group.
+    require_mention          Optional group flag; defaults to false.
 
-  Agent fields:
+  Agent fields
     name                     Unique local agent name.
-    isolate                  Backend session and queue isolation: "none" or "session".
-    workspace                Optional agent workdir. Defaults to ~/.agora/workspace.
-    type                     Backend type: "codex", "coco", "claude_code", or "custom".
+    isolate                  Backend session isolation: "none" or "session".
+    workspace                Optional workdir; defaults to ~/.agora/workspace.
+    type                     "codex", "coco", "claude_code", or "custom".
     path                     Backend executable path.
     model                    Optional Codex model override.
     effort                   Optional Codex reasoning effort override.
-    agent_sandbox            Optional backend sandbox: "read-only", "workspace-write",
-                             or "danger-full-access". This is separate from session isolation.
-    proxy                    Optional agent-specific HTTP proxy. Injected into the agent
-                             process as HTTP_PROXY/HTTPS_PROXY (upper and lower case).
+    agent_sandbox            Optional Codex sandbox: "read-only",
+                             "workspace-write", or "danger-full-access".
+    proxy                    Optional agent-specific HTTP proxy. Injected as
+                             HTTP_PROXY/HTTPS_PROXY in upper and lower case.
     subscribe                Channel subscriptions for this agent.
     subscribe[].channel      Name of a configured channel.
-    subscribe[].filter       Optional reserved channel filter; currently ignored.
+    subscribe[].filter       Reserved channel filter; currently ignored.
 
-  Example:
-    {"proxy":"127.0.0.1:7890",
-     "channels":[{"type":"lark","name":"lark1","app_id":"xxx","secret":"xxx",
-     "permission":{"users":[{"id":"ou_user_1"}],
-     "groups":[{"id":"oc_group_1","require_mention":true}]}},
-     {"type":"telegram","name":"telegram1","token":"xxx",
-     "permission":{"users":[{"id":"*"}],"groups":[{"id":"*"}]}}],
-     "agents":[{"name":"codex","isolate":"none","type":"codex",
-     "path":"/opt/homebrew/bin/codex","agent_sandbox":"danger-full-access",
-     "subscribe":[{"channel":"lark1","filter":{}},
-     {"channel":"telegram1","filter":{}}]}]}
+  Proxy format
+    proxy                    address:port or user:password@address:port. An optional
+                             http:// prefix is accepted. Component-level values
+                             override the top-level default.
