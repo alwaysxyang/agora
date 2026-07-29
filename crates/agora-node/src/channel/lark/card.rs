@@ -730,7 +730,7 @@ impl LarkCardContent {
                 elements.push(json!({
                     "tag": "markdown",
                     "content": format!(
-                        "<font color='blue'>`{phase_number:02}`</font>  **{}**\n<font color='grey'>✦</font> {thinking}",
+                        "<font color='blue'>**{phase_number:02}**</font>  **{}**\n<font color='blue'>✦</font> {thinking}",
                         i18n::THINKING_TITLE
                     )
                 }));

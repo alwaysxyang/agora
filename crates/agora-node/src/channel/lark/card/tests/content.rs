@@ -50,7 +50,7 @@ fn lark_card_uses_json_v2_for_standard_markdown() {
         card.pointer("/body/elements/0/elements/0/content")
             .and_then(|v| v.as_str()),
         Some(
-            "<font color='blue'>`01`</font>  **思考过程**\n<font color='grey'>✦</font> Inspecting the channel"
+            "<font color='blue'>**01**</font>  **思考过程**\n<font color='blue'>✦</font> Inspecting the channel"
         )
     );
 }
@@ -201,7 +201,7 @@ fn lark_card_groups_thinking_and_running_progress_in_one_expanded_panel() {
     );
     assert_eq!(
         process.pointer("/elements/0/content").unwrap(),
-        "<font color='blue'>`01`</font>  **思考过程**\n<font color='grey'>✦</font> Inspecting the channel"
+        "<font color='blue'>**01**</font>  **思考过程**\n<font color='blue'>✦</font> Inspecting the channel"
     );
     assert_eq!(process.pointer("/elements/1/tag").unwrap(), "column_set");
     assert_eq!(
@@ -519,8 +519,8 @@ fn lark_card_groups_process_and_keeps_final_answer_separate() {
     );
     let rendered = serde_json::to_string(&card).unwrap();
     assert!(rendered.contains("**任务过程**"));
-    assert!(rendered.contains("<font color='blue'>`01`</font>  **思考过程**"));
-    assert!(rendered.contains("<font color='grey'>✦</font> Inspecting the channel"));
+    assert!(rendered.contains("<font color='blue'>**01**</font>  **思考过程**"));
+    assert!(rendered.contains("<font color='blue'>✦</font> Inspecting the channel"));
     assert!(rendered.contains("Checking reply delivery"));
     assert!(rendered.contains("✓  exit 0"));
     assert!(rendered.contains("```bash\\n$ cargo test\\n```"));
@@ -648,8 +648,8 @@ fn lark_card_keeps_all_thinking_updates_with_latest_last() {
         .map(|index| rendered.find(&format!("Thinking {index}")).unwrap())
         .collect::<Vec<_>>();
     assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
-    assert!(rendered.contains("`01`"));
-    assert!(rendered.contains("`05`"));
+    assert!(rendered.contains("<font color='blue'>**01**</font>"));
+    assert!(rendered.contains("<font color='blue'>**05**</font>"));
 }
 
 #[test]
@@ -721,8 +721,8 @@ fn lark_card_groups_progress_under_the_latest_thinking_phase() {
     assert!(read_config < read_source);
     assert!(read_source < verify);
     assert!(verify < run_tests);
-    assert!(rendered.contains("`01`"));
-    assert!(rendered.contains("`02`"));
+    assert!(rendered.contains("<font color='blue'>**01**</font>"));
+    assert!(rendered.contains("<font color='blue'>**02**</font>"));
 }
 
 #[test]
