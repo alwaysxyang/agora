@@ -87,6 +87,33 @@ fn proxy_decision_is_redacted_before_serialization_and_debug_output() {
     assert!(!debug.contains("secret-password"));
 }
 
+#[test]
+fn allow_and_deny_decisions_have_stable_redacted_json() {
+    let allow = serde_json::to_value(Decision::Allow.redacted()).unwrap();
+    assert_eq!(allow, serde_json::json!({ "action": "allow" }));
+
+    let deny = Decision::Deny {
+        reason: Some("blocked by policy".to_string()),
+    };
+    let deny = serde_json::to_value(deny.redacted()).unwrap();
+    assert_eq!(
+        deny,
+        serde_json::json!({
+            "action": "deny",
+            "reason": "blocked by policy",
+        })
+    );
+
+    let proxy = Decision::Proxy {
+        proxy: Proxy::Http(HttpProxy {
+            address: "proxy.example:8080".to_string(),
+            basic_auth: None,
+        }),
+    };
+    let proxy = serde_json::to_value(proxy.redacted()).unwrap();
+    assert!(proxy["proxy"]["basic_auth"].is_null());
+}
+
 #[tokio::test]
 async fn closure_callback_receives_an_owned_event() {
     let received = Arc::new(Mutex::new(Vec::new()));

@@ -37,6 +37,18 @@ fn network_config_requires_a_positive_connection_limit() {
 #[test]
 fn network_config_requires_positive_inspection_and_callback_timeouts() {
     let config = NetworkConfig {
+        upstream_connect_timeout: std::time::Duration::ZERO,
+        ..NetworkConfig::default()
+    };
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("upstream_connect_timeout")
+    );
+
+    let config = NetworkConfig {
         domain_inspection_timeout: std::time::Duration::ZERO,
         ..NetworkConfig::default()
     };

@@ -110,6 +110,22 @@ fn exits_with_seven() {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn records_current_executable() {
+    let Some(output) = std::env::var_os("AGORA_SANDBOX_TEST_CURRENT_EXE") else {
+        return;
+    };
+    std::fs::write(
+        output,
+        std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .as_bytes(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn intercepted_child_process() {
     if std::env::var_os("AGORA_SANDBOX_TEST_CHILD").is_none() {
@@ -419,6 +435,127 @@ async fn injected_hook_routes_a_real_child_connection_through_the_proxy() {
             EventType::NetworkConnectionClosed,
         ]
     );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test]
+async fn runner_uses_and_removes_a_temporary_executable_copy() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-executable-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let output = directory.join("current-exe");
+    let command = SandboxCommand::new(std::env::current_exe().unwrap())
+        .arg("records_current_executable")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("AGORA_SANDBOX_TEST_CURRENT_EXE", &output);
+
+    let outcome = Sandbox::new(SandboxConfig::new(hook_library()), NoopCallback)
+        .run(command)
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    let executable = PathBuf::from(std::fs::read_to_string(&output).unwrap());
+    assert_ne!(executable, std::env::current_exe().unwrap());
+    assert!(!executable.exists(), "temporary executable was retained");
+    assert!(
+        !executable.parent().unwrap().exists(),
+        "temporary executable directory was retained"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test]
+async fn copied_bash_routes_system_curl_through_the_proxy() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let destination = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut bytes = [0_u8; 1024];
+            let read = tokio::io::AsyncReadExt::read(&mut stream, &mut bytes)
+                .await
+                .unwrap();
+            assert_ne!(read, 0);
+            request.extend_from_slice(&bytes[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        tokio::io::AsyncWriteExt::write_all(
+            &mut stream,
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    });
+    let events = Arc::new(Mutex::new(Vec::<NetworkEvent>::new()));
+    let callback = {
+        let events = Arc::clone(&events);
+        move |event| {
+            events.lock().unwrap().push(event);
+            std::future::ready(Decision::Allow)
+        }
+    };
+    let script = format!(
+        "/usr/bin/env -i PATH=/usr/bin:/bin curl \
+         --silent --show-error --output /dev/null http://{destination}/"
+    );
+
+    let outcome = Sandbox::new(SandboxConfig::new(hook_library()), callback)
+        .run(SandboxCommand::new("/bin/bash").args(["-c", &script]))
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == EventType::NetworkConnectAttempt)
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test]
+async fn runner_terminates_background_descendants_before_returning() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-process-group-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let output = directory.join("background-pid");
+    let script = format!("/bin/sleep 30 & echo $! > {}", output.display());
+
+    let outcome = Sandbox::new(SandboxConfig::new(hook_library()), NoopCallback)
+        .run(SandboxCommand::new("/bin/bash").args(["-c", &script]))
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    let pid = std::fs::read_to_string(&output)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(target_os = "macos")]

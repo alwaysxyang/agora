@@ -1,4 +1,5 @@
 use super::*;
+use crate::hook::config::HookConfig;
 use crate::protocol::parse_connect_request_prefix;
 use std::sync::Mutex;
 
@@ -47,6 +48,9 @@ fn runtime() -> HookRuntime {
                 "AGORA_SANDBOX_TOKEN" => "hook-token",
                 "AGORA_SANDBOX_PROXY_IPV4" => "127.0.0.1:41000",
                 "AGORA_SANDBOX_PROXY_IPV6" => "[::1]:41001",
+                "AGORA_SANDBOX_EXECUTION_CONTROL" => "127.0.0.1:41002",
+                "AGORA_SANDBOX_EXECUTION_TOKEN" => "execution-token",
+                "AGORA_SANDBOX_HOOK_LIBRARIES" => "/tmp/hook.dylib",
                 _ => return None,
             }
             .to_string(),

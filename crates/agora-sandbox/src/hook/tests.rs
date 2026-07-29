@@ -30,6 +30,9 @@ fn hook_configuration_requires_all_runtime_values() {
         ("AGORA_SANDBOX_TOKEN", "token"),
         ("AGORA_SANDBOX_PROXY_IPV4", "127.0.0.1:41000"),
         ("AGORA_SANDBOX_PROXY_IPV6", "[::1]:41001"),
+        ("AGORA_SANDBOX_EXECUTION_CONTROL", "127.0.0.1:41002"),
+        ("AGORA_SANDBOX_EXECUTION_TOKEN", "execution-token"),
+        ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
     ]);
     let config = HookConfig::from_getter(|key| values.get(key).map(ToString::to_string)).unwrap();
 
@@ -41,8 +44,9 @@ fn hook_configuration_requires_all_runtime_values() {
         config.proxy_for(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 443))),
         "[::1]:41001".parse().unwrap()
     );
-    assert!(config.is_proxy("127.0.0.1:41000".parse().unwrap()));
-    assert!(config.is_proxy("[::1]:41001".parse().unwrap()));
+    assert!(config.is_internal("127.0.0.1:41000".parse().unwrap()));
+    assert!(config.is_internal("[::1]:41001".parse().unwrap()));
+    assert!(config.is_internal("127.0.0.1:41002".parse().unwrap()));
 
     let error = HookConfig::from_getter(|key| {
         (key != "AGORA_SANDBOX_TOKEN")
@@ -74,6 +78,9 @@ fn hook_configuration_rejects_invalid_or_non_loopback_proxy_addresses() {
         ("AGORA_SANDBOX_TOKEN", "token"),
         ("AGORA_SANDBOX_PROXY_IPV4", "127.0.0.1:41000"),
         ("AGORA_SANDBOX_PROXY_IPV6", "[::1]:41001"),
+        ("AGORA_SANDBOX_EXECUTION_CONTROL", "127.0.0.1:41002"),
+        ("AGORA_SANDBOX_EXECUTION_TOKEN", "execution-token"),
+        ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
     ]);
     let parse = |overrides: &[(&str, &str)]| {
         HookConfig::from_getter(|key| {
@@ -118,6 +125,11 @@ fn hook_configuration_rejects_invalid_or_non_loopback_proxy_addresses() {
         parse(&[("AGORA_SANDBOX_PROXY_IPV6", "127.0.0.1:80")])
             .unwrap_err()
             .contains("IPv6 loopback")
+    );
+    assert!(
+        parse(&[("AGORA_SANDBOX_EXECUTION_CONTROL", "[::1]:80")])
+            .unwrap_err()
+            .contains("IPv4 loopback")
     );
 }
 

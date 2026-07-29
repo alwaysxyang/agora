@@ -1,6 +1,9 @@
 #![cfg(target_os = "macos")]
 
-use super::config::HookConfig;
+use super::config;
+#[cfg(test)]
+use super::dyld::DyldInterpose;
+use super::dyld::{dyld_interpose, function_from_interpose};
 use super::socket::{RawSocketAddress, set_errno, socket_addr_from_raw};
 use crate::protocol::{
     ConnectRequest, HookOperation, PROTOCOL_VERSION, ProcessIdentity, encode_connect_request,
@@ -45,6 +48,7 @@ thread_local! {
 static HOOK_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn initialize_hook() {
+    config::initialize();
     HOOK_INITIALIZED.store(true, Ordering::Release);
 }
 
@@ -73,7 +77,7 @@ impl Drop for HookGuard {
 }
 
 struct HookRuntime {
-    config: HookConfig,
+    config: config::HookConfig,
     process: ProcessContext,
 }
 
@@ -112,7 +116,7 @@ impl HookRuntime {
         static RUNTIME: OnceLock<Option<HookRuntime>> = OnceLock::new();
         RUNTIME
             .get_or_init(|| {
-                HookConfig::from_environment().ok().map(|config| Self {
+                config::global().cloned().map(|config| Self {
                     config,
                     process: ProcessContext::new(
                         std::env::current_exe()
@@ -231,7 +235,7 @@ pub unsafe extern "C" fn agora_sandbox_connect(
     let Some(runtime) = HookRuntime::global() else {
         return unsafe { HookRuntime::deny() };
     };
-    if runtime.config.is_proxy(destination) {
+    if runtime.config.is_internal(destination) {
         return unsafe { original(socket, address, length) };
     }
     let Some(connectx) = original_connectx() else {
@@ -299,7 +303,7 @@ pub unsafe extern "C" fn agora_sandbox_connectx(
     let Some(runtime) = HookRuntime::global() else {
         return unsafe { HookRuntime::deny() };
     };
-    if runtime.config.is_proxy(destination) {
+    if runtime.config.is_internal(destination) {
         return unsafe {
             original(
                 socket,
@@ -346,36 +350,6 @@ fn original_connect() -> Option<ConnectFn> {
 
 fn original_connectx() -> Option<ConnectxFn> {
     function_from_interpose(&INTERPOSE_CONNECTX)
-}
-
-fn function_from_interpose<T>(interpose: &DyldInterpose) -> Option<T>
-where
-    T: Copy,
-{
-    if interpose.replacee.is_null() {
-        None
-    } else {
-        Some(unsafe { mem::transmute_copy(&interpose.replacee) })
-    }
-}
-
-#[repr(C)]
-struct DyldInterpose {
-    replacement: *const libc::c_void,
-    replacee: *const libc::c_void,
-}
-
-unsafe impl Sync for DyldInterpose {}
-
-macro_rules! dyld_interpose {
-    ($name:ident, $replacement:path, $replacee:path) => {
-        #[used]
-        #[unsafe(link_section = "__DATA,__interpose")]
-        static $name: DyldInterpose = DyldInterpose {
-            replacement: $replacement as *const () as *const libc::c_void,
-            replacee: $replacee as *const () as *const libc::c_void,
-        };
-    };
 }
 
 unsafe extern "C" {

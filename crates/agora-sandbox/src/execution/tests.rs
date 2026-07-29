@@ -1,0 +1,191 @@
+use super::ExecutionController;
+use super::protocol::{
+    PrepareRequest, PrepareResponse, decode_prepare_request, decode_prepare_response,
+    encode_prepare_request, encode_prepare_response, frame_length,
+};
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use uuid::Uuid;
+
+fn body(frame: &[u8]) -> &[u8] {
+    let length = frame_length(frame[..4].try_into().unwrap()).unwrap();
+    assert_eq!(length, frame.len() - 4);
+    &frame[4..]
+}
+
+#[test]
+fn execution_prepare_protocol_preserves_paths() {
+    let request = encode_prepare_request("token", Path::new("/tmp/客户端")).unwrap();
+    assert_eq!(
+        decode_prepare_request(body(&request)).unwrap(),
+        PrepareRequest {
+            token: "token".to_string(),
+            executable: PathBuf::from("/tmp/客户端"),
+        }
+    );
+
+    let response =
+        encode_prepare_response(&PrepareResponse::Ready(PathBuf::from("/tmp/agora/curl"))).unwrap();
+    assert_eq!(
+        decode_prepare_response(body(&response)).unwrap(),
+        PrepareResponse::Ready(PathBuf::from("/tmp/agora/curl"))
+    );
+}
+
+#[test]
+fn execution_prepare_protocol_rejects_invalid_frames() {
+    assert!(encode_prepare_request("", Path::new("/bin/bash")).is_err());
+    assert!(decode_prepare_request(&[]).is_err());
+    assert!(decode_prepare_response(&[]).is_err());
+    assert!(frame_length(0_u32.to_be_bytes()).is_err());
+    assert!(frame_length(u32::MAX.to_be_bytes()).is_err());
+
+    let response = encode_prepare_response(&PrepareResponse::Error("denied".to_string())).unwrap();
+    assert_eq!(
+        decode_prepare_response(body(&response)).unwrap(),
+        PrepareResponse::Error("denied".to_string())
+    );
+}
+
+#[test]
+fn execution_prepare_protocol_rejects_malformed_requests() {
+    let mut unsupported =
+        body(&encode_prepare_request("token", Path::new("/bin/sh")).unwrap()).to_vec();
+    unsupported[1] = 2;
+    assert!(decode_prepare_request(&unsupported).is_err());
+
+    let mut invalid_lengths = unsupported;
+    invalid_lengths[0..2].copy_from_slice(&1_u16.to_be_bytes());
+    invalid_lengths[2..4].copy_from_slice(&0_u16.to_be_bytes());
+    assert!(decode_prepare_request(&invalid_lengths).is_err());
+
+    let invalid_token = [0, 1, 0, 1, 0, 0, 0, 1, 0xff, b'x'];
+    assert!(decode_prepare_request(&invalid_token).is_err());
+}
+
+#[test]
+fn execution_prepare_protocol_rejects_malformed_responses() {
+    let ready = encode_prepare_response(&PrepareResponse::Ready(PathBuf::from("/bin/sh"))).unwrap();
+    let mut unsupported = body(&ready).to_vec();
+    unsupported[1] = 2;
+    assert!(decode_prepare_response(&unsupported).is_err());
+
+    let mut invalid_length = body(&ready).to_vec();
+    invalid_length[3..7].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert!(decode_prepare_response(&invalid_length).is_err());
+
+    let mut invalid_status = body(&ready).to_vec();
+    invalid_status[2] = 2;
+    assert!(decode_prepare_response(&invalid_status).is_err());
+
+    let invalid_error = [0, 1, 1, 0, 0, 0, 1, 0xff];
+    assert!(decode_prepare_response(&invalid_error).is_err());
+
+    let oversized = OsString::from_vec(vec![b'x'; 64 * 1024]);
+    assert!(
+        encode_prepare_request("token", Path::new(&oversized)).is_err(),
+        "the protocol must reject a body larger than its frame limit"
+    );
+    assert!(encode_prepare_response(&PrepareResponse::Error("x".repeat(64 * 1024))).is_err());
+}
+
+#[tokio::test]
+async fn execution_controller_rejects_an_invalid_token() {
+    let run_id = format!("test-{}", Uuid::new_v4());
+    let controller = ExecutionController::start(&run_id).await.unwrap();
+    let mut stream = TcpStream::connect(controller.runtime().control())
+        .await
+        .unwrap();
+    stream
+        .write_all(&encode_prepare_request("wrong-token", Path::new("/bin/sh")).unwrap())
+        .await
+        .unwrap();
+    let mut prefix = [0_u8; 4];
+    stream.read_exact(&mut prefix).await.unwrap();
+    let mut response = vec![0_u8; frame_length(prefix).unwrap()];
+    stream.read_exact(&mut response).await.unwrap();
+
+    assert_eq!(
+        decode_prepare_response(&response).unwrap(),
+        PrepareResponse::Error("invalid execution token".to_string())
+    );
+    controller.shutdown().await.unwrap();
+    assert!(
+        !std::env::temp_dir()
+            .join(format!("agora-sandbox-{run_id}"))
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn execution_controller_prepares_the_root_executable_and_cleans_up() {
+    let run_id = format!("test-{}", Uuid::new_v4());
+    let directory = std::env::temp_dir().join(format!("agora-sandbox-{run_id}"));
+    let controller = ExecutionController::start(&run_id).await.unwrap();
+
+    let prepared = controller.prepare(PathBuf::from("/bin/sh")).await.unwrap();
+
+    assert!(prepared.starts_with(&directory));
+    assert!(prepared.is_file());
+    controller.shutdown().await.unwrap();
+    assert!(!directory.exists());
+}
+
+#[tokio::test]
+async fn execution_controller_returns_preparation_errors_to_the_hook() {
+    let run_id = format!("test-{}", Uuid::new_v4());
+    let controller = ExecutionController::start(&run_id).await.unwrap();
+    let mut stream = TcpStream::connect(controller.runtime().control())
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            &encode_prepare_request(
+                controller.runtime().token(),
+                Path::new("/missing/agora-executable"),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut prefix = [0_u8; 4];
+    stream.read_exact(&mut prefix).await.unwrap();
+    let mut response = vec![0_u8; frame_length(prefix).unwrap()];
+    stream.read_exact(&mut response).await.unwrap();
+
+    let PrepareResponse::Error(message) = decode_prepare_response(&response).unwrap() else {
+        panic!("missing executable must not be prepared");
+    };
+    assert!(message.contains("failed to resolve executable"));
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn execution_controller_reports_a_malformed_hook_request() {
+    let run_id = format!("test-{}", Uuid::new_v4());
+    let mut controller = ExecutionController::start(&run_id).await.unwrap();
+    let mut stream = TcpStream::connect(controller.runtime().control())
+        .await
+        .unwrap();
+    stream.write_all(&0_u32.to_be_bytes()).await.unwrap();
+
+    let error = controller.wait_failure().await;
+
+    assert!(error.to_string().contains("execution controller failed"));
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_the_execution_controller_removes_its_directory() {
+    let run_id = format!("test-{}", Uuid::new_v4());
+    let directory = std::env::temp_dir().join(format!("agora-sandbox-{run_id}"));
+    let controller = ExecutionController::start(&run_id).await.unwrap();
+    assert!(directory.is_dir());
+
+    drop(controller);
+
+    assert!(!directory.exists());
+}
