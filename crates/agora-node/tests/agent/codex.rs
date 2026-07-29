@@ -147,15 +147,17 @@ async fn codex_agent_classifies_thinking_progress_and_final_answer() {
             OutputEvent::Thinking {
                 text: "Inspecting the channel path".to_string(),
             },
-            OutputEvent::Progress {
+            OutputEvent::CommandExecution {
                 id: "cmd-1".to_string(),
-                text: "Run `cargo test`".to_string(),
+                command: "cargo test".to_string(),
                 status: ProgressStatus::Running,
+                exit_code: None,
             },
-            OutputEvent::Progress {
+            OutputEvent::CommandExecution {
                 id: "cmd-1".to_string(),
-                text: "Run `cargo test`".to_string(),
+                command: "cargo test".to_string(),
                 status: ProgressStatus::Completed,
+                exit_code: Some(0),
             },
             OutputEvent::Answer {
                 text: "All checks passed".to_string(),
@@ -388,7 +390,7 @@ async fn codex_agent_maps_all_supported_json_events_and_stream_boundaries() {
             r#"{"type":"item.completed","item":{"id":"reason-1","type":"reasoning","text":"  compact   reasoning  "}}"#,
             "'\n",
             "printf '%s\\n' '",
-            r#"{"type":"item.started","item":{"type":"command_execution","command":"echo `unsafe`","status":"declined"}}"#,
+            r#"{"type":"item.started","item":{"type":"command_execution","command":"echo `unsafe` && /bin/bash -lc \"pwd && rg --files -g !target -g !**/.git/** | sed -n 1,260p && git status --short && git log -1 --oneline && find spec -maxdepth 2 -type f -print && echo end-of-command\"","status":"declined"}}"#,
             "'\n",
             "printf '%s\\n' '",
             r#"{"type":"item.updated","item":{"id":"files-1","type":"file_change","changes":[{},{}],"status":"in_progress"}}"#,
@@ -455,10 +457,11 @@ async fn codex_agent_maps_all_supported_json_events_and_stream_boundaries() {
     assert!(output.events.contains(&OutputEvent::Thinking {
         text: "compact reasoning".to_string(),
     }));
-    assert!(output.events.contains(&OutputEvent::Progress {
+    assert!(output.events.contains(&OutputEvent::CommandExecution {
         id: "codex-progress".to_string(),
-        text: "Run `echo 'unsafe'`".to_string(),
+        command: r#"echo `unsafe` && /bin/bash -lc "pwd && rg --files -g !target -g !**/.git/** | sed -n 1,260p && git status --short && git log -1 --oneline && find spec -maxdepth 2 -type f -print && echo end-of-command""#.to_string(),
         status: ProgressStatus::Failed,
+        exit_code: None,
     }));
     assert!(output.events.contains(&OutputEvent::Progress {
         id: "files-1".to_string(),

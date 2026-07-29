@@ -748,15 +748,27 @@ impl TelegramRichContent {
                 }
             }
             OutputEvent::Progress { id, text, status } => {
-                if let Some(index) = self.progress.iter().position(|entry| entry.id == id) {
-                    self.progress.remove(index);
-                }
-                self.progress
-                    .push_front(TelegramProgressEntry { id, text, status });
+                self.apply_progress(id, text, status);
+            }
+            OutputEvent::CommandExecution {
+                id,
+                command,
+                status,
+                exit_code: _,
+            } => {
+                self.apply_progress(id, format!("Run `{command}`"), status);
             }
             OutputEvent::Answer { text } => self.answer.push_str(&text),
             OutputEvent::Usage(usage) => self.usage = Some(usage),
         }
+    }
+
+    fn apply_progress(&mut self, id: String, text: String, status: ProgressStatus) {
+        if let Some(index) = self.progress.iter().position(|entry| entry.id == id) {
+            self.progress.remove(index);
+        }
+        self.progress
+            .push_front(TelegramProgressEntry { id, text, status });
     }
 
     fn stop_running_progress(&mut self) {

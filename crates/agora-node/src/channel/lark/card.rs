@@ -50,11 +50,15 @@ struct LarkAgentCardState {
 pub(super) struct LarkCardContent {
     agent_name: String,
     interrupt: Option<String>,
-    thinking: VecDeque<String>,
-    progress: VecDeque<LarkProgressEntry>,
+    process: VecDeque<LarkProcessPhase>,
     answer: String,
     usage: Option<TokenUsage>,
     state: LarkRunState,
+}
+
+struct LarkProcessPhase {
+    thinking: Option<String>,
+    progress: VecDeque<LarkProgressEntry>,
 }
 
 enum LarkRunState {
@@ -70,6 +74,14 @@ struct LarkProgressEntry {
     id: String,
     text: String,
     status: ProgressStatus,
+    kind: LarkProgressKind,
+    exit_code: Option<i32>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LarkProgressKind {
+    Message,
+    Command,
 }
 
 pub(super) struct LarkReplyCard;
@@ -286,8 +298,7 @@ impl LarkCardContent {
         Self {
             agent_name,
             interrupt: None,
-            thinking: VecDeque::new(),
-            progress: VecDeque::new(),
+            process: VecDeque::new(),
             answer: String::new(),
             usage: None,
             state: LarkRunState::Running,
@@ -305,18 +316,63 @@ impl LarkCardContent {
         match event {
             OutputEvent::Thinking { text } => {
                 if !text.trim().is_empty() {
-                    self.thinking.push_front(text);
+                    self.process.push_front(LarkProcessPhase {
+                        thinking: Some(text),
+                        progress: VecDeque::new(),
+                    });
                 }
             }
             OutputEvent::Progress { id, text, status } => {
-                if let Some(index) = self.progress.iter().position(|entry| entry.id == id) {
-                    self.progress.remove(index);
-                }
-                self.progress
-                    .push_front(LarkProgressEntry { id, text, status });
+                self.apply_progress(id, text, status, LarkProgressKind::Message, None);
+            }
+            OutputEvent::CommandExecution {
+                id,
+                command,
+                status,
+                exit_code,
+            } => {
+                self.apply_progress(id, command, status, LarkProgressKind::Command, exit_code);
             }
             OutputEvent::Answer { text } => self.answer.push_str(&text),
             OutputEvent::Usage(usage) => self.usage = Some(usage),
+        }
+    }
+
+    fn apply_progress(
+        &mut self,
+        id: String,
+        text: String,
+        status: ProgressStatus,
+        kind: LarkProgressKind,
+        exit_code: Option<i32>,
+    ) {
+        for phase in &mut self.process {
+            if let Some(index) = phase.progress.iter().position(|entry| entry.id == id) {
+                phase.progress.remove(index);
+                phase.progress.push_front(LarkProgressEntry {
+                    id,
+                    text,
+                    status,
+                    kind,
+                    exit_code,
+                });
+                return;
+            }
+        }
+        if self.process.is_empty() {
+            self.process.push_front(LarkProcessPhase {
+                thinking: None,
+                progress: VecDeque::new(),
+            });
+        }
+        if let Some(phase) = self.process.front_mut() {
+            phase.progress.push_front(LarkProgressEntry {
+                id,
+                text,
+                status,
+                kind,
+                exit_code,
+            });
         }
     }
 
@@ -337,18 +393,22 @@ impl LarkCardContent {
     }
 
     pub(super) fn stop(&mut self) {
-        for entry in &mut self.progress {
-            if entry.status == ProgressStatus::Running {
-                entry.status = ProgressStatus::Stopped;
+        for phase in &mut self.process {
+            for entry in &mut phase.progress {
+                if entry.status == ProgressStatus::Running {
+                    entry.status = ProgressStatus::Stopped;
+                }
             }
         }
         self.state = LarkRunState::Stopped;
     }
 
     pub(super) fn interrupt(&mut self) {
-        for entry in &mut self.progress {
-            if entry.status == ProgressStatus::Running {
-                entry.status = ProgressStatus::Stopped;
+        for phase in &mut self.process {
+            for entry in &mut phase.progress {
+                if entry.status == ProgressStatus::Running {
+                    entry.status = ProgressStatus::Stopped;
+                }
             }
         }
         self.state = LarkRunState::Interrupted;
@@ -375,49 +435,21 @@ impl LarkCardContent {
         );
         let mut elements = Vec::new();
 
-        if !self.thinking.is_empty() {
-            let thinking = self
-                .thinking
-                .iter()
-                .flat_map(|entry| entry.lines())
-                .map(|line| format!("> • {}", line.trim()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let count = self.thinking.len();
-            elements.push(Self::collapsible_panel(
+        if !self.process.is_empty() {
+            let summary = self.progress_summary();
+            let status = if summary.is_empty() {
+                String::new()
+            } else {
+                format!(" · {summary}")
+            };
+            elements.push(Self::collapsible_panel_elements(
                 format!(
-                    "**{}**  <font color='grey'>· {}</font>",
-                    i18n::THINKING_TITLE,
-                    i18n::update_count(count)
-                ),
-                false,
-                thinking,
-            ));
-        }
-
-        if !self.progress.is_empty() {
-            let progress = self
-                .progress
-                .iter()
-                .map(|entry| {
-                    let marker = match entry.status {
-                        ProgressStatus::Running => "<font color='blue'>●</font>",
-                        ProgressStatus::Completed => "<font color='green'>✓</font>",
-                        ProgressStatus::Failed => "<font color='red'>×</font>",
-                        ProgressStatus::Stopped => "<font color='grey'>■</font>",
-                    };
-                    format!("{marker}  {}", entry.text)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            elements.push(Self::collapsible_panel(
-                format!(
-                    "**{}**  <font color='grey'>·</font> {}",
-                    i18n::PROGRESS_TITLE,
-                    self.progress_summary()
+                    "**{}**  <font color='grey'>· {}</font>{status}",
+                    i18n::PROCESS_TITLE,
+                    i18n::phase_count(self.process.len())
                 ),
                 !finished,
-                progress,
+                self.process_elements(),
             ));
         }
 
@@ -527,6 +559,14 @@ impl LarkCardContent {
                 "update_multi": true,
                 "summary": {
                     "content": format!("{}: {}", self.agent_name, status)
+                },
+                "style": {
+                    "color": {
+                        "cus-0": {
+                            "light_mode": "rgba(230, 233, 238, 1)",
+                            "dark_mode": "rgba(45, 48, 54, 1)"
+                        }
+                    }
                 }
             },
             "header": {
@@ -580,6 +620,17 @@ impl LarkCardContent {
     }
 
     fn collapsible_panel(title: String, expanded: bool, content: String) -> Value {
+        Self::collapsible_panel_elements(
+            title,
+            expanded,
+            vec![json!({
+                "tag": "markdown",
+                "content": content
+            })],
+        )
+    }
+
+    fn collapsible_panel_elements(title: String, expanded: bool, elements: Vec<Value>) -> Value {
         json!({
             "tag": "collapsible_panel",
             "expanded": expanded,
@@ -605,32 +656,25 @@ impl LarkCardContent {
             },
             "vertical_spacing": "6px",
             "padding": "2px 12px 10px 12px",
-            "elements": [{
-                "tag": "markdown",
-                "content": content
-            }]
+            "elements": elements
         })
     }
 
     fn progress_summary(&self) -> String {
         let completed = self
-            .progress
-            .iter()
+            .progress_entries()
             .filter(|entry| entry.status == ProgressStatus::Completed)
             .count();
         let running = self
-            .progress
-            .iter()
+            .progress_entries()
             .filter(|entry| entry.status == ProgressStatus::Running)
             .count();
         let failed = self
-            .progress
-            .iter()
+            .progress_entries()
             .filter(|entry| entry.status == ProgressStatus::Failed)
             .count();
         let stopped = self
-            .progress
-            .iter()
+            .progress_entries()
             .filter(|entry| entry.status == ProgressStatus::Stopped)
             .count();
 
@@ -660,6 +704,141 @@ impl LarkCardContent {
             ));
         }
         parts.join(" · ")
+    }
+
+    fn process_elements(&self) -> Vec<Value> {
+        let mut elements = Vec::new();
+        for (index, phase) in self.process.iter().rev().enumerate() {
+            if index > 0 {
+                elements.push(json!({ "tag": "hr" }));
+            }
+            elements.extend(Self::phase_elements(phase, index + 1));
+        }
+        elements
+    }
+
+    fn phase_elements(phase: &LarkProcessPhase, phase_number: usize) -> Vec<Value> {
+        let mut elements = Vec::new();
+        if let Some(thinking) = &phase.thinking {
+            let thinking = thinking
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !thinking.is_empty() {
+                elements.push(json!({
+                    "tag": "markdown",
+                    "content": format!(
+                        "<font color='blue'>`{phase_number:02}`</font>  **{}**\n<font color='grey'>✦</font> {thinking}",
+                        i18n::THINKING_TITLE
+                    )
+                }));
+            }
+        }
+
+        for command in phase
+            .progress
+            .iter()
+            .filter(|entry| entry.kind == LarkProgressKind::Command)
+        {
+            elements.push(Self::terminal_element(command));
+        }
+
+        let progress = phase
+            .progress
+            .iter()
+            .filter(|entry| entry.kind == LarkProgressKind::Message)
+            .map(|entry| {
+                let marker = Self::progress_marker(entry.status);
+                format!("{marker}  {}", entry.text)
+            })
+            .collect::<Vec<_>>();
+        if !progress.is_empty() {
+            elements.push(json!({
+                "tag": "markdown",
+                "content": progress.join("\n")
+            }));
+        }
+
+        elements
+    }
+
+    fn terminal_element(entry: &LarkProgressEntry) -> Value {
+        let (marker, color, status) = match entry.status {
+            ProgressStatus::Running => ("●", "blue", i18n::SHELL_RUNNING),
+            ProgressStatus::Completed => ("✓", "green", i18n::SHELL_COMPLETED),
+            ProgressStatus::Failed => ("×", "red", i18n::SHELL_FAILED),
+            ProgressStatus::Stopped => ("■", "grey", i18n::SHELL_STOPPED),
+        };
+        let status = entry.exit_code.map_or_else(
+            || status.to_string(),
+            |exit_code| format!("exit {exit_code}"),
+        );
+        json!({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "background_style": "cus-0",
+            "margin": "4px 0",
+            "columns": [{
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "vertical_spacing": "2px",
+                "padding": "6px 8px 8px 8px",
+                "elements": [
+                    {
+                        "tag": "column_set",
+                        "flex_mode": "none",
+                        "columns": [
+                            {
+                                "tag": "column",
+                                "width": "weighted",
+                                "weight": 1,
+                                "vertical_align": "center",
+                                "elements": [{
+                                    "tag": "markdown",
+                                    "content": format!("**{}**", i18n::SHELL_TITLE),
+                                    "text_size": "notation"
+                                }]
+                            },
+                            {
+                                "tag": "column",
+                                "width": "auto",
+                                "vertical_align": "center",
+                                "elements": [{
+                                    "tag": "markdown",
+                                    "content": format!(
+                                        "<font color='{color}'>{marker}  {status}</font>"
+                                    ),
+                                    "text_size": "notation",
+                                    "text_align": "right"
+                                }]
+                            }
+                        ]
+                    },
+                    {
+                        "tag": "markdown",
+                        "content": format!("```bash\n$ {}\n```", entry.text),
+                        "text_size": "normal"
+                    }
+                ]
+            }]
+        })
+    }
+
+    fn progress_entries(&self) -> impl Iterator<Item = &LarkProgressEntry> {
+        self.process.iter().flat_map(|phase| phase.progress.iter())
+    }
+
+    fn progress_marker(status: ProgressStatus) -> &'static str {
+        match status {
+            ProgressStatus::Running => "<font color='blue'>●</font>",
+            ProgressStatus::Completed => "<font color='green'>✓</font>",
+            ProgressStatus::Failed => "<font color='red'>×</font>",
+            ProgressStatus::Stopped => "<font color='grey'>■</font>",
+        }
     }
 
     fn failure_view(message: &str) -> (&'static str, &'static str) {

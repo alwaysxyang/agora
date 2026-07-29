@@ -3,6 +3,12 @@ use crate::task::ProgressStatus;
 
 pub(crate) const THINKING_TITLE: &str = "思考过程";
 pub(crate) const PROGRESS_TITLE: &str = "执行进度";
+pub(crate) const PROCESS_TITLE: &str = "任务过程";
+pub(crate) const SHELL_TITLE: &str = "SHELL";
+pub(crate) const SHELL_RUNNING: &str = "Running";
+pub(crate) const SHELL_COMPLETED: &str = "Completed";
+pub(crate) const SHELL_FAILED: &str = "Failed";
+pub(crate) const SHELL_STOPPED: &str = "Stopped";
 pub(crate) const FINAL_ANSWER_TITLE: &str = "最终回答";
 pub(crate) const PARTIAL_ANSWER_TITLE: &str = "部分回答";
 pub(crate) const RUN_FAILED_TITLE: &str = "任务失败";
@@ -79,6 +85,10 @@ pub(crate) fn run_status(status: RunStatus) -> &'static str {
 
 pub(crate) fn update_count(count: usize) -> String {
     format!("{count} 条")
+}
+
+pub(crate) fn phase_count(count: usize) -> String {
+    format!("{count} 个阶段")
 }
 
 pub(crate) fn progress_count(status: ProgressStatus, count: usize) -> String {

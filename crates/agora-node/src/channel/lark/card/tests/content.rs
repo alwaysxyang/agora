@@ -49,7 +49,9 @@ fn lark_card_uses_json_v2_for_standard_markdown() {
     assert_eq!(
         card.pointer("/body/elements/0/elements/0/content")
             .and_then(|v| v.as_str()),
-        Some("> • Inspecting the channel")
+        Some(
+            "<font color='blue'>`01`</font>  **思考过程**\n<font color='grey'>✦</font> Inspecting the channel"
+        )
     );
 }
 
@@ -130,10 +132,11 @@ fn lark_card_uses_chinese_system_labels() {
     content.apply_output(OutputEvent::Thinking {
         text: "Inspecting the project".to_string(),
     });
-    content.apply_output(OutputEvent::Progress {
+    content.apply_output(OutputEvent::CommandExecution {
         id: "command-1".to_string(),
-        text: "Run `cargo test`".to_string(),
+        command: "cargo test".to_string(),
         status: ProgressStatus::Completed,
+        exit_code: None,
     });
     content.apply_output(OutputEvent::Answer {
         text: "All checks passed.".to_string(),
@@ -154,9 +157,8 @@ fn lark_card_uses_chinese_system_labels() {
             .and_then(serde_json::Value::as_str),
         Some("已完成")
     );
-    assert!(rendered.contains("**思考过程**"));
-    assert!(rendered.contains("1 条"));
-    assert!(rendered.contains("**执行进度**"));
+    assert!(rendered.contains("**任务过程**"));
+    assert!(rendered.contains("1 个阶段"));
     assert!(rendered.contains("1 项已完成"));
     assert!(rendered.contains("**最终回答**"));
     assert!(rendered.contains("<font color='grey'>Total</font>"));
@@ -166,69 +168,168 @@ fn lark_card_uses_chinese_system_labels() {
 }
 
 #[test]
-fn lark_card_collapses_thinking_and_expands_running_progress() {
+fn lark_card_groups_thinking_and_running_progress_in_one_expanded_panel() {
     let mut content = LarkCardContent::new("codex-dev".to_string());
     content.apply_output(OutputEvent::Thinking {
         text: "Inspecting the channel".to_string(),
     });
-    content.apply_output(OutputEvent::Progress {
+    content.apply_output(OutputEvent::CommandExecution {
         id: "command-1".to_string(),
-        text: "Run `cargo test`".to_string(),
+        command: "cargo test --workspace".to_string(),
         status: ProgressStatus::Running,
+        exit_code: None,
+    });
+    content.apply_output(OutputEvent::Progress {
+        id: "message-1".to_string(),
+        text: "Checking test results".to_string(),
+        status: ProgressStatus::Completed,
     });
 
     let card = content.build_card();
-    let thinking = card.pointer("/body/elements/0").unwrap();
-    let progress = card.pointer("/body/elements/1").unwrap();
+    let process = card.pointer("/body/elements/0").unwrap();
 
-    assert_eq!(thinking["tag"], "collapsible_panel");
-    assert_eq!(thinking["expanded"], false);
-    assert_eq!(thinking["background_color"], "grey-50");
-    assert_eq!(thinking.pointer("/border/color").unwrap(), "grey-200");
-    assert_eq!(thinking.pointer("/border/corner_radius").unwrap(), "8px");
-    assert!(thinking.pointer("/header/background_color").is_none());
-    assert_eq!(thinking["padding"], "2px 12px 10px 12px");
+    assert_eq!(process["tag"], "collapsible_panel");
+    assert_eq!(process["expanded"], true);
+    assert_eq!(process["background_color"], "grey-50");
+    assert_eq!(process.pointer("/border/color").unwrap(), "grey-200");
+    assert_eq!(process.pointer("/border/corner_radius").unwrap(), "8px");
+    assert!(process.pointer("/header/background_color").is_none());
+    assert_eq!(process["padding"], "2px 12px 10px 12px");
     assert_eq!(
-        thinking.pointer("/header/padding").unwrap(),
+        process.pointer("/header/padding").unwrap(),
         "8px 12px 8px 12px"
     );
     assert_eq!(
-        thinking.pointer("/header/title/content").unwrap(),
-        "**思考过程**  <font color='grey'>· 1 条</font>"
+        process.pointer("/elements/0/content").unwrap(),
+        "<font color='blue'>`01`</font>  **思考过程**\n<font color='grey'>✦</font> Inspecting the channel"
     );
-    assert_eq!(progress["tag"], "collapsible_panel");
-    assert_eq!(progress["expanded"], true);
-    assert_eq!(progress["background_color"], "grey-50");
-    assert_eq!(progress.pointer("/border/color").unwrap(), "grey-200");
-    assert_eq!(progress.pointer("/border/corner_radius").unwrap(), "8px");
+    assert_eq!(process.pointer("/elements/1/tag").unwrap(), "column_set");
     assert_eq!(
-        progress.pointer("/elements/0/content").unwrap(),
-        "<font color='blue'>●</font>  Run `cargo test`"
+        process
+            .pointer("/elements/1/columns/0/elements/0/columns/0/elements/0/content")
+            .unwrap(),
+        "**SHELL**"
     );
     assert_eq!(
-        progress.pointer("/header/title/content").unwrap(),
-        "**执行进度**  <font color='grey'>·</font> <font color='blue'>●</font> <font color='grey'>1 项进行中</font>"
+        process
+            .pointer("/elements/1/columns/0/elements/0/columns/1/elements/0/content")
+            .unwrap(),
+        "<font color='blue'>●  Running</font>"
     );
+    assert_eq!(
+        process
+            .pointer("/elements/1/columns/0/elements/1/content")
+            .unwrap(),
+        "```bash\n$ cargo test --workspace\n```"
+    );
+    assert_eq!(
+        process.pointer("/elements/2/content").unwrap(),
+        "<font color='green'>✓</font>  Checking test results"
+    );
+    assert_eq!(
+        process.pointer("/header/title/content").unwrap(),
+        "**任务过程**  <font color='grey'>· 1 个阶段</font> · <font color='green'>✓</font> <font color='grey'>1 项已完成</font> · <font color='blue'>●</font> <font color='grey'>1 项进行中</font>"
+    );
+}
+
+#[test]
+fn lark_card_renders_agent_command_in_one_light_console() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.apply_output(OutputEvent::CommandExecution {
+        id: "command-1".to_string(),
+        command: "/bin/bash -lc 'cargo test' && echo $HOME".to_string(),
+        status: ProgressStatus::Completed,
+        exit_code: Some(0),
+    });
+
+    let card = content.build_card();
+    let console = card.pointer("/body/elements/0/elements/0").unwrap();
+    let console_header = console.pointer("/columns/0/elements/0").unwrap();
+    let command = console.pointer("/columns/0/elements/1").unwrap();
+
+    assert_eq!(console["tag"], "column_set");
+    assert_eq!(console["background_style"], "cus-0");
+    assert_eq!(
+        console.pointer("/columns/0/padding").unwrap(),
+        "6px 8px 8px 8px"
+    );
+    assert_eq!(console_header["tag"], "column_set");
+    assert_eq!(
+        console_header
+            .pointer("/columns/0/elements/0/content")
+            .unwrap(),
+        "**SHELL**"
+    );
+    assert_eq!(
+        console_header
+            .pointer("/columns/1/elements/0/content")
+            .unwrap(),
+        "<font color='green'>✓  exit 0</font>"
+    );
+    assert_eq!(
+        console_header
+            .pointer("/columns/1/elements/0/text_align")
+            .unwrap(),
+        "right"
+    );
+    assert_eq!(command["tag"], "markdown");
+    assert_eq!(
+        command["content"],
+        "```bash\n$ /bin/bash -lc 'cargo test' && echo $HOME\n```"
+    );
+    assert_eq!(
+        card.pointer("/config/style/color/cus-0/light_mode")
+            .unwrap(),
+        "rgba(230, 233, 238, 1)"
+    );
+}
+
+#[test]
+fn lark_card_renders_the_complete_agent_command() {
+    let command = format!(
+        "/bin/bash -lc \"pwd && {} && echo end-of-command\"",
+        "rg --files ".repeat(20)
+    );
+    assert!(command.chars().count() > 160);
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.apply_output(OutputEvent::CommandExecution {
+        id: "command-1".to_string(),
+        command,
+        status: ProgressStatus::Running,
+        exit_code: None,
+    });
+
+    let card = content.build_card();
+    let rendered = card
+        .pointer("/body/elements/0/elements/0/columns/0/elements/1/content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
+
+    assert!(rendered.starts_with("```bash\n$ /bin/bash"));
+    assert!(rendered.contains("end-of-command"));
+    assert!(!rendered.contains("..."));
+    assert!(rendered.ends_with("\n```"));
 }
 
 #[test]
 fn lark_card_collapses_progress_after_completion() {
     let mut content = LarkCardContent::new("codex-dev".to_string());
-    content.apply_output(OutputEvent::Progress {
+    content.apply_output(OutputEvent::CommandExecution {
         id: "command-1".to_string(),
-        text: "Run `cargo test`".to_string(),
+        command: "cargo test".to_string(),
         status: ProgressStatus::Completed,
+        exit_code: None,
     });
     content.complete();
 
     let card = content.build_card();
-    let progress = card.pointer("/body/elements/0").unwrap();
+    let process = card.pointer("/body/elements/0").unwrap();
 
-    assert_eq!(progress["tag"], "collapsible_panel");
-    assert_eq!(progress["expanded"], false);
+    assert_eq!(process["tag"], "collapsible_panel");
+    assert_eq!(process["expanded"], false);
     assert_eq!(
-        progress.pointer("/header/title/content").unwrap(),
-        "**执行进度**  <font color='grey'>·</font> <font color='green'>✓</font> <font color='grey'>1 项已完成</font>"
+        process.pointer("/header/title/content").unwrap(),
+        "**任务过程**  <font color='grey'>· 1 个阶段</font> · <font color='green'>✓</font> <font color='grey'>1 项已完成</font>"
     );
 }
 
@@ -250,11 +351,11 @@ fn lark_card_progress_summary_shows_completed_and_failed_statuses() {
     content.complete();
 
     let card = content.build_card();
-    let progress = card.pointer("/body/elements/0").unwrap();
+    let process = card.pointer("/body/elements/0").unwrap();
 
     assert_eq!(
-        progress.pointer("/header/title/content").unwrap(),
-        "**执行进度**  <font color='grey'>·</font> <font color='green'>✓</font> <font color='grey'>2 项已完成</font> · <font color='red'>×</font> <font color='grey'>1 项失败</font>"
+        process.pointer("/header/title/content").unwrap(),
+        "**任务过程**  <font color='grey'>· 1 个阶段</font> · <font color='green'>✓</font> <font color='grey'>2 项已完成</font> · <font color='red'>×</font> <font color='grey'>1 项失败</font>"
     );
 }
 
@@ -313,10 +414,11 @@ fn lark_card_preserves_output_and_marks_the_run_as_stopped() {
     content.apply_output(OutputEvent::Thinking {
         text: "Inspecting the project".to_string(),
     });
-    content.apply_output(OutputEvent::Progress {
+    content.apply_output(OutputEvent::CommandExecution {
         id: "command-1".to_string(),
-        text: "Run `cargo test`".to_string(),
+        command: "cargo test".to_string(),
         status: ProgressStatus::Running,
+        exit_code: None,
     });
     content.apply_output(OutputEvent::Answer {
         text: "Work completed before the stop.".to_string(),
@@ -336,7 +438,8 @@ fn lark_card_preserves_output_and_marks_the_run_as_stopped() {
             .and_then(serde_json::Value::as_str),
         Some("grey")
     );
-    assert!(rendered.contains("<font color='grey'>■</font>  Run `cargo test`"));
+    assert!(rendered.contains("■  Stopped"));
+    assert!(rendered.contains("```bash\\n$ cargo test\\n```"));
     assert!(rendered.contains("<font color='grey'>1 项已停止</font>"));
     assert!(rendered.contains("<font color='grey'>▌</font> **任务已停止**"));
     assert!(rendered.contains("已按请求停止任务，已有输出已保留。"));
@@ -347,10 +450,11 @@ fn lark_card_preserves_output_and_marks_the_run_as_stopped() {
 #[test]
 fn lark_card_preserves_output_and_marks_the_run_as_interrupted() {
     let mut content = LarkCardContent::new("codex-dev".to_string());
-    content.apply_output(OutputEvent::Progress {
+    content.apply_output(OutputEvent::CommandExecution {
         id: "command-1".to_string(),
-        text: "Run `cargo test`".to_string(),
+        command: "cargo test".to_string(),
         status: ProgressStatus::Running,
+        exit_code: None,
     });
     content.apply_output(OutputEvent::Answer {
         text: "Work completed before shutdown.".to_string(),
@@ -370,7 +474,8 @@ fn lark_card_preserves_output_and_marks_the_run_as_interrupted() {
             .and_then(serde_json::Value::as_str),
         Some("orange")
     );
-    assert!(rendered.contains("<font color='grey'>■</font>  Run `cargo test`"));
+    assert!(rendered.contains("■  Stopped"));
+    assert!(rendered.contains("```bash\\n$ cargo test\\n```"));
     assert!(rendered.contains("<font color='orange'>▌</font> **任务已中断**"));
     assert!(rendered.contains("Agora Node 即将退出，本次任务已中断，当前输出已保留。"));
     assert!(rendered.contains("Node 恢复后，请重新发送消息继续。"));
@@ -379,20 +484,22 @@ fn lark_card_preserves_output_and_marks_the_run_as_interrupted() {
 }
 
 #[test]
-fn lark_card_separates_thinking_progress_and_final_answer() {
+fn lark_card_groups_process_and_keeps_final_answer_separate() {
     let mut content = LarkCardContent::new("codex-dev".to_string());
     content.apply_output(OutputEvent::Thinking {
         text: "Inspecting the channel\nChecking reply delivery".to_string(),
     });
-    content.apply_output(OutputEvent::Progress {
+    content.apply_output(OutputEvent::CommandExecution {
         id: "command-1".to_string(),
-        text: "Run `cargo test`".to_string(),
+        command: "cargo test".to_string(),
         status: ProgressStatus::Running,
+        exit_code: None,
     });
-    content.apply_output(OutputEvent::Progress {
+    content.apply_output(OutputEvent::CommandExecution {
         id: "command-1".to_string(),
-        text: "Run `cargo test`".to_string(),
+        command: "cargo test".to_string(),
         status: ProgressStatus::Completed,
+        exit_code: Some(0),
     });
     content.apply_output(OutputEvent::Answer {
         text: "The Lark path is ready.".to_string(),
@@ -411,15 +518,17 @@ fn lark_card_separates_thinking_progress_and_final_answer() {
         Some("已完成")
     );
     let rendered = serde_json::to_string(&card).unwrap();
-    assert!(rendered.contains("**思考过程**"));
-    assert!(rendered.contains("> • Inspecting the channel"));
-    assert!(rendered.contains("> • Checking reply delivery"));
-    assert!(rendered.contains("**执行进度**"));
-    assert!(rendered.contains("<font color='green'>✓</font>  Run `cargo test`"));
+    assert!(rendered.contains("**任务过程**"));
+    assert!(rendered.contains("<font color='blue'>`01`</font>  **思考过程**"));
+    assert!(rendered.contains("<font color='grey'>✦</font> Inspecting the channel"));
+    assert!(rendered.contains("Checking reply delivery"));
+    assert!(rendered.contains("✓  exit 0"));
+    assert!(rendered.contains("```bash\\n$ cargo test\\n```"));
     assert!(rendered.contains("<font color='blue'>▌</font> **最终回答**"));
     assert!(rendered.contains("The Lark path is ready."));
     assert!(!rendered.contains("正在等待 Agent 输出"));
-    assert_eq!(rendered.matches("Run `cargo test`").count(), 1);
+    assert_eq!(rendered.matches("```bash\\n$ cargo test\\n```").count(), 1);
+    assert_eq!(rendered.matches("collapsible_panel").count(), 1);
 }
 
 #[test]
@@ -524,7 +633,7 @@ fn lark_card_shows_queued_state_until_the_agent_starts() {
 }
 
 #[test]
-fn lark_card_keeps_all_thinking_updates_with_latest_first() {
+fn lark_card_keeps_all_thinking_updates_with_latest_last() {
     let mut content = LarkCardContent::new("codex-dev".to_string());
     for index in 0..5 {
         content.apply_output(OutputEvent::Thinking {
@@ -533,14 +642,14 @@ fn lark_card_keeps_all_thinking_updates_with_latest_first() {
     }
 
     let card = content.build_card();
-    let rendered = card
-        .pointer("/body/elements/0/elements/0/content")
-        .and_then(|value| value.as_str())
-        .unwrap();
-    assert_eq!(
-        rendered,
-        "> • Thinking 4\n> • Thinking 3\n> • Thinking 2\n> • Thinking 1\n> • Thinking 0"
-    );
+    let rendered =
+        serde_json::to_string(card.pointer("/body/elements/0/elements").unwrap()).unwrap();
+    let positions = (0..5)
+        .map(|index| rendered.find(&format!("Thinking {index}")).unwrap())
+        .collect::<Vec<_>>();
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(rendered.contains("`01`"));
+    assert!(rendered.contains("`05`"));
 }
 
 #[test]
@@ -563,6 +672,57 @@ fn lark_card_keeps_all_progress_entries_with_latest_first() {
         rendered,
         "<font color='green'>✓</font>  Progress 5\n<font color='green'>✓</font>  Progress 4\n<font color='green'>✓</font>  Progress 3\n<font color='green'>✓</font>  Progress 2\n<font color='green'>✓</font>  Progress 1\n<font color='green'>✓</font>  Progress 0"
     );
+}
+
+#[test]
+fn lark_card_groups_progress_under_the_latest_thinking_phase() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.apply_output(OutputEvent::Thinking {
+        text: "Inspect the project".to_string(),
+    });
+    content.apply_output(OutputEvent::Progress {
+        id: "read-config".to_string(),
+        text: "Read config".to_string(),
+        status: ProgressStatus::Running,
+    });
+    content.apply_output(OutputEvent::Progress {
+        id: "read-source".to_string(),
+        text: "Read source".to_string(),
+        status: ProgressStatus::Completed,
+    });
+    content.apply_output(OutputEvent::Thinking {
+        text: "Verify behavior".to_string(),
+    });
+    content.apply_output(OutputEvent::Progress {
+        id: "run-tests".to_string(),
+        text: "Run tests".to_string(),
+        status: ProgressStatus::Completed,
+    });
+    content.apply_output(OutputEvent::Progress {
+        id: "read-config".to_string(),
+        text: "Read config".to_string(),
+        status: ProgressStatus::Completed,
+    });
+
+    let process = content.build_card();
+    let process = process.pointer("/body/elements/0").unwrap();
+    let rendered = serde_json::to_string(process.pointer("/elements").unwrap()).unwrap();
+
+    assert_eq!(
+        process.pointer("/header/title/content").unwrap(),
+        "**任务过程**  <font color='grey'>· 2 个阶段</font> · <font color='green'>✓</font> <font color='grey'>3 项已完成</font>"
+    );
+    let inspect = rendered.find("Inspect the project").unwrap();
+    let read_config = rendered.find("Read config").unwrap();
+    let read_source = rendered.find("Read source").unwrap();
+    let verify = rendered.find("Verify behavior").unwrap();
+    let run_tests = rendered.find("Run tests").unwrap();
+    assert!(inspect < read_config);
+    assert!(read_config < read_source);
+    assert!(read_source < verify);
+    assert!(verify < run_tests);
+    assert!(rendered.contains("`01`"));
+    assert!(rendered.contains("`02`"));
 }
 
 #[test]

@@ -8,6 +8,12 @@ pub enum OutputEvent {
         text: String,
         status: ProgressStatus,
     },
+    CommandExecution {
+        id: String,
+        command: String,
+        status: ProgressStatus,
+        exit_code: Option<i32>,
+    },
     Answer {
         text: String,
     },

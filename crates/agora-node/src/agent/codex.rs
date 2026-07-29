@@ -337,12 +337,17 @@ where
                     .get("command")
                     .and_then(Value::as_str)
                     .unwrap_or("command");
-                self.publish_progress(
-                    item,
-                    format!("Run `{}`", Self::concise(&command.replace('`', "'"), 160)),
-                    Self::progress_status(event_type, item),
-                )
-                .await?;
+                self.output
+                    .write(OutputEvent::CommandExecution {
+                        id: Self::progress_id(item),
+                        command: command.to_string(),
+                        status: Self::progress_status(event_type, item),
+                        exit_code: item
+                            .get("exit_code")
+                            .and_then(Value::as_i64)
+                            .and_then(|code| i32::try_from(code).ok()),
+                    })
+                    .await?;
             }
             "file_change" => {
                 let count = item
@@ -418,14 +423,20 @@ where
         text: String,
         status: ProgressStatus,
     ) -> Result<()> {
-        let id = item
-            .get("id")
+        self.output
+            .write(OutputEvent::Progress {
+                id: Self::progress_id(item),
+                text,
+                status,
+            })
+            .await
+    }
+
+    fn progress_id(item: &Value) -> String {
+        item.get("id")
             .and_then(Value::as_str)
             .unwrap_or("codex-progress")
-            .to_string();
-        self.output
-            .write(OutputEvent::Progress { id, text, status })
-            .await
+            .to_string()
     }
 
     fn progress_status(event_type: &str, item: &Value) -> ProgressStatus {

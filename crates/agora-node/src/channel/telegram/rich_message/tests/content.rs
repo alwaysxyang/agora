@@ -9,10 +9,11 @@ fn telegram_rich_message_puts_all_thinking_before_the_answer_and_usage() {
     content.apply(RunEvent::Output(OutputEvent::Thinking {
         text: "Checking the tests".to_string(),
     }));
-    content.apply(RunEvent::Output(OutputEvent::Progress {
+    content.apply(RunEvent::Output(OutputEvent::CommandExecution {
         id: "command-1".to_string(),
-        text: "Run `cargo test`".to_string(),
+        command: "cargo test".to_string(),
         status: ProgressStatus::Completed,
+        exit_code: Some(0),
     }));
     content.apply(RunEvent::Output(OutputEvent::Answer {
         text: "**All checks passed.**\n\n- tests\n- clippy".to_string(),
@@ -51,10 +52,11 @@ fn telegram_rich_message_shows_all_thinking_while_running() {
     content.apply(RunEvent::Output(OutputEvent::Thinking {
         text: "Checking the tests".to_string(),
     }));
-    content.apply(RunEvent::Output(OutputEvent::Progress {
+    content.apply(RunEvent::Output(OutputEvent::CommandExecution {
         id: "command-1".to_string(),
-        text: "Run `cargo test`".to_string(),
+        command: "cargo test".to_string(),
         status: ProgressStatus::Running,
+        exit_code: None,
     }));
 
     assert_eq!(

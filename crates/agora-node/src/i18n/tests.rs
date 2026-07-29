@@ -25,6 +25,7 @@ fn chinese_copy_covers_every_status_and_failure_category() {
 #[test]
 fn chinese_copy_formats_dynamic_command_and_agent_messages() {
     assert_eq!(update_count(3), "3 条");
+    assert_eq!(phase_count(3), "3 个阶段");
     assert_eq!(queued_message(4), "正在排队，前面还有 4 个任务...");
     assert_eq!(cached_tokens(12), "12 cached");
     assert_eq!(
