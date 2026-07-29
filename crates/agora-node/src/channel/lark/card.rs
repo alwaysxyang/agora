@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 const MAX_ANSWER_BYTES: usize = 20 * 1024;
+const MAX_PROCESS_ELEMENTS: usize = 160;
 const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 
 pub(super) struct LarkAgentCard {
@@ -707,14 +708,85 @@ impl LarkCardContent {
     }
 
     fn process_elements(&self) -> Vec<Value> {
+        let mut phases = self
+            .process
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(index, phase)| Self::phase_elements(phase, index + 1))
+            .filter(|phase| !phase.is_empty())
+            .collect::<VecDeque<_>>();
+        let mut element_count = Self::process_element_count(&phases);
+        let omitted = element_count > MAX_PROCESS_ELEMENTS;
+        let mut omitted_phases = 0;
+
+        if omitted {
+            let available = MAX_PROCESS_ELEMENTS.saturating_sub(1);
+            while element_count > available {
+                if phases.len() > 1 {
+                    let removed = phases.pop_front().unwrap_or_default();
+                    omitted_phases += 1;
+                    element_count = element_count.saturating_sub(
+                        removed
+                            .iter()
+                            .map(Self::tagged_element_count)
+                            .sum::<usize>()
+                            + 1,
+                    );
+                } else if let Some(phase) = phases.front_mut() {
+                    if let Some(removed) = phase.pop() {
+                        element_count =
+                            element_count.saturating_sub(Self::tagged_element_count(&removed));
+                    } else {
+                        phases.clear();
+                        element_count = 0;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
         let mut elements = Vec::new();
-        for (index, phase) in self.process.iter().rev().enumerate() {
+        if omitted {
+            elements.push(json!({
+                "tag": "markdown",
+                "content": format!(
+                    "<font color='grey'>{}</font>",
+                    i18n::truncated_phase_count(omitted_phases)
+                )
+            }));
+        }
+        for (index, phase) in phases.into_iter().enumerate() {
             if index > 0 {
                 elements.push(json!({ "tag": "hr" }));
             }
-            elements.extend(Self::phase_elements(phase, index + 1));
+            elements.extend(phase);
         }
         elements
+    }
+
+    fn process_element_count(phases: &VecDeque<Vec<Value>>) -> usize {
+        phases
+            .iter()
+            .flatten()
+            .map(Self::tagged_element_count)
+            .sum::<usize>()
+            + phases.len().saturating_sub(1)
+    }
+
+    fn tagged_element_count(value: &Value) -> usize {
+        match value {
+            Value::Array(values) => values.iter().map(Self::tagged_element_count).sum(),
+            Value::Object(values) => {
+                usize::from(values.contains_key("tag"))
+                    + values
+                        .values()
+                        .map(Self::tagged_element_count)
+                        .sum::<usize>()
+            }
+            _ => 0,
+        }
     }
 
     fn phase_elements(phase: &LarkProcessPhase, phase_number: usize) -> Vec<Value> {

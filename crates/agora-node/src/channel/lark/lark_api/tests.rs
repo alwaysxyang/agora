@@ -1,5 +1,7 @@
 use super::*;
 use crate::channel::test_http::{HttpMockServer, MockResponse};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
@@ -382,6 +384,28 @@ async fn lark_http_results_cover_missing_fields_errors_and_binary_defaults() {
             .to_string()
             .contains("404")
     );
+}
+
+#[tokio::test]
+async fn lark_patch_retries_transient_server_failures() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let captured_attempts = Arc::clone(&attempts);
+    let server = HttpMockServer::start(move |request| {
+        assert_eq!(request.method, "PATCH");
+        if captured_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            MockResponse::json(r#"{"code":1,"msg":"busy"}"#).with_status(503)
+        } else {
+            MockResponse::json(r#"{"code":0,"msg":"ok"}"#)
+        }
+    })
+    .await;
+    let api = LarkApi::with_base_url(config(), server.base_url()).unwrap();
+
+    api.patch_card("token", "om_reply", &json!({ "schema": "2.0" }))
+        .await
+        .unwrap();
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

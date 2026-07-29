@@ -91,6 +91,14 @@ pub(crate) fn phase_count(count: usize) -> String {
     format!("{count} 个阶段")
 }
 
+pub(crate) fn truncated_phase_count(count: usize) -> String {
+    if count == 0 {
+        "已省略当前阶段中的较早过程".to_string()
+    } else {
+        format!("已省略 {count} 个较早阶段")
+    }
+}
+
 pub(crate) fn progress_count(status: ProgressStatus, count: usize) -> String {
     match status {
         ProgressStatus::Running => format!("{count} 项进行中"),

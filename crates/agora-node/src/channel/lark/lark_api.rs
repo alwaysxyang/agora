@@ -30,6 +30,8 @@ const LARK_HTTP_MAX_IDLE_CONNECTIONS_PER_HOST: usize = 10;
 const LARK_HTTP_IDLE_TIMEOUT_SECONDS: u64 = 300;
 const LARK_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 10;
 const LARK_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 60;
+const LARK_PATCH_MAX_ATTEMPTS: usize = 3;
+const LARK_PATCH_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub(super) struct LarkApi {
@@ -403,21 +405,39 @@ impl LarkApi {
         message_id: &str,
         card: &Value,
     ) -> Result<()> {
-        let response = self
-            .client
-            .patch(format!(
-                "{}/open-apis/im/v1/messages/{}",
-                self.base_url, message_id
-            ))
-            .bearer_auth(token)
-            .json(&PatchCardRequest {
-                content: serde_json::to_string(card)?,
-            })
-            .send()
-            .await?
-            .json::<LarkEmptyResponse>()
-            .await?;
-        response.into_result()
+        let url = format!("{}/open-apis/im/v1/messages/{}", self.base_url, message_id);
+        let content = serde_json::to_string(card)?;
+        let mut delay = LARK_PATCH_RETRY_INITIAL_DELAY;
+
+        for attempt in 1..=LARK_PATCH_MAX_ATTEMPTS {
+            match self
+                .client
+                .patch(&url)
+                .bearer_auth(token)
+                .json(&PatchCardRequest {
+                    content: content.clone(),
+                })
+                .send()
+                .await
+            {
+                Ok(response)
+                    if attempt < LARK_PATCH_MAX_ATTEMPTS
+                        && (response.status().is_server_error()
+                            || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS) => {}
+                Ok(response) => {
+                    return response.json::<LarkEmptyResponse>().await?.into_result();
+                }
+                Err(error) if attempt < LARK_PATCH_MAX_ATTEMPTS => {
+                    logger::debug!("lark card patch retry attempt={} error={}", attempt, error);
+                }
+                Err(error) => return Err(error.into()),
+            }
+
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2);
+        }
+
+        Err(anyhow!("lark card patch attempts exhausted"))
     }
 }
 

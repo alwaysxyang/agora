@@ -726,6 +726,51 @@ fn lark_card_groups_progress_under_the_latest_thinking_phase() {
 }
 
 #[test]
+fn lark_card_limits_rendered_elements_and_keeps_the_latest_process() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    for index in 0..40 {
+        content.apply_output(OutputEvent::Thinking {
+            text: format!("Thinking {index}"),
+        });
+        content.apply_output(OutputEvent::CommandExecution {
+            id: format!("command-{index}"),
+            command: format!("cargo test package-{index}"),
+            status: ProgressStatus::Completed,
+            exit_code: Some(0),
+        });
+    }
+    content.apply_output(OutputEvent::Answer {
+        text: "Partial answer".to_string(),
+    });
+    content.apply_output(OutputEvent::Usage(TokenUsage {
+        input_tokens: 42_800,
+        cached_input_tokens: 31_600,
+        output_tokens: 3_200,
+        reasoning_output_tokens: 1_900,
+    }));
+    content.fail("agent exited unexpectedly".to_string());
+
+    let card = content.build_card();
+    let rendered = serde_json::to_string(&card).unwrap();
+
+    assert!(tagged_element_count(&card) <= 200);
+    assert!(rendered.contains("Thinking 39"));
+    assert!(!rendered.contains("Thinking 0"));
+    assert!(rendered.contains("已省略 24 个较早阶段"));
+}
+
+fn tagged_element_count(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(values) => values.iter().map(tagged_element_count).sum(),
+        serde_json::Value::Object(values) => {
+            usize::from(values.contains_key("tag"))
+                + values.values().map(tagged_element_count).sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
+#[test]
 fn lark_card_renders_token_usage_without_a_heading() {
     let mut content = LarkCardContent::new("codex-dev".to_string());
     content.apply_output(OutputEvent::Answer {
