@@ -120,8 +120,9 @@ when an agent uses `isolate: session`.
 `TelegramRichMessage` accumulates the same neutral events used by the Lark card:
 
 - run state and queue depth;
-- thinking updates, newest first;
-- progress entries, newest first, with updates replacing an entry by id;
+- process phases started by each thinking update;
+- command and progress entries attached to the current phase, with updates
+  replacing an entry by id without moving it to another phase;
 - answer chunks in original order;
 - final token usage.
 
@@ -131,15 +132,29 @@ the agent's final answer is passed through without a second Markdown parser.
 Agora adds only channel-owned framing around it:
 
 - agent name and run status;
-- a collapsible `<details>` section for accumulated thinking;
-- a collapsible `<details>` section for progress and its status summary;
+- one collapsible `任务过程` `<details>` section containing numbered phases in
+  oldest-first order, so the latest phase remains at the bottom;
+- the thinking update followed by its subsequent command and progress entries
+  inside each phase;
+- a terminal-style `<pre><code class="language-bash">` block for every command,
+  with the shell label, status, terminal exit code, and complete command text in
+  one native code panel. Agora never abbreviates command text; panel color and
+  horizontal navigation follow the Telegram client and active theme;
 - a `Final answer` or `Partial answer` heading;
 - a compact usage footer after a terminal event;
 - concise failure, stopped, or interrupted notices.
 
+The process section is open while a run is active and collapsed after a
+terminal event. Process state remains unbounded in memory. When a rendered
+snapshot approaches Telegram's Rich Message limits, the renderer omits the
+oldest complete phases first, retains the newest phases, and shows an omission
+notice. Final answer and usage sections remain independent of that process
+budget.
+
 While a private-chat run is active, the newest thinking text may additionally
-use Telegram's draft-only `<tg-thinking>` block. The persisted final message
-uses `<details>` because thinking blocks are valid only in drafts.
+use Telegram's draft-only `<tg-thinking>` block together with the latest entry
+from that phase. The persisted final message uses `<details>` because thinking
+blocks are valid only in drafts.
 
 ## Streaming Strategy
 
@@ -216,11 +231,12 @@ standard test-only `#[cfg(test)] mod tests;` declaration:
   filtering, offset advancement, command suffix normalization, chat/topic
   session identity, photo download/redelivery, reply targets, and
   configured-channel delegation.
-- `src/channel/telegram/rich_message/tests/` covers event accumulation, newest-
-  first thinking/progress order, status summaries, original answer Markdown,
-  private draft/final behavior, group send/edit behavior, update coalescing,
-  independent agent runs, delivery failures, non-idempotent retry boundaries,
-  and terminal states.
+- `src/channel/telegram/rich_message/tests/` covers event accumulation, phase
+  grouping, oldest-first phase order, command terminal rendering, status
+  summaries, process-limit omission, original answer Markdown, private
+  draft/final behavior, group send/edit behavior, update coalescing, independent
+  agent runs, delivery failures, non-idempotent retry boundaries, and terminal
+  states.
 - Config tests cover the Telegram token shape and reject the old name-only
   placeholder form.
 

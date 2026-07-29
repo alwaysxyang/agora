@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn telegram_rich_message_puts_all_thinking_before_the_answer_and_usage() {
+fn telegram_rich_message_groups_thinking_and_commands_into_ordered_phases() {
     let mut content = TelegramRichContent::new("codex-dev".to_string());
     content.apply(RunEvent::Output(OutputEvent::Thinking {
         text: "Inspecting <the project>".to_string(),
@@ -26,25 +26,26 @@ fn telegram_rich_message_puts_all_thinking_before_the_answer_and_usage() {
     })));
     content.apply(RunEvent::Completed { exit_code: 0 });
 
-    assert_eq!(
-        content.render(false),
-        "**✦ 思考过程 · 2 条**\n\n\
-         <details><summary>◈ 推理节点 · 02</summary>\n\n\
-         Checking the tests\n\n\
-         </details>\n\n\
-         <details><summary>◈ 推理节点 · 01</summary>\n\n\
-         Inspecting &lt;the project&gt;\n\n\
-         </details>\n\n\
-         <details><summary>◇ 执行进度 · ✓ 1 项已完成</summary>\n\n\
-         - ✓ Run `cargo test`\n\n\
-         </details>\n\n\
-         **All checks passed.**\n\n- tests\n- clippy\n\n\
-         > **◈ TOKEN USAGE** · 46.0K tokens · Input 42.8K · 31.6K cached · Output 3.2K · Reasoning 1.9K"
+    let rendered = content.render(false);
+
+    assert!(
+        rendered.starts_with("<details><summary>✦ 任务过程 · 2 个阶段 · ✓ 1 项已完成</summary>")
     );
+    assert!(rendered.contains("**01 · 思考过程**\n\n> ✦ Inspecting &lt;the project&gt;"));
+    assert!(rendered.contains("**02 · 思考过程**\n\n> ✦ Checking the tests"));
+    assert!(rendered.contains(
+        "<pre><code class=\"language-bash\"># SHELL · ✓ exit 0\n$ cargo test</code></pre>"
+    ));
+    assert!(rendered.find("Inspecting") < rendered.find("Checking"));
+    assert!(rendered.find("Checking") < rendered.find("# SHELL"));
+    assert!(rendered.find("</details>") < rendered.find("**All checks passed.**"));
+    assert!(rendered.ends_with(
+        "> **◈ TOKEN USAGE** · 46.0K tokens · Input 42.8K · 31.6K cached · Output 3.2K · Reasoning 1.9K"
+    ));
 }
 
 #[test]
-fn telegram_rich_message_shows_all_thinking_while_running() {
+fn telegram_rich_message_expands_the_process_while_running() {
     let mut content = TelegramRichContent::new("codex-dev".to_string());
     content.apply(RunEvent::Output(OutputEvent::Thinking {
         text: "Inspecting the project".to_string(),
@@ -59,25 +60,42 @@ fn telegram_rich_message_shows_all_thinking_while_running() {
         exit_code: None,
     }));
 
-    assert_eq!(
-        content.render(false),
-        "**✦ 思考过程 · 2 条**\n\n\
-         <details><summary>◈ 推理节点 · 02</summary>\n\n\
-         Checking the tests\n\n\
-         </details>\n\n\
-         <details><summary>◈ 推理节点 · 01</summary>\n\n\
-         Inspecting the project\n\n\
-         </details>\n\n\
-         <details open><summary>◇ 执行进度 · ● 1 项进行中</summary>\n\n\
-         - ● Run `cargo test`\n\n\
-         </details>"
+    let rendered = content.render(false);
+    assert!(
+        rendered
+            .starts_with("<details open><summary>✦ 任务过程 · 2 个阶段 · ● 1 项进行中</summary>")
     );
+    assert!(rendered.contains(
+        "<pre><code class=\"language-bash\"># SHELL · ● Running\n$ cargo test</code></pre>"
+    ));
     assert_eq!(
         content.render(true),
-        "<tg-thinking>Checking the tests\n\n\
-         Inspecting the project\n\n\
-         ● Run `cargo test`</tg-thinking>"
+        "<tg-thinking>Checking the tests\n\n● $ cargo test</tg-thinking>"
     );
+}
+
+#[test]
+fn telegram_rich_message_preserves_the_complete_agent_command() {
+    let command = format!(
+        "/bin/bash -lc \"pwd && {} && echo end-of-command\"",
+        "rg --files ".repeat(40)
+    );
+    assert!(command.chars().count() > 400);
+    let mut content = TelegramRichContent::new("codex-dev".to_string());
+    content.apply(RunEvent::Output(OutputEvent::CommandExecution {
+        id: "command-1".to_string(),
+        command: command.clone(),
+        status: ProgressStatus::Running,
+        exit_code: None,
+    }));
+
+    let rendered = content.render(false);
+    let escaped_command = TelegramRichContent::escape_structural_text(&command);
+
+    assert!(rendered.contains("<pre><code class=\"language-bash\"># SHELL · ● Running\n$ "));
+    assert!(rendered.contains(&escaped_command));
+    assert!(rendered.contains("end-of-command"));
+    assert!(!rendered.contains("..."));
 }
 
 #[test]
@@ -102,12 +120,18 @@ fn telegram_rich_message_updates_the_latest_progress_marker() {
 }
 
 #[test]
-fn telegram_rich_message_keeps_all_progress_after_completion_with_latest_first() {
+fn telegram_rich_message_keeps_progress_in_its_original_phase() {
     let mut content = TelegramRichContent::new("codex-dev".to_string());
+    content.apply(RunEvent::Output(OutputEvent::Thinking {
+        text: "Plan the checks".to_string(),
+    }));
     content.apply(RunEvent::Output(OutputEvent::Progress {
         id: "command-1".to_string(),
         text: "Run tests".to_string(),
         status: ProgressStatus::Running,
+    }));
+    content.apply(RunEvent::Output(OutputEvent::Thinking {
+        text: "Review the result".to_string(),
     }));
     content.apply(RunEvent::Output(OutputEvent::Progress {
         id: "command-2".to_string(),
@@ -127,11 +151,13 @@ fn telegram_rich_message_keeps_all_progress_after_completion_with_latest_first()
     assert_eq!(rendered.matches("Check formatting").count(), 1);
     assert!(rendered.contains("× Run tests"));
     assert!(rendered.contains("✓ Check formatting"));
-    assert!(rendered.find("Run tests") < rendered.find("Check formatting"));
+    assert!(rendered.find("Plan the checks") < rendered.find("Run tests"));
+    assert!(rendered.find("Run tests") < rendered.find("Review the result"));
+    assert!(rendered.find("Review the result") < rendered.find("Check formatting"));
 }
 
 #[test]
-fn telegram_rich_message_renders_latest_thinking_first() {
+fn telegram_rich_message_renders_latest_thinking_last() {
     let mut content = TelegramRichContent::new("codex-dev".to_string());
     content.apply(RunEvent::Output(OutputEvent::Thinking {
         text: "First update".to_string(),
@@ -142,7 +168,7 @@ fn telegram_rich_message_renders_latest_thinking_first() {
 
     let rendered = content.render(false);
 
-    assert!(rendered.find("Latest update") < rendered.find("First update"));
+    assert!(rendered.find("First update") < rendered.find("Latest update"));
 }
 
 #[test]
@@ -157,6 +183,28 @@ fn telegram_rich_message_marks_running_progress_stopped_when_the_run_stops() {
     content.apply(RunEvent::Stopped);
 
     assert!(content.render(false).contains("■ Run tests"));
+}
+
+#[test]
+fn telegram_rich_message_omits_oldest_process_phases_before_latest_output() {
+    let mut content = TelegramRichContent::new("codex-dev".to_string());
+    for index in 0..500 {
+        content.apply(RunEvent::Output(OutputEvent::Thinking {
+            text: format!("phase-{index:03} {}", "detail ".repeat(20)),
+        }));
+    }
+    content.apply(RunEvent::Output(OutputEvent::Answer {
+        text: "Final answer remains visible".to_string(),
+    }));
+    content.apply(RunEvent::Completed { exit_code: 0 });
+
+    let rendered = content.render(false);
+
+    assert!(TelegramRichContent::within_limits(&rendered));
+    assert!(rendered.contains("已省略"));
+    assert!(!rendered.contains("phase-000"));
+    assert!(rendered.contains("phase-499"));
+    assert!(rendered.contains("Final answer remains visible"));
 }
 
 #[test]
@@ -246,13 +294,13 @@ fn telegram_rich_message_uses_native_thinking_only_for_active_drafts() {
     })));
     content.apply(RunEvent::Completed { exit_code: 0 });
     assert!(!content.render(true).contains("<tg-thinking>"));
-    assert_eq!(
-        content.render(false),
-        "**✦ 思考过程 · 1 条**\n\n\
-         <details><summary>◈ 推理节点 · 01</summary>\n\n\
-         Reviewing the change\n\n</details>\n\n**已完成**\n\n\
-         > **◈ TOKEN USAGE** · 1.0K tokens · Input 800 · 600 cached · Output 200 · Reasoning 100"
-    );
+    let rendered = content.render(false);
+    assert!(rendered.starts_with("<details><summary>✦ 任务过程 · 1 个阶段</summary>"));
+    assert!(rendered.contains("**01 · 思考过程**\n\n> ✦ Reviewing the change"));
+    assert!(rendered.contains("</details>\n\n**已完成**"));
+    assert!(rendered.ends_with(
+        "> **◈ TOKEN USAGE** · 1.0K tokens · Input 800 · 600 cached · Output 200 · Reasoning 100"
+    ));
 }
 
 #[test]

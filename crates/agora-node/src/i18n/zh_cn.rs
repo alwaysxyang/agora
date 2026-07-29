@@ -2,7 +2,6 @@ use super::{FailureCopy, RunStatus};
 use crate::task::ProgressStatus;
 
 pub(crate) const THINKING_TITLE: &str = "思考过程";
-pub(crate) const PROGRESS_TITLE: &str = "执行进度";
 pub(crate) const PROCESS_TITLE: &str = "任务过程";
 pub(crate) const SHELL_TITLE: &str = "SHELL";
 pub(crate) const SHELL_RUNNING: &str = "Running";
@@ -81,10 +80,6 @@ pub(crate) fn run_status(status: RunStatus) -> &'static str {
         RunStatus::Stopped => "已停止",
         RunStatus::Interrupted => "已中断",
     }
-}
-
-pub(crate) fn update_count(count: usize) -> String {
-    format!("{count} 条")
 }
 
 pub(crate) fn phase_count(count: usize) -> String {
