@@ -17,7 +17,6 @@ pub enum TlsMode {
     #[default]
     Off,
     Auto,
-    Require,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,9 +46,6 @@ impl NetworkConfig {
     pub fn validate(self) -> Result<()> {
         if self.enforcement == NetworkEnforcement::Strict {
             bail!("strict network enforcement is unavailable until native egress denial is active");
-        }
-        if self.tls != TlsMode::Off {
-            bail!("TLS termination is not implemented; use tls=off");
         }
         if self.upstream_connect_timeout.is_zero() {
             bail!("upstream_connect_timeout must be greater than zero");

@@ -12,6 +12,18 @@ pub(super) struct DomainObservation {
     pub(super) source: DomainSource,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct InspectionObservation {
+    pub(super) domain: Option<DomainObservation>,
+    pub(super) tls: Option<TlsClientHello>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TlsClientHello {
+    pub(super) server_name: Option<String>,
+    pub(super) alpn: Vec<Vec<u8>>,
+}
+
 pub(super) struct ProtocolInspector {
     buffer: Vec<u8>,
     protocol: Protocol,
@@ -27,14 +39,14 @@ impl ProtocolInspector {
 
     pub(super) fn inspect(&mut self, bytes: &[u8]) -> InspectionState {
         if self.protocol == Protocol::Done {
-            return InspectionState::Complete(None);
+            return InspectionState::Complete(InspectionObservation::default());
         }
         if bytes.is_empty() {
             return InspectionState::Pending;
         }
         if self.buffer.len().saturating_add(bytes.len()) > MAX_INSPECTION_BYTES {
             self.finish();
-            return InspectionState::Complete(None);
+            return InspectionState::Complete(InspectionObservation::default());
         }
         self.buffer.extend_from_slice(bytes);
         if self.protocol == Protocol::Unknown {
@@ -49,7 +61,9 @@ impl ProtocolInspector {
         let result = match self.protocol {
             Protocol::Http => Self::inspect_http(&self.buffer),
             Protocol::Tls => Self::inspect_tls(&self.buffer),
-            Protocol::Unknown | Protocol::Done => InspectionResult::Complete(None),
+            Protocol::Unknown | Protocol::Done => {
+                InspectionResult::Complete(InspectionObservation::default())
+            }
         };
         match result {
             InspectionResult::Pending => InspectionState::Pending,
@@ -59,7 +73,7 @@ impl ProtocolInspector {
             }
             InspectionResult::Invalid => {
                 self.finish();
-                InspectionState::Complete(None)
+                InspectionState::Complete(InspectionObservation::default())
             }
         }
     }
@@ -79,7 +93,10 @@ impl ProtocolInspector {
                         domain,
                         source: DomainSource::HttpHost,
                     });
-                InspectionResult::Complete(observation)
+                InspectionResult::Complete(InspectionObservation {
+                    domain: observation,
+                    tls: None,
+                })
             }
             Err(_) => InspectionResult::Invalid,
         }
@@ -94,15 +111,22 @@ impl ProtocolInspector {
         match acceptor.accept() {
             Ok(None) => InspectionResult::Pending,
             Ok(Some(accepted)) => {
-                let observation = accepted
-                    .client_hello()
+                let hello = accepted.client_hello();
+                let server_name = hello
                     .server_name()
-                    .and_then(|domain| Self::normalize_domain(domain.as_bytes()))
-                    .map(|domain| DomainObservation {
-                        domain,
-                        source: DomainSource::TlsSni,
-                    });
-                InspectionResult::Complete(observation)
+                    .and_then(|value| Self::normalize_domain(value.as_bytes()));
+                let domain = server_name.as_ref().map(|value| DomainObservation {
+                    domain: value.clone(),
+                    source: DomainSource::TlsSni,
+                });
+                let alpn = hello
+                    .alpn()
+                    .map(|protocols| protocols.map(<[u8]>::to_vec).collect())
+                    .unwrap_or_default();
+                InspectionResult::Complete(InspectionObservation {
+                    domain,
+                    tls: Some(TlsClientHello { server_name, alpn }),
+                })
             }
             Err(_) => InspectionResult::Invalid,
         }
@@ -138,7 +162,7 @@ impl ProtocolInspector {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum InspectionState {
     Pending,
-    Complete(Option<DomainObservation>),
+    Complete(InspectionObservation),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +175,6 @@ enum Protocol {
 
 enum InspectionResult {
     Pending,
-    Complete(Option<DomainObservation>),
+    Complete(InspectionObservation),
     Invalid,
 }

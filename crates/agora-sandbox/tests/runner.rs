@@ -1,6 +1,8 @@
 use agora_sandbox::callback::{Decision, EventType, NetworkEvent, NoopCallback};
 use agora_sandbox::network::{NetworkEnforcement, TlsMode};
 use agora_sandbox::runner::{Sandbox, SandboxCommand, SandboxConfig};
+#[cfg(target_os = "macos")]
+use base64::Engine;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::os::fd::FromRawFd;
@@ -75,7 +77,7 @@ fn hook_library() -> PathBuf {
 }
 
 #[test]
-fn unsupported_enforcement_and_tls_modes_fail_validation() {
+fn unsupported_enforcement_and_missing_tls_ca_fail_validation() {
     let hook = PathBuf::from("/tmp/hook.dylib");
     let mut config = SandboxConfig::new(&hook);
     config.network.enforcement = NetworkEnforcement::Strict;
@@ -83,9 +85,42 @@ fn unsupported_enforcement_and_tls_modes_fail_validation() {
     assert!(error.to_string().contains("strict network enforcement"));
 
     config.network.enforcement = NetworkEnforcement::Intercept;
-    config.network.tls = TlsMode::Require;
+    config.network.tls = TlsMode::Auto;
     let error = config.validate().unwrap_err();
-    assert!(error.to_string().contains("TLS termination"));
+    assert!(
+        error
+            .to_string()
+            .contains("requires a CA certificate and private key")
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_rejects_a_malformed_tls_ca_before_starting_the_child() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-malformed-ca-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let certificate = directory.join("ca.pem");
+    let private_key = directory.join("ca-key.pem");
+    let marker = directory.join("child-started");
+    std::fs::write(&certificate, b"not a certificate").unwrap();
+    std::fs::write(&private_key, b"not a private key").unwrap();
+    let mut config = SandboxConfig::new(hook_library()).with_tls_ca(&certificate, &private_key);
+    config.network.tls = TlsMode::Auto;
+    let command = SandboxCommand::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("touch {}", marker.display()));
+
+    let error = Sandbox::new(config, NoopCallback)
+        .run(command)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("TLS CA certificate"));
+    assert!(!marker.exists());
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]
@@ -110,7 +145,7 @@ fn exits_with_seven() {
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 #[test]
 fn records_current_executable() {
     let Some(output) = std::env::var_os("AGORA_SANDBOX_TEST_CURRENT_EXE") else {
@@ -437,7 +472,7 @@ async fn injected_hook_routes_a_real_child_connection_through_the_proxy() {
     );
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn runner_uses_and_removes_a_temporary_executable_copy() {
     let directory = std::env::temp_dir().join(format!(
@@ -468,7 +503,57 @@ async fn runner_uses_and_removes_a_temporary_executable_copy() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_injects_a_process_local_sec_trust_anchor() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-trust-anchor-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let anchor = directory.join("ca.der");
+    let leaf = directory.join("leaf.der");
+    std::fs::write(
+        &anchor,
+        base64::engine::general_purpose::STANDARD
+            .decode(include_str!("fixtures/test-ca.der.b64").trim())
+            .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &leaf,
+        base64::engine::general_purpose::STANDARD
+            .decode(include_str!("fixtures/test-leaf.der.b64").trim())
+            .unwrap(),
+    )
+    .unwrap();
+
+    let command = SandboxCommand::new("/usr/bin/security")
+        .arg("verify-cert")
+        .arg("-c")
+        .arg(&leaf)
+        .arg("-p")
+        .arg("ssl")
+        .arg("-d")
+        .arg("2026-08-01-00:00:00")
+        .arg("-s")
+        .arg("example.test");
+    let config = SandboxConfig::new(hook_library()).with_tls_trust_anchor(&anchor);
+
+    let outcome = Sandbox::new(config, NoopCallback)
+        .run(command)
+        .await
+        .unwrap();
+
+    assert!(
+        outcome.status().success(),
+        "security verify-cert failed with {:?}",
+        outcome.status()
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn copied_bash_routes_system_curl_through_the_proxy() {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -528,7 +613,7 @@ async fn copied_bash_routes_system_curl_through_the_proxy() {
     );
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn runner_terminates_background_descendants_before_returning() {
     let directory = std::env::temp_dir().join(format!(

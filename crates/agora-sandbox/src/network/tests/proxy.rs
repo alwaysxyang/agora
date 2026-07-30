@@ -1,16 +1,20 @@
-use super::super::{NetworkConfig, NetworkController, NetworkRunContext, NetworkRuntime};
+use super::super::tls::{TlsAuthority, TlsBridge};
+use super::super::{NetworkConfig, NetworkController, NetworkRunContext, NetworkRuntime, TlsMode};
 use crate::callback::{
     BasicAuth, Callback, Decision, DomainSource, EventType, HttpProxy, NetworkEvent, Proxy,
+    TlsOutcome, TlsPolicy,
 };
 use crate::protocol::{
     ConnectRequest, HookOperation, PROTOCOL_VERSION, ProcessIdentity, encode_connect_request,
 };
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, RootCertStore};
+use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 #[derive(Clone, Default)]
 struct EventLog(Arc<Mutex<Vec<NetworkEvent>>>);
@@ -62,6 +66,19 @@ impl ProxyFixture {
         .unwrap();
         Self { controller, events }
     }
+
+    async fn start_with_tls(config: NetworkConfig, tls: TlsBridge) -> Self {
+        let events = EventLog::default();
+        let controller = NetworkController::start_with_tls_for_test(
+            config,
+            NetworkRunContext::new("sandbox-1", "run-1"),
+            events.clone(),
+            tls,
+        )
+        .await
+        .unwrap();
+        Self { controller, events }
+    }
 }
 
 fn connect_request(
@@ -101,6 +118,43 @@ async fn echo_server() -> SocketAddr {
         }
     });
     address
+}
+
+async fn tls_echo_server(identity: &str) -> (SocketAddr, CertificateDer<'static>) {
+    let (issuer, root) = test_ca();
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(vec![identity.to_string()]).unwrap();
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    let certificate = params.signed_by(&key, &issuer).unwrap();
+    let private_key = PrivatePkcs8KeyDer::from(key.serialize_der());
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certificate.der().clone(), root.clone()],
+            private_key.into(),
+        )
+        .unwrap();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let mut stream = acceptor.accept(stream).await.unwrap();
+                let mut buffer = [0_u8; 64];
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    stream.write_all(&buffer[..read]).await.unwrap();
+                }
+            });
+        }
+    });
+    (address, root)
 }
 
 async fn open_tunnel(
@@ -650,4 +704,155 @@ async fn connection_limit_rejects_excess_tunnels() {
     assert_eq!(&echoed, b"one");
     drop(first);
     fixture.controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn auto_tls_intercepts_and_relays_with_the_upstream_alpn() {
+    let identity = "origin.example.test";
+    let (destination, origin_root) = tls_echo_server(identity).await;
+    let (authority, interception_root) = interception_authority();
+    let tls = TlsBridge::with_root_certificates(authority, vec![origin_root]).unwrap();
+    let config = NetworkConfig {
+        tls: TlsMode::Auto,
+        ..NetworkConfig::default()
+    };
+    let fixture = ProxyFixture::start_with_tls(config, tls).await;
+    let runtime = fixture.controller.runtime().clone();
+    let request = connect_request(&runtime, destination, "connection-tls-intercepted");
+    let tunnel = open_tunnel(&runtime, &request, &[]).await;
+    let mut roots = RootCertStore::empty();
+    roots.add(interception_root).unwrap();
+    let mut client_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let connector = TlsConnector::from(Arc::new(client_config));
+    let mut client = connector
+        .connect(ServerName::try_from(identity.to_string()).unwrap(), tunnel)
+        .await
+        .unwrap();
+
+    client.write_all(b"hello").await.unwrap();
+    let mut echoed = [0_u8; 5];
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"hello");
+    assert_eq!(client.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+    client.shutdown().await.unwrap();
+
+    fixture.events.wait_for_len(3).await;
+    let events = fixture.events.snapshot();
+    let established = events
+        .iter()
+        .find(|event| event.event_type == EventType::NetworkConnectEstablished)
+        .unwrap();
+    let tls = established.tls.as_ref().unwrap();
+    assert_eq!(tls.policy, TlsPolicy::Auto);
+    assert_eq!(tls.outcome, TlsOutcome::Terminated);
+    assert_eq!(tls.alpn.as_deref(), Some("h2"));
+
+    fixture.controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn tls_interception_rejects_an_untrusted_upstream_certificate() {
+    let identity = "untrusted.example.test";
+    let (destination, _) = tls_echo_server(identity).await;
+    let (authority, interception_root) = interception_authority();
+    let (_, wrong_root) = test_ca();
+    let tls = TlsBridge::with_root_certificates(authority, vec![wrong_root]).unwrap();
+    let config = NetworkConfig {
+        tls: TlsMode::Auto,
+        ..NetworkConfig::default()
+    };
+    let fixture = ProxyFixture::start_with_tls(config, tls).await;
+    let runtime = fixture.controller.runtime().clone();
+    let request = connect_request(&runtime, destination, "connection-tls-untrusted");
+    let tunnel = open_tunnel(&runtime, &request, &[]).await;
+    let mut roots = RootCertStore::empty();
+    roots.add(interception_root).unwrap();
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(client_config));
+
+    assert!(
+        connector
+            .connect(ServerName::try_from(identity.to_string()).unwrap(), tunnel)
+            .await
+            .is_err()
+    );
+    fixture.events.wait_for_len(2).await;
+    let events = fixture.events.snapshot();
+    let failed = events
+        .iter()
+        .find(|event| event.event_type == EventType::NetworkConnectFailed)
+        .unwrap();
+    assert_eq!(failed.tls.as_ref().unwrap().outcome, TlsOutcome::Failed);
+
+    fixture.controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn auto_tls_passes_plaintext_through_unchanged() {
+    let destination = echo_server().await;
+    let (authority, _) = interception_authority();
+    let (_, origin_root) = test_ca();
+    let tls = TlsBridge::with_root_certificates(authority, vec![origin_root]).unwrap();
+    let config = NetworkConfig {
+        tls: TlsMode::Auto,
+        ..NetworkConfig::default()
+    };
+    let fixture = ProxyFixture::start_with_tls(config, tls).await;
+    let runtime = fixture.controller.runtime().clone();
+    let request = connect_request(&runtime, destination, "connection-plaintext-passthrough");
+    let mut client = open_tunnel(&runtime, &request, b"plaintext").await;
+    let mut echoed = [0_u8; 9];
+
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"plaintext");
+    fixture.events.wait_for_len(2).await;
+    let events = fixture.events.snapshot();
+    let established = events
+        .iter()
+        .find(|event| event.event_type == EventType::NetworkConnectEstablished)
+        .unwrap();
+    assert!(established.tls.is_none());
+
+    drop(client);
+    fixture.controller.shutdown().await.unwrap();
+}
+
+fn interception_authority() -> (TlsAuthority, CertificateDer<'static>) {
+    let (certificate, key) = test_ca_pem();
+    let root = rustls_pemfile::certs(&mut certificate.as_bytes())
+        .next()
+        .unwrap()
+        .unwrap();
+    let authority = TlsAuthority::from_pem(certificate.as_bytes(), key.as_bytes(), 16).unwrap();
+    (authority, root)
+}
+
+fn test_ca() -> (CertifiedIssuer<'static, KeyPair>, CertificateDer<'static>) {
+    let key = KeyPair::generate().unwrap();
+    let params = ca_params();
+    let issuer = CertifiedIssuer::self_signed(params, key).unwrap();
+    let root = issuer.der().clone();
+    (issuer, root)
+}
+
+fn test_ca_pem() -> (String, String) {
+    let key = KeyPair::generate().unwrap();
+    let certificate = ca_params().self_signed(&key).unwrap();
+    (certificate.pem(), key.serialize_pem())
+}
+
+fn ca_params() -> CertificateParams {
+    let mut params = CertificateParams::new(vec!["Agora Test CA".to_string()]).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    params
 }

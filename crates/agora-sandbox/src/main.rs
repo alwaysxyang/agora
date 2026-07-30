@@ -4,10 +4,11 @@ use agora_core::lifecycle::{
 };
 use agora_sandbox::{
     callback::{Callback, Decision, EventType, NetworkEvent},
+    network::TlsMode,
     runner::{Sandbox, SandboxCommand, SandboxConfig},
 };
 use anyhow::{Context, Result};
-use clap::{ColorChoice, Parser};
+use clap::{ColorChoice, Parser, ValueEnum};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -34,6 +35,38 @@ struct Arguments {
     /// Path for JSON Lines audit records; defaults to stdout
     #[arg(long)]
     audit_file: Option<PathBuf>,
+
+    /// Path to a DER CA certificate trusted by sandboxed SecTrust TLS clients
+    #[arg(long)]
+    tls_trust_anchor: Option<PathBuf>,
+
+    /// TLS interception mode
+    #[arg(long, value_enum, default_value_t = TlsArgument::Off)]
+    tls: TlsArgument,
+
+    /// Path to the PEM CA certificate used for TLS interception
+    #[arg(long, requires = "tls_ca_key")]
+    tls_ca_cert: Option<PathBuf>,
+
+    /// Path to the PEM CA private key used for TLS interception
+    #[arg(long, requires = "tls_ca_cert")]
+    tls_ca_key: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum TlsArgument {
+    #[default]
+    Off,
+    Auto,
+}
+
+impl From<TlsArgument> for TlsMode {
+    fn from(value: TlsArgument) -> Self {
+        match value {
+            TlsArgument::Off => Self::Off,
+            TlsArgument::Auto => Self::Auto,
+        }
+    }
 }
 
 struct JsonCallback {
@@ -173,7 +206,14 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
         Some(path) => path,
         None => default_hook_library()?,
     };
-    let config = SandboxConfig::new(hook_library);
+    let mut config = SandboxConfig::new(hook_library);
+    config.network.tls = arguments.tls.into();
+    if let Some(anchor) = arguments.tls_trust_anchor {
+        config = config.with_tls_trust_anchor(anchor);
+    }
+    if let (Some(certificate), Some(private_key)) = (arguments.tls_ca_cert, arguments.tls_ca_key) {
+        config = config.with_tls_ca(certificate, private_key);
+    }
     let command = parse_command(&arguments.command)?;
     let callback = JsonCallback::new(arguments.audit_file.as_deref())?;
 

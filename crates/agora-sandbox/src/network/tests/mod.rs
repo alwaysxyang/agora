@@ -1,9 +1,10 @@
 mod proxy;
 
 use super::inspection::DomainObservation;
-use super::{NetworkConfig, NetworkController, NetworkRunContext, NetworkState};
+use super::{NetworkConfig, NetworkController, NetworkRunContext, NetworkState, TlsMode};
 use crate::callback::{DomainSource, NoopCallback};
 use crate::protocol::{HookOperation, ProcessIdentity, RouteRegistration};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 fn registration() -> RouteRegistration {
@@ -87,6 +88,39 @@ async fn controller_reports_an_unexpected_listener_exit() {
     let error = controller.wait_failure().await;
 
     assert!(error.to_string().contains("proxy listener"));
+}
+
+#[tokio::test]
+async fn controller_starts_tls_interception_from_a_fixed_ca() {
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(vec!["Agora Sandbox Test CA".to_string()]).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let certificate = params.self_signed(&key).unwrap();
+    let config = NetworkConfig {
+        tls: TlsMode::Auto,
+        ..NetworkConfig::default()
+    };
+
+    let controller = NetworkController::start_with_tls_ca(
+        config,
+        NetworkRunContext::new("sandbox", "run"),
+        NoopCallback,
+        certificate.pem().as_bytes(),
+        key.serialize_pem().as_bytes(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        controller.runtime().tls_trust_anchor_der(),
+        Some(certificate.der().as_ref())
+    );
+    controller.shutdown().await.unwrap();
 }
 
 #[test]

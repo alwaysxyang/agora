@@ -36,6 +36,8 @@ fn hook_configuration_requires_all_runtime_values() {
     ]);
     let config = HookConfig::from_getter(|key| values.get(key).map(ToString::to_string)).unwrap();
 
+    assert_eq!(config.tls_trust_anchor_der(), None);
+
     assert_eq!(
         config.proxy_for(SocketAddr::from(([203, 0, 113, 10], 443))),
         SocketAddr::from(([127, 0, 0, 1], 41000))
@@ -55,6 +57,27 @@ fn hook_configuration_requires_all_runtime_values() {
     })
     .unwrap_err();
     assert!(error.contains("AGORA_SANDBOX_TOKEN"));
+}
+
+#[test]
+fn hook_configuration_propagates_an_optional_tls_trust_anchor() {
+    let values = HashMap::from([
+        ("AGORA_SANDBOX_TOKEN", "token"),
+        ("AGORA_SANDBOX_PROXY_IPV4", "127.0.0.1:41000"),
+        ("AGORA_SANDBOX_PROXY_IPV6", "[::1]:41001"),
+        ("AGORA_SANDBOX_EXECUTION_CONTROL", "127.0.0.1:41002"),
+        ("AGORA_SANDBOX_EXECUTION_TOKEN", "execution-token"),
+        ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
+        ("AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER", "Y2VydGlmaWNhdGU="),
+    ]);
+
+    let config = HookConfig::from_getter(|key| values.get(key).map(ToString::to_string)).unwrap();
+
+    assert_eq!(config.tls_trust_anchor_der(), Some("Y2VydGlmaWNhdGU="));
+    assert!(config.child_environment().contains(&(
+        "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER",
+        "Y2VydGlmaWNhdGU=".to_string()
+    )));
 }
 
 #[test]

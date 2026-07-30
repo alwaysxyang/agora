@@ -1,0 +1,212 @@
+use anyhow::{Context, Result, bail};
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, Issuer, KeyPair,
+    KeyUsagePurpose, PublicKeyData,
+};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use rustls::sign::CertifiedKey;
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard};
+use time::{Duration, OffsetDateTime};
+use x509_parser::prelude::{FromDer, X509Certificate};
+
+const LEAF_VALIDITY: Duration = Duration::days(1);
+const CLOCK_SKEW: Duration = Duration::minutes(5);
+
+pub(in crate::network) struct TlsAuthority {
+    issuer: Issuer<'static, KeyPair>,
+    trust_anchor_der: Vec<u8>,
+    cache: Mutex<CertificateCache>,
+}
+
+impl fmt::Debug for TlsAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TlsAuthority")
+            .field("trust_anchor_der_len", &self.trust_anchor_der.len())
+            .field("cache_capacity", &lock(&self.cache).capacity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TlsAuthority {
+    pub(in crate::network) fn from_pem(
+        certificate_pem: &[u8],
+        private_key_pem: &[u8],
+        cache_capacity: usize,
+    ) -> Result<Self> {
+        if cache_capacity == 0 {
+            bail!("TLS certificate cache capacity must be greater than zero");
+        }
+        let certificate_der = parse_ca_certificate(certificate_pem)?;
+        let private_key = std::str::from_utf8(private_key_pem)
+            .context("TLS CA private key is not valid UTF-8 PEM")?;
+        let private_key = KeyPair::from_pem(private_key).context("failed to parse TLS CA key")?;
+        validate_ca(&certificate_der, &private_key)?;
+        let issuer = Issuer::from_ca_cert_der(&certificate_der, private_key)
+            .context("failed to initialize TLS CA issuer")?;
+
+        Ok(Self {
+            issuer,
+            trust_anchor_der: certificate_der.to_vec(),
+            cache: Mutex::new(CertificateCache::new(cache_capacity)),
+        })
+    }
+
+    pub(super) fn issue(&self, identity: &str) -> Result<Arc<IssuedCertificate>> {
+        let identity = normalize_identity(identity)?;
+        if let Some(certificate) = lock(&self.cache).get(&identity) {
+            return Ok(certificate);
+        }
+
+        let signing_key = KeyPair::generate().context("failed to generate TLS leaf key")?;
+        let mut params = CertificateParams::new(vec![identity.clone()])
+            .context("failed to create TLS leaf certificate parameters")?;
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - CLOCK_SKEW;
+        params.not_after = now + LEAF_VALIDITY;
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, identity.clone());
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.use_authority_key_identifier_extension = true;
+        let certificate = params
+            .signed_by(&signing_key, &self.issuer)
+            .context("failed to sign TLS leaf certificate")?;
+        let certificate_der = certificate.der().clone();
+        let private_key = PrivatePkcs8KeyDer::from(signing_key.serialize_der());
+        let certified_key = CertifiedKey::from_der(
+            vec![certificate_der.clone()],
+            private_key.into(),
+            &rustls::crypto::aws_lc_rs::default_provider(),
+        )
+        .context("failed to prepare TLS leaf certificate")?;
+        let issued = Arc::new(IssuedCertificate {
+            certified_key: Arc::new(certified_key),
+        });
+        lock(&self.cache).insert(identity, Arc::clone(&issued));
+        Ok(issued)
+    }
+
+    pub(in crate::network) fn trust_anchor_der(&self) -> Vec<u8> {
+        self.trust_anchor_der.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn cache_len(&self) -> usize {
+        lock(&self.cache).entries.len()
+    }
+}
+
+pub(super) struct IssuedCertificate {
+    certified_key: Arc<CertifiedKey>,
+}
+
+impl IssuedCertificate {
+    pub(super) fn certified_key(&self) -> Arc<CertifiedKey> {
+        Arc::clone(&self.certified_key)
+    }
+
+    #[cfg(test)]
+    pub(super) fn certificate_der(&self) -> &[u8] {
+        self.certified_key.cert[0].as_ref()
+    }
+}
+
+struct CertificateCache {
+    capacity: usize,
+    entries: HashMap<String, Arc<IssuedCertificate>>,
+    order: VecDeque<String>,
+}
+
+impl CertificateCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, identity: &str) -> Option<Arc<IssuedCertificate>> {
+        let certificate = self.entries.get(identity).cloned()?;
+        self.touch(identity);
+        Some(certificate)
+    }
+
+    fn insert(&mut self, identity: String, certificate: Arc<IssuedCertificate>) {
+        self.entries.insert(identity.clone(), certificate);
+        self.touch(&identity);
+        while self.entries.len() > self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    fn touch(&mut self, identity: &str) {
+        if let Some(index) = self.order.iter().position(|entry| entry == identity) {
+            self.order.remove(index);
+        }
+        self.order.push_back(identity.to_string());
+    }
+}
+
+fn parse_ca_certificate(pem: &[u8]) -> Result<CertificateDer<'static>> {
+    let mut certificates = rustls_pemfile::certs(&mut &*pem)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to parse TLS CA certificate PEM")?;
+    if certificates.len() != 1 {
+        bail!("TLS CA certificate PEM must contain exactly one certificate");
+    }
+    Ok(certificates.remove(0))
+}
+
+fn validate_ca(certificate_der: &CertificateDer<'_>, private_key: &KeyPair) -> Result<()> {
+    let (remainder, certificate) = X509Certificate::from_der(certificate_der)
+        .map_err(|error| anyhow::anyhow!("failed to parse TLS CA certificate: {error}"))?;
+    if !remainder.is_empty() {
+        bail!("TLS CA certificate contains trailing data");
+    }
+    let is_ca = certificate
+        .basic_constraints()
+        .context("failed to read TLS CA basic constraints")?
+        .is_some_and(|constraints| constraints.value.ca);
+    if !is_ca {
+        bail!("TLS CA certificate is not a certificate authority");
+    }
+    let can_sign = certificate
+        .key_usage()
+        .context("failed to read TLS CA key usage")?
+        .is_some_and(|usage| usage.value.key_cert_sign());
+    if !can_sign {
+        bail!("TLS CA certificate cannot sign certificates");
+    }
+    if certificate.public_key().raw != private_key.subject_public_key_info() {
+        bail!("TLS CA private key does not match the certificate");
+    }
+    Ok(())
+}
+
+fn normalize_identity(identity: &str) -> Result<String> {
+    let identity = identity.trim().trim_end_matches('.').to_ascii_lowercase();
+    if identity.is_empty() {
+        bail!("TLS certificate identity must not be empty");
+    }
+    Ok(identity)
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests;

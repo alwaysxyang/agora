@@ -12,6 +12,12 @@ const MACH_64_MAGIC: u32 = 0xfeed_facf;
 const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 const CPU_SUBTYPE_ARM64E: u32 = 2;
 
+#[derive(Debug, PartialEq, Eq)]
+struct ArchitectureSelection {
+    slice: String,
+    rewrite_arm64e: bool,
+}
+
 pub(super) struct ExecutableStore {
     directory: PathBuf,
     prepared: HashMap<PathBuf, PathBuf>,
@@ -49,16 +55,14 @@ impl ExecutableStore {
         }
 
         let architectures = Self::architectures(&source)?;
-        let selected = if architectures.iter().any(|value| value == "arm64") {
-            "arm64"
-        } else if architectures.iter().any(|value| value == "arm64e") {
-            "arm64e"
-        } else {
-            bail!(
-                "executable {} has no supported arm64 architecture",
-                source.display()
-            );
-        };
+        let selected = Self::select_architecture(Self::native_architecture(), &architectures)
+            .with_context(|| {
+                format!(
+                    "executable {} is incompatible with sandbox build target {}",
+                    source.display(),
+                    Self::native_architecture()
+                )
+            })?;
         let destination = self.destination(&source);
         let prepared: Result<PathBuf> = (|| {
             if architectures.len() == 1 {
@@ -75,7 +79,7 @@ impl ExecutableStore {
                     [
                         source.as_os_str(),
                         OsStr::new("-thin"),
-                        OsStr::new(selected),
+                        OsStr::new(&selected.slice),
                         OsStr::new("-output"),
                         destination.as_os_str(),
                     ],
@@ -87,7 +91,7 @@ impl ExecutableStore {
                 &destination,
                 fs::Permissions::from_mode(source_mode | 0o200),
             )?;
-            if selected == "arm64e" {
+            if selected.rewrite_arm64e {
                 Self::rewrite_arm64e_subtype(&destination)?;
             }
             Self::run_tool(
@@ -169,6 +173,32 @@ impl ExecutableStore {
             .split_ascii_whitespace()
             .map(ToString::to_string)
             .collect())
+    }
+
+    fn native_architecture() -> &'static str {
+        match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            architecture => architecture,
+        }
+    }
+
+    fn select_architecture(
+        target: &str,
+        architectures: &[String],
+    ) -> Result<ArchitectureSelection> {
+        if architectures.iter().any(|value| value == target) {
+            return Ok(ArchitectureSelection {
+                slice: target.to_string(),
+                rewrite_arm64e: false,
+            });
+        }
+        if target == "arm64" && architectures.iter().any(|value| value == "arm64e") {
+            return Ok(ArchitectureSelection {
+                slice: "arm64e".to_string(),
+                rewrite_arm64e: true,
+            });
+        }
+        bail!("no architecture compatible with build target {target}")
     }
 
     fn rewrite_arm64e_subtype(path: &Path) -> Result<()> {

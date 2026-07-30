@@ -112,6 +112,10 @@ async fn async_main_reports_a_missing_hook_before_starting_a_child() {
         command: "/bin/true".to_string(),
         hook_library: Some(PathBuf::from("/missing/agora-hook.dylib")),
         audit_file: None,
+        tls_trust_anchor: None,
+        tls: super::TlsArgument::Off,
+        tls_ca_cert: None,
+        tls_ca_key: None,
     };
 
     assert!(

@@ -7,14 +7,16 @@ const PROXY_IPV6: &str = "AGORA_SANDBOX_PROXY_IPV6";
 const EXECUTION_CONTROL: &str = "AGORA_SANDBOX_EXECUTION_CONTROL";
 const EXECUTION_TOKEN: &str = "AGORA_SANDBOX_EXECUTION_TOKEN";
 const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
+const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
 
-pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 6] = [
+pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 7] = [
     TOKEN,
     PROXY_IPV4,
     PROXY_IPV6,
     EXECUTION_CONTROL,
     EXECUTION_TOKEN,
     HOOK_LIBRARIES,
+    TLS_TRUST_ANCHOR_DER,
 ];
 
 #[derive(Clone, Debug)]
@@ -25,6 +27,7 @@ pub(super) struct HookConfig {
     execution_control: SocketAddr,
     execution_token: String,
     hook_libraries: String,
+    tls_trust_anchor_der: Option<String>,
 }
 
 impl HookConfig {
@@ -45,6 +48,7 @@ impl HookConfig {
             .map_err(|error| format!("invalid {EXECUTION_CONTROL}: {error}"))?;
         let execution_token = Self::required(&mut get, EXECUTION_TOKEN)?;
         let hook_libraries = Self::required(&mut get, HOOK_LIBRARIES)?;
+        let tls_trust_anchor_der = get(TLS_TRUST_ANCHOR_DER).filter(|value| !value.is_empty());
         if !proxy_ipv4.ip().is_loopback() || !matches!(proxy_ipv4.ip(), IpAddr::V4(_)) {
             return Err(format!("{PROXY_IPV4} must be an IPv4 loopback address"));
         }
@@ -64,6 +68,7 @@ impl HookConfig {
             execution_control,
             execution_token,
             hook_libraries,
+            tls_trust_anchor_der,
         })
     }
 
@@ -90,15 +95,23 @@ impl HookConfig {
         &self.hook_libraries
     }
 
-    pub(super) fn child_environment(&self) -> [(&'static str, String); 6] {
-        [
+    pub(super) fn tls_trust_anchor_der(&self) -> Option<&str> {
+        self.tls_trust_anchor_der.as_deref()
+    }
+
+    pub(super) fn child_environment(&self) -> Vec<(&'static str, String)> {
+        let mut environment = vec![
             (TOKEN, self.token.clone()),
             (PROXY_IPV4, self.proxy_ipv4.to_string()),
             (PROXY_IPV6, self.proxy_ipv6.to_string()),
             (EXECUTION_CONTROL, self.execution_control.to_string()),
             (EXECUTION_TOKEN, self.execution_token.clone()),
             (HOOK_LIBRARIES, self.hook_libraries.clone()),
-        ]
+        ];
+        if let Some(anchor) = &self.tls_trust_anchor_der {
+            environment.push((TLS_TRUST_ANCHOR_DER, anchor.clone()));
+        }
+        environment
     }
 
     pub(super) fn is_internal(&self, destination: SocketAddr) -> bool {

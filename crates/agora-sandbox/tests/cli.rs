@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use base64::Engine;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -52,8 +54,31 @@ fn sandbox_cli_documents_only_available_options() {
     assert!(stdout.contains("-c, --command <COMMAND>"));
     assert!(stdout.contains("--hook-library <HOOK_LIBRARY>"));
     assert!(stdout.contains("--audit-file <AUDIT_FILE>"));
+    assert!(stdout.contains("--tls-trust-anchor <TLS_TRUST_ANCHOR>"));
+    assert!(stdout.contains("--tls <TLS>"));
+    assert!(stdout.contains("[possible values: off, auto]"));
+    assert!(!stdout.contains("off, auto, require"));
+    assert!(stdout.contains("--tls-ca-cert <TLS_CA_CERT>"));
+    assert!(stdout.contains("--tls-ca-key <TLS_CA_KEY>"));
     assert!(!stdout.contains("--network-enforcement"));
-    assert!(!stdout.contains("--tls"));
+}
+
+#[test]
+fn sandbox_cli_requires_both_tls_ca_files() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .args([
+            "--tls",
+            "auto",
+            "--tls-ca-cert",
+            "/tmp/ca.pem",
+            "-c",
+            "/bin/true",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--tls-ca-key"));
 }
 
 #[test]
@@ -64,6 +89,54 @@ fn sandbox_cli_requires_a_command() {
 
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--command <COMMAND>"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_cli_injects_the_configured_tls_trust_anchor() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-cli-trust-anchor-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let anchor = directory.join("ca.der");
+    let leaf = directory.join("leaf.der");
+    std::fs::write(
+        &anchor,
+        base64::engine::general_purpose::STANDARD
+            .decode(include_str!("fixtures/test-ca.der.b64").trim())
+            .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &leaf,
+        base64::engine::general_purpose::STANDARD
+            .decode(include_str!("fixtures/test-leaf.der.b64").trim())
+            .unwrap(),
+    )
+    .unwrap();
+
+    let command = format!(
+        "/usr/bin/security verify-cert -c {} -p ssl -d 2026-08-01-00:00:00 -s example.test",
+        leaf.display()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .arg("--hook-library")
+        .arg(hook_library())
+        .arg("--tls-trust-anchor")
+        .arg(&anchor)
+        .arg("-c")
+        .arg(command)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

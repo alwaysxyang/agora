@@ -2,12 +2,14 @@ mod config;
 mod http_proxy;
 mod inspection;
 mod proxy;
+mod tls;
 
 pub use config::{NetworkConfig, NetworkEnforcement, TlsMode};
 
 use crate::callback::{
     Callback, Decision, DomainSource, EVENT_SCHEMA_VERSION, EventMetrics, EventResult, EventStatus,
     EventType, NetworkContext, NetworkEvent, NetworkProtocol, ProcessContext, Proxy, Subsystem,
+    TlsContext,
 };
 use crate::protocol::{ConnectRequest, PROTOCOL_VERSION, ProtocolError, RouteRegistration};
 use anyhow::{Context, Result};
@@ -17,6 +19,7 @@ use inspection::DomainObservation;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tls::{TlsAuthority, TlsBridge};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
@@ -42,6 +45,7 @@ pub(crate) struct NetworkRuntime {
     token: String,
     proxy_ipv4: SocketAddr,
     proxy_ipv6: SocketAddr,
+    tls_trust_anchor_der: Option<Vec<u8>>,
 }
 
 impl NetworkRuntime {
@@ -55,6 +59,10 @@ impl NetworkRuntime {
 
     pub(crate) fn proxy_ipv6(&self) -> SocketAddr {
         self.proxy_ipv6
+    }
+
+    pub(crate) fn tls_trust_anchor_der(&self) -> Option<&[u8]> {
+        self.tls_trust_anchor_der.as_deref()
     }
 }
 
@@ -73,8 +81,55 @@ impl NetworkController {
     where
         C: Callback,
     {
-        config.validate()?;
+        Self::start_inner(config, context, callback, None).await
+    }
 
+    pub(crate) async fn start_with_tls_ca<C>(
+        config: NetworkConfig,
+        context: NetworkRunContext,
+        callback: C,
+        certificate_pem: &[u8],
+        private_key_pem: &[u8],
+    ) -> Result<Self>
+    where
+        C: Callback,
+    {
+        const CERTIFICATE_CACHE_CAPACITY: usize = 2048;
+
+        let authority =
+            TlsAuthority::from_pem(certificate_pem, private_key_pem, CERTIFICATE_CACHE_CAPACITY)?;
+        let tls = TlsBridge::new(authority)?;
+        Self::start_inner(config, context, callback, Some(Arc::new(tls))).await
+    }
+
+    #[cfg(test)]
+    pub(in crate::network) async fn start_with_tls_for_test<C>(
+        config: NetworkConfig,
+        context: NetworkRunContext,
+        callback: C,
+        tls: TlsBridge,
+    ) -> Result<Self>
+    where
+        C: Callback,
+    {
+        Self::start_inner(config, context, callback, Some(Arc::new(tls))).await
+    }
+
+    async fn start_inner<C>(
+        config: NetworkConfig,
+        context: NetworkRunContext,
+        callback: C,
+        tls: Option<Arc<TlsBridge>>,
+    ) -> Result<Self>
+    where
+        C: Callback,
+    {
+        config.validate()?;
+        if config.tls != TlsMode::Off && tls.is_none() {
+            anyhow::bail!("TLS interception requires a configured CA certificate and private key");
+        }
+
+        let tls_trust_anchor_der = tls.as_deref().map(TlsBridge::trust_anchor_der);
         let token = Uuid::new_v4().simple().to_string();
         let ipv4_listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -90,6 +145,7 @@ impl NetworkController {
             context,
             token: token.clone(),
             callback,
+            tls,
             connections: Arc::new(Semaphore::new(max_connections)),
         });
         let (shutdown, shutdown_receiver) = watch::channel(false);
@@ -104,6 +160,7 @@ impl NetworkController {
                 token,
                 proxy_ipv4,
                 proxy_ipv6,
+                tls_trust_anchor_der,
             },
             shutdown,
             tasks,
@@ -165,6 +222,7 @@ where
     context: NetworkRunContext,
     token: String,
     callback: C,
+    tls: Option<Arc<TlsBridge>>,
     connections: Arc<Semaphore>,
 }
 
@@ -174,6 +232,7 @@ struct EventPublication {
     decision: Option<Decision>,
     result: EventResult,
     metrics: Option<EventMetrics>,
+    tls: Option<TlsContext>,
 }
 
 struct UpstreamConnection {
@@ -216,6 +275,7 @@ where
                     error_message: None,
                 },
                 metrics: None,
+                tls: None,
             },
         ))
         .await
@@ -244,68 +304,32 @@ where
                     error_message: reason,
                 },
                 metrics: None,
+                tls: None,
             },
         );
         let _ = self.dispatch(event).await;
     }
 
-    pub(super) async fn connect_upstream(
+    pub(super) async fn open_upstream(
         &self,
         registration: &RouteRegistration,
-        observation: Option<&DomainObservation>,
         decision: &Decision,
     ) -> io::Result<UpstreamConnection> {
         let upstream = tokio::time::timeout(
             self.config.upstream_connect_timeout,
-            Self::open_upstream(registration.destination, decision),
+            Self::dial_upstream(registration.destination, decision),
         )
         .await;
-        let result = match upstream {
+        match upstream {
             Ok(result) => result,
             Err(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "upstream connection timed out",
             )),
-        };
-
-        match &result {
-            Ok(_) => {
-                self.publish_route_event(
-                    registration,
-                    EventType::NetworkConnectEstablished,
-                    1,
-                    observation,
-                    decision.clone(),
-                    EventResult {
-                        status: EventStatus::Succeeded,
-                        error_code: None,
-                        error_message: None,
-                    },
-                )
-                .await;
-            }
-            Err(error) => {
-                let errno = error.raw_os_error();
-                let message = error.to_string();
-                self.publish_route_event(
-                    registration,
-                    EventType::NetworkConnectFailed,
-                    1,
-                    observation,
-                    decision.clone(),
-                    EventResult {
-                        status: EventStatus::Failed,
-                        error_code: errno.map(|value| value.to_string()),
-                        error_message: Some(message.clone()),
-                    },
-                )
-                .await;
-            }
         }
-        result
     }
 
-    async fn open_upstream(
+    async fn dial_upstream(
         destination: SocketAddr,
         decision: &Decision,
     ) -> io::Result<UpstreamConnection> {
@@ -330,26 +354,66 @@ where
         }
     }
 
-    async fn publish_route_event(
+    pub(super) async fn publish_established(
         &self,
         registration: &RouteRegistration,
-        event_type: EventType,
-        sequence: u64,
         observation: Option<&DomainObservation>,
-        decision: Decision,
-        result: EventResult,
+        decision: &Decision,
+        tls: Option<TlsContext>,
     ) {
-        let event = self.network_event(
+        self.publish_route_event(
             registration,
             observation,
             EventPublication {
-                event_type,
-                sequence,
-                decision: Some(decision),
-                result,
+                event_type: EventType::NetworkConnectEstablished,
+                sequence: 1,
+                decision: Some(decision.clone()),
+                result: EventResult {
+                    status: EventStatus::Succeeded,
+                    error_code: None,
+                    error_message: None,
+                },
                 metrics: None,
+                tls,
             },
-        );
+        )
+        .await;
+    }
+
+    pub(super) async fn publish_failed(
+        &self,
+        registration: &RouteRegistration,
+        observation: Option<&DomainObservation>,
+        decision: &Decision,
+        error: &io::Error,
+        tls: Option<TlsContext>,
+    ) {
+        self.publish_route_event(
+            registration,
+            observation,
+            EventPublication {
+                event_type: EventType::NetworkConnectFailed,
+                sequence: 1,
+                decision: Some(decision.clone()),
+                result: EventResult {
+                    status: EventStatus::Failed,
+                    error_code: error.raw_os_error().map(|value| value.to_string()),
+                    error_message: Some(error.to_string()),
+                },
+                metrics: None,
+                tls,
+            },
+        )
+        .await;
+    }
+
+    async fn publish_route_event(
+        &self,
+        registration: &RouteRegistration,
+        observation: Option<&DomainObservation>,
+        publication: EventPublication,
+    ) {
+        let event = self.network_event(registration, observation, publication);
         let _ = self.dispatch(event).await;
     }
 
@@ -360,6 +424,7 @@ where
         duration_ms: u64,
         observation: Option<&DomainObservation>,
         decision: &Decision,
+        tls: Option<TlsContext>,
     ) {
         let (status, error_code, error_message, metrics) = match result {
             Ok((bytes_sent, bytes_received)) => (
@@ -396,6 +461,7 @@ where
                     error_message,
                 },
                 metrics: Some(metrics),
+                tls,
             },
         );
         let _ = self.dispatch(event).await;
@@ -430,7 +496,7 @@ where
             sequence: Some(publication.sequence),
             process: Self::process_context(&registration.process),
             network: Some(Self::network_context(registration, observation)),
-            tls: None,
+            tls: publication.tls,
             decision: publication.decision,
             result: publication.result,
             metrics: publication.metrics,

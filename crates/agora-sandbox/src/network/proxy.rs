@@ -1,8 +1,8 @@
 use super::inspection::{
-    DomainObservation, InspectionState, MAX_INSPECTION_BYTES, ProtocolInspector,
+    InspectionObservation, InspectionState, MAX_INSPECTION_BYTES, ProtocolInspector,
 };
-use super::{NetworkState, UpstreamConnection};
-use crate::callback::{Callback, Decision};
+use super::{NetworkState, TlsMode, UpstreamConnection};
+use crate::callback::{Callback, Decision, TlsContext, TlsOutcome, TlsPolicy};
 use crate::protocol::{
     ConnectRequest, HANDSHAKE_TIMEOUT, MAX_FRAME_SIZE, ProtocolError, RouteRegistration,
     parse_connect_request_prefix,
@@ -22,6 +22,13 @@ where
 {
     listener: TcpListener,
     state: Arc<NetworkState<C>>,
+}
+
+struct RelayContext {
+    registration: RouteRegistration,
+    observation: InspectionObservation,
+    decision: Decision,
+    tls: Option<TlsContext>,
 }
 
 impl<C> ProxyServer<C>
@@ -88,36 +95,135 @@ where
             Ok(result) => result,
             Err(_) => return,
         };
-        let decision = state.authorize(&registration, observation.as_ref()).await;
+        let decision = state
+            .authorize(&registration, observation.domain.as_ref())
+            .await;
         if matches!(decision, Decision::Deny { .. }) {
             drop(client);
             state
-                .publish_denied(&registration, observation.as_ref(), &decision)
+                .publish_denied(&registration, observation.domain.as_ref(), &decision)
                 .await;
             return;
         }
-        if let Ok(upstream) = state
-            .connect_upstream(&registration, observation.as_ref(), &decision)
-            .await
+        let upstream = match state.open_upstream(&registration, &decision).await {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                let tls = observation
+                    .tls
+                    .as_ref()
+                    .map(|_| Self::tls_context(state.config.tls, TlsOutcome::Failed, None));
+                state
+                    .publish_failed(
+                        &registration,
+                        observation.domain.as_ref(),
+                        &decision,
+                        &error,
+                        tls,
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        if state.config.tls != TlsMode::Off
+            && let Some(hello) = observation.tls.as_ref()
         {
-            Self::relay(
-                state,
-                client,
-                upstream,
-                registration,
-                initial_data,
-                observation,
-                decision,
+            let identity = hello
+                .server_name
+                .clone()
+                .unwrap_or_else(|| registration.destination.ip().to_string());
+            let bridge = state
+                .tls
+                .as_ref()
+                .expect("validated TLS mode must have a bridge");
+            match bridge
+                .establish(
+                    client,
+                    upstream,
+                    initial_data,
+                    hello,
+                    identity,
+                    state.config.upstream_connect_timeout,
+                )
+                .await
+            {
+                Ok(connection) => {
+                    let tls = Self::tls_context(
+                        state.config.tls,
+                        TlsOutcome::Terminated,
+                        connection.alpn().map(str::to_string),
+                    );
+                    state
+                        .publish_established(
+                            &registration,
+                            observation.domain.as_ref(),
+                            &decision,
+                            Some(tls.clone()),
+                        )
+                        .await;
+                    Self::relay_tls(
+                        state,
+                        connection,
+                        RelayContext {
+                            registration,
+                            observation,
+                            decision,
+                            tls: Some(tls),
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    state
+                        .publish_failed(
+                            &registration,
+                            observation.domain.as_ref(),
+                            &decision,
+                            &error,
+                            Some(Self::tls_context(
+                                state.config.tls,
+                                TlsOutcome::Failed,
+                                None,
+                            )),
+                        )
+                        .await;
+                }
+            }
+            return;
+        }
+
+        let tls = observation
+            .tls
+            .as_ref()
+            .map(|_| Self::tls_context(state.config.tls, TlsOutcome::Passthrough, None));
+        state
+            .publish_established(
+                &registration,
+                observation.domain.as_ref(),
+                &decision,
+                tls.clone(),
             )
             .await;
-        }
+        Self::relay(
+            state,
+            client,
+            upstream,
+            initial_data,
+            RelayContext {
+                registration,
+                observation,
+                decision,
+                tls,
+            },
+        )
+        .await;
     }
 
     async fn inspect_domain(
         client: &mut TcpStream,
         mut initial_data: Vec<u8>,
         timeout: std::time::Duration,
-    ) -> io::Result<(Vec<u8>, Option<DomainObservation>)> {
+    ) -> io::Result<(Vec<u8>, InspectionObservation)> {
         let mut inspector = ProtocolInspector::new();
         if !initial_data.is_empty() {
             match inspector.inspect(&initial_data) {
@@ -152,7 +258,7 @@ where
                 }
             }
         }
-        Ok((initial_data, None))
+        Ok((initial_data, InspectionObservation::default()))
     }
 
     async fn read_request(
@@ -188,10 +294,8 @@ where
         state: Arc<NetworkState<C>>,
         client: TcpStream,
         upstream: UpstreamConnection,
-        registration: RouteRegistration,
         initial_client_data: Vec<u8>,
-        observation: Option<DomainObservation>,
-        decision: Decision,
+        context: RelayContext,
     ) {
         let started = Instant::now();
         let result = Self::copy_bidirectional(
@@ -204,13 +308,46 @@ where
         let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         state
             .publish_closed(
-                &registration,
+                &context.registration,
                 result,
                 duration_ms,
-                observation.as_ref(),
-                &decision,
+                context.observation.domain.as_ref(),
+                &context.decision,
+                context.tls,
             )
             .await;
+    }
+
+    async fn relay_tls(
+        state: Arc<NetworkState<C>>,
+        connection: super::tls::TlsConnection,
+        context: RelayContext,
+    ) {
+        let started = Instant::now();
+        let result = connection.relay().await;
+        let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        state
+            .publish_closed(
+                &context.registration,
+                result,
+                duration_ms,
+                context.observation.domain.as_ref(),
+                &context.decision,
+                context.tls,
+            )
+            .await;
+    }
+
+    fn tls_context(mode: TlsMode, outcome: TlsOutcome, alpn: Option<String>) -> TlsContext {
+        let policy = match mode {
+            TlsMode::Off => TlsPolicy::Off,
+            TlsMode::Auto => TlsPolicy::Auto,
+        };
+        TlsContext {
+            policy,
+            outcome,
+            alpn,
+        }
     }
 
     async fn copy_bidirectional(

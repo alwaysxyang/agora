@@ -1,4 +1,6 @@
-use super::inspection::{DomainObservation, InspectionState, ProtocolInspector};
+use super::inspection::{
+    DomainObservation, InspectionObservation, InspectionState, ProtocolInspector, TlsClientHello,
+};
 use crate::callback::DomainSource;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
@@ -14,26 +16,35 @@ fn http_host_is_detected_and_normalized() {
     );
     assert_eq!(
         inspector.inspect(b"Connection: close\r\n\r\n"),
-        InspectionState::Complete(Some(DomainObservation {
-            domain: "example.com".to_string(),
-            source: DomainSource::HttpHost,
-        }))
+        InspectionState::Complete(InspectionObservation {
+            domain: Some(DomainObservation {
+                domain: "example.com".to_string(),
+                source: DomainSource::HttpHost,
+            }),
+            tls: None,
+        })
     );
 }
 
 #[test]
 fn fragmented_tls_client_hello_sni_is_detected() {
-    let hello = tls_client_hello("secure.example.com");
+    let hello = tls_client_hello("secure.example.com", &[b"h2", b"http/1.1"]);
     let split = hello.len() / 2;
     let mut inspector = ProtocolInspector::new();
 
     assert_eq!(inspector.inspect(&hello[..split]), InspectionState::Pending);
     assert_eq!(
         inspector.inspect(&hello[split..]),
-        InspectionState::Complete(Some(DomainObservation {
-            domain: "secure.example.com".to_string(),
-            source: DomainSource::TlsSni,
-        }))
+        InspectionState::Complete(InspectionObservation {
+            domain: Some(DomainObservation {
+                domain: "secure.example.com".to_string(),
+                source: DomainSource::TlsSni,
+            }),
+            tls: Some(TlsClientHello {
+                server_name: Some("secure.example.com".to_string()),
+                alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            }),
+        })
     );
 }
 
@@ -43,18 +54,19 @@ fn non_http_and_non_tls_payload_has_no_domain() {
 
     assert_eq!(
         inspector.inspect(b"SSH-2.0-OpenSSH_9.9\r\n"),
-        InspectionState::Complete(None)
+        InspectionState::Complete(InspectionObservation::default())
     );
     assert_eq!(
         inspector.inspect(b"Host: misleading.example\r\n\r\n"),
-        InspectionState::Complete(None)
+        InspectionState::Complete(InspectionObservation::default())
     );
 }
 
-fn tls_client_hello(server_name: &str) -> Vec<u8> {
-    let config = ClientConfig::builder()
+fn tls_client_hello(server_name: &str, alpn: &[&[u8]]) -> Vec<u8> {
+    let mut config = ClientConfig::builder()
         .with_root_certificates(RootCertStore::empty())
         .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
     let server_name = ServerName::try_from(server_name.to_string()).expect("valid server name");
     let mut connection =
         ClientConnection::new(Arc::new(config), server_name).expect("client connection");

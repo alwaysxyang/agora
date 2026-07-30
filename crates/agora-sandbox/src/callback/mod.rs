@@ -259,7 +259,6 @@ pub struct TlsContext {
 pub enum TlsPolicy {
     Off,
     Auto,
-    Require,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

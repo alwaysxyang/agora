@@ -43,6 +43,10 @@ fn executable_store_prepares_and_caches_a_native_copy() {
     assert!(first.is_file());
     assert_ne!(first, Path::new("/bin/sh"));
     assert_eq!(
+        ExecutableStore::architectures(&first).unwrap(),
+        [ExecutableStore::native_architecture()]
+    );
+    assert_eq!(
         directory.metadata().unwrap().permissions().mode() & 0o777,
         0o700
     );
@@ -77,6 +81,7 @@ fn executable_store_rejects_non_files_and_non_executable_files() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn executable_store_rewrites_a_single_arm64e_slice() {
     let root = TestDirectory::new();
     let source = root.path().join("arm64e-sh");
@@ -98,7 +103,32 @@ fn executable_store_rewrites_a_single_arm64e_slice() {
 }
 
 #[test]
-fn executable_store_rejects_an_x86_only_slice() {
+fn architecture_selection_matches_the_build_target() {
+    let architectures = vec!["arm64".to_string(), "x86_64".to_string()];
+
+    let x86 = ExecutableStore::select_architecture("x86_64", &architectures).unwrap();
+    let arm = ExecutableStore::select_architecture("arm64", &architectures).unwrap();
+
+    assert_eq!(x86.slice, "x86_64");
+    assert!(!x86.rewrite_arm64e);
+    assert_eq!(arm.slice, "arm64");
+    assert!(!arm.rewrite_arm64e);
+}
+
+#[test]
+fn arm64e_is_only_an_arm64_fallback() {
+    let architectures = vec!["arm64e".to_string()];
+
+    let arm = ExecutableStore::select_architecture("arm64", &architectures).unwrap();
+
+    assert_eq!(arm.slice, "arm64e");
+    assert!(arm.rewrite_arm64e);
+    assert!(ExecutableStore::select_architecture("x86_64", &architectures).is_err());
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn executable_store_rejects_a_slice_incompatible_with_the_build_target() {
     let root = TestDirectory::new();
     let source = root.path().join("x86-sh");
     let status = Command::new("/usr/bin/lipo")
@@ -115,7 +145,7 @@ fn executable_store_rejects_an_x86_only_slice() {
     assert!(
         error
             .to_string()
-            .contains("no supported arm64 architecture")
+            .contains("incompatible with sandbox build target arm64")
     );
 }
 

@@ -1,8 +1,10 @@
 use crate::callback::Callback;
 #[cfg(target_os = "macos")]
 use crate::execution::{ExecutionController, resolve_executable};
-use crate::network::{NetworkConfig, NetworkController, NetworkRunContext};
+use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
 use anyhow::{Context, Result, bail};
+#[cfg(target_os = "macos")]
+use base64::Engine;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 #[cfg(target_os = "macos")]
@@ -26,11 +28,21 @@ const EXECUTION_CONTROL: &str = "AGORA_SANDBOX_EXECUTION_CONTROL";
 const EXECUTION_TOKEN: &str = "AGORA_SANDBOX_EXECUTION_TOKEN";
 #[cfg(target_os = "macos")]
 const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
+#[cfg(target_os = "macos")]
+const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
 
 #[derive(Clone, Debug)]
 pub struct SandboxConfig {
     pub network: NetworkConfig,
     hook_library: PathBuf,
+    tls_trust_anchor: Option<PathBuf>,
+    tls_ca: Option<TlsCaFiles>,
+}
+
+#[derive(Clone, Debug)]
+struct TlsCaFiles {
+    certificate: PathBuf,
+    private_key: PathBuf,
 }
 
 impl SandboxConfig {
@@ -38,6 +50,8 @@ impl SandboxConfig {
         Self {
             network: NetworkConfig::default(),
             hook_library: hook_library.into(),
+            tls_trust_anchor: None,
+            tls_ca: None,
         }
     }
 
@@ -45,17 +59,76 @@ impl SandboxConfig {
         &self.hook_library
     }
 
+    pub fn with_tls_trust_anchor(mut self, certificate: impl Into<PathBuf>) -> Self {
+        self.tls_trust_anchor = Some(certificate.into());
+        self
+    }
+
+    pub fn tls_trust_anchor(&self) -> Option<&Path> {
+        self.tls_trust_anchor.as_deref()
+    }
+
+    pub fn with_tls_ca(
+        mut self,
+        certificate: impl Into<PathBuf>,
+        private_key: impl Into<PathBuf>,
+    ) -> Self {
+        self.tls_ca = Some(TlsCaFiles {
+            certificate: certificate.into(),
+            private_key: private_key.into(),
+        });
+        self
+    }
+
+    pub fn tls_ca(&self) -> Option<(&Path, &Path)> {
+        self.tls_ca
+            .as_ref()
+            .map(|ca| (ca.certificate.as_path(), ca.private_key.as_path()))
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
+        if self.network.tls != TlsMode::Off && self.tls_ca.is_none() {
+            bail!("TLS interception requires a CA certificate and private key");
+        }
         #[cfg(not(target_os = "macos"))]
         bail!("the network hook is currently supported only on macOS");
-        #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
-        bail!("sandbox executable preparation is currently supported only on arm64 macOS");
         if !self.hook_library.is_file() {
             bail!(
                 "sandbox hook library does not exist: {}",
                 self.hook_library.display()
             );
+        }
+        if let Some(anchor) = &self.tls_trust_anchor
+            && !anchor.is_file()
+        {
+            bail!(
+                "sandbox TLS trust anchor does not exist: {}",
+                anchor.display()
+            );
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(anchor) = &self.tls_trust_anchor
+            && !crate::hook::validate_trust_anchor(anchor)
+        {
+            bail!(
+                "sandbox TLS trust anchor is not a valid DER certificate: {}",
+                anchor.display()
+            );
+        }
+        if let Some(ca) = &self.tls_ca {
+            if !ca.certificate.is_file() {
+                bail!(
+                    "sandbox TLS CA certificate does not exist: {}",
+                    ca.certificate.display()
+                );
+            }
+            if !ca.private_key.is_file() {
+                bail!(
+                    "sandbox TLS CA private key does not exist: {}",
+                    ca.private_key.display()
+                );
+            }
         }
         Ok(())
     }
@@ -154,6 +227,36 @@ where
                 self.config.hook_library.display()
             )
         })?;
+        let tls_trust_anchor_der = self
+            .config
+            .tls_trust_anchor
+            .as_ref()
+            .map(|path| {
+                std::fs::read(path)
+                    .with_context(|| format!("failed to read TLS trust anchor {}", path.display()))
+                    .map(|der| base64::engine::general_purpose::STANDARD.encode(der))
+            })
+            .transpose()?;
+        let tls_ca = self
+            .config
+            .tls_ca
+            .as_ref()
+            .map(|ca| {
+                let certificate = std::fs::read(&ca.certificate).with_context(|| {
+                    format!(
+                        "failed to read TLS CA certificate {}",
+                        ca.certificate.display()
+                    )
+                })?;
+                let private_key = std::fs::read(&ca.private_key).with_context(|| {
+                    format!(
+                        "failed to read TLS CA private key {}",
+                        ca.private_key.display()
+                    )
+                })?;
+                Ok::<_, anyhow::Error>((certificate, private_key))
+            })
+            .transpose()?;
         let sandbox_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
         let mut execution = {
@@ -163,12 +266,27 @@ where
             command.set_program(prepared);
             controller
         };
-        let mut controller = NetworkController::start(
-            self.config.network,
-            NetworkRunContext::new(&sandbox_id, &run_id),
-            self.callback,
-        )
-        .await?;
+        let context = NetworkRunContext::new(&sandbox_id, &run_id);
+        let controller = match tls_ca {
+            Some((certificate, private_key)) => {
+                NetworkController::start_with_tls_ca(
+                    self.config.network,
+                    context,
+                    self.callback,
+                    &certificate,
+                    &private_key,
+                )
+                .await
+            }
+            None => NetworkController::start(self.config.network, context, self.callback).await,
+        };
+        let mut controller = match controller {
+            Ok(controller) => controller,
+            Err(error) => {
+                let _ = execution.shutdown().await;
+                return Err(error);
+            }
+        };
         let runtime = controller.runtime();
         let execution_runtime = execution.runtime();
         let injected_libraries = Self::injected_libraries(&hook_library)?;
@@ -185,6 +303,17 @@ where
             .env(EXECUTION_TOKEN, execution_runtime.token())
             .env(HOOK_LIBRARIES, &injected_libraries)
             .env("DYLD_INSERT_LIBRARIES", injected_libraries);
+        let tls_trust_anchors = tls_trust_anchor_der
+            .into_iter()
+            .chain(
+                runtime
+                    .tls_trust_anchor_der()
+                    .map(|der| base64::engine::general_purpose::STANDARD.encode(der)),
+            )
+            .collect::<Vec<_>>();
+        if !tls_trust_anchors.is_empty() {
+            child.env(TLS_TRUST_ANCHOR_DER, tls_trust_anchors.join(","));
+        }
         child.as_std_mut().process_group(0);
 
         let mut child = match child.spawn() {
