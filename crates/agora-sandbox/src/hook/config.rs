@@ -1,3 +1,4 @@
+use crate::trace::{TRACE_IDS_ENVIRONMENT, TraceContext};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::OnceLock;
 
@@ -18,7 +19,7 @@ const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
     "GIT_SSL_CAINFO",
 ];
 
-pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 13] = [
+pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 14] = [
     TOKEN,
     PROXY_IPV4,
     PROXY_IPV6,
@@ -27,6 +28,7 @@ pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 13] = [
     HOOK_LIBRARIES,
     TLS_TRUST_ANCHOR_DER,
     TLS_TRUST_BUNDLE,
+    TRACE_IDS_ENVIRONMENT,
     TLS_CLIENT_TRUST_ENVIRONMENT[0],
     TLS_CLIENT_TRUST_ENVIRONMENT[1],
     TLS_CLIENT_TRUST_ENVIRONMENT[2],
@@ -44,6 +46,7 @@ pub(super) struct HookConfig {
     hook_libraries: String,
     tls_trust_anchor_der: Option<String>,
     tls_trust_bundle: Option<String>,
+    trace: TraceContext,
 }
 
 impl HookConfig {
@@ -66,6 +69,8 @@ impl HookConfig {
         let hook_libraries = Self::required(&mut get, HOOK_LIBRARIES)?;
         let tls_trust_anchor_der = get(TLS_TRUST_ANCHOR_DER).filter(|value| !value.is_empty());
         let tls_trust_bundle = get(TLS_TRUST_BUNDLE).filter(|value| !value.is_empty());
+        let trace = TraceContext::parse(&Self::required(&mut get, TRACE_IDS_ENVIRONMENT)?)
+            .map_err(|error| format!("invalid {TRACE_IDS_ENVIRONMENT}: {error}"))?;
         if !proxy_ipv4.ip().is_loopback() || !matches!(proxy_ipv4.ip(), IpAddr::V4(_)) {
             return Err(format!("{PROXY_IPV4} must be an IPv4 loopback address"));
         }
@@ -87,6 +92,7 @@ impl HookConfig {
             hook_libraries,
             tls_trust_anchor_der,
             tls_trust_bundle,
+            trace,
         })
     }
 
@@ -122,7 +128,19 @@ impl HookConfig {
         self.tls_trust_bundle.as_deref()
     }
 
+    pub(super) fn trace(&self) -> &TraceContext {
+        &self.trace
+    }
+
+    #[cfg(test)]
     pub(super) fn child_environment(&self) -> Vec<(&'static str, String)> {
+        self.child_environment_for(&self.trace)
+    }
+
+    pub(super) fn child_environment_for(
+        &self,
+        trace: &TraceContext,
+    ) -> Vec<(&'static str, String)> {
         let mut environment = vec![
             (TOKEN, self.token.clone()),
             (PROXY_IPV4, self.proxy_ipv4.to_string()),
@@ -130,6 +148,7 @@ impl HookConfig {
             (EXECUTION_CONTROL, self.execution_control.to_string()),
             (EXECUTION_TOKEN, self.execution_token.clone()),
             (HOOK_LIBRARIES, self.hook_libraries.clone()),
+            (TRACE_IDS_ENVIRONMENT, trace.encode()),
         ];
         if let Some(anchor) = &self.tls_trust_anchor_der {
             environment.push((TLS_TRUST_ANCHOR_DER, anchor.clone()));

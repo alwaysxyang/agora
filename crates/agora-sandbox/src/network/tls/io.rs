@@ -3,13 +3,13 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-pub(super) struct PrefixedIo<T> {
+pub(in crate::network) struct PrefixedIo<T> {
     prefix: io::Cursor<Vec<u8>>,
     inner: T,
 }
 
 impl<T> PrefixedIo<T> {
-    pub(super) fn new(prefix: Vec<u8>, inner: T) -> Self {
+    pub(in crate::network) fn new(prefix: Vec<u8>, inner: T) -> Self {
         Self {
             prefix: io::Cursor::new(prefix),
             inner,

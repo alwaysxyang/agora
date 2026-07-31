@@ -1,10 +1,12 @@
 use super::{
     ChildArguments, ChildEnvironment, PrepareError, PreparedExecutable, ProcessHookGuard,
     ProcessHookRuntime, agora_sandbox_execv, agora_sandbox_execve, agora_sandbox_execvp,
-    agora_sandbox_posix_spawn, agora_sandbox_posix_spawnp, current_environment, execute, io_errno,
-    prepared_executable, requested_executable,
+    agora_sandbox_posix_spawn, agora_sandbox_posix_spawnp, command_request, current_environment,
+    execute, io_errno, prepared_executable, requested_executable,
 };
+use crate::execution::{CommandRequest, ProcessOperation, decode_prepare_request};
 use crate::hook::config::HookConfig;
+use crate::trace::TraceContext;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
@@ -34,6 +36,7 @@ fn config_with_control_and_token(control: SocketAddr, execution_token: &str) -> 
             "AGORA_SANDBOX_HOOK_LIBRARIES",
             "/tmp/hook.dylib".to_string(),
         ),
+        ("AGORA_SANDBOX_TRACE_IDS", "trace-root".to_string()),
     ]);
     HookConfig::from_getter(|key| values.get(key).cloned()).unwrap()
 }
@@ -53,12 +56,30 @@ fn config_with_tls_bundle() -> HookConfig {
             "AGORA_SANDBOX_HOOK_LIBRARIES",
             "/tmp/hook.dylib".to_string(),
         ),
+        ("AGORA_SANDBOX_TRACE_IDS", "trace-root".to_string()),
         (
             "AGORA_SANDBOX_TLS_TRUST_BUNDLE",
             "/tmp/agora-ca.pem".to_string(),
         ),
     ]);
     HookConfig::from_getter(|key| values.get(key).cloned()).unwrap()
+}
+
+fn child_trace() -> TraceContext {
+    TraceContext::parse("trace-root").unwrap().child()
+}
+
+fn command(executable: &Path) -> CommandRequest {
+    CommandRequest {
+        trace_ids: child_trace().ids().to_vec(),
+        pid: 42,
+        ppid: 1,
+        process_executable: "/bin/bash".to_string(),
+        executable: executable.to_string_lossy().into_owned(),
+        arguments: vec![executable.to_string_lossy().into_owned()],
+        current_dir: "/tmp".to_string(),
+        operation: ProcessOperation::PosixSpawn,
+    }
 }
 
 fn response(status: u8, content: &[u8]) -> Vec<u8> {
@@ -133,7 +154,8 @@ fn child_environment_restores_runtime_values_after_the_caller_clears_them() {
     let path = CString::new("PATH=/usr/bin:/bin").unwrap();
     let values = [path.as_ptr(), std::ptr::null()];
 
-    let environment = unsafe { ChildEnvironment::new(values.as_ptr(), &config()) }.unwrap();
+    let environment =
+        unsafe { ChildEnvironment::new(values.as_ptr(), &config(), &child_trace()) }.unwrap();
     let entries = environment
         .values
         .iter()
@@ -143,15 +165,21 @@ fn child_environment_restores_runtime_values_after_the_caller_clears_them() {
     assert!(entries.contains(&"PATH=/usr/bin:/bin"));
     assert!(entries.contains(&"AGORA_SANDBOX_TOKEN=token"));
     assert!(entries.contains(&"AGORA_SANDBOX_EXECUTION_TOKEN=execution-token"));
+    assert!(
+        entries
+            .iter()
+            .any(|entry| { entry.starts_with("AGORA_SANDBOX_TRACE_IDS=trace-root, ") })
+    );
     assert!(entries.contains(&"DYLD_INSERT_LIBRARIES=/tmp/hook.dylib"));
 }
 
 #[test]
 fn child_environment_accepts_a_null_source_environment() {
-    let environment = unsafe { ChildEnvironment::new(std::ptr::null(), &config()) }.unwrap();
+    let environment =
+        unsafe { ChildEnvironment::new(std::ptr::null(), &config(), &child_trace()) }.unwrap();
 
     assert!(!environment.as_exec_ptr().is_null());
-    assert_eq!(environment.values.len(), 7);
+    assert_eq!(environment.values.len(), 8);
 }
 
 #[test]
@@ -208,7 +236,8 @@ fn child_environment_replaces_untrusted_runtime_values() {
     ];
     let pointers = [stale[0].as_ptr(), stale[1].as_ptr(), std::ptr::null()];
 
-    let environment = unsafe { ChildEnvironment::new(pointers.as_ptr(), &config()) }.unwrap();
+    let environment =
+        unsafe { ChildEnvironment::new(pointers.as_ptr(), &config(), &child_trace()) }.unwrap();
     let entries = unsafe {
         let mut current = environment.as_exec_ptr();
         let mut entries = Vec::new();
@@ -230,8 +259,10 @@ fn child_environment_restores_tls_trust_after_the_caller_clears_it() {
     let stale = CString::new("SSL_CERT_FILE=/tmp/untrusted.pem").unwrap();
     let values = [stale.as_ptr(), std::ptr::null()];
 
-    let environment =
-        unsafe { ChildEnvironment::new(values.as_ptr(), &config_with_tls_bundle()) }.unwrap();
+    let environment = unsafe {
+        ChildEnvironment::new(values.as_ptr(), &config_with_tls_bundle(), &child_trace())
+    }
+    .unwrap();
     let entries = environment
         .values
         .iter()
@@ -312,10 +343,60 @@ fn requested_executable_resolves_direct_and_path_based_programs() {
 }
 
 #[test]
+fn command_request_records_the_current_process_and_complete_argument_list() {
+    let arguments = [
+        CString::new("curl").unwrap(),
+        CString::new("https://example.com").unwrap(),
+    ];
+    let pointers = [
+        arguments[0].as_ptr(),
+        arguments[1].as_ptr(),
+        std::ptr::null(),
+    ];
+    let trace = TraceContext::parse("trace-root, trace-child").unwrap();
+
+    let request = unsafe {
+        command_request(
+            Path::new("/usr/bin/curl"),
+            pointers.as_ptr(),
+            ProcessOperation::Execve,
+            &trace,
+        )
+    }
+    .unwrap();
+
+    assert_eq!(request.trace_ids, ["trace-root", "trace-child"]);
+    assert_eq!(request.pid, std::process::id());
+    assert_eq!(request.ppid, unsafe { libc::getppid() as u32 });
+    assert!(!request.process_executable.is_empty());
+    assert_eq!(request.executable, "/usr/bin/curl");
+    assert_eq!(request.arguments, ["curl", "https://example.com"]);
+    assert_eq!(
+        request.current_dir,
+        std::env::current_dir().unwrap().to_string_lossy()
+    );
+    assert_eq!(request.operation, ProcessOperation::Execve);
+
+    let request = unsafe {
+        command_request(
+            Path::new("/bin/true"),
+            std::ptr::null(),
+            ProcessOperation::Execv,
+            &trace,
+        )
+    }
+    .unwrap();
+    assert!(request.arguments.is_empty());
+}
+
+#[test]
 fn process_runtime_returns_the_prepared_executable() {
     let (runtime, server) = runtime_with_response(response(0, b"/tmp/prepared-curl"));
+    let command = command(Path::new("/usr/bin/curl"));
 
-    let prepared = runtime.prepare(Path::new("/usr/bin/curl")).unwrap();
+    let prepared = runtime
+        .prepare(Path::new("/usr/bin/curl"), Some(&command))
+        .unwrap();
 
     assert_eq!(prepared.to_bytes(), b"/tmp/prepared-curl");
     let request = server.join().unwrap();
@@ -329,6 +410,8 @@ fn process_runtime_returns_the_prepared_executable() {
             .windows(b"/usr/bin/curl".len())
             .any(|value| value == b"/usr/bin/curl")
     );
+    let request = decode_prepare_request(&request).unwrap();
+    assert_eq!(request.command, Some(command));
 }
 
 #[test]
@@ -344,7 +427,9 @@ fn process_runtime_prepares_a_shebang_interpreter_and_preserves_the_script() {
         response(0, b"/tmp/prepared-env"),
     ]);
 
-    let prepared = runtime.prepare_executable(&script).unwrap();
+    let prepared = runtime
+        .prepare_executable(&script, &command(&script))
+        .unwrap();
 
     assert_eq!(prepared.program.to_bytes(), b"/tmp/prepared-env");
     assert_eq!(prepared.arguments[0].to_bytes(), b"node");
@@ -379,7 +464,9 @@ fn process_runtime_rejects_a_nul_in_a_shebang_argument() {
         response(0, b"/tmp/prepared-sh"),
     ]);
 
-    let error = runtime.prepare_executable(&script).unwrap_err();
+    let error = runtime
+        .prepare_executable(&script, &command(&script))
+        .unwrap_err();
 
     assert_eq!(error.errno, libc::EINVAL);
     assert_eq!(error.to_string(), "shebang argument contains NUL");
@@ -398,7 +485,9 @@ fn process_runtime_keeps_a_direct_executable_unchanged() {
     let (runtime, server) =
         runtime_with_response(response(0, executable.as_os_str().as_encoded_bytes()));
 
-    let prepared = runtime.prepare_executable(&executable).unwrap();
+    let prepared = runtime
+        .prepare_executable(&executable, &command(&executable))
+        .unwrap();
 
     assert_eq!(
         prepared.program.to_bytes(),
@@ -413,21 +502,27 @@ fn process_runtime_keeps_a_direct_executable_unchanged() {
 fn process_runtime_propagates_denied_and_invalid_responses() {
     let (runtime, denied_server) =
         runtime_with_response(error_response(libc::ENOENT, b"missing executable"));
-    let denied = runtime.prepare(Path::new("/bin/sh")).unwrap_err();
+    let denied = runtime.prepare(Path::new("/bin/sh"), None).unwrap_err();
     assert_eq!(denied.errno, libc::ENOENT);
     assert_eq!(denied.to_string(), "missing executable");
     denied_server.join().unwrap();
 
     let (runtime, invalid_server) = runtime_with_response(response(2, b"invalid"));
     assert_eq!(
-        runtime.prepare(Path::new("/bin/sh")).unwrap_err().errno,
+        runtime
+            .prepare(Path::new("/bin/sh"), None)
+            .unwrap_err()
+            .errno,
         libc::EPROTO
     );
     invalid_server.join().unwrap();
 
     let (runtime, nul_server) = runtime_with_response(response(0, b"/tmp/a\0b"));
     assert_eq!(
-        runtime.prepare(Path::new("/bin/sh")).unwrap_err().errno,
+        runtime
+            .prepare(Path::new("/bin/sh"), None)
+            .unwrap_err()
+            .errno,
         libc::EINVAL
     );
     nul_server.join().unwrap();
@@ -444,7 +539,7 @@ fn process_runtime_rejects_an_oversized_execution_token_before_sending() {
         let mut byte = [0_u8; 1];
         assert_eq!(stream.read(&mut byte).unwrap(), 0);
     });
-    let error = runtime.prepare(Path::new("/bin/sh")).unwrap_err();
+    let error = runtime.prepare(Path::new("/bin/sh"), None).unwrap_err();
 
     assert_eq!(error.errno, libc::EINVAL);
     server.join().unwrap();
@@ -498,11 +593,29 @@ fn process_interposers_fail_closed_during_recursive_entry() {
 #[test]
 fn process_runtime_and_direct_execution_fail_closed_without_configuration() {
     assert!(ProcessHookRuntime::global().is_none());
-    assert!(unsafe { prepared_executable(std::ptr::null(), false) }.is_err());
+    assert!(
+        unsafe {
+            prepared_executable(
+                std::ptr::null(),
+                false,
+                std::ptr::null(),
+                ProcessOperation::Execve,
+            )
+        }
+        .is_err()
+    );
 
     let _guard = ProcessHookGuard::enter().unwrap();
     assert_eq!(
-        unsafe { execute(std::ptr::null(), false, std::ptr::null(), std::ptr::null(),) },
+        unsafe {
+            execute(
+                std::ptr::null(),
+                false,
+                std::ptr::null(),
+                std::ptr::null(),
+                ProcessOperation::Execve,
+            )
+        },
         -1
     );
 }

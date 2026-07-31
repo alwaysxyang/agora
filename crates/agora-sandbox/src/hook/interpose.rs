@@ -142,6 +142,7 @@ impl HookRuntime {
             connection_id,
             destination,
             process,
+            trace_ids: self.config.trace().ids().to_vec(),
             operation,
         };
         let request = match encode_connect_request(&request) {

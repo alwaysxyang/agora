@@ -3,8 +3,9 @@ use super::{
     exit_status_code, parse_command, signal_exit_code,
 };
 use agora_sandbox::callback::{
-    EVENT_SCHEMA_VERSION, EventResult, EventStatus, EventType, NetworkContext, NetworkEvent,
-    NetworkProtocol, ProcessContext, Subsystem,
+    CommandContext, EVENT_SCHEMA_VERSION, Event, EventResult, EventStatus, EventType,
+    NetworkContext, NetworkEvent, NetworkProtocol, ProcessContext, ProcessEvent, ProcessOperation,
+    Subsystem,
 };
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ fn event(event_type: EventType, connection_id: Option<&str>, network: bool) -> N
         event_type,
         sandbox_id: "sandbox".to_string(),
         run_id: "run".to_string(),
+        trace_ids: vec!["trace-root".to_string()],
         connection_id: connection_id.map(ToString::to_string),
         sequence: Some(0),
         process: ProcessContext {
@@ -47,6 +49,35 @@ fn event(event_type: EventType, connection_id: Option<&str>, network: bool) -> N
     }
 }
 
+fn process_event() -> ProcessEvent {
+    ProcessEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "process-event".to_string(),
+        occurred_at: "2026-07-29T12:00:01Z".to_string(),
+        subsystem: Subsystem::Process,
+        event_type: EventType::ProcessExecAttempt,
+        sandbox_id: "sandbox".to_string(),
+        run_id: "run".to_string(),
+        trace_ids: vec!["trace-root".to_string(), "trace-child".to_string()],
+        process: ProcessContext {
+            pid: 43,
+            ppid: 42,
+            executable: "/bin/bash".to_string(),
+        },
+        command: CommandContext {
+            executable: "/usr/bin/curl".to_string(),
+            arguments: vec!["curl".to_string(), "https://example.com".to_string()],
+            current_dir: "/tmp".to_string(),
+            operation: ProcessOperation::PosixSpawn,
+        },
+        result: EventResult {
+            status: EventStatus::Started,
+            error_code: None,
+            error_message: None,
+        },
+    }
+}
+
 #[test]
 fn command_parser_rejects_empty_input_and_preserves_quoted_arguments() {
     assert!(
@@ -68,34 +99,66 @@ fn audit_state_writes_attempts_immediately_without_terminal_duplicates() {
     let mut state = AuditState::new(Some(&path)).unwrap();
 
     state
-        .on_event(&event(EventType::NetworkConnectAttempt, None, false))
+        .on_event(&Event::Network(event(
+            EventType::NetworkConnectAttempt,
+            None,
+            false,
+        )))
         .unwrap();
     state
-        .on_event(&event(
+        .on_event(&Event::Network(event(
             EventType::NetworkConnectDenied,
             Some("connection"),
             true,
-        ))
+        )))
         .unwrap();
     state
-        .on_event(&event(
+        .on_event(&Event::Network(event(
             EventType::NetworkConnectAttempt,
             Some("connection"),
             true,
-        ))
+        )))
         .unwrap();
     state
-        .on_event(&event(
+        .on_event(&Event::Network(event(
             EventType::NetworkConnectFailed,
             Some("connection"),
             true,
-        ))
+        )))
         .unwrap();
 
     let output = std::fs::read_to_string(&path).unwrap();
     assert_eq!(output.lines().count(), 1);
     assert!(output.contains("example.com"));
     assert!(output.contains("203.0.113.10"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn audit_state_writes_process_and_network_records_to_the_same_stream() {
+    let root = std::env::temp_dir().join(format!("agora-audit-events-{}", Uuid::new_v4()));
+    let path = root.join("audit.jsonl");
+    let mut state = AuditState::new(Some(&path)).unwrap();
+
+    state.on_event(&Event::Process(process_event())).unwrap();
+    state
+        .on_event(&Event::Network(event(
+            EventType::NetworkConnectAttempt,
+            Some("connection"),
+            true,
+        )))
+        .unwrap();
+
+    let records = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records[0]["type"], "process");
+    assert_eq!(records[0]["executable"], "/usr/bin/curl");
+    assert_eq!(records[0]["trace_ids"][1], "trace-child");
+    assert_eq!(records[1]["type"], "network");
+    assert_eq!(records[1]["trace_ids"][0], "trace-root");
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -1,10 +1,11 @@
+use crate::trace::{TRACE_IDS_HEADER, TraceContext};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024;
 pub const MAX_HEADERS: usize = 32;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -16,6 +17,7 @@ pub struct ConnectRequest {
     pub connection_id: String,
     pub destination: SocketAddr,
     pub process: ProcessIdentity,
+    pub trace_ids: Vec<String>,
     pub operation: HookOperation,
 }
 
@@ -25,6 +27,7 @@ impl ConnectRequest {
             connection_id: self.connection_id,
             destination: self.destination,
             process: self.process,
+            trace_ids: self.trace_ids,
             operation: self.operation,
         }
     }
@@ -35,6 +38,7 @@ pub struct RouteRegistration {
     pub connection_id: String,
     pub destination: SocketAddr,
     pub process: ProcessIdentity,
+    pub trace_ids: Vec<String>,
     pub operation: HookOperation,
 }
 
@@ -105,6 +109,9 @@ impl std::error::Error for ProtocolError {}
 pub fn encode_connect_request(request: &ConnectRequest) -> io::Result<Vec<u8>> {
     validate_token(&request.token)?;
     validate_header_value("connection id", &request.connection_id, false)?;
+    let trace_ids = TraceContext::new(request.trace_ids.clone())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+        .encode();
 
     let authority = request.destination.to_string();
     let executable = hex_encode(request.process.executable.as_bytes());
@@ -117,6 +124,7 @@ pub fn encode_connect_request(request: &ConnectRequest) -> io::Result<Vec<u8>> {
          Agora-Pid: {}\r\n\
          Agora-Ppid: {}\r\n\
          Agora-Operation: {}\r\n\
+         {TRACE_IDS_HEADER}: {}\r\n\
          Agora-Executable-Hex: {}\r\n\
          \r\n",
         request.token,
@@ -125,6 +133,7 @@ pub fn encode_connect_request(request: &ConnectRequest) -> io::Result<Vec<u8>> {
         request.process.pid,
         request.process.ppid,
         request.operation.as_str(),
+        trace_ids,
         executable,
     );
     ensure_frame_size(message.len())?;
@@ -179,6 +188,8 @@ pub fn parse_connect_request_prefix(
     )?)?;
     let executable = String::from_utf8(executable)
         .map_err(|_| ProtocolError::bad_request("invalid executable encoding"))?;
+    let trace_ids = TraceContext::parse(required_header_string(parsed.headers, TRACE_IDS_HEADER)?)
+        .map_err(ProtocolError::bad_request)?;
     Ok(Some((
         ConnectRequest {
             protocol_version: required_header_string(parsed.headers, "Agora-Version")?
@@ -193,6 +204,7 @@ pub fn parse_connect_request_prefix(
                 ppid: parse_u32_header(parsed.headers, "Agora-Ppid")?,
                 executable,
             },
+            trace_ids: trace_ids.ids().to_vec(),
             operation,
         },
         consumed,

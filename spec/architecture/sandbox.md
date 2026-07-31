@@ -43,7 +43,15 @@ The versioned execution-preparation protocol returns a structured POSIX errno wi
 
 ## Audit Timing
 
-The CLI writes one compact audit record as soon as a validated connection attempt has been inspected. The record therefore appears before a long-lived connection closes and includes a normalized domain when HTTP `Host` or TLS SNI supplied one. TLS passthrough exposes the domain but not the encrypted request path or body.
+The callback receives a unified `Event` containing either a `NetworkEvent` or a `ProcessEvent`. Event schema version 6 adds process execution attempts and a trace ID chain. Process events are audit-only: the callback decision is ignored for now. Network decisions continue to allow, deny, or proxy a connection.
+
+The CLI writes compact JSON Lines records to the configured audit destination. Records use `type: "network"` or `type: "process"`. A network record is written as soon as a validated connection attempt has been inspected, so it appears before a long-lived connection closes and includes a normalized domain when HTTP `Host` or TLS SNI supplied one. TLS passthrough exposes the domain but not the encrypted request path or body. A process record includes the requested executable, arguments, current directory, parent process, and execution operation.
+
+Every run starts with one trace ID in `AGORA_SANDBOX_TRACE_IDS`. A hooked process appends one ID when it starts a descendant and forwards the comma-separated ancestor chain through the child environment. Network CONNECT protocol version 6 requires the same chain in `Agora-Trace-Ids`, allowing process and network events to be correlated. A chain contains at most 32 entries; appending to a full chain removes the oldest entry.
+
+Connection handlers are isolated from their listeners. A malformed or unauthenticated network or execution-control connection is rejected without terminating the controller or other sandbox work. On relay failure, the closing network event has failed status but retains all bytes successfully written in each direction before the error instead of reporting both counters as zero.
+
+The macOS test suite includes a full transparent TLS path using a copied `/bin/bash`, system `/usr/bin/curl`, an automatically trusted sandbox CA, TLS interception, and a local HTTPS origin. The client does not receive an explicit `--cacert` argument.
 
 ## TLS Certificate Lifecycle
 

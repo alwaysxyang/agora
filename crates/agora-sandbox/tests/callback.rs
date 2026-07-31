@@ -1,7 +1,8 @@
 use agora_sandbox::callback::{
-    BasicAuth, Callback, Decision, DomainSource, EVENT_SCHEMA_VERSION, EventMetrics, EventResult,
-    EventStatus, EventType, HttpProxy, NetworkContext, NetworkEvent, NetworkProtocol, NoopCallback,
-    ProcessContext, Proxy, Redact, Subsystem,
+    BasicAuth, Callback, CommandContext, Decision, DomainSource, EVENT_SCHEMA_VERSION, Event,
+    EventMetrics, EventResult, EventStatus, EventType, HttpProxy, NetworkContext, NetworkEvent,
+    NetworkProtocol, NoopCallback, ProcessContext, ProcessEvent, ProcessOperation, Proxy, Redact,
+    Subsystem,
 };
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,7 @@ fn network_event() -> NetworkEvent {
         event_type: EventType::NetworkConnectAttempt,
         sandbox_id: "sandbox-1".to_string(),
         run_id: "run-1".to_string(),
+        trace_ids: vec!["trace-root".to_string()],
         connection_id: Some("connection-1".to_string()),
         sequence: Some(0),
         process: ProcessContext {
@@ -46,12 +48,41 @@ fn network_event() -> NetworkEvent {
     }
 }
 
+fn process_event() -> ProcessEvent {
+    ProcessEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "event-2".to_string(),
+        occurred_at: "2026-07-23T12:34:56.789Z".to_string(),
+        subsystem: Subsystem::Process,
+        event_type: EventType::ProcessExecAttempt,
+        sandbox_id: "sandbox-1".to_string(),
+        run_id: "run-1".to_string(),
+        trace_ids: vec!["trace-root".to_string(), "trace-child".to_string()],
+        process: ProcessContext {
+            pid: 101,
+            ppid: 100,
+            executable: "/bin/bash".to_string(),
+        },
+        command: CommandContext {
+            executable: "/usr/bin/curl".to_string(),
+            arguments: vec!["curl".to_string(), "https://example.com".to_string()],
+            current_dir: "/tmp".to_string(),
+            operation: ProcessOperation::Execve,
+        },
+        result: EventResult {
+            status: EventStatus::Started,
+            error_code: None,
+            error_message: None,
+        },
+    }
+}
+
 #[test]
 fn callback_event_uses_stable_versioned_json_fields() {
     let event = network_event();
     let value = serde_json::to_value(event.redacted()).unwrap();
 
-    assert_eq!(value["schema_version"], 5);
+    assert_eq!(value["schema_version"], EVENT_SCHEMA_VERSION);
     assert_eq!(value["subsystem"], "network");
     assert_eq!(value["event_type"], "network.connect.attempt");
     assert_eq!(value["network"]["protocol"], "tcp");
@@ -61,6 +92,21 @@ fn callback_event_uses_stable_versioned_json_fields() {
     assert_eq!(value["network"]["domain_source"], "http_host");
     assert!(value["decision"].is_null());
     assert_eq!(value["result"]["status"], "started");
+}
+
+#[test]
+fn process_event_uses_the_same_redacted_event_boundary() {
+    let event = Event::Process(process_event());
+    let value = serde_json::to_value(event.redacted()).unwrap();
+
+    assert!(event.as_network().is_none());
+    assert!(event.clone().into_network().is_none());
+    assert_eq!(value["schema_version"], EVENT_SCHEMA_VERSION);
+    assert_eq!(value["subsystem"], "process");
+    assert_eq!(value["event_type"], "process.exec.attempt");
+    assert_eq!(value["trace_ids"][1], "trace-child");
+    assert_eq!(value["command"]["executable"], "/usr/bin/curl");
+    assert_eq!(value["command"]["operation"], "execve");
 }
 
 #[test]
@@ -119,23 +165,26 @@ async fn closure_callback_receives_an_owned_event() {
     let received = Arc::new(Mutex::new(Vec::new()));
     let callback = {
         let received = Arc::clone(&received);
-        move |event: NetworkEvent| {
+        move |event: Event| {
             received.lock().unwrap().push(event);
             std::future::ready(Decision::Allow)
         }
     };
 
-    assert_eq!(callback.on_event(network_event()).await, Decision::Allow);
+    assert_eq!(
+        callback.on_event(Event::Network(network_event())).await,
+        Decision::Allow
+    );
 
     let events = received.lock().unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event_id, "event-1");
+    assert_eq!(events[0].as_network().unwrap().event_id, "event-1");
 }
 
 #[tokio::test]
 async fn noop_callback_allows_events_without_side_effects() {
     assert_eq!(
-        NoopCallback.on_event(network_event()).await,
+        NoopCallback.on_event(Event::Network(network_event())).await,
         Decision::Allow
     );
 }

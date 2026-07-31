@@ -51,6 +51,7 @@ fn runtime() -> HookRuntime {
                 "AGORA_SANDBOX_EXECUTION_CONTROL" => "127.0.0.1:41002",
                 "AGORA_SANDBOX_EXECUTION_TOKEN" => "execution-token",
                 "AGORA_SANDBOX_HOOK_LIBRARIES" => "/tmp/hook.dylib",
+                "AGORA_SANDBOX_TRACE_IDS" => "trace-root",
                 _ => return None,
             }
             .to_string(),

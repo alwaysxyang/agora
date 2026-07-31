@@ -4,18 +4,18 @@ use std::fmt;
 use std::future::Future;
 use std::net::IpAddr;
 
-pub const EVENT_SCHEMA_VERSION: u16 = 5;
+pub const EVENT_SCHEMA_VERSION: u16 = 6;
 
 pub trait Callback: Send + Sync + 'static {
-    fn on_event(&self, event: NetworkEvent) -> impl Future<Output = Decision> + Send;
+    fn on_event(&self, event: Event) -> impl Future<Output = Decision> + Send;
 }
 
 impl<F, Fut> Callback for F
 where
-    F: Fn(NetworkEvent) -> Fut + Send + Sync + 'static,
+    F: Fn(Event) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Decision> + Send,
 {
-    fn on_event(&self, event: NetworkEvent) -> impl Future<Output = Decision> + Send {
+    fn on_event(&self, event: Event) -> impl Future<Output = Decision> + Send {
         self(event)
     }
 }
@@ -24,8 +24,44 @@ where
 pub struct NoopCallback;
 
 impl Callback for NoopCallback {
-    fn on_event(&self, _event: NetworkEvent) -> impl Future<Output = Decision> + Send {
+    fn on_event(&self, _event: Event) -> impl Future<Output = Decision> + Send {
         std::future::ready(Decision::Allow)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    Network(NetworkEvent),
+    Process(ProcessEvent),
+}
+
+impl Event {
+    pub fn as_network(&self) -> Option<&NetworkEvent> {
+        match self {
+            Self::Network(event) => Some(event),
+            Self::Process(_) => None,
+        }
+    }
+
+    pub fn into_network(self) -> Option<NetworkEvent> {
+        match self {
+            Self::Network(event) => Some(event),
+            Self::Process(_) => None,
+        }
+    }
+}
+
+impl Redact for Event {}
+
+impl Serialize for Redacted<'_, Event> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.0 {
+            Event::Network(event) => event.redacted().serialize(serializer),
+            Event::Process(event) => event.serialize(serializer),
+        }
     }
 }
 
@@ -148,6 +184,7 @@ pub struct NetworkEvent {
     pub event_type: EventType,
     pub sandbox_id: String,
     pub run_id: String,
+    pub trace_ids: Vec<String>,
     pub connection_id: Option<String>,
     pub sequence: Option<u64>,
     pub process: ProcessContext,
@@ -166,7 +203,7 @@ impl Serialize for Redacted<'_, NetworkEvent> {
         S: serde::Serializer,
     {
         let event = self.0;
-        let mut state = serializer.serialize_struct("NetworkEvent", 16)?;
+        let mut state = serializer.serialize_struct("NetworkEvent", 17)?;
         state.serialize_field("schema_version", &event.schema_version)?;
         state.serialize_field("event_id", &event.event_id)?;
         state.serialize_field("occurred_at", &event.occurred_at)?;
@@ -174,6 +211,7 @@ impl Serialize for Redacted<'_, NetworkEvent> {
         state.serialize_field("event_type", &event.event_type)?;
         state.serialize_field("sandbox_id", &event.sandbox_id)?;
         state.serialize_field("run_id", &event.run_id)?;
+        state.serialize_field("trace_ids", &event.trace_ids)?;
         state.serialize_field("connection_id", &event.connection_id)?;
         state.serialize_field("sequence", &event.sequence)?;
         state.serialize_field("process", &event.process)?;
@@ -212,6 +250,8 @@ pub enum EventType {
     FilesystemWrite,
     #[serde(rename = "process.started")]
     ProcessStarted,
+    #[serde(rename = "process.exec.attempt")]
+    ProcessExecAttempt,
     #[serde(rename = "process.exited")]
     ProcessExited,
 }
@@ -221,6 +261,39 @@ pub struct ProcessContext {
     pub pid: u32,
     pub ppid: u32,
     pub executable: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessEvent {
+    pub schema_version: u16,
+    pub event_id: String,
+    pub occurred_at: String,
+    pub subsystem: Subsystem,
+    pub event_type: EventType,
+    pub sandbox_id: String,
+    pub run_id: String,
+    pub trace_ids: Vec<String>,
+    pub process: ProcessContext,
+    pub command: CommandContext,
+    pub result: EventResult,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandContext {
+    pub executable: String,
+    pub arguments: Vec<String>,
+    pub current_dir: String,
+    pub operation: ProcessOperation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessOperation {
+    PosixSpawn,
+    PosixSpawnp,
+    Execve,
+    Execv,
+    Execvp,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

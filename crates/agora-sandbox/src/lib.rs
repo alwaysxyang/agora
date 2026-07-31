@@ -6,3 +6,4 @@ mod hook;
 pub mod network;
 mod protocol;
 pub mod runner;
+mod trace;

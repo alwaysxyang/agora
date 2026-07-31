@@ -15,6 +15,7 @@ fn connect_request() -> ConnectRequest {
             ppid: 100,
             executable: "/usr/bin/curl".to_string(),
         },
+        trace_ids: vec!["trace-root".to_string(), "trace-curl".to_string()],
         operation: HookOperation::Connect,
     }
 }
@@ -66,6 +67,10 @@ fn connect_request_round_trips_through_http_headers() {
         head.windows(b"Proxy-Authorization: Bearer token-1".len())
             .any(|window| window == b"Proxy-Authorization: Bearer token-1")
     );
+    assert!(
+        head.windows(b"Agora-Trace-Ids: trace-root, trace-curl".len())
+            .any(|window| window == b"Agora-Trace-Ids: trace-root, trace-curl")
+    );
     assert!(body.is_empty());
     let (parsed, consumed) = parse_connect_request_prefix(head).unwrap().unwrap();
     assert_eq!(consumed, head.len());
@@ -114,6 +119,7 @@ fn connectx_request_round_trips_and_becomes_a_route_registration() {
     assert_eq!(registration.connection_id, "connection-1");
     assert_eq!(registration.destination, request.destination);
     assert_eq!(registration.process, request.process);
+    assert_eq!(registration.trace_ids, request.trace_ids);
     assert_eq!(registration.operation, HookOperation::Connectx);
 }
 
@@ -216,7 +222,10 @@ fn parser_rejects_missing_duplicate_and_malformed_agora_headers() {
             "Agora-Operation",
         ),
         (
-            valid.replace("Agora-Version: 5", "Agora-Version: invalid"),
+            valid.replace(
+                &format!("Agora-Version: {PROTOCOL_VERSION}"),
+                "Agora-Version: invalid",
+            ),
             "Agora-Version",
         ),
         (

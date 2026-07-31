@@ -463,8 +463,10 @@ fn audit_records(output: &[u8]) -> Vec<serde_json::Value> {
 
 fn assert_audit_record(record: &serde_json::Value, destination: SocketAddr) {
     let object = record.as_object().unwrap();
-    assert_eq!(object.len(), 5);
+    assert_eq!(object.len(), 7);
+    assert_eq!(record["type"], "network");
     assert!(record["access_time"].as_str().is_some());
+    assert_eq!(record["trace_ids"].as_array().unwrap().len(), 1);
     assert!(record["pid"].as_u64().is_some_and(|pid| pid > 0));
     assert_eq!(record["destination_ip"], destination.ip().to_string());
     assert_eq!(record["destination_port"], destination.port());

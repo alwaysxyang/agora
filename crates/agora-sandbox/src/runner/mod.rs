@@ -2,6 +2,7 @@ use crate::callback::Callback;
 #[cfg(target_os = "macos")]
 use crate::execution::{ExecutionController, resolve_executable, resolve_shebang};
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
+use crate::trace::{TRACE_IDS_ENVIRONMENT, TraceContext};
 use anyhow::{Context, Result, bail};
 #[cfg(target_os = "macos")]
 use base64::Engine;
@@ -58,6 +59,8 @@ pub struct SandboxConfig {
     workdir: PathBuf,
     tls_trust_anchor: Option<PathBuf>,
     tls_ca: Option<TlsCaFiles>,
+    #[cfg(test)]
+    upstream_tls_roots: Option<Vec<rustls::pki_types::CertificateDer<'static>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +77,8 @@ impl SandboxConfig {
             workdir: Self::default_workdir(),
             tls_trust_anchor: None,
             tls_ca: None,
+            #[cfg(test)]
+            upstream_tls_roots: None,
         }
     }
 
@@ -122,6 +127,15 @@ impl SandboxConfig {
         self.tls_ca
             .as_ref()
             .map(|ca| (ca.certificate.as_path(), ca.private_key.as_path()))
+    }
+
+    #[cfg(test)]
+    fn with_upstream_tls_roots(
+        mut self,
+        roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    ) -> Self {
+        self.upstream_tls_roots = Some(roots);
+        self
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -356,6 +370,7 @@ where
     #[cfg(target_os = "macos")]
     pub async fn run(self, mut command: SandboxCommand) -> Result<SandboxOutcome> {
         self.config.validate()?;
+        let callback = std::sync::Arc::new(self.callback);
         let _ = command.effective_current_dir()?;
         let tls_ca_files = self.config.tls_ca_for_workdir()?;
         let hook_library = self.config.hook_library.canonicalize().with_context(|| {
@@ -401,8 +416,23 @@ where
             .transpose()?;
         let sandbox_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
+        let trace = TraceContext::root();
         let mut execution = {
-            let controller = ExecutionController::start(self.config.workdir.join("root")).await?;
+            let execution_callback = {
+                let callback = std::sync::Arc::clone(&callback);
+                move |event| {
+                    let callback = std::sync::Arc::clone(&callback);
+                    async move { callback.on_event(event).await }
+                }
+            };
+            let controller = ExecutionController::start_with_callback(
+                self.config.workdir.join("root"),
+                sandbox_id.clone(),
+                run_id.clone(),
+                execution_callback,
+                self.config.network.callback_timeout,
+            )
+            .await?;
             let executable = command.resolved_program()?;
             let prepared = controller.prepare(executable).await?;
             if let Some(shebang) = resolve_shebang(&prepared)? {
@@ -414,18 +444,60 @@ where
             controller
         };
         let context = NetworkRunContext::new(&sandbox_id, &run_id);
+        let network_callback = {
+            let callback = std::sync::Arc::clone(&callback);
+            move |event| {
+                let callback = std::sync::Arc::clone(&callback);
+                async move { callback.on_event(event).await }
+            }
+        };
+        #[cfg(test)]
+        let upstream_tls_roots = self.config.upstream_tls_roots.clone();
+        #[cfg(test)]
+        let controller = match (tls_ca.as_ref(), upstream_tls_roots) {
+            (Some((certificate, private_key, _, _)), Some(roots)) => {
+                NetworkController::start_with_tls_ca_and_roots(
+                    self.config.network,
+                    context,
+                    network_callback,
+                    certificate,
+                    private_key,
+                    roots,
+                )
+                .await
+            }
+            (tls_ca, None) => match tls_ca {
+                Some((certificate, private_key, _, _)) => {
+                    NetworkController::start_with_tls_ca(
+                        self.config.network,
+                        context,
+                        network_callback,
+                        certificate,
+                        private_key,
+                    )
+                    .await
+                }
+                None => {
+                    NetworkController::start(self.config.network, context, network_callback).await
+                }
+            },
+            (None, Some(_)) => Err(anyhow::anyhow!(
+                "test upstream TLS roots require TLS interception"
+            )),
+        };
+        #[cfg(not(test))]
         let controller = match tls_ca.as_ref() {
             Some((certificate, private_key, _, _)) => {
                 NetworkController::start_with_tls_ca(
                     self.config.network,
                     context,
-                    self.callback,
+                    network_callback,
                     certificate,
                     private_key,
                 )
                 .await
             }
-            None => NetworkController::start(self.config.network, context, self.callback).await,
+            None => NetworkController::start(self.config.network, context, network_callback).await,
         };
         let mut controller = match controller {
             Ok(controller) => controller,
@@ -449,6 +521,7 @@ where
             .env(EXECUTION_CONTROL, execution_runtime.control().to_string())
             .env(EXECUTION_TOKEN, execution_runtime.token())
             .env(HOOK_LIBRARIES, &injected_libraries)
+            .env(TRACE_IDS_ENVIRONMENT, trace.encode())
             .env("DYLD_INSERT_LIBRARIES", injected_libraries);
         let tls_trust_anchors = tls_trust_anchor_der
             .into_iter()

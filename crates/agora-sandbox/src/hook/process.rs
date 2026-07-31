@@ -4,8 +4,10 @@ use super::config::{self, CHILD_RUNTIME_ENVIRONMENT, HookConfig};
 use super::dyld::{dyld_interpose, function_from_interpose};
 use super::socket::set_errno;
 use crate::execution::{
-    PrepareResponse, decode_prepare_response, encode_prepare_request, frame_length, resolve_shebang,
+    CommandRequest, PrepareResponse, ProcessOperation, decode_prepare_response,
+    encode_prepare_request, encode_prepare_request_with_command, frame_length, resolve_shebang,
 };
+use crate::trace::TraceContext;
 use std::cell::Cell;
 use std::ffi::{CStr, CString, OsStr};
 use std::io::{self, Read, Write};
@@ -157,7 +159,11 @@ struct ChildEnvironment {
 }
 
 impl ChildEnvironment {
-    unsafe fn new(environment: *const *const libc::c_char, config: &HookConfig) -> Option<Self> {
+    unsafe fn new(
+        environment: *const *const libc::c_char,
+        config: &HookConfig,
+        trace: &TraceContext,
+    ) -> Option<Self> {
         let mut values = Vec::new();
         if !environment.is_null() {
             let mut current = environment;
@@ -173,7 +179,7 @@ impl ChildEnvironment {
                 current = unsafe { current.add(1) };
             }
         }
-        for (key, value) in config.child_environment() {
+        for (key, value) in config.child_environment_for(trace) {
             let mut entry = Vec::with_capacity(key.len() + 1 + value.len());
             entry.extend_from_slice(key.as_bytes());
             entry.push(b'=');
@@ -214,15 +220,24 @@ impl ProcessHookRuntime {
             .as_ref()
     }
 
-    fn prepare(&self, executable: &Path) -> Result<CString, PrepareError> {
+    fn prepare(
+        &self,
+        executable: &Path,
+        command: Option<&CommandRequest>,
+    ) -> Result<CString, PrepareError> {
         let mut stream = TcpStream::connect(self.config.execution_control())?;
         let timeout = Some(Duration::from_secs(30));
         stream.set_read_timeout(timeout)?;
         stream.set_write_timeout(timeout)?;
-        stream.write_all(&encode_prepare_request(
-            self.config.execution_token(),
-            executable,
-        )?)?;
+        let request = match command {
+            Some(command) => encode_prepare_request_with_command(
+                self.config.execution_token(),
+                executable,
+                command,
+            )?,
+            None => encode_prepare_request(self.config.execution_token(), executable)?,
+        };
+        stream.write_all(&request)?;
         let mut prefix = [0_u8; 4];
         stream.read_exact(&mut prefix)?;
         let length = frame_length(prefix)?;
@@ -238,8 +253,12 @@ impl ProcessHookRuntime {
         }
     }
 
-    fn prepare_executable(&self, executable: &Path) -> Result<PreparedExecutable, PrepareError> {
-        let program = self.prepare(executable)?;
+    fn prepare_executable(
+        &self,
+        executable: &Path,
+        command: &CommandRequest,
+    ) -> Result<PreparedExecutable, PrepareError> {
+        let program = self.prepare(executable, Some(command))?;
         let script = Path::new(OsStr::from_bytes(program.to_bytes()));
         let Some(shebang) = resolve_shebang(script)
             .map_err(|error| PrepareError::from_anyhow(error, libc::ENOEXEC))?
@@ -249,7 +268,7 @@ impl ProcessHookRuntime {
                 arguments: Vec::new(),
             });
         };
-        let interpreter = self.prepare(&shebang.interpreter)?;
+        let interpreter = self.prepare(&shebang.interpreter, None)?;
         let mut arguments = Vec::with_capacity(2);
         if let Some(argument) = shebang.argument {
             arguments.push(
@@ -303,7 +322,9 @@ unsafe fn requested_executable(path: *const libc::c_char, search_path: bool) -> 
 unsafe fn prepared_executable(
     path: *const libc::c_char,
     search_path: bool,
-) -> Result<PreparedExecutable, PrepareError> {
+    arguments: *const *const libc::c_char,
+    operation: ProcessOperation,
+) -> Result<(PreparedExecutable, TraceContext), PrepareError> {
     let runtime = ProcessHookRuntime::global()
         .ok_or_else(|| PrepareError::new(libc::EACCES, "sandbox process runtime is unavailable"))?;
     let executable = unsafe { requested_executable(path, search_path) }.ok_or_else(|| {
@@ -316,7 +337,40 @@ unsafe fn prepared_executable(
             "requested executable could not be resolved",
         )
     })?;
-    runtime.prepare_executable(&executable)
+    let trace = runtime.config.trace().child();
+    let command = unsafe { command_request(&executable, arguments, operation, &trace) }?;
+    let prepared = runtime.prepare_executable(&executable, &command)?;
+    Ok((prepared, trace))
+}
+
+unsafe fn command_request(
+    executable: &Path,
+    arguments: *const *const libc::c_char,
+    operation: ProcessOperation,
+    trace: &TraceContext,
+) -> Result<CommandRequest, PrepareError> {
+    let mut values = Vec::new();
+    if !arguments.is_null() {
+        let mut current = arguments;
+        while !(unsafe { *current }).is_null() {
+            values.push(
+                unsafe { CStr::from_ptr(*current) }
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            current = unsafe { current.add(1) };
+        }
+    }
+    Ok(CommandRequest {
+        trace_ids: trace.ids().to_vec(),
+        pid: std::process::id(),
+        ppid: unsafe { libc::getppid() as u32 },
+        process_executable: std::env::current_exe()?.to_string_lossy().into_owned(),
+        executable: executable.to_string_lossy().into_owned(),
+        arguments: values,
+        current_dir: std::env::current_dir()?.to_string_lossy().into_owned(),
+        operation,
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -334,7 +388,14 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
     let Some(_guard) = ProcessHookGuard::enter() else {
         return libc::EACCES;
     };
-    let prepared = match unsafe { prepared_executable(path, false) } {
+    let (prepared, trace) = match unsafe {
+        prepared_executable(
+            path,
+            false,
+            arguments.cast::<*const libc::c_char>(),
+            ProcessOperation::PosixSpawn,
+        )
+    } {
         Ok(prepared) => prepared,
         Err(error) => return error.errno,
     };
@@ -342,7 +403,11 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
         return libc::EACCES;
     };
     let Some(environment) = (unsafe {
-        ChildEnvironment::new(environment.cast::<*const libc::c_char>(), &runtime.config)
+        ChildEnvironment::new(
+            environment.cast::<*const libc::c_char>(),
+            &runtime.config,
+            &trace,
+        )
     }) else {
         return libc::EACCES;
     };
@@ -378,7 +443,14 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
     let Some(_guard) = ProcessHookGuard::enter() else {
         return libc::EACCES;
     };
-    let prepared = match unsafe { prepared_executable(file, true) } {
+    let (prepared, trace) = match unsafe {
+        prepared_executable(
+            file,
+            true,
+            arguments.cast::<*const libc::c_char>(),
+            ProcessOperation::PosixSpawnp,
+        )
+    } {
         Ok(prepared) => prepared,
         Err(error) => return error.errno,
     };
@@ -386,7 +458,11 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
         return libc::EACCES;
     };
     let Some(environment) = (unsafe {
-        ChildEnvironment::new(environment.cast::<*const libc::c_char>(), &runtime.config)
+        ChildEnvironment::new(
+            environment.cast::<*const libc::c_char>(),
+            &runtime.config,
+            &trace,
+        )
     }) else {
         return libc::EACCES;
     };
@@ -413,7 +489,15 @@ pub unsafe extern "C" fn agora_sandbox_execve(
     arguments: *const *const libc::c_char,
     environment: *const *const libc::c_char,
 ) -> libc::c_int {
-    unsafe { execute(path, false, arguments, environment) }
+    unsafe {
+        execute(
+            path,
+            false,
+            arguments,
+            environment,
+            ProcessOperation::Execve,
+        )
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -421,7 +505,15 @@ pub unsafe extern "C" fn agora_sandbox_execv(
     path: *const libc::c_char,
     arguments: *const *const libc::c_char,
 ) -> libc::c_int {
-    unsafe { execute(path, false, arguments, current_environment()) }
+    unsafe {
+        execute(
+            path,
+            false,
+            arguments,
+            current_environment(),
+            ProcessOperation::Execv,
+        )
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -429,7 +521,15 @@ pub unsafe extern "C" fn agora_sandbox_execvp(
     file: *const libc::c_char,
     arguments: *const *const libc::c_char,
 ) -> libc::c_int {
-    unsafe { execute(file, true, arguments, current_environment()) }
+    unsafe {
+        execute(
+            file,
+            true,
+            arguments,
+            current_environment(),
+            ProcessOperation::Execvp,
+        )
+    }
 }
 
 unsafe fn execute(
@@ -437,6 +537,7 @@ unsafe fn execute(
     search_path: bool,
     arguments: *const *const libc::c_char,
     environment: *const *const libc::c_char,
+    operation: ProcessOperation,
 ) -> libc::c_int {
     let Some(original) = original_execve() else {
         unsafe { set_errno(libc::ENOSYS) };
@@ -446,18 +547,21 @@ unsafe fn execute(
         unsafe { set_errno(libc::EACCES) };
         return -1;
     };
-    let prepared = match unsafe { prepared_executable(path, search_path) } {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            unsafe { set_errno(error.errno) };
-            return -1;
-        }
-    };
+    let (prepared, trace) =
+        match unsafe { prepared_executable(path, search_path, arguments, operation) } {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                unsafe { set_errno(error.errno) };
+                return -1;
+            }
+        };
     let Some(runtime) = ProcessHookRuntime::global() else {
         unsafe { set_errno(libc::EACCES) };
         return -1;
     };
-    let Some(environment) = (unsafe { ChildEnvironment::new(environment, &runtime.config) }) else {
+    let Some(environment) =
+        (unsafe { ChildEnvironment::new(environment, &runtime.config, &trace) })
+    else {
         unsafe { set_errno(libc::EACCES) };
         return -1;
     };

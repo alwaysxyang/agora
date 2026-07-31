@@ -1,12 +1,16 @@
 use super::ExecutionController;
 use super::protocol::{
-    PrepareRequest, PrepareResponse, decode_prepare_request, decode_prepare_response,
-    encode_prepare_request, encode_prepare_response, frame_length,
+    CommandRequest, PrepareRequest, PrepareResponse, ProcessOperation, decode_prepare_request,
+    decode_prepare_response, encode_prepare_request, encode_prepare_request_with_command,
+    encode_prepare_response, frame_length,
 };
+use crate::callback::{Decision, Event, EventType};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
@@ -39,12 +43,24 @@ fn body(frame: &[u8]) -> &[u8] {
 
 #[test]
 fn execution_prepare_protocol_preserves_paths() {
-    let request = encode_prepare_request("token", Path::new("/tmp/客户端")).unwrap();
+    let command = CommandRequest {
+        trace_ids: vec!["trace-root".to_string(), "trace-child".to_string()],
+        pid: 101,
+        ppid: 100,
+        process_executable: "/bin/bash".to_string(),
+        executable: "/usr/bin/curl".to_string(),
+        arguments: vec!["curl".to_string(), "https://example.com".to_string()],
+        current_dir: "/tmp".to_string(),
+        operation: ProcessOperation::Execve,
+    };
+    let request =
+        encode_prepare_request_with_command("token", Path::new("/tmp/客户端"), &command).unwrap();
     assert_eq!(
         decode_prepare_request(body(&request)).unwrap(),
         PrepareRequest {
             token: "token".to_string(),
             executable: PathBuf::from("/tmp/客户端"),
+            command: Some(command),
         }
     );
 
@@ -90,7 +106,7 @@ fn execution_prepare_protocol_rejects_malformed_requests() {
     invalid_lengths[2..4].copy_from_slice(&0_u16.to_be_bytes());
     assert!(decode_prepare_request(&invalid_lengths).is_err());
 
-    let invalid_token = [0, 1, 0, 1, 0, 0, 0, 1, 0xff, b'x'];
+    let invalid_token = [0, 2, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0xff, b'x'];
     assert!(decode_prepare_request(&invalid_token).is_err());
 }
 
@@ -161,8 +177,79 @@ async fn execution_controller_rejects_an_invalid_token() {
             message: "invalid execution token".to_string(),
         }
     );
+
+    let prepared = controller.prepare(PathBuf::from("/bin/sh")).await.unwrap();
+
+    assert!(prepared.is_file());
     controller.shutdown().await.unwrap();
     assert!(directory.join(".lock").is_file());
+}
+
+#[tokio::test]
+async fn execution_controller_publishes_commands_without_applying_network_decisions() {
+    let root = TestDirectory::new();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let callback = {
+        let events = Arc::clone(&events);
+        move |event: Event| {
+            events.lock().unwrap().push(event);
+            std::future::ready(Decision::Deny {
+                reason: Some("process events are audit-only".to_string()),
+            })
+        }
+    };
+    let controller = ExecutionController::start_with_callback(
+        root.cache(),
+        "sandbox-1".to_string(),
+        "run-1".to_string(),
+        callback,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    let command = CommandRequest {
+        trace_ids: vec!["trace-root".to_string(), "trace-child".to_string()],
+        pid: 101,
+        ppid: 100,
+        process_executable: "/bin/bash".to_string(),
+        executable: "/bin/sh".to_string(),
+        arguments: vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
+        current_dir: "/tmp".to_string(),
+        operation: ProcessOperation::PosixSpawn,
+    };
+    let mut stream = TcpStream::connect(controller.runtime().control())
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            &encode_prepare_request_with_command(
+                controller.runtime().token(),
+                Path::new("/bin/sh"),
+                &command,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut prefix = [0_u8; 4];
+    stream.read_exact(&mut prefix).await.unwrap();
+    let mut response = vec![0_u8; frame_length(prefix).unwrap()];
+    stream.read_exact(&mut response).await.unwrap();
+
+    assert!(matches!(
+        decode_prepare_response(&response).unwrap(),
+        PrepareResponse::Ready(_)
+    ));
+    {
+        let events = events.lock().unwrap();
+        let Event::Process(event) = &events[0] else {
+            panic!("expected a process event");
+        };
+        assert_eq!(event.event_type, EventType::ProcessExecAttempt);
+        assert_eq!(event.trace_ids, command.trace_ids);
+        assert_eq!(event.command.arguments, command.arguments);
+    }
+    controller.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -216,17 +303,63 @@ async fn execution_controller_returns_preparation_errors_to_the_hook() {
 }
 
 #[tokio::test]
-async fn execution_controller_reports_a_malformed_hook_request() {
+async fn execution_controller_isolates_a_malformed_hook_request() {
     let root = TestDirectory::new();
-    let mut controller = ExecutionController::start(root.cache()).await.unwrap();
+    let controller = ExecutionController::start(root.cache()).await.unwrap();
     let mut stream = TcpStream::connect(controller.runtime().control())
         .await
         .unwrap();
     stream.write_all(&0_u32.to_be_bytes()).await.unwrap();
+    stream.shutdown().await.unwrap();
 
-    let error = controller.wait_failure().await;
+    let prepared = controller.prepare(PathBuf::from("/bin/sh")).await.unwrap();
 
-    assert!(error.to_string().contains("execution controller failed"));
+    assert!(prepared.is_file());
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn execution_controller_isolates_an_invalid_command_trace() {
+    let root = TestDirectory::new();
+    let controller = ExecutionController::start(root.cache()).await.unwrap();
+    let command = CommandRequest {
+        trace_ids: vec!["invalid\ntrace".to_string()],
+        pid: 101,
+        ppid: 100,
+        process_executable: "/bin/bash".to_string(),
+        executable: "/bin/sh".to_string(),
+        arguments: vec!["/bin/sh".to_string()],
+        current_dir: "/tmp".to_string(),
+        operation: ProcessOperation::Execve,
+    };
+    let mut stream = TcpStream::connect(controller.runtime().control())
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            &encode_prepare_request_with_command(
+                controller.runtime().token(),
+                Path::new("/bin/sh"),
+                &command,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut prefix = [0_u8; 4];
+    stream.read_exact(&mut prefix).await.unwrap();
+    let mut response = vec![0_u8; frame_length(prefix).unwrap()];
+    stream.read_exact(&mut response).await.unwrap();
+
+    let PrepareResponse::Error { errno, message } = decode_prepare_response(&response).unwrap()
+    else {
+        panic!("an invalid trace must be rejected");
+    };
+    assert_eq!(errno, libc::EINVAL);
+    assert!(message.contains("invalid command trace ids"));
+
+    let prepared = controller.prepare(PathBuf::from("/bin/sh")).await.unwrap();
+    assert!(prepared.is_file());
     controller.shutdown().await.unwrap();
 }
 

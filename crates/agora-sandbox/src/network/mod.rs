@@ -2,6 +2,7 @@ mod config;
 mod http_proxy;
 mod inspection;
 mod proxy;
+mod relay;
 mod tls;
 
 pub use config::{NetworkConfig, NetworkEnforcement, TlsMode};
@@ -13,15 +14,16 @@ pub fn generate_tls_ca(certificate: impl AsRef<Path>, private_key: impl AsRef<Pa
 }
 
 use crate::callback::{
-    Callback, Decision, DomainSource, EVENT_SCHEMA_VERSION, EventMetrics, EventResult, EventStatus,
-    EventType, NetworkContext, NetworkEvent, NetworkProtocol, ProcessContext, Proxy, Subsystem,
-    TlsContext,
+    Callback, Decision, DomainSource, EVENT_SCHEMA_VERSION, Event, EventMetrics, EventResult,
+    EventStatus, EventType, NetworkContext, NetworkEvent, NetworkProtocol, ProcessContext, Proxy,
+    Subsystem, TlsContext,
 };
 use crate::protocol::{ConnectRequest, PROTOCOL_VERSION, ProtocolError, RouteRegistration};
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use http_proxy::HttpProxyConnector;
 use inspection::DomainObservation;
+use relay::RelayOutcome;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -105,6 +107,26 @@ impl NetworkController {
         let authority =
             TlsAuthority::from_pem(certificate_pem, private_key_pem, CERTIFICATE_CACHE_CAPACITY)?;
         let tls = TlsBridge::new(authority)?;
+        Self::start_inner(config, context, callback, Some(Arc::new(tls))).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start_with_tls_ca_and_roots<C>(
+        config: NetworkConfig,
+        context: NetworkRunContext,
+        callback: C,
+        certificate_pem: &[u8],
+        private_key_pem: &[u8],
+        upstream_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    ) -> Result<Self>
+    where
+        C: Callback,
+    {
+        const CERTIFICATE_CACHE_CAPACITY: usize = 2048;
+
+        let authority =
+            TlsAuthority::from_pem(certificate_pem, private_key_pem, CERTIFICATE_CACHE_CAPACITY)?;
+        let tls = TlsBridge::with_root_certificates(authority, upstream_roots)?;
         Self::start_inner(config, context, callback, Some(Arc::new(tls))).await
     }
 
@@ -426,32 +448,23 @@ where
     pub(super) async fn publish_closed(
         &self,
         registration: &RouteRegistration,
-        result: std::io::Result<(u64, u64)>,
+        outcome: RelayOutcome,
         duration_ms: u64,
         observation: Option<&DomainObservation>,
         decision: &Decision,
         tls: Option<TlsContext>,
     ) {
-        let (status, error_code, error_message, metrics) = match result {
-            Ok((bytes_sent, bytes_received)) => (
-                EventStatus::Succeeded,
-                None,
-                None,
-                EventMetrics {
-                    bytes_sent,
-                    bytes_received,
-                    duration_ms,
-                },
-            ),
-            Err(error) => (
+        let metrics = EventMetrics {
+            bytes_sent: outcome.bytes_sent,
+            bytes_received: outcome.bytes_received,
+            duration_ms,
+        };
+        let (status, error_code, error_message) = match outcome.error {
+            None => (EventStatus::Succeeded, None, None),
+            Some(error) => (
                 EventStatus::Failed,
                 error.raw_os_error().map(|value| value.to_string()),
                 Some(error.to_string()),
-                EventMetrics {
-                    bytes_sent: 0,
-                    bytes_received: 0,
-                    duration_ms,
-                },
             ),
         };
         let event = self.network_event(
@@ -474,8 +487,11 @@ where
     }
 
     async fn dispatch(&self, event: NetworkEvent) -> Decision {
-        match tokio::time::timeout(self.config.callback_timeout, self.callback.on_event(event))
-            .await
+        match tokio::time::timeout(
+            self.config.callback_timeout,
+            self.callback.on_event(Event::Network(event)),
+        )
+        .await
         {
             Ok(decision) => decision,
             Err(_) => Decision::Deny {
@@ -498,6 +514,7 @@ where
             event_type: publication.event_type,
             sandbox_id: self.context.sandbox_id.clone(),
             run_id: self.context.run_id.clone(),
+            trace_ids: registration.trace_ids.clone(),
             connection_id: Some(registration.connection_id.clone()),
             sequence: Some(publication.sequence),
             process: Self::process_context(&registration.process),

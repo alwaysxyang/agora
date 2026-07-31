@@ -1,14 +1,15 @@
 use super::{
-    SandboxCommand, SandboxConfig, SandboxOutcome, process_group_exists, signal_process_group,
-    wait_for_child_or_service,
+    Sandbox, SandboxCommand, SandboxConfig, SandboxOutcome, process_group_exists,
+    signal_process_group, wait_for_child_or_service,
 };
-use crate::callback::NoopCallback;
+use crate::callback::{Decision, Event, EventType, NoopCallback, TlsOutcome};
 use crate::execution::ExecutionController;
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
 use base64::Engine;
 use std::ffi::OsStr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 fn sleeping_child() -> tokio::process::Child {
@@ -16,6 +17,183 @@ fn sleeping_child() -> tokio::process::Child {
     command.arg("30").kill_on_drop(true);
     command.as_std_mut().process_group(0);
     command.spawn().unwrap()
+}
+
+#[cfg(target_os = "macos")]
+fn built_hook_library() -> PathBuf {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["build", "-p", "agora-sandbox", "--lib"])
+        .current_dir(workspace)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                workspace.join(path)
+            }
+        })
+        .unwrap_or_else(|| workspace.join("target"));
+    target.join("debug/libagora_sandbox.dylib")
+}
+
+#[cfg(target_os = "macos")]
+async fn local_https_origin(
+    identity: &str,
+) -> (
+    std::net::SocketAddr,
+    rustls::pki_types::CertificateDer<'static>,
+    tokio::task::JoinHandle<()>,
+) {
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair, KeyUsagePurpose,
+    };
+    use rustls::ServerConfig;
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::TlsAcceptor;
+
+    let root_key = KeyPair::generate().unwrap();
+    let mut root_params = CertificateParams::new(vec!["Agora Origin Test CA".to_string()]).unwrap();
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root_params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let issuer = CertifiedIssuer::self_signed(root_params, root_key).unwrap();
+    let origin_root = issuer.der().clone();
+    let server_key = KeyPair::generate().unwrap();
+    let mut server_params = CertificateParams::new(vec![identity.to_string()]).unwrap();
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let server_certificate = server_params.signed_by(&server_key, &issuer).unwrap();
+    let mut server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![server_certificate.der().clone(), origin_root.clone()],
+            PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+        )
+        .unwrap();
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = acceptor.accept(stream).await.unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut bytes = [0_u8; 1024];
+            let read = stream.read(&mut bytes).await.unwrap();
+            assert_ne!(read, 0);
+            request.extend_from_slice(&bytes[..read]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    (address, origin_root, task)
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn system_curl_completes_the_transparent_tls_chain() {
+    let identity = "origin.agora.test";
+    let (origin, origin_root, origin_task) = local_https_origin(identity).await;
+    let root = std::env::temp_dir().join(format!("agora-curl-tls-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let output = root.join("response.txt");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let callback = {
+        let events = Arc::clone(&events);
+        move |event| {
+            events.lock().unwrap().push(event);
+            std::future::ready(Decision::Allow)
+        }
+    };
+    let mut config = SandboxConfig::new(built_hook_library())
+        .with_workdir(&root)
+        .with_upstream_tls_roots(vec![origin_root]);
+    config.network.tls = TlsMode::Auto;
+    let url = format!("https://{identity}:{}/", origin.port());
+    let resolve = format!("{identity}:{}:127.0.0.1", origin.port());
+    let script = format!(
+        "/usr/bin/curl --silent --show-error --fail --connect-timeout 5 --max-time 10 --resolve {resolve} {url} --output {}",
+        output.display()
+    );
+    let command = SandboxCommand::new("/bin/bash").args(["-c", script.as_str()]);
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        Sandbox::new(config, callback).run(command),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        outcome.status().success(),
+        "curl exited with {:?}; events: {:#?}",
+        outcome.status().code(),
+        events.lock().unwrap()
+    );
+    tokio::time::timeout(Duration::from_secs(2), origin_task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(std::fs::read(&output).unwrap(), b"ok");
+
+    let events = events.lock().unwrap();
+    let process = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Process(event) if event.command.executable == "/usr/bin/curl" => Some(event),
+            Event::Network(_) | Event::Process(_) => None,
+        })
+        .expect("curl process event");
+    let established = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Network(event)
+                if event.event_type == EventType::NetworkConnectEstablished
+                    && event
+                        .network
+                        .as_ref()
+                        .is_some_and(|network| network.destination_port == origin.port()) =>
+            {
+                Some(event)
+            }
+            Event::Network(_) | Event::Process(_) => None,
+        })
+        .expect("curl TLS connection event");
+    assert_eq!(process.trace_ids, established.trace_ids);
+    assert!(process.trace_ids.len() >= 2);
+    assert_eq!(
+        established.tls.as_ref().map(|tls| tls.outcome),
+        Some(TlsOutcome::Terminated)
+    );
+    assert_eq!(
+        established
+            .network
+            .as_ref()
+            .and_then(|network| network.domain.as_deref()),
+        Some(identity)
+    );
+    drop(events);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

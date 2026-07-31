@@ -3,7 +3,7 @@ use agora_core::lifecycle::{
     signal::{Signal, SignalHandlers},
 };
 use agora_sandbox::{
-    callback::{Callback, Decision, EventType, NetworkEvent},
+    callback::{Callback, Decision, Event, EventType, ProcessOperation},
     network::TlsMode,
     runner::{Sandbox, SandboxCommand, SandboxConfig},
 };
@@ -100,7 +100,7 @@ impl JsonCallback {
 }
 
 impl Callback for JsonCallback {
-    fn on_event(&self, event: NetworkEvent) -> impl Future<Output = Decision> + Send {
+    fn on_event(&self, event: Event) -> impl Future<Output = Decision> + Send {
         if let Err(error) = lock(&self.state).on_event(&event) {
             eprintln!("failed to write sandbox audit record: {error:#}");
         }
@@ -119,17 +119,35 @@ impl AuditState {
         })
     }
 
-    fn on_event(&mut self, event: &NetworkEvent) -> Result<()> {
-        if event.event_type == EventType::NetworkConnectAttempt
-            && let Some(network) = event.network.as_ref()
-        {
-            self.output.write_record(&AuditRecord {
-                access_time: event.occurred_at.clone(),
-                pid: event.process.pid,
-                destination_ip: network.destination_ip,
-                destination_port: network.destination_port,
-                domain: network.domain.clone(),
-            })?;
+    fn on_event(&mut self, event: &Event) -> Result<()> {
+        let record = match event {
+            Event::Network(event) if event.event_type == EventType::NetworkConnectAttempt => {
+                event.network.as_ref().map(|network| AuditRecord::Network {
+                    access_time: event.occurred_at.clone(),
+                    trace_ids: event.trace_ids.clone(),
+                    pid: event.process.pid,
+                    destination_ip: network.destination_ip,
+                    destination_port: network.destination_port,
+                    domain: network.domain.clone(),
+                })
+            }
+            Event::Process(event) if event.event_type == EventType::ProcessExecAttempt => {
+                Some(AuditRecord::Process {
+                    access_time: event.occurred_at.clone(),
+                    trace_ids: event.trace_ids.clone(),
+                    pid: event.process.pid,
+                    ppid: event.process.ppid,
+                    process_executable: event.process.executable.clone(),
+                    executable: event.command.executable.clone(),
+                    arguments: event.command.arguments.clone(),
+                    current_dir: event.command.current_dir.clone(),
+                    operation: event.command.operation,
+                })
+            }
+            _ => None,
+        };
+        if let Some(record) = record {
+            self.output.write_record(&record)?;
         }
         Ok(())
     }
@@ -178,12 +196,27 @@ impl AuditOutput {
 }
 
 #[derive(Serialize)]
-struct AuditRecord {
-    access_time: String,
-    pid: u32,
-    destination_ip: std::net::IpAddr,
-    destination_port: u16,
-    domain: Option<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AuditRecord {
+    Network {
+        access_time: String,
+        trace_ids: Vec<String>,
+        pid: u32,
+        destination_ip: std::net::IpAddr,
+        destination_port: u16,
+        domain: Option<String>,
+    },
+    Process {
+        access_time: String,
+        trace_ids: Vec<String>,
+        pid: u32,
+        ppid: u32,
+        process_executable: String,
+        executable: String,
+        arguments: Vec<String>,
+        current_dir: String,
+        operation: ProcessOperation,
+    },
 }
 
 async fn async_main(arguments: Arguments) -> Result<u8> {

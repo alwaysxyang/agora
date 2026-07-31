@@ -1,7 +1,7 @@
 use super::super::tls::{TlsAuthority, TlsBridge};
 use super::super::{NetworkConfig, NetworkController, NetworkRunContext, NetworkRuntime, TlsMode};
 use crate::callback::{
-    BasicAuth, Callback, Decision, DomainSource, EventType, HttpProxy, NetworkEvent, Proxy,
+    BasicAuth, Callback, Decision, DomainSource, Event, EventType, HttpProxy, NetworkEvent, Proxy,
     TlsOutcome, TlsPolicy,
 };
 use crate::protocol::{
@@ -10,7 +10,7 @@ use crate::protocol::{
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -20,8 +20,10 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 struct EventLog(Arc<Mutex<Vec<NetworkEvent>>>);
 
 impl Callback for EventLog {
-    fn on_event(&self, event: NetworkEvent) -> impl Future<Output = Decision> + Send {
-        self.0.lock().unwrap().push(event);
+    fn on_event(&self, event: Event) -> impl Future<Output = Decision> + Send {
+        if let Some(event) = event.into_network() {
+            self.0.lock().unwrap().push(event);
+        }
         std::future::ready(Decision::Allow)
     }
 }
@@ -96,6 +98,7 @@ fn connect_request(
             ppid: 1,
             executable: "/tmp/test-client".to_string(),
         },
+        trace_ids: vec!["trace-test".to_string()],
         operation: HookOperation::Connect,
     }
 }
@@ -228,6 +231,7 @@ async fn connect_request_relays_bytes_and_emits_ordered_audit_events() {
     let network = events[0].network.as_ref().unwrap();
     assert_eq!(network.destination_ip, destination.ip());
     assert_eq!(network.destination_port, destination.port());
+    assert!(events.iter().all(|event| event.trace_ids == ["trace-test"]));
 
     fixture.controller.shutdown().await.unwrap();
 }
@@ -334,9 +338,9 @@ async fn http_host_is_audited_from_relayed_payload() {
 
 #[tokio::test]
 async fn invalid_credentials_and_versions_are_rejected_without_audit_events() {
+    let destination = echo_server().await;
     let fixture = ProxyFixture::start().await;
     let runtime = fixture.controller.runtime().clone();
-    let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9);
 
     let mut request = connect_request(&runtime, destination, "connection-auth");
     request.token = "wrong-token".to_string();
@@ -346,6 +350,13 @@ async fn invalid_credentials_and_versions_are_rejected_without_audit_events() {
     request.protocol_version += 1;
     assert_rejected(&runtime, &request).await;
     assert!(fixture.events.snapshot().is_empty());
+
+    request.protocol_version = PROTOCOL_VERSION;
+    request.connection_id = "connection-after-rejection".to_string();
+    let mut client = open_tunnel(&runtime, &request, b"still-alive").await;
+    let mut echoed = [0_u8; 11];
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"still-alive");
 
     fixture.controller.shutdown().await.unwrap();
 }
@@ -384,7 +395,8 @@ async fn denied_http_domain_never_connects_to_upstream() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let callback = {
         let events = Arc::clone(&events);
-        move |event: NetworkEvent| {
+        move |event: Event| {
+            let event = event.into_network().unwrap();
             let denied = event.event_type == EventType::NetworkConnectAttempt
                 && event
                     .network
@@ -450,7 +462,8 @@ async fn denied_http_domain_never_connects_to_upstream() {
 async fn denied_tls_sni_never_connects_to_upstream() {
     let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let destination = upstream.local_addr().unwrap();
-    let callback = |event: NetworkEvent| async move {
+    let callback = |event: Event| async move {
+        let event = event.into_network().unwrap();
         let denied = event.event_type == EventType::NetworkConnectAttempt
             && event
                 .network
@@ -491,7 +504,8 @@ async fn denied_tls_sni_never_connects_to_upstream() {
 async fn callback_timeout_denies_before_connecting_to_upstream() {
     let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let destination = upstream.local_addr().unwrap();
-    let callback = |event: NetworkEvent| async move {
+    let callback = |event: Event| async move {
+        let event = event.into_network().unwrap();
         if event.event_type == EventType::NetworkConnectAttempt {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
@@ -559,7 +573,8 @@ async fn proxy_decision_uses_http_connect_with_basic_auth() {
     let callback = {
         let decision = decision.clone();
         let events = Arc::clone(&events);
-        move |event: NetworkEvent| {
+        move |event: Event| {
+            let event = event.into_network().unwrap();
             let result = if event.event_type == EventType::NetworkConnectAttempt {
                 decision.clone()
             } else {
@@ -629,7 +644,8 @@ async fn http_proxy_rejection_is_fail_closed_without_direct_fallback() {
             .await
             .unwrap();
     });
-    let callback = move |event: NetworkEvent| {
+    let callback = move |event: Event| {
+        let event = event.into_network().unwrap();
         std::future::ready(if event.event_type == EventType::NetworkConnectAttempt {
             Decision::Proxy {
                 proxy: Proxy::Http(HttpProxy {

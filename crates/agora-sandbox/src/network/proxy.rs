@@ -1,6 +1,8 @@
 use super::inspection::{
     InspectionObservation, InspectionState, MAX_INSPECTION_BYTES, ProtocolInspector,
 };
+use super::relay::relay_bidirectional;
+use super::tls::PrefixedIo;
 use super::{NetworkState, TlsMode, UpstreamConnection};
 use crate::callback::{Callback, Decision, TlsContext, TlsOutcome, TlsPolicy};
 use crate::protocol::{
@@ -11,7 +13,7 @@ use anyhow::{Context, Result};
 use std::io;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -298,11 +300,9 @@ where
         context: RelayContext,
     ) {
         let started = Instant::now();
-        let result = Self::copy_bidirectional(
-            client,
-            upstream.stream,
-            initial_client_data,
-            upstream.initial_data,
+        let result = relay_bidirectional(
+            PrefixedIo::new(initial_client_data, client),
+            PrefixedIo::new(upstream.initial_data, upstream.stream),
         )
         .await;
         let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -348,45 +348,5 @@ where
             outcome,
             alpn,
         }
-    }
-
-    async fn copy_bidirectional(
-        client: TcpStream,
-        upstream: TcpStream,
-        initial_client_data: Vec<u8>,
-        initial_upstream_data: Vec<u8>,
-    ) -> io::Result<(u64, u64)> {
-        let (mut client_reader, mut client_writer) = client.into_split();
-        let (mut upstream_reader, mut upstream_writer) = upstream.into_split();
-        let client_to_upstream = async {
-            let mut bytes_sent = 0_u64;
-            if !initial_client_data.is_empty() {
-                upstream_writer.write_all(&initial_client_data).await?;
-                bytes_sent = initial_client_data.len() as u64;
-            }
-            let mut buffer = [0_u8; 16 * 1024];
-            loop {
-                let read = client_reader.read(&mut buffer).await?;
-                if read == 0 {
-                    upstream_writer.shutdown().await?;
-                    break;
-                }
-                upstream_writer.write_all(&buffer[..read]).await?;
-                bytes_sent = bytes_sent.saturating_add(read as u64);
-            }
-            Ok::<_, io::Error>(bytes_sent)
-        };
-        let upstream_to_client = async {
-            let mut bytes_received = 0_u64;
-            if !initial_upstream_data.is_empty() {
-                client_writer.write_all(&initial_upstream_data).await?;
-                bytes_received = initial_upstream_data.len() as u64;
-            }
-            bytes_received = bytes_received
-                .saturating_add(tokio::io::copy(&mut upstream_reader, &mut client_writer).await?);
-            client_writer.shutdown().await?;
-            Ok::<_, io::Error>(bytes_received)
-        };
-        tokio::try_join!(client_to_upstream, upstream_to_client)
     }
 }

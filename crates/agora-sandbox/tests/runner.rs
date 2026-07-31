@@ -1,4 +1,4 @@
-use agora_sandbox::callback::{Decision, EventType, NetworkEvent, NoopCallback};
+use agora_sandbox::callback::{Decision, Event, EventType, NetworkEvent, NoopCallback};
 use agora_sandbox::network::{NetworkEnforcement, TlsMode};
 use agora_sandbox::runner::{Sandbox, SandboxCommand, SandboxConfig};
 #[cfg(target_os = "macos")]
@@ -549,8 +549,10 @@ async fn injected_hook_routes_a_real_child_connection_through_the_proxy() {
     let events = Arc::new(Mutex::new(Vec::<NetworkEvent>::new()));
     let callback = {
         let events = Arc::clone(&events);
-        move |event| {
-            events.lock().unwrap().push(event);
+        move |event: Event| {
+            if let Some(event) = event.into_network() {
+                events.lock().unwrap().push(event);
+            }
             std::future::ready(Decision::Allow)
         }
     };
@@ -901,8 +903,10 @@ async fn copied_bash_routes_system_curl_through_the_proxy() {
     let events = Arc::new(Mutex::new(Vec::<NetworkEvent>::new()));
     let callback = {
         let events = Arc::clone(&events);
-        move |event| {
-            events.lock().unwrap().push(event);
+        move |event: Event| {
+            if let Some(event) = event.into_network() {
+                events.lock().unwrap().push(event);
+            }
             std::future::ready(Decision::Allow)
         }
     };
@@ -988,8 +992,10 @@ async fn injected_hook_refreshes_process_identity_after_fork() {
     let events = Arc::new(Mutex::new(Vec::<NetworkEvent>::new()));
     let callback = {
         let events = Arc::clone(&events);
-        move |event| {
-            events.lock().unwrap().push(event);
+        move |event: Event| {
+            if let Some(event) = event.into_network() {
+                events.lock().unwrap().push(event);
+            }
             std::future::ready(Decision::Allow)
         }
     };
@@ -1124,8 +1130,11 @@ async fn assert_injected_nonblocking_connection(child_test: &str, child_environm
             .await
             .unwrap();
     });
-    let callback = |event: NetworkEvent| async move {
-        if event.event_type == EventType::NetworkConnectAttempt {
+    let callback = |event: Event| async move {
+        if event
+            .as_network()
+            .is_some_and(|event| event.event_type == EventType::NetworkConnectAttempt)
+        {
             tokio::time::sleep(Duration::from_millis(750)).await;
         }
         Decision::Allow

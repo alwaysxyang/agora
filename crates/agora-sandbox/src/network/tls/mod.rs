@@ -8,8 +8,9 @@ pub(super) use certificate::TlsAuthority;
 
 use super::UpstreamConnection;
 use super::inspection::TlsClientHello;
+use super::relay::{RelayOutcome, relay_bidirectional};
 use anyhow::{Result, bail};
-use io::PrefixedIo;
+pub(super) use io::PrefixedIo;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -129,8 +130,8 @@ impl TlsConnection {
         self.alpn.as_deref()
     }
 
-    pub(in crate::network) async fn relay(mut self) -> std_io::Result<(u64, u64)> {
-        tokio::io::copy_bidirectional(&mut self.downstream, &mut self.upstream).await
+    pub(in crate::network) async fn relay(self) -> RelayOutcome {
+        relay_bidirectional(self.downstream, self.upstream).await
     }
 }
 
