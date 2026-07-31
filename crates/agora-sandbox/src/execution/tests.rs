@@ -4,11 +4,32 @@ use super::protocol::{
     encode_prepare_request, encode_prepare_response, frame_length,
 };
 use std::ffi::OsString;
+use std::fs;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("agora-execution-test-{}", Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    fn cache(&self) -> PathBuf {
+        self.0.join("cache")
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 fn body(frame: &[u8]) -> &[u8] {
     let length = frame_length(frame[..4].try_into().unwrap()).unwrap();
@@ -94,8 +115,9 @@ fn execution_prepare_protocol_rejects_malformed_responses() {
 
 #[tokio::test]
 async fn execution_controller_rejects_an_invalid_token() {
-    let run_id = format!("test-{}", Uuid::new_v4());
-    let controller = ExecutionController::start(&run_id).await.unwrap();
+    let root = TestDirectory::new();
+    let directory = root.cache();
+    let controller = ExecutionController::start(directory.clone()).await.unwrap();
     let mut stream = TcpStream::connect(controller.runtime().control())
         .await
         .unwrap();
@@ -113,31 +135,32 @@ async fn execution_controller_rejects_an_invalid_token() {
         PrepareResponse::Error("invalid execution token".to_string())
     );
     controller.shutdown().await.unwrap();
-    assert!(
-        !std::env::temp_dir()
-            .join(format!("agora-sandbox-{run_id}"))
-            .exists()
-    );
+    assert!(directory.join(".lock").is_file());
 }
 
 #[tokio::test]
-async fn execution_controller_prepares_the_root_executable_and_cleans_up() {
-    let run_id = format!("test-{}", Uuid::new_v4());
-    let directory = std::env::temp_dir().join(format!("agora-sandbox-{run_id}"));
-    let controller = ExecutionController::start(&run_id).await.unwrap();
+async fn execution_controller_prepares_and_reuses_the_root_executable() {
+    let root = TestDirectory::new();
+    let directory = root.cache();
+    let controller = ExecutionController::start(directory.clone()).await.unwrap();
 
     let prepared = controller.prepare(PathBuf::from("/bin/sh")).await.unwrap();
 
     assert!(prepared.starts_with(&directory));
     assert!(prepared.is_file());
     controller.shutdown().await.unwrap();
-    assert!(!directory.exists());
+    assert!(prepared.is_file());
+
+    let controller = ExecutionController::start(directory).await.unwrap();
+    let reused = controller.prepare(PathBuf::from("/bin/sh")).await.unwrap();
+    assert_eq!(reused, prepared);
+    controller.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn execution_controller_returns_preparation_errors_to_the_hook() {
-    let run_id = format!("test-{}", Uuid::new_v4());
-    let controller = ExecutionController::start(&run_id).await.unwrap();
+    let root = TestDirectory::new();
+    let controller = ExecutionController::start(root.cache()).await.unwrap();
     let mut stream = TcpStream::connect(controller.runtime().control())
         .await
         .unwrap();
@@ -165,8 +188,8 @@ async fn execution_controller_returns_preparation_errors_to_the_hook() {
 
 #[tokio::test]
 async fn execution_controller_reports_a_malformed_hook_request() {
-    let run_id = format!("test-{}", Uuid::new_v4());
-    let mut controller = ExecutionController::start(&run_id).await.unwrap();
+    let root = TestDirectory::new();
+    let mut controller = ExecutionController::start(root.cache()).await.unwrap();
     let mut stream = TcpStream::connect(controller.runtime().control())
         .await
         .unwrap();
@@ -179,13 +202,13 @@ async fn execution_controller_reports_a_malformed_hook_request() {
 }
 
 #[tokio::test]
-async fn dropping_the_execution_controller_removes_its_directory() {
-    let run_id = format!("test-{}", Uuid::new_v4());
-    let directory = std::env::temp_dir().join(format!("agora-sandbox-{run_id}"));
-    let controller = ExecutionController::start(&run_id).await.unwrap();
+async fn dropping_the_execution_controller_retains_its_cache_directory() {
+    let root = TestDirectory::new();
+    let directory = root.cache();
+    let controller = ExecutionController::start(directory.clone()).await.unwrap();
     assert!(directory.is_dir());
 
     drop(controller);
 
-    assert!(!directory.exists());
+    assert!(directory.is_dir());
 }

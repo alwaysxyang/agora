@@ -45,6 +45,10 @@ fn hook_library() -> PathBuf {
     .clone()
 }
 
+fn cli_workdir() -> PathBuf {
+    workspace_root().join("target/agora-sandbox-test-cache/cli")
+}
+
 #[test]
 fn sandbox_cli_documents_only_available_options() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
@@ -57,6 +61,7 @@ fn sandbox_cli_documents_only_available_options() {
     assert!(stdout.contains("-c, --command <COMMAND>"));
     assert!(stdout.contains("--hook-library <HOOK_LIBRARY>"));
     assert!(stdout.contains("--audit-file <AUDIT_FILE>"));
+    assert!(stdout.contains("--workdir <WORKDIR>"));
     assert!(stdout.contains("--tls-trust-anchor <TLS_TRUST_ANCHOR>"));
     assert!(stdout.contains("--tls <TLS>"));
     assert!(stdout.contains("[possible values: off, auto]"));
@@ -97,6 +102,8 @@ fn sandbox_cli_generates_and_overwrites_a_tls_certificate_authority() {
     let accepted = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
         .arg("--hook-library")
         .arg(hook_library())
+        .arg("--workdir")
+        .arg(cli_workdir())
         .args(["--tls", "auto", "--tls-ca-cert"])
         .arg(&certificate)
         .arg("--tls-ca-key")
@@ -157,6 +164,8 @@ fn sandbox_cli_runs_an_interactive_bash_in_a_terminal() {
         .arg(env!("CARGO_BIN_EXE_agora-sandbox"))
         .arg("--hook-library")
         .arg(hook_library())
+        .arg("--workdir")
+        .arg(cli_workdir())
         .arg("-c")
         .arg("/bin/bash")
         .stdin(Stdio::piped())
@@ -255,6 +264,8 @@ fn sandbox_cli_injects_the_configured_tls_trust_anchor() {
     let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
         .arg("--hook-library")
         .arg(hook_library())
+        .arg("--workdir")
+        .arg(cli_workdir())
         .arg("--tls-trust-anchor")
         .arg(&anchor)
         .arg("-c")
@@ -353,6 +364,8 @@ fn run_audited_cli(audit_file: Option<&Path>) -> (Output, SocketAddr) {
     process
         .arg("--hook-library")
         .arg(hook_library())
+        .arg("--workdir")
+        .arg(cli_workdir())
         .arg("-c")
         .arg(command)
         .env("AGORA_SANDBOX_TEST_CLI_CHILD", "1")

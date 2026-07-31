@@ -41,6 +41,10 @@ struct Arguments {
     #[arg(long)]
     audit_file: Option<PathBuf>,
 
+    /// Directory for prepared executable copies; defaults to ~/.agora-sandbox/bin
+    #[arg(long)]
+    workdir: Option<PathBuf>,
+
     /// Path to a DER CA certificate trusted by sandboxed SecTrust TLS clients
     #[arg(long)]
     tls_trust_anchor: Option<PathBuf>,
@@ -237,6 +241,9 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
         None => default_hook_library()?,
     };
     let mut config = SandboxConfig::new(hook_library);
+    if let Some(workdir) = arguments.workdir {
+        config = config.with_workdir(workdir);
+    }
     config.network.tls = arguments.tls.into();
     if let Some(anchor) = arguments.tls_trust_anchor {
         config = config.with_tls_trust_anchor(anchor);

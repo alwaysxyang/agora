@@ -85,6 +85,11 @@ fn hook_library() -> PathBuf {
     .clone()
 }
 
+fn sandbox_config() -> SandboxConfig {
+    SandboxConfig::new(hook_library())
+        .with_workdir(workspace_root().join("target/agora-sandbox-test-cache/runner"))
+}
+
 #[test]
 fn unsupported_enforcement_and_missing_tls_ca_fail_validation() {
     let hook = PathBuf::from("/tmp/hook.dylib");
@@ -116,7 +121,7 @@ async fn runner_rejects_a_malformed_tls_ca_before_starting_the_child() {
     let marker = directory.join("child-started");
     std::fs::write(&certificate, b"not a certificate").unwrap();
     std::fs::write(&private_key, b"not a private key").unwrap();
-    let mut config = SandboxConfig::new(hook_library()).with_tls_ca(&certificate, &private_key);
+    let mut config = sandbox_config().with_tls_ca(&certificate, &private_key);
     config.network.tls = TlsMode::Auto;
     let command = SandboxCommand::new("/bin/sh")
         .arg("-c")
@@ -134,7 +139,7 @@ async fn runner_rejects_a_malformed_tls_ca_before_starting_the_child() {
 
 #[tokio::test]
 async fn runner_propagates_child_exit_status() {
-    let sandbox = Sandbox::new(SandboxConfig::new(hook_library()), NoopCallback);
+    let sandbox = Sandbox::new(sandbox_config(), NoopCallback);
     let command = SandboxCommand::new(std::env::current_exe().unwrap())
         .arg("exits_with_seven")
         .arg("--exact")
@@ -466,7 +471,7 @@ async fn injected_hook_routes_a_real_child_connection_through_the_proxy() {
         .arg("--nocapture")
         .env("AGORA_SANDBOX_TEST_CHILD", "1")
         .env("AGORA_SANDBOX_TEST_DESTINATION", destination.to_string());
-    let outcome = Sandbox::new(SandboxConfig::new(hook_library()), callback)
+    let outcome = Sandbox::new(sandbox_config(), callback)
         .run(command)
         .await
         .unwrap();
@@ -497,20 +502,22 @@ async fn injected_hook_routes_a_real_child_connection_through_the_proxy() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn runner_uses_and_removes_a_temporary_executable_copy() {
+async fn runner_uses_and_reuses_a_persistent_executable_copy() {
     let directory = std::env::temp_dir().join(format!(
         "agora-sandbox-executable-test-{}",
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&directory).unwrap();
-    let output = directory.join("current-exe");
+    let workdir = directory.join("cache");
+    let output = directory.join("current-exe-first");
     let command = SandboxCommand::new(std::env::current_exe().unwrap())
         .arg("records_current_executable")
         .arg("--exact")
         .arg("--nocapture")
         .env("AGORA_SANDBOX_TEST_CURRENT_EXE", &output);
+    let config = SandboxConfig::new(hook_library()).with_workdir(&workdir);
 
-    let outcome = Sandbox::new(SandboxConfig::new(hook_library()), NoopCallback)
+    let outcome = Sandbox::new(config.clone(), NoopCallback)
         .run(command)
         .await
         .unwrap();
@@ -518,10 +525,23 @@ async fn runner_uses_and_removes_a_temporary_executable_copy() {
     assert!(outcome.status().success());
     let executable = PathBuf::from(std::fs::read_to_string(&output).unwrap());
     assert_ne!(executable, std::env::current_exe().unwrap());
-    assert!(!executable.exists(), "temporary executable was retained");
-    assert!(
-        !executable.parent().unwrap().exists(),
-        "temporary executable directory was retained"
+    assert!(executable.starts_with(&workdir));
+    assert!(executable.is_file(), "prepared executable was not retained");
+
+    let second_output = directory.join("current-exe-second");
+    let second = SandboxCommand::new(std::env::current_exe().unwrap())
+        .arg("records_current_executable")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("AGORA_SANDBOX_TEST_CURRENT_EXE", &second_output);
+    let outcome = Sandbox::new(config, NoopCallback)
+        .run(second)
+        .await
+        .unwrap();
+    assert!(outcome.status().success());
+    assert_eq!(
+        PathBuf::from(std::fs::read_to_string(second_output).unwrap()),
+        executable
     );
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -561,7 +581,7 @@ async fn runner_injects_a_process_local_sec_trust_anchor() {
         .arg("2026-08-01-00:00:00")
         .arg("-s")
         .arg("example.test");
-    let config = SandboxConfig::new(hook_library()).with_tls_trust_anchor(&anchor);
+    let config = sandbox_config().with_tls_trust_anchor(&anchor);
 
     let outcome = Sandbox::new(config, NoopCallback)
         .run(command)
@@ -600,7 +620,7 @@ async fn runner_injects_the_configured_tls_ca_path() {
     let ca = params.self_signed(&key).unwrap();
     std::fs::write(&certificate, ca.pem()).unwrap();
     std::fs::write(&private_key, key.serialize_pem()).unwrap();
-    let mut config = SandboxConfig::new(hook_library()).with_tls_ca(&certificate, &private_key);
+    let mut config = sandbox_config().with_tls_ca(&certificate, &private_key);
     config.network.tls = TlsMode::Auto;
     let script = format!(
         "/usr/bin/env -i AGORA_SANDBOX_TEST_TLS_TRUST_ENV='{}' '{}' \
@@ -670,7 +690,7 @@ async fn copied_bash_routes_system_curl_through_the_proxy() {
          --silent --show-error --output /dev/null http://{destination}/"
     );
 
-    let outcome = Sandbox::new(SandboxConfig::new(hook_library()), callback)
+    let outcome = Sandbox::new(sandbox_config(), callback)
         .run(SandboxCommand::new("/bin/bash").args(["-c", &script]))
         .await
         .unwrap();
@@ -700,7 +720,7 @@ async fn runner_terminates_background_descendants_before_returning() {
     let output = directory.join("background-pid");
     let script = format!("/bin/sleep 30 & echo $! > {}", output.display());
 
-    let outcome = Sandbox::new(SandboxConfig::new(hook_library()), NoopCallback)
+    let outcome = Sandbox::new(sandbox_config(), NoopCallback)
         .run(SandboxCommand::new("/bin/bash").args(["-c", &script]))
         .await
         .unwrap();
@@ -759,7 +779,7 @@ async fn injected_hook_refreshes_process_identity_after_fork() {
         .env("AGORA_SANDBOX_TEST_FORK_CHILD", "1")
         .env("AGORA_SANDBOX_TEST_DESTINATION", destination.to_string());
 
-    let outcome = Sandbox::new(SandboxConfig::new(hook_library()), callback)
+    let outcome = Sandbox::new(sandbox_config(), callback)
         .run(command)
         .await
         .unwrap();
@@ -825,7 +845,7 @@ async fn injected_hook_blocks_unsupported_connectx_without_direct_fallback() {
         .arg("--nocapture")
         .env("AGORA_SANDBOX_TEST_UNSUPPORTED_CONNECTX_CHILD", "1")
         .env("AGORA_SANDBOX_TEST_DESTINATION", destination.to_string());
-    let outcome = Sandbox::new(SandboxConfig::new(hook_library()), NoopCallback)
+    let outcome = Sandbox::new(sandbox_config(), NoopCallback)
         .run(command)
         .await
         .unwrap();
@@ -895,7 +915,7 @@ async fn assert_injected_nonblocking_connection(child_test: &str, child_environm
         .arg("--nocapture")
         .env(child_environment, "1")
         .env("AGORA_SANDBOX_TEST_DESTINATION", destination.to_string());
-    let outcome = Sandbox::new(SandboxConfig::new(hook_library()), callback)
+    let outcome = Sandbox::new(sandbox_config(), callback)
         .run(command)
         .await
         .unwrap();

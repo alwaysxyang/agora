@@ -8,7 +8,7 @@ use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMod
 use base64::Engine;
 use std::ffi::OsStr;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 fn sleeping_child() -> tokio::process::Child {
@@ -23,6 +23,15 @@ fn sandbox_config_and_command_builders_preserve_runtime_inputs() {
     let missing_hook = std::env::temp_dir().join("agora-missing-hook.dylib");
     let config = SandboxConfig::new(&missing_hook);
     assert_eq!(config.hook_library(), missing_hook);
+    let expected_workdir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".agora-sandbox/bin");
+    assert_eq!(config.workdir(), expected_workdir);
+    assert_eq!(
+        config.clone().with_workdir("/tmp/agora-cache").workdir(),
+        Path::new("/tmp/agora-cache")
+    );
     assert_eq!(config.tls_trust_anchor(), None);
     assert_eq!(config.tls_ca(), None);
     assert!(
@@ -194,6 +203,10 @@ fn process_group_helpers_treat_a_missing_group_as_already_stopped() {
 
 #[tokio::test]
 async fn proxy_failure_terminates_the_child_process() {
+    let workdir = std::env::temp_dir().join(format!(
+        "agora-proxy-failure-cache-{}",
+        uuid::Uuid::new_v4()
+    ));
     let mut controller = NetworkController::start(
         NetworkConfig::default(),
         NetworkRunContext::new("sandbox", "run"),
@@ -202,9 +215,7 @@ async fn proxy_failure_terminates_the_child_process() {
     .await
     .unwrap();
     let mut child = sleeping_child();
-    let mut execution = ExecutionController::start("proxy-failure-test")
-        .await
-        .unwrap();
+    let mut execution = ExecutionController::start(workdir.clone()).await.unwrap();
     controller.abort_listener_for_test();
     let process_group = child.id().unwrap() as libc::pid_t;
 
@@ -224,10 +235,15 @@ async fn proxy_failure_terminates_the_child_process() {
     assert!(child.try_wait().unwrap().is_some());
     controller.shutdown().await.unwrap();
     execution.shutdown().await.unwrap();
+    std::fs::remove_dir_all(workdir).unwrap();
 }
 
 #[tokio::test]
 async fn execution_controller_failure_terminates_the_child_process() {
+    let workdir = std::env::temp_dir().join(format!(
+        "agora-execution-failure-cache-{}",
+        uuid::Uuid::new_v4()
+    ));
     let mut controller = NetworkController::start(
         NetworkConfig::default(),
         NetworkRunContext::new("sandbox", "run"),
@@ -236,9 +252,7 @@ async fn execution_controller_failure_terminates_the_child_process() {
     .await
     .unwrap();
     let mut child = sleeping_child();
-    let mut execution = ExecutionController::start("execution-failure-test")
-        .await
-        .unwrap();
+    let mut execution = ExecutionController::start(workdir.clone()).await.unwrap();
     execution.abort_server_for_test();
     let process_group = child.id().unwrap() as libc::pid_t;
 
@@ -258,4 +272,5 @@ async fn execution_controller_failure_terminates_the_child_process() {
     assert!(child.try_wait().unwrap().is_some());
     controller.shutdown().await.unwrap();
     assert!(execution.shutdown().await.is_ok());
+    std::fs::remove_dir_all(workdir).unwrap();
 }

@@ -31,15 +31,13 @@ impl ExecutionRuntime {
 pub(crate) struct ExecutionController {
     runtime: ExecutionRuntime,
     store: Arc<Mutex<ExecutableStore>>,
-    directory: PathBuf,
     shutdown: watch::Sender<bool>,
     tasks: JoinSet<Result<()>>,
 }
 
 impl ExecutionController {
-    pub(crate) async fn start(run_id: &str) -> Result<Self> {
-        let directory = std::env::temp_dir().join(format!("agora-sandbox-{run_id}"));
-        let store = Arc::new(Mutex::new(ExecutableStore::new(directory.clone())?));
+    pub(crate) async fn start(directory: PathBuf) -> Result<Self> {
+        let store = Arc::new(Mutex::new(ExecutableStore::new(directory)?));
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .context("failed to bind sandbox execution controller")?;
@@ -55,7 +53,6 @@ impl ExecutionController {
         Ok(Self {
             runtime: ExecutionRuntime { token, control },
             store,
-            directory,
             shutdown,
             tasks,
         })
@@ -94,7 +91,7 @@ impl ExecutionController {
                 _ => {}
             }
         }
-        let cleanup = lock(&self.store).cleanup();
+        let cleanup = lock(&self.store).finish();
         if let Some(error) = first_error {
             return Err(error);
         }
@@ -113,7 +110,6 @@ impl Drop for ExecutionController {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
         self.tasks.abort_all();
-        let _ = std::fs::remove_dir_all(&self.directory);
     }
 }
 

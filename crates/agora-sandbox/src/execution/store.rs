@@ -1,16 +1,21 @@
 use anyhow::{Context, Result, bail};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use uuid::Uuid;
 
 const MACH_64_MAGIC: u32 = 0xfeed_facf;
 const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 const CPU_SUBTYPE_ARM64E: u32 = 2;
+const CACHE_ENTRY_PREFIX: &str = "cache-v1-";
+const CACHE_ENTRY_LIMIT: usize = 10;
+const CACHE_LOCK_FILE: &str = ".lock";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ArchitectureSelection {
@@ -20,13 +25,13 @@ struct ArchitectureSelection {
 
 pub(super) struct ExecutableStore {
     directory: PathBuf,
-    prepared: HashMap<PathBuf, PathBuf>,
-    next_id: u64,
+    lock: File,
+    shared_lock_held: bool,
 }
 
 impl ExecutableStore {
     pub(super) fn new(directory: PathBuf) -> Result<Self> {
-        fs::create_dir(&directory).with_context(|| {
+        fs::create_dir_all(&directory).with_context(|| {
             format!(
                 "failed to create sandbox executable directory {}",
                 directory.display()
@@ -38,10 +43,28 @@ impl ExecutableStore {
                 directory.display()
             )
         })?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join(CACHE_LOCK_FILE))
+            .with_context(|| {
+                format!(
+                    "failed to open sandbox executable cache lock {}",
+                    directory.display()
+                )
+            })?;
+        Self::flock(&lock, libc::LOCK_SH).with_context(|| {
+            format!(
+                "failed to lock sandbox executable cache {}",
+                directory.display()
+            )
+        })?;
         Ok(Self {
             directory,
-            prepared: HashMap::new(),
-            next_id: 1,
+            lock,
+            shared_lock_held: true,
         })
     }
 
@@ -49,9 +72,35 @@ impl ExecutableStore {
         let source = source
             .canonicalize()
             .with_context(|| format!("failed to resolve executable {}", source.display()))?;
-        Self::validate_source(&source)?;
-        if let Some(prepared) = self.prepared.get(&source) {
-            return Ok(prepared.clone());
+        let metadata = Self::validate_source(&source)?;
+        let destination = self.destination(&source, &metadata);
+        match destination.symlink_metadata() {
+            Ok(metadata) if metadata.is_file() && metadata.mode() & 0o111 != 0 => {
+                return Ok(destination);
+            }
+            Ok(metadata) if metadata.is_file() => {
+                fs::remove_file(&destination).with_context(|| {
+                    format!(
+                        "failed to replace invalid sandbox executable cache entry {}",
+                        destination.display()
+                    )
+                })?;
+            }
+            Ok(_) => {
+                bail!(
+                    "sandbox executable cache entry is not a file: {}",
+                    destination.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect sandbox executable cache entry {}",
+                        destination.display()
+                    )
+                });
+            }
         }
 
         let architectures = Self::architectures(&source)?;
@@ -63,14 +112,16 @@ impl ExecutableStore {
                     Self::native_architecture()
                 )
             })?;
-        let destination = self.destination(&source);
+        let temporary = self
+            .directory
+            .join(format!(".tmp-{}", Uuid::new_v4().simple()));
         let prepared: Result<PathBuf> = (|| {
             if architectures.len() == 1 {
-                fs::copy(&source, &destination).with_context(|| {
+                fs::copy(&source, &temporary).with_context(|| {
                     format!(
                         "failed to copy executable {} to {}",
                         source.display(),
-                        destination.display()
+                        temporary.display()
                     )
                 })?;
             } else {
@@ -81,18 +132,15 @@ impl ExecutableStore {
                         OsStr::new("-thin"),
                         OsStr::new(&selected.slice),
                         OsStr::new("-output"),
-                        destination.as_os_str(),
+                        temporary.as_os_str(),
                     ],
                     "failed to extract native executable architecture",
                 )?;
             }
             let source_mode = source.metadata()?.mode();
-            fs::set_permissions(
-                &destination,
-                fs::Permissions::from_mode(source_mode | 0o200),
-            )?;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(source_mode | 0o200))?;
             if selected.rewrite_arm64e {
-                Self::rewrite_arm64e_subtype(&destination)?;
+                Self::rewrite_arm64e_subtype(&temporary)?;
             }
             Self::run_tool(
                 "/usr/bin/codesign",
@@ -101,35 +149,60 @@ impl ExecutableStore {
                     OsStr::new("--sign"),
                     OsStr::new("-"),
                     OsStr::new("--timestamp=none"),
-                    destination.as_os_str(),
+                    temporary.as_os_str(),
                 ],
                 "failed to ad-hoc sign executable copy",
             )?;
-            fs::set_permissions(&destination, fs::Permissions::from_mode(source_mode))?;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(source_mode))?;
+            fs::rename(&temporary, &destination).with_context(|| {
+                format!(
+                    "failed to publish sandbox executable cache entry {}",
+                    destination.display()
+                )
+            })?;
             Ok(destination.clone())
         })();
         if prepared.is_err() {
-            let _ = fs::remove_file(&destination);
+            let _ = fs::remove_file(&temporary);
         }
-        let prepared = prepared?;
-        self.prepared.insert(source, prepared.clone());
-        Ok(prepared)
+        prepared
     }
 
-    pub(super) fn cleanup(&self) -> Result<()> {
-        match fs::remove_dir_all(&self.directory) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).with_context(|| {
-                format!(
-                    "failed to remove sandbox executable directory {}",
-                    self.directory.display()
-                )
-            }),
+    pub(super) fn finish(&mut self) -> Result<()> {
+        if !self.shared_lock_held {
+            return Ok(());
         }
+        Self::flock(&self.lock, libc::LOCK_UN).with_context(|| {
+            format!(
+                "failed to unlock sandbox executable cache {}",
+                self.directory.display()
+            )
+        })?;
+        self.shared_lock_held = false;
+
+        match Self::flock(&self.lock, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect sandbox executable cache activity {}",
+                        self.directory.display()
+                    )
+                });
+            }
+        }
+        let prune = self.prune();
+        let unlock = Self::flock(&self.lock, libc::LOCK_UN).with_context(|| {
+            format!(
+                "failed to unlock sandbox executable cache cleanup {}",
+                self.directory.display()
+            )
+        });
+        prune.and(unlock)
     }
 
-    fn validate_source(source: &Path) -> Result<()> {
+    fn validate_source(source: &Path) -> Result<Metadata> {
         let metadata = source
             .metadata()
             .with_context(|| format!("failed to inspect executable {}", source.display()))?;
@@ -139,12 +212,10 @@ impl ExecutableStore {
         if metadata.mode() & 0o111 == 0 {
             bail!("sandbox executable is not executable: {}", source.display());
         }
-        Ok(())
+        Ok(metadata)
     }
 
-    fn destination(&mut self, source: &Path) -> PathBuf {
-        let id = self.next_id;
-        self.next_id += 1;
+    fn destination(&self, source: &Path, metadata: &Metadata) -> PathBuf {
         let name = source
             .file_name()
             .unwrap_or_else(|| OsStr::new("executable"))
@@ -157,8 +228,60 @@ impl ExecutableStore {
                     '_'
                 }
             })
+            .take(48)
             .collect::<String>();
-        self.directory.join(format!("{id:08}-{name}"))
+        self.directory.join(format!(
+            "{CACHE_ENTRY_PREFIX}{:x}-{:x}-{:x}-{:x}-{:x}-{:x}-{:x}-{}-{name}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.size(),
+            metadata.mtime() as u64,
+            metadata.mtime_nsec() as u64,
+            metadata.ctime() as u64,
+            metadata.ctime_nsec() as u64,
+            Self::native_architecture(),
+        ))
+    }
+
+    fn prune(&self) -> Result<()> {
+        let mut entries = fs::read_dir(&self.directory)
+            .with_context(|| {
+                format!(
+                    "failed to read sandbox executable cache {}",
+                    self.directory.display()
+                )
+            })?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(CACHE_ENTRY_PREFIX))
+                    && entry.file_type().is_ok_and(|file_type| file_type.is_file())
+            })
+            .collect::<Vec<_>>();
+        if entries.len() <= CACHE_ENTRY_LIMIT {
+            return Ok(());
+        }
+        entries.sort_by_cached_key(|_| Uuid::new_v4());
+        let remove = entries.len() - CACHE_ENTRY_LIMIT;
+        for entry in entries.into_iter().take(remove) {
+            fs::remove_file(entry.path()).with_context(|| {
+                format!(
+                    "failed to prune sandbox executable cache entry {}",
+                    entry.path().display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn flock(file: &File, operation: libc::c_int) -> std::io::Result<()> {
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
 
     fn architectures(source: &Path) -> Result<Vec<String>> {

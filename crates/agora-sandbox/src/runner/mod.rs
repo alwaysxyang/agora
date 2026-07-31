@@ -45,6 +45,7 @@ const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
 pub struct SandboxConfig {
     pub network: NetworkConfig,
     hook_library: PathBuf,
+    workdir: PathBuf,
     tls_trust_anchor: Option<PathBuf>,
     tls_ca: Option<TlsCaFiles>,
 }
@@ -60,6 +61,7 @@ impl SandboxConfig {
         Self {
             network: NetworkConfig::default(),
             hook_library: hook_library.into(),
+            workdir: default_workdir(),
             tls_trust_anchor: None,
             tls_ca: None,
         }
@@ -67,6 +69,15 @@ impl SandboxConfig {
 
     pub fn hook_library(&self) -> &Path {
         &self.hook_library
+    }
+
+    pub fn with_workdir(mut self, workdir: impl Into<PathBuf>) -> Self {
+        self.workdir = workdir.into();
+        self
+    }
+
+    pub fn workdir(&self) -> &Path {
+        &self.workdir
     }
 
     pub fn with_tls_trust_anchor(mut self, certificate: impl Into<PathBuf>) -> Self {
@@ -279,7 +290,7 @@ where
         let sandbox_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
         let mut execution = {
-            let controller = ExecutionController::start(&run_id).await?;
+            let controller = ExecutionController::start(self.config.workdir.clone()).await?;
             let executable = command.resolved_program()?;
             let prepared = controller.prepare(executable).await?;
             command.set_program(prepared);
@@ -397,6 +408,13 @@ where
         }
         std::env::join_paths(libraries).context("invalid DYLD_INSERT_LIBRARIES path")
     }
+}
+
+fn default_workdir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".agora-sandbox/bin")
 }
 
 #[cfg(target_os = "macos")]
