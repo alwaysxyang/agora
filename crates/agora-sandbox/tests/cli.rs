@@ -2,9 +2,12 @@
 use base64::Engine;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -61,6 +64,135 @@ fn sandbox_cli_documents_only_available_options() {
     assert!(stdout.contains("--tls-ca-cert <TLS_CA_CERT>"));
     assert!(stdout.contains("--tls-ca-key <TLS_CA_KEY>"));
     assert!(!stdout.contains("--network-enforcement"));
+    assert!(stdout.contains("tls"));
+}
+
+#[test]
+fn sandbox_cli_generates_and_overwrites_a_tls_certificate_authority() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-cli-generate-ca-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let certificate = directory.join("nested/ca.pem");
+    let private_key = directory.join("nested/ca-key.pem");
+
+    let generated = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .args(["tls", "generate", "--cert"])
+        .arg(&certificate)
+        .arg("--key")
+        .arg(&private_key)
+        .output()
+        .unwrap();
+
+    assert!(
+        generated.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let certificate_pem = std::fs::read_to_string(&certificate).unwrap();
+    let private_key_pem = std::fs::read_to_string(&private_key).unwrap();
+    assert!(certificate_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+    assert!(private_key_pem.starts_with("-----BEGIN PRIVATE KEY-----"));
+    let accepted = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .arg("--hook-library")
+        .arg(hook_library())
+        .args(["--tls", "auto", "--tls-ca-cert"])
+        .arg(&certificate)
+        .arg("--tls-ca-key")
+        .arg(&private_key)
+        .args(["-c", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    assert!(
+        accepted.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&accepted.stdout),
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(
+            certificate.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            private_key.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    let regenerated = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .args(["tls", "generate", "--cert"])
+        .arg(&certificate)
+        .arg("--key")
+        .arg(&private_key)
+        .output()
+        .unwrap();
+
+    assert!(
+        regenerated.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&regenerated.stdout),
+        String::from_utf8_lossy(&regenerated.stderr)
+    );
+    assert_ne!(
+        std::fs::read_to_string(&certificate).unwrap(),
+        certificate_pem
+    );
+    assert_ne!(
+        std::fs::read_to_string(&private_key).unwrap(),
+        private_key_pem
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_cli_runs_an_interactive_bash_in_a_terminal() {
+    let mut process = Command::new("/usr/bin/script");
+    process
+        .arg("-q")
+        .arg("/dev/null")
+        .arg(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .arg("--hook-library")
+        .arg(hook_library())
+        .arg("-c")
+        .arg("/bin/bash")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = process.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"echo AGORA_INTERACTIVE_BASH_OK\nexit\n")
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("interactive sandbox Bash did not exit before the deadline");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("AGORA_INTERACTIVE_BASH_OK"),
+        "stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 #[test]

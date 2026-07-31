@@ -1,8 +1,62 @@
-use super::TlsAuthority;
+use super::{TlsAuthority, generate_ca};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 use std::net::{IpAddr, Ipv4Addr};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
+
+#[test]
+fn ca_generation_creates_parent_directories_and_replaces_existing_outputs() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-generate-ca-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let certificate = directory.join("nested/ca.pem");
+    let private_key = directory.join("nested/ca-key.pem");
+
+    generate_ca(&certificate, &private_key).unwrap();
+    let first_certificate = std::fs::read_to_string(&certificate).unwrap();
+    let first_private_key = std::fs::read_to_string(&private_key).unwrap();
+    assert!(first_certificate.starts_with("-----BEGIN CERTIFICATE-----"));
+    assert!(first_private_key.starts_with("-----BEGIN PRIVATE KEY-----"));
+
+    generate_ca(&certificate, &private_key).unwrap();
+
+    assert_ne!(
+        std::fs::read_to_string(&certificate).unwrap(),
+        first_certificate
+    );
+    assert_ne!(
+        std::fs::read_to_string(&private_key).unwrap(),
+        first_private_key
+    );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            certificate.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            private_key.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn ca_generation_rejects_one_path_for_both_outputs() {
+    let path = std::env::temp_dir().join(format!(
+        "agora-sandbox-duplicate-ca-path-{}",
+        uuid::Uuid::new_v4()
+    ));
+
+    let error = generate_ca(&path, &path).unwrap_err();
+
+    assert!(error.to_string().contains("paths must differ"));
+    assert!(!path.exists());
+}
 
 #[test]
 fn authority_rejects_malformed_ca_material() {

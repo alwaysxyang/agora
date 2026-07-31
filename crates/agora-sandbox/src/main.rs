@@ -4,11 +4,11 @@ use agora_core::lifecycle::{
 };
 use agora_sandbox::{
     callback::{Callback, Decision, EventType, NetworkEvent},
-    network::TlsMode,
+    network::{TlsMode, generate_tls_ca},
     runner::{Sandbox, SandboxCommand, SandboxConfig},
 };
 use anyhow::{Context, Result};
-use clap::{ColorChoice, Parser, ValueEnum};
+use clap::{ColorChoice, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -21,12 +21,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 #[command(
     name = "agora-sandbox",
     about = "Run a command with Agora sandbox network interception and auditing",
-    color = ColorChoice::Auto
+    color = ColorChoice::Auto,
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true
 )]
 struct Arguments {
     /// Command line to run; shell operators are not interpreted
-    #[arg(short = 'c', long)]
-    command: String,
+    #[arg(short = 'c', long, required = true)]
+    command: Option<String>,
+
+    #[command(subcommand)]
+    subcommand: Option<CliCommand>,
 
     /// Path to the injectable libagora_sandbox.dylib
     #[arg(long)]
@@ -51,6 +56,27 @@ struct Arguments {
     /// Path to the PEM CA private key used for TLS interception
     #[arg(long, requires = "tls_ca_cert")]
     tls_ca_key: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum CliCommand {
+    /// Manage TLS interception material
+    #[command(subcommand)]
+    Tls(TlsCommand),
+}
+
+#[derive(Subcommand)]
+enum TlsCommand {
+    /// Generate or replace a PEM certificate authority and private key
+    Generate {
+        /// Destination path for the PEM CA certificate
+        #[arg(long)]
+        cert: PathBuf,
+
+        /// Destination path for the PEM PKCS#8 private key
+        #[arg(long)]
+        key: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -202,6 +228,10 @@ struct AuditRecord {
 }
 
 async fn async_main(arguments: Arguments) -> Result<u8> {
+    if let Some(CliCommand::Tls(TlsCommand::Generate { cert, key })) = arguments.subcommand {
+        generate_tls_ca(cert, key)?;
+        return Ok(0);
+    }
     let hook_library = match arguments.hook_library {
         Some(path) => path,
         None => default_hook_library()?,
@@ -214,7 +244,12 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
     if let (Some(certificate), Some(private_key)) = (arguments.tls_ca_cert, arguments.tls_ca_key) {
         config = config.with_tls_ca(certificate, private_key);
     }
-    let command = parse_command(&arguments.command)?;
+    let command = parse_command(
+        arguments
+            .command
+            .as_deref()
+            .context("missing sandbox command")?,
+    )?;
     let callback = JsonCallback::new(arguments.audit_file.as_deref())?;
 
     let status = Arc::new(Mutex::new(None::<ExitStatus>));

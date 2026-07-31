@@ -1,4 +1,4 @@
-mod certificate;
+pub(super) mod certificate;
 mod io;
 
 #[cfg(test)]

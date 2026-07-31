@@ -1,18 +1,81 @@
 use anyhow::{Context, Result, bail};
 use rcgen::{
-    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, Issuer, KeyPair,
-    KeyUsagePurpose, PublicKeyData,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, PublicKeyData,
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use time::{Duration, OffsetDateTime};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 const LEAF_VALIDITY: Duration = Duration::days(1);
 const CLOCK_SKEW: Duration = Duration::minutes(5);
+const CA_VALIDITY: Duration = Duration::days(3650);
+
+pub(in crate::network) fn generate_ca(
+    certificate_path: &Path,
+    private_key_path: &Path,
+) -> Result<()> {
+    if certificate_path == private_key_path {
+        bail!("TLS CA certificate and private key paths must differ");
+    }
+    let key = KeyPair::generate().context("failed to generate TLS CA private key")?;
+    let mut params = CertificateParams::new(Vec::new())
+        .context("failed to create TLS CA certificate parameters")?;
+    let now = OffsetDateTime::now_utc();
+    params.not_before = now - CLOCK_SKEW;
+    params.not_after = now + CA_VALIDITY;
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "Agora Sandbox CA");
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let certificate = params
+        .self_signed(&key)
+        .context("failed to generate TLS CA certificate")?;
+
+    write_ca_file(certificate_path, certificate.pem().as_bytes())?;
+    write_ca_file(private_key_path, key.serialize_pem().as_bytes())?;
+    Ok(())
+}
+
+fn write_ca_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create TLS CA directory {}", parent.display()))?;
+
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to open TLS CA file {}", path.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("failed to write TLS CA file {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync TLS CA file {}", path.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to secure TLS CA file {}", path.display()))?;
+    Ok(())
+}
 
 pub(in crate::network) struct TlsAuthority {
     issuer: Issuer<'static, KeyPair>,

@@ -30,6 +30,16 @@ const EXECUTION_TOKEN: &str = "AGORA_SANDBOX_EXECUTION_TOKEN";
 const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
 #[cfg(target_os = "macos")]
 const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
+#[cfg(target_os = "macos")]
+const TLS_TRUST_BUNDLE: &str = "AGORA_SANDBOX_TLS_TRUST_BUNDLE";
+#[cfg(target_os = "macos")]
+const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
+    "SSL_CERT_FILE",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "GIT_SSL_CAINFO",
+];
 
 #[derive(Clone, Debug)]
 pub struct SandboxConfig {
@@ -237,26 +247,35 @@ where
                     .map(|der| base64::engine::general_purpose::STANDARD.encode(der))
             })
             .transpose()?;
-        let tls_ca = self
-            .config
-            .tls_ca
-            .as_ref()
-            .map(|ca| {
-                let certificate = std::fs::read(&ca.certificate).with_context(|| {
-                    format!(
-                        "failed to read TLS CA certificate {}",
-                        ca.certificate.display()
-                    )
-                })?;
-                let private_key = std::fs::read(&ca.private_key).with_context(|| {
-                    format!(
-                        "failed to read TLS CA private key {}",
-                        ca.private_key.display()
-                    )
-                })?;
-                Ok::<_, anyhow::Error>((certificate, private_key))
-            })
-            .transpose()?;
+        let tls_ca = if self.config.network.tls == TlsMode::Off {
+            None
+        } else {
+            self.config
+                .tls_ca
+                .as_ref()
+                .map(|ca| {
+                    let certificate_path = ca.certificate.canonicalize().with_context(|| {
+                        format!(
+                            "failed to resolve TLS CA certificate {}",
+                            ca.certificate.display()
+                        )
+                    })?;
+                    let certificate = std::fs::read(&certificate_path).with_context(|| {
+                        format!(
+                            "failed to read TLS CA certificate {}",
+                            certificate_path.display()
+                        )
+                    })?;
+                    let private_key = std::fs::read(&ca.private_key).with_context(|| {
+                        format!(
+                            "failed to read TLS CA private key {}",
+                            ca.private_key.display()
+                        )
+                    })?;
+                    Ok::<_, anyhow::Error>((certificate, private_key, certificate_path))
+                })
+                .transpose()?
+        };
         let sandbox_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
         let mut execution = {
@@ -267,14 +286,14 @@ where
             controller
         };
         let context = NetworkRunContext::new(&sandbox_id, &run_id);
-        let controller = match tls_ca {
-            Some((certificate, private_key)) => {
+        let controller = match tls_ca.as_ref() {
+            Some((certificate, private_key, _)) => {
                 NetworkController::start_with_tls_ca(
                     self.config.network,
                     context,
                     self.callback,
-                    &certificate,
-                    &private_key,
+                    certificate,
+                    private_key,
                 )
                 .await
             }
@@ -314,7 +333,14 @@ where
         if !tls_trust_anchors.is_empty() {
             child.env(TLS_TRUST_ANCHOR_DER, tls_trust_anchors.join(","));
         }
+        if let Some((_, _, certificate)) = &tls_ca {
+            child.env(TLS_TRUST_BUNDLE, certificate);
+            for key in TLS_CLIENT_TRUST_ENVIRONMENT {
+                child.env(key, certificate);
+            }
+        }
         child.as_std_mut().process_group(0);
+        let mut terminal = ForegroundTerminal::capture()?;
 
         let mut child = match child.spawn() {
             Ok(child) => child,
@@ -328,12 +354,25 @@ where
             .id()
             .and_then(|id| libc::pid_t::try_from(id).ok())
             .context("sandbox child has no valid process id")?;
+        if let Some(terminal) = terminal.as_mut()
+            && let Err(error) = terminal.handoff(process_group)
+        {
+            let _ = terminate_process_group(&mut child, process_group).await;
+            let _ = controller.shutdown().await;
+            let _ = execution.shutdown().await;
+            return Err(error);
+        }
         let status =
             wait_for_child_or_service(&mut child, process_group, &mut controller, &mut execution)
                 .await;
+        let terminal_restore = terminal
+            .as_mut()
+            .map(ForegroundTerminal::restore)
+            .transpose();
         let shutdown = controller.shutdown().await;
         let execution_shutdown = execution.shutdown().await;
         let status = status?;
+        terminal_restore?;
         shutdown?;
         execution_shutdown?;
 
@@ -357,6 +396,96 @@ where
             libraries.extend(std::env::split_paths(&existing));
         }
         std::env::join_paths(libraries).context("invalid DYLD_INSERT_LIBRARIES path")
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct ForegroundTerminal {
+    descriptor: libc::c_int,
+    original_process_group: libc::pid_t,
+    handed_off: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl ForegroundTerminal {
+    fn capture() -> Result<Option<Self>> {
+        let descriptor = libc::STDIN_FILENO;
+        if unsafe { libc::isatty(descriptor) } != 1 {
+            return Ok(None);
+        }
+        let original_process_group = unsafe { libc::tcgetpgrp(descriptor) };
+        if original_process_group == -1 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to inspect sandbox terminal process group");
+        }
+        if original_process_group != unsafe { libc::getpgrp() } {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            descriptor,
+            original_process_group,
+            handed_off: false,
+        }))
+    }
+
+    fn handoff(&mut self, process_group: libc::pid_t) -> Result<()> {
+        set_terminal_process_group(self.descriptor, process_group)
+            .context("failed to hand terminal to sandbox child")?;
+        self.handed_off = true;
+        if unsafe { libc::kill(-process_group, libc::SIGCONT) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).context("failed to continue sandbox child process group");
+            }
+        }
+        Ok(())
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if !self.handed_off {
+            return Ok(());
+        }
+        set_terminal_process_group(self.descriptor, self.original_process_group)
+            .context("failed to restore sandbox terminal process group")?;
+        self.handed_off = false;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ForegroundTerminal {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_terminal_process_group(
+    descriptor: libc::c_int,
+    process_group: libc::pid_t,
+) -> std::io::Result<()> {
+    let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    unsafe {
+        libc::sigemptyset(blocked.as_mut_ptr());
+        libc::sigaddset(blocked.as_mut_ptr(), libc::SIGTTOU);
+        let blocked = blocked.assume_init();
+        let block_error = libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, previous.as_mut_ptr());
+        if block_error != 0 {
+            return Err(std::io::Error::from_raw_os_error(block_error));
+        }
+        let previous = previous.assume_init();
+        let result = libc::tcsetpgrp(descriptor, process_group);
+        let error = (result == -1).then(std::io::Error::last_os_error);
+        let restore_error =
+            libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        if restore_error != 0 {
+            return Err(std::io::Error::from_raw_os_error(restore_error));
+        }
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 

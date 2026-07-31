@@ -12,6 +12,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
+const TLS_TRUST_ENVIRONMENT: [&str; 5] = [
+    "SSL_CERT_FILE",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "GIT_SSL_CAINFO",
+];
+
+#[cfg(target_os = "macos")]
 type TestAssociationId = u32;
 #[cfg(target_os = "macos")]
 type TestConnectionId = u32;
@@ -159,6 +168,20 @@ fn records_current_executable() {
             .as_bytes(),
     )
     .unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn records_tls_trust_environment() {
+    let Some(output) = std::env::var_os("AGORA_SANDBOX_TEST_TLS_TRUST_ENV") else {
+        return;
+    };
+    let values = TLS_TRUST_ENVIRONMENT
+        .iter()
+        .map(|key| format!("{key}={}", std::env::var(key).unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(output, values).unwrap();
 }
 
 #[test]
@@ -550,6 +573,59 @@ async fn runner_injects_a_process_local_sec_trust_anchor() {
         "security verify-cert failed with {:?}",
         outcome.status()
     );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_injects_the_configured_tls_ca_path() {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-tls-environment-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let certificate = directory.join("ca.pem");
+    let private_key = directory.join("ca-key.pem");
+    let output = directory.join("environment");
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let ca = params.self_signed(&key).unwrap();
+    std::fs::write(&certificate, ca.pem()).unwrap();
+    std::fs::write(&private_key, key.serialize_pem()).unwrap();
+    let mut config = SandboxConfig::new(hook_library()).with_tls_ca(&certificate, &private_key);
+    config.network.tls = TlsMode::Auto;
+    let script = format!(
+        "/usr/bin/env -i AGORA_SANDBOX_TEST_TLS_TRUST_ENV='{}' '{}' \
+         records_tls_trust_environment --exact --nocapture",
+        output.display(),
+        std::env::current_exe().unwrap().display()
+    );
+    let command = SandboxCommand::new("/bin/bash").args(["-c", &script]);
+
+    let outcome = Sandbox::new(config, NoopCallback)
+        .run(command)
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    let values = std::fs::read_to_string(&output).unwrap();
+    let paths = values
+        .lines()
+        .map(|line| PathBuf::from(line.split_once('=').unwrap().1))
+        .collect::<Vec<_>>();
+    assert_eq!(paths.len(), TLS_TRUST_ENVIRONMENT.len());
+    assert!(paths.iter().all(|path| !path.as_os_str().is_empty()));
+    assert!(paths.iter().all(|path| path == &paths[0]));
+    assert_eq!(paths[0], certificate.canonicalize().unwrap());
+    assert!(certificate.exists());
     std::fs::remove_dir_all(directory).unwrap();
 }
 

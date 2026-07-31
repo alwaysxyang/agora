@@ -35,6 +35,29 @@ fn config_with_control(control: SocketAddr) -> HookConfig {
     HookConfig::from_getter(|key| values.get(key).cloned()).unwrap()
 }
 
+fn config_with_tls_bundle() -> HookConfig {
+    let control = "127.0.0.1:41002".to_string();
+    let values = HashMap::from([
+        ("AGORA_SANDBOX_TOKEN", "token".to_string()),
+        ("AGORA_SANDBOX_PROXY_IPV4", "127.0.0.1:41000".to_string()),
+        ("AGORA_SANDBOX_PROXY_IPV6", "[::1]:41001".to_string()),
+        ("AGORA_SANDBOX_EXECUTION_CONTROL", control),
+        (
+            "AGORA_SANDBOX_EXECUTION_TOKEN",
+            "execution-token".to_string(),
+        ),
+        (
+            "AGORA_SANDBOX_HOOK_LIBRARIES",
+            "/tmp/hook.dylib".to_string(),
+        ),
+        (
+            "AGORA_SANDBOX_TLS_TRUST_BUNDLE",
+            "/tmp/agora-ca.pem".to_string(),
+        ),
+    ]);
+    HookConfig::from_getter(|key| values.get(key).cloned()).unwrap()
+}
+
 fn response(status: u8, content: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&1_u16.to_be_bytes());
@@ -117,6 +140,27 @@ fn child_environment_replaces_untrusted_runtime_values() {
     assert!(!entries.contains(&"DYLD_INSERT_LIBRARIES=/tmp/untrusted.dylib"));
     assert!(entries.contains(&"AGORA_SANDBOX_TOKEN=token"));
     assert!(entries.contains(&"DYLD_INSERT_LIBRARIES=/tmp/hook.dylib"));
+}
+
+#[test]
+fn child_environment_restores_tls_trust_after_the_caller_clears_it() {
+    let stale = CString::new("SSL_CERT_FILE=/tmp/untrusted.pem").unwrap();
+    let values = [stale.as_ptr(), std::ptr::null()];
+
+    let environment =
+        unsafe { ChildEnvironment::new(values.as_ptr(), &config_with_tls_bundle()) }.unwrap();
+    let entries = environment
+        .values
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert!(!entries.contains(&"SSL_CERT_FILE=/tmp/untrusted.pem"));
+    assert!(entries.contains(&"SSL_CERT_FILE=/tmp/agora-ca.pem"));
+    assert!(entries.contains(&"CURL_CA_BUNDLE=/tmp/agora-ca.pem"));
+    assert!(entries.contains(&"REQUESTS_CA_BUNDLE=/tmp/agora-ca.pem"));
+    assert!(entries.contains(&"NODE_EXTRA_CA_CERTS=/tmp/agora-ca.pem"));
+    assert!(entries.contains(&"GIT_SSL_CAINFO=/tmp/agora-ca.pem"));
 }
 
 #[test]

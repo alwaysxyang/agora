@@ -69,15 +69,31 @@ fn hook_configuration_propagates_an_optional_tls_trust_anchor() {
         ("AGORA_SANDBOX_EXECUTION_TOKEN", "execution-token"),
         ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
         ("AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER", "Y2VydGlmaWNhdGU="),
+        ("AGORA_SANDBOX_TLS_TRUST_BUNDLE", "/tmp/agora-ca.pem"),
     ]);
 
     let config = HookConfig::from_getter(|key| values.get(key).map(ToString::to_string)).unwrap();
 
     assert_eq!(config.tls_trust_anchor_der(), Some("Y2VydGlmaWNhdGU="));
+    assert_eq!(config.tls_trust_bundle(), Some("/tmp/agora-ca.pem"));
     assert!(config.child_environment().contains(&(
         "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER",
         "Y2VydGlmaWNhdGU=".to_string()
     )));
+    for key in [
+        "SSL_CERT_FILE",
+        "CURL_CA_BUNDLE",
+        "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+        "GIT_SSL_CAINFO",
+    ] {
+        assert!(
+            config
+                .child_environment()
+                .contains(&(key, "/tmp/agora-ca.pem".to_string())),
+            "missing {key}"
+        );
+    }
 }
 
 #[test]

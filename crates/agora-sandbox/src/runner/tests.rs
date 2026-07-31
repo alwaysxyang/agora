@@ -72,6 +72,39 @@ fn sandbox_config_requires_a_tls_ca_for_interception() {
 }
 
 #[test]
+fn sandbox_config_rejects_missing_tls_ca_files() {
+    let root =
+        std::env::temp_dir().join(format!("agora-missing-ca-files-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let hook = root.join("hook.dylib");
+    let certificate = root.join("ca.pem");
+    let private_key = root.join("ca-key.pem");
+    std::fs::write(&hook, b"hook").unwrap();
+    std::fs::write(&private_key, b"private key").unwrap();
+    let mut config = SandboxConfig::new(&hook).with_tls_ca(&certificate, &private_key);
+    config.network.tls = TlsMode::Auto;
+
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("TLS CA certificate does not exist")
+    );
+
+    std::fs::write(&certificate, b"certificate").unwrap();
+    std::fs::remove_file(&private_key).unwrap();
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("TLS CA private key does not exist")
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn sandbox_config_preserves_tls_ca_paths() {
     let root = std::env::temp_dir().join(format!("agora-tls-ca-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();

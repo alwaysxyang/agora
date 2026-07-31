@@ -8,8 +8,17 @@ const EXECUTION_CONTROL: &str = "AGORA_SANDBOX_EXECUTION_CONTROL";
 const EXECUTION_TOKEN: &str = "AGORA_SANDBOX_EXECUTION_TOKEN";
 const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
 const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
+const TLS_TRUST_BUNDLE: &str = "AGORA_SANDBOX_TLS_TRUST_BUNDLE";
 
-pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 7] = [
+const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
+    "SSL_CERT_FILE",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "GIT_SSL_CAINFO",
+];
+
+pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 13] = [
     TOKEN,
     PROXY_IPV4,
     PROXY_IPV6,
@@ -17,6 +26,12 @@ pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 7] = [
     EXECUTION_TOKEN,
     HOOK_LIBRARIES,
     TLS_TRUST_ANCHOR_DER,
+    TLS_TRUST_BUNDLE,
+    TLS_CLIENT_TRUST_ENVIRONMENT[0],
+    TLS_CLIENT_TRUST_ENVIRONMENT[1],
+    TLS_CLIENT_TRUST_ENVIRONMENT[2],
+    TLS_CLIENT_TRUST_ENVIRONMENT[3],
+    TLS_CLIENT_TRUST_ENVIRONMENT[4],
 ];
 
 #[derive(Clone, Debug)]
@@ -28,6 +43,7 @@ pub(super) struct HookConfig {
     execution_token: String,
     hook_libraries: String,
     tls_trust_anchor_der: Option<String>,
+    tls_trust_bundle: Option<String>,
 }
 
 impl HookConfig {
@@ -49,6 +65,7 @@ impl HookConfig {
         let execution_token = Self::required(&mut get, EXECUTION_TOKEN)?;
         let hook_libraries = Self::required(&mut get, HOOK_LIBRARIES)?;
         let tls_trust_anchor_der = get(TLS_TRUST_ANCHOR_DER).filter(|value| !value.is_empty());
+        let tls_trust_bundle = get(TLS_TRUST_BUNDLE).filter(|value| !value.is_empty());
         if !proxy_ipv4.ip().is_loopback() || !matches!(proxy_ipv4.ip(), IpAddr::V4(_)) {
             return Err(format!("{PROXY_IPV4} must be an IPv4 loopback address"));
         }
@@ -69,6 +86,7 @@ impl HookConfig {
             execution_token,
             hook_libraries,
             tls_trust_anchor_der,
+            tls_trust_bundle,
         })
     }
 
@@ -99,6 +117,11 @@ impl HookConfig {
         self.tls_trust_anchor_der.as_deref()
     }
 
+    #[cfg(test)]
+    pub(super) fn tls_trust_bundle(&self) -> Option<&str> {
+        self.tls_trust_bundle.as_deref()
+    }
+
     pub(super) fn child_environment(&self) -> Vec<(&'static str, String)> {
         let mut environment = vec![
             (TOKEN, self.token.clone()),
@@ -110,6 +133,14 @@ impl HookConfig {
         ];
         if let Some(anchor) = &self.tls_trust_anchor_der {
             environment.push((TLS_TRUST_ANCHOR_DER, anchor.clone()));
+        }
+        if let Some(bundle) = &self.tls_trust_bundle {
+            environment.push((TLS_TRUST_BUNDLE, bundle.clone()));
+            environment.extend(
+                TLS_CLIENT_TRUST_ENVIRONMENT
+                    .into_iter()
+                    .map(|key| (key, bundle.clone())),
+            );
         }
         environment
     }

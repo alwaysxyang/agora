@@ -6,6 +6,12 @@ mod tls;
 
 pub use config::{NetworkConfig, NetworkEnforcement, TlsMode};
 
+use std::path::Path;
+
+pub fn generate_tls_ca(certificate: impl AsRef<Path>, private_key: impl AsRef<Path>) -> Result<()> {
+    tls::certificate::generate_ca(certificate.as_ref(), private_key.as_ref())
+}
+
 use crate::callback::{
     Callback, Decision, DomainSource, EVENT_SCHEMA_VERSION, EventMetrics, EventResult, EventStatus,
     EventType, NetworkContext, NetworkEvent, NetworkProtocol, ProcessContext, Proxy, Subsystem,
