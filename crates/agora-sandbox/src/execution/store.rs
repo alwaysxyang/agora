@@ -5,15 +5,24 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
+use std::os::macos::fs::MetadataExt as MacMetadataExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 const MACH_64_MAGIC: u32 = 0xfeed_facf;
 const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 const CPU_SUBTYPE_ARM64E: u32 = 2;
+const SF_RESTRICTED: u32 = 0x0008_0000;
+const CSR_ALLOW_UNRESTRICTED_FS: libc::c_uint = 1 << 1;
+const CS_RESTRICT: u32 = 0x0000_0800;
+const CS_REQUIRE_LV: u32 = 0x0000_2000;
+const CS_RUNTIME: u32 = 0x0001_0000;
+const CS_DYLD_RESTRICTED: u32 = CS_RESTRICT | CS_REQUIRE_LV | CS_RUNTIME;
+const MAX_SHEBANG_LINE_SIZE: usize = 1024;
 const CACHE_LOCK_FILE: &str = ".lock";
 const CHECKSUM_MANIFEST_FILE: &str = "checksums.json";
 const CHECKSUM_MANIFEST_TEMP_FILE: &str = ".checksums.json.tmp";
@@ -23,6 +32,12 @@ const CHECKSUM_MANIFEST_VERSION: u32 = 1;
 struct ArchitectureSelection {
     slice: String,
     rewrite_arm64e: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Shebang {
+    pub(crate) interpreter: PathBuf,
+    pub(crate) argument: Option<OsString>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -79,14 +94,52 @@ impl ExecutableStore {
             .canonicalize()
             .with_context(|| format!("failed to resolve executable {}", source.display()))?;
         let metadata = Self::validate_source(&source)?;
-        let checksum = Self::checksum(&source)?;
+        if resolve_shebang(&source)?.is_some() || !Self::requires_copy(&source, &metadata)? {
+            return Ok(source);
+        }
+        self.prepare_copy(&source, &metadata)
+    }
+
+    fn requires_copy(source: &Path, metadata: &Metadata) -> Result<bool> {
+        let sip_restricted =
+            metadata.st_flags() & SF_RESTRICTED != 0 && sip_restricts_protected_files();
+        Ok(sip_restricted || Self::code_signing_flags(source)? & CS_DYLD_RESTRICTED != 0)
+    }
+
+    fn code_signing_flags(source: &Path) -> Result<u32> {
+        let output = Command::new("/usr/bin/codesign")
+            .args(["--display", "--verbose=4"])
+            .arg(source)
+            .output()
+            .context("failed to run codesign while inspecting an executable signature")?;
+        if !output.status.success() {
+            return Ok(0);
+        }
+        Self::parse_code_signing_flags(&output.stderr)
+            .context("failed to parse executable code signature")
+    }
+
+    fn parse_code_signing_flags(details: &[u8]) -> Result<u32> {
+        let details = std::str::from_utf8(details)?;
+        let flags = details
+            .lines()
+            .find_map(|line| line.split_once(" flags=0x").map(|(_, flags)| flags))
+            .context("codesign output has no CodeDirectory flags")?;
+        let end = flags
+            .find(|byte: char| !byte.is_ascii_hexdigit())
+            .unwrap_or(flags.len());
+        u32::from_str_radix(&flags[..end], 16).context("invalid CodeDirectory flags")
+    }
+
+    fn prepare_copy(&self, source: &Path, metadata: &Metadata) -> Result<PathBuf> {
+        let checksum = Self::checksum(source)?;
         Self::flock(&self.lock, libc::LOCK_EX).with_context(|| {
             format!(
                 "failed to lock sandbox executable root {}",
                 self.directory.display()
             )
         })?;
-        let prepared = self.prepare_locked(&source, &metadata, &checksum);
+        let prepared = self.prepare_locked(source, metadata, &checksum);
         let unlock = Self::flock(&self.lock, libc::LOCK_UN).with_context(|| {
             format!(
                 "failed to unlock sandbox executable root {}",
@@ -105,6 +158,15 @@ impl ExecutableStore {
         }
     }
 
+    #[cfg(test)]
+    fn prepare_copy_for_test(&self, source: &Path) -> Result<PathBuf> {
+        let source = source
+            .canonicalize()
+            .with_context(|| format!("failed to resolve executable {}", source.display()))?;
+        let metadata = Self::validate_source(&source)?;
+        self.prepare_copy(&source, &metadata)
+    }
+
     fn prepare_locked(
         &self,
         source: &Path,
@@ -112,8 +174,11 @@ impl ExecutableStore {
         checksum: &str,
     ) -> Result<PathBuf> {
         let destination = self.destination(source)?;
+        let parent = destination
+            .parent()
+            .context("executable destination has no parent")?;
         let key = source.to_string_lossy().into_owned();
-        let mut manifest = self.load_manifest()?;
+        let mut manifest = self.load_manifest(parent)?;
         match destination.symlink_metadata() {
             Ok(metadata) if metadata.is_file() && metadata.mode() & 0o111 != 0 => {
                 if manifest
@@ -142,9 +207,6 @@ impl ExecutableStore {
             }
         }
 
-        let parent = destination
-            .parent()
-            .context("executable destination has no parent")?;
         fs::create_dir_all(parent).with_context(|| {
             format!(
                 "failed to create sandbox executable mapping directory {}",
@@ -208,7 +270,7 @@ impl ExecutableStore {
                 )
             })?;
             manifest.files.insert(key, checksum.to_string());
-            self.write_manifest(&manifest)?;
+            self.write_manifest(parent, &manifest)?;
             Ok(destination.clone())
         })();
         if prepared.is_err() {
@@ -240,8 +302,8 @@ impl ExecutableStore {
         Ok(self.directory.join(relative))
     }
 
-    fn load_manifest(&self) -> Result<ChecksumManifest> {
-        let path = self.directory.join(CHECKSUM_MANIFEST_FILE);
+    fn load_manifest(&self, directory: &Path) -> Result<ChecksumManifest> {
+        let path = directory.join(CHECKSUM_MANIFEST_FILE);
         let contents = match fs::read(&path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -271,9 +333,9 @@ impl ExecutableStore {
         Ok(manifest)
     }
 
-    fn write_manifest(&self, manifest: &ChecksumManifest) -> Result<()> {
-        let path = self.directory.join(CHECKSUM_MANIFEST_FILE);
-        let temporary = self.directory.join(CHECKSUM_MANIFEST_TEMP_FILE);
+    fn write_manifest(&self, directory: &Path, manifest: &ChecksumManifest) -> Result<()> {
+        let path = directory.join(CHECKSUM_MANIFEST_FILE);
+        let temporary = directory.join(CHECKSUM_MANIFEST_TEMP_FILE);
         let contents = serde_json::to_vec_pretty(manifest)
             .context("failed to serialize sandbox executable checksum manifest")?;
         let written = (|| {
@@ -402,6 +464,68 @@ impl ExecutableStore {
         }
         String::from_utf8(output.stdout).with_context(|| context)
     }
+}
+
+pub(crate) fn resolve_shebang(path: &Path) -> Result<Option<Shebang>> {
+    let mut file = File::open(path)
+        .with_context(|| format!("failed to open executable {}", path.display()))?;
+    let mut line = [0_u8; MAX_SHEBANG_LINE_SIZE];
+    let length = file
+        .read(&mut line)
+        .with_context(|| format!("failed to read executable {}", path.display()))?;
+    let line = &line[..length];
+    if !line.starts_with(b"#!") {
+        return Ok(None);
+    }
+    let end = match line.iter().position(|byte| *byte == b'\n') {
+        Some(end) => end,
+        None if length < MAX_SHEBANG_LINE_SIZE => length,
+        None => bail!("executable shebang is too long: {}", path.display()),
+    };
+    let mut command = &line[2..end];
+    if command.last() == Some(&b'\r') {
+        command = &command[..command.len() - 1];
+    }
+    command = trim_ascii_whitespace(command);
+    if command.is_empty() {
+        bail!("executable shebang has no interpreter: {}", path.display());
+    }
+    let interpreter_end = command
+        .iter()
+        .position(|byte| byte.is_ascii_whitespace())
+        .unwrap_or(command.len());
+    let interpreter = PathBuf::from(OsString::from_vec(command[..interpreter_end].to_vec()));
+    if !interpreter.is_absolute() {
+        bail!(
+            "executable shebang interpreter is not absolute: {}",
+            path.display()
+        );
+    }
+    let argument = trim_ascii_whitespace(&command[interpreter_end..]);
+    let argument = (!argument.is_empty()).then(|| OsString::from_vec(argument.to_vec()));
+    Ok(Some(Shebang {
+        interpreter,
+        argument,
+    }))
+}
+
+fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn sip_restricts_protected_files() -> bool {
+    static RESTRICTED: OnceLock<bool> = OnceLock::new();
+    *RESTRICTED.get_or_init(|| unsafe { csr_check(CSR_ALLOW_UNRESTRICTED_FS) != 0 })
+}
+
+unsafe extern "C" {
+    fn csr_check(mask: libc::c_uint) -> libc::c_int;
 }
 
 pub(crate) fn resolve_executable(

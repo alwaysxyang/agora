@@ -1,12 +1,18 @@
 use crate::callback::Callback;
 #[cfg(target_os = "macos")]
-use crate::execution::{ExecutionController, resolve_executable};
+use crate::execution::{ExecutionController, resolve_executable, resolve_shebang};
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
 use anyhow::{Context, Result, bail};
 #[cfg(target_os = "macos")]
 use base64::Engine;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+#[cfg(target_os = "macos")]
+use std::fs::OpenOptions;
+#[cfg(target_os = "macos")]
+use std::io::Write;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -32,8 +38,10 @@ const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
 const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
 #[cfg(target_os = "macos")]
 const TLS_TRUST_BUNDLE: &str = "AGORA_SANDBOX_TLS_TRUST_BUNDLE";
-const DEFAULT_TLS_CA_CERTIFICATE: &str = "ca/ca.pem";
-const DEFAULT_TLS_CA_PRIVATE_KEY: &str = "ca/ca-key.pem";
+const DEFAULT_TLS_CA_CERTIFICATE: &str = "ca/ca.crt";
+const DEFAULT_TLS_CA_PRIVATE_KEY: &str = "ca/ca.key";
+#[cfg(target_os = "macos")]
+const TLS_TRUST_BUNDLE_DIRECTORY: &str = "ca";
 #[cfg(target_os = "macos")]
 const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
     "SSL_CERT_FILE",
@@ -73,7 +81,7 @@ impl SandboxConfig {
         std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".agora-sandbox/root")
+            .join(".agora-sandbox")
     }
 
     pub fn hook_library(&self) -> &Path {
@@ -143,39 +151,85 @@ impl SandboxConfig {
                 anchor.display()
             );
         }
-        if let Some(ca) = &self.tls_ca {
-            if !ca.certificate.is_file() {
-                bail!(
-                    "sandbox TLS CA certificate does not exist: {}",
-                    ca.certificate.display()
-                );
-            }
-            if !ca.private_key.is_file() {
-                bail!(
-                    "sandbox TLS CA private key does not exist: {}",
-                    ca.private_key.display()
-                );
-            }
-        }
         Ok(())
     }
 
-    fn tls_ca_for_workdir(&self, workdir: &Path) -> Result<Option<TlsCaFiles>> {
+    fn tls_ca_for_workdir(&self) -> Result<Option<TlsCaFiles>> {
         if self.network.tls == TlsMode::Off {
             return Ok(None);
         }
-        if let Some(ca) = &self.tls_ca {
-            return Ok(Some(ca.clone()));
-        }
-
-        let ca = TlsCaFiles {
-            certificate: workdir.join(DEFAULT_TLS_CA_CERTIFICATE),
-            private_key: workdir.join(DEFAULT_TLS_CA_PRIVATE_KEY),
-        };
+        let ca = self.tls_ca.clone().unwrap_or_else(|| TlsCaFiles {
+            certificate: self.workdir.join(DEFAULT_TLS_CA_CERTIFICATE),
+            private_key: self.workdir.join(DEFAULT_TLS_CA_PRIVATE_KEY),
+        });
         if !ca.certificate.is_file() || !ca.private_key.is_file() {
             crate::network::generate_tls_ca(&ca.certificate, &ca.private_key)?;
         }
         Ok(Some(ca))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_tls_trust_bundle(&self, ca_certificate: &[u8]) -> Result<PathBuf> {
+        let native = rustls_native_certs::load_native_certs();
+        if native.certs.is_empty() {
+            let details = native
+                .errors
+                .first()
+                .map_or_else(|| "no certificates found".to_string(), ToString::to_string);
+            bail!("failed to load native TLS roots for client trust bundle: {details}");
+        }
+        let mut bundle = ca_certificate.to_vec();
+        if !bundle.ends_with(b"\n") {
+            bundle.push(b'\n');
+        }
+        for certificate in native.certs {
+            bundle.extend_from_slice(b"-----BEGIN CERTIFICATE-----\n");
+            let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.as_ref());
+            for line in encoded.as_bytes().chunks(64) {
+                bundle.extend_from_slice(line);
+                bundle.push(b'\n');
+            }
+            bundle.extend_from_slice(b"-----END CERTIFICATE-----\n");
+        }
+
+        let mut fingerprint = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d_u128;
+        for byte in ca_certificate {
+            fingerprint ^= u128::from(*byte);
+            fingerprint = fingerprint.wrapping_mul(309_485_009_821_345_068_724_781_371);
+        }
+        let path = self
+            .workdir
+            .join(TLS_TRUST_BUNDLE_DIRECTORY)
+            .join(format!("trust-bundle-{fingerprint:032x}.crt"));
+        let parent = path
+            .parent()
+            .context("TLS client trust bundle path has no parent")?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create TLS client trust bundle directory {}",
+                parent.display()
+            )
+        })?;
+        let temporary = parent.join(format!(".trust-bundle-{}.tmp", Uuid::new_v4().simple()));
+        let written = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(&bundle)?;
+            file.flush()?;
+            std::fs::rename(&temporary, &path)?;
+            Ok::<_, std::io::Error>(())
+        })();
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error).with_context(|| {
+                format!("failed to write TLS client trust bundle {}", path.display())
+            });
+        }
+        path.canonicalize()
+            .context("failed to resolve TLS client trust bundle")
     }
 }
 
@@ -266,6 +320,21 @@ impl SandboxCommand {
     fn set_program(&mut self, program: PathBuf) {
         self.program = program.into_os_string();
     }
+
+    #[cfg(target_os = "macos")]
+    fn set_script_interpreter(
+        &mut self,
+        interpreter: PathBuf,
+        interpreter_argument: Option<OsString>,
+        script: PathBuf,
+    ) {
+        self.program = interpreter.into_os_string();
+        let mut arguments = Vec::with_capacity(self.arguments.len() + 2);
+        arguments.extend(interpreter_argument);
+        arguments.push(script.into_os_string());
+        arguments.append(&mut self.arguments);
+        self.arguments = arguments;
+    }
 }
 
 pub struct Sandbox<C>
@@ -287,8 +356,8 @@ where
     #[cfg(target_os = "macos")]
     pub async fn run(self, mut command: SandboxCommand) -> Result<SandboxOutcome> {
         self.config.validate()?;
-        let workdir = command.effective_current_dir()?;
-        let tls_ca_files = self.config.tls_ca_for_workdir(&workdir)?;
+        let _ = command.effective_current_dir()?;
+        let tls_ca_files = self.config.tls_ca_for_workdir()?;
         let hook_library = self.config.hook_library.canonicalize().with_context(|| {
             format!(
                 "failed to resolve sandbox hook library {}",
@@ -326,21 +395,27 @@ where
                         ca.private_key.display()
                     )
                 })?;
-                Ok::<_, anyhow::Error>((certificate, private_key, certificate_path))
+                let trust_bundle = self.config.write_tls_trust_bundle(&certificate)?;
+                Ok::<_, anyhow::Error>((certificate, private_key, certificate_path, trust_bundle))
             })
             .transpose()?;
         let sandbox_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
         let mut execution = {
-            let controller = ExecutionController::start(self.config.workdir.clone()).await?;
+            let controller = ExecutionController::start(self.config.workdir.join("root")).await?;
             let executable = command.resolved_program()?;
             let prepared = controller.prepare(executable).await?;
-            command.set_program(prepared);
+            if let Some(shebang) = resolve_shebang(&prepared)? {
+                let interpreter = controller.prepare(shebang.interpreter).await?;
+                command.set_script_interpreter(interpreter, shebang.argument, prepared);
+            } else {
+                command.set_program(prepared);
+            }
             controller
         };
         let context = NetworkRunContext::new(&sandbox_id, &run_id);
         let controller = match tls_ca.as_ref() {
-            Some((certificate, private_key, _)) => {
+            Some((certificate, private_key, _, _)) => {
                 NetworkController::start_with_tls_ca(
                     self.config.network,
                     context,
@@ -386,10 +461,10 @@ where
         if !tls_trust_anchors.is_empty() {
             child.env(TLS_TRUST_ANCHOR_DER, tls_trust_anchors.join(","));
         }
-        if let Some((_, _, certificate)) = &tls_ca {
-            child.env(TLS_TRUST_BUNDLE, certificate);
+        if let Some((_, _, _, trust_bundle)) = &tls_ca {
+            child.env(TLS_TRUST_BUNDLE, trust_bundle);
             for key in TLS_CLIENT_TRUST_ENVIRONMENT {
-                child.env(key, certificate);
+                child.env(key, trust_bundle);
             }
         }
         child.as_std_mut().process_group(0);

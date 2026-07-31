@@ -1,6 +1,6 @@
 use super::{
-    ChildEnvironment, ProcessHookGuard, ProcessHookRuntime, agora_sandbox_execv,
-    agora_sandbox_execve, agora_sandbox_execvp, agora_sandbox_posix_spawn,
+    ChildArguments, ChildEnvironment, PreparedExecutable, ProcessHookGuard, ProcessHookRuntime,
+    agora_sandbox_execv, agora_sandbox_execve, agora_sandbox_execvp, agora_sandbox_posix_spawn,
     agora_sandbox_posix_spawnp, current_environment, execute, prepared_executable,
     requested_executable,
 };
@@ -9,8 +9,10 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::thread;
+use uuid::Uuid;
 
 fn config() -> HookConfig {
     config_with_control("127.0.0.1:41002".parse().unwrap())
@@ -91,6 +93,33 @@ fn runtime_with_response(response: Vec<u8>) -> (ProcessHookRuntime, thread::Join
     )
 }
 
+fn runtime_with_responses(
+    responses: Vec<Vec<u8>>,
+) -> (ProcessHookRuntime, thread::JoinHandle<Vec<Vec<u8>>>) {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let control = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        responses
+            .into_iter()
+            .map(|response| {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut prefix = [0_u8; 4];
+                stream.read_exact(&mut prefix).unwrap();
+                let mut request = vec![0_u8; u32::from_be_bytes(prefix) as usize];
+                stream.read_exact(&mut request).unwrap();
+                stream.write_all(&response).unwrap();
+                request
+            })
+            .collect()
+    });
+    (
+        ProcessHookRuntime {
+            config: config_with_control(control),
+        },
+        server,
+    )
+}
+
 #[test]
 fn child_environment_restores_runtime_values_after_the_caller_clears_them() {
     let path = CString::new("PATH=/usr/bin:/bin").unwrap();
@@ -115,6 +144,52 @@ fn child_environment_accepts_a_null_source_environment() {
 
     assert!(!environment.as_exec_ptr().is_null());
     assert_eq!(environment.values.len(), 7);
+}
+
+#[test]
+fn child_arguments_replace_a_script_with_its_prepared_interpreter() {
+    let original = [
+        CString::new("/usr/local/bin/codex").unwrap(),
+        CString::new("--version").unwrap(),
+    ];
+    let pointers = [original[0].as_ptr(), original[1].as_ptr(), std::ptr::null()];
+    let prepared = PreparedExecutable {
+        program: CString::new("/tmp/root/usr/bin/env").unwrap(),
+        arguments: vec![
+            CString::new("node").unwrap(),
+            CString::new("/usr/local/bin/codex").unwrap(),
+        ],
+    };
+
+    let arguments = unsafe { ChildArguments::new(pointers.as_ptr(), &prepared) }.unwrap();
+    let values = arguments
+        .values
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        values,
+        [
+            "/tmp/root/usr/bin/env",
+            "node",
+            "/usr/local/bin/codex",
+            "--version",
+        ]
+    );
+    assert!(!arguments.as_exec_ptr().is_null());
+
+    let direct = PreparedExecutable {
+        program: CString::new("/usr/local/bin/codex").unwrap(),
+        arguments: Vec::new(),
+    };
+    let arguments = unsafe { ChildArguments::new(pointers.as_ptr(), &direct) }.unwrap();
+    let values = arguments
+        .values
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["/usr/local/bin/codex", "--version"]);
 }
 
 #[test]
@@ -213,6 +288,63 @@ fn process_runtime_returns_the_prepared_executable() {
             .windows(b"/usr/bin/curl".len())
             .any(|value| value == b"/usr/bin/curl")
     );
+}
+
+#[test]
+fn process_runtime_prepares_a_shebang_interpreter_and_preserves_the_script() {
+    let directory = std::env::temp_dir().join(format!("agora-hook-script-{}", Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let script = directory.join("client");
+    std::fs::write(&script, b"#!/usr/bin/env node\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let script = script.canonicalize().unwrap();
+    let (runtime, server) = runtime_with_responses(vec![
+        response(0, script.as_os_str().as_encoded_bytes()),
+        response(0, b"/tmp/prepared-env"),
+    ]);
+
+    let prepared = runtime.prepare_executable(&script).unwrap();
+
+    assert_eq!(prepared.program.to_bytes(), b"/tmp/prepared-env");
+    assert_eq!(prepared.arguments[0].to_bytes(), b"node");
+    assert_eq!(
+        prepared.arguments[1].to_bytes(),
+        script.as_os_str().as_encoded_bytes()
+    );
+    let requests = server.join().unwrap();
+    assert!(
+        requests[0]
+            .windows(script.as_os_str().as_encoded_bytes().len())
+            .any(|value| value == script.as_os_str().as_encoded_bytes())
+    );
+    assert!(
+        requests[1]
+            .windows(b"/usr/bin/env".len())
+            .any(|value| value == b"/usr/bin/env")
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn process_runtime_keeps_a_direct_executable_unchanged() {
+    let directory = std::env::temp_dir().join(format!("agora-hook-binary-{}", Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let executable = directory.join("client");
+    std::fs::write(&executable, b"not a script").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let executable = executable.canonicalize().unwrap();
+    let (runtime, server) =
+        runtime_with_response(response(0, executable.as_os_str().as_encoded_bytes()));
+
+    let prepared = runtime.prepare_executable(&executable).unwrap();
+
+    assert_eq!(
+        prepared.program.to_bytes(),
+        executable.as_os_str().as_encoded_bytes()
+    );
+    assert!(prepared.arguments.is_empty());
+    server.join().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

@@ -4,13 +4,12 @@ use agora_core::lifecycle::{
 };
 use agora_sandbox::{
     callback::{Callback, Decision, EventType, NetworkEvent},
-    network::{TlsMode, generate_tls_ca},
+    network::TlsMode,
     runner::{Sandbox, SandboxCommand, SandboxConfig},
 };
 use anyhow::{Context, Result};
 use clap::{ColorChoice, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -41,7 +40,7 @@ struct Arguments {
     #[arg(long)]
     audit_file: Option<PathBuf>,
 
-    /// Mapped root for prepared executable copies; defaults to ~/.agora-sandbox/root
+    /// Sandbox work directory; defaults to ~/.agora-sandbox
     #[arg(long)]
     workdir: Option<PathBuf>,
 
@@ -53,40 +52,22 @@ struct Arguments {
     #[arg(long, value_enum, default_value_t = TlsArgument::Off)]
     tls: TlsArgument,
 
-    /// PEM CA certificate; TLS auto defaults to <workdir>/ca/ca.pem
+    /// PEM CA certificate; TLS auto defaults to <workdir>/ca/ca.crt
     #[arg(long, requires = "tls_ca_key")]
     tls_ca_cert: Option<PathBuf>,
 
-    /// PEM CA private key; TLS auto defaults to <workdir>/ca/ca-key.pem
+    /// PEM CA private key; TLS auto defaults to <workdir>/ca/ca.key
     #[arg(long, requires = "tls_ca_cert")]
     tls_ca_key: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
 enum CliCommand {
-    /// Remove every prepared executable from the mapped root
+    /// Remove every prepared executable from <workdir>/root
     Clean {
-        /// Mapped root to remove; defaults to ~/.agora-sandbox/root
+        /// Sandbox work directory; defaults to ~/.agora-sandbox
         #[arg(long)]
         workdir: Option<PathBuf>,
-    },
-
-    /// Manage TLS interception material
-    #[command(subcommand)]
-    Tls(TlsCommand),
-}
-
-#[derive(Subcommand)]
-enum TlsCommand {
-    /// Generate or replace a PEM certificate authority and private key
-    Generate {
-        /// Destination path for the PEM CA certificate
-        #[arg(long)]
-        cert: PathBuf,
-
-        /// Destination path for the PEM PKCS#8 private key
-        #[arg(long)]
-        key: PathBuf,
     },
 }
 
@@ -129,59 +110,26 @@ impl Callback for JsonCallback {
 
 struct AuditState {
     output: AuditOutput,
-    pending: HashMap<String, AuditRecord>,
 }
 
 impl AuditState {
     fn new(path: Option<&Path>) -> Result<Self> {
         Ok(Self {
             output: AuditOutput::new(path)?,
-            pending: HashMap::new(),
         })
     }
 
     fn on_event(&mut self, event: &NetworkEvent) -> Result<()> {
-        match event.event_type {
-            EventType::NetworkConnectAttempt => {
-                let (Some(connection_id), Some(network)) =
-                    (event.connection_id.as_ref(), event.network.as_ref())
-                else {
-                    return Ok(());
-                };
-                self.pending.insert(
-                    connection_id.clone(),
-                    AuditRecord {
-                        access_time: event.occurred_at.clone(),
-                        pid: event.process.pid,
-                        destination_ip: network.destination_ip,
-                        destination_port: network.destination_port,
-                        domain: network.domain.clone(),
-                    },
-                );
-            }
-            EventType::NetworkConnectDenied
-            | EventType::NetworkConnectFailed
-            | EventType::NetworkConnectionClosed => {
-                let Some(network) = event.network.as_ref() else {
-                    return Ok(());
-                };
-                let mut record = event
-                    .connection_id
-                    .as_ref()
-                    .and_then(|connection_id| self.pending.remove(connection_id))
-                    .unwrap_or_else(|| AuditRecord {
-                        access_time: event.occurred_at.clone(),
-                        pid: event.process.pid,
-                        destination_ip: network.destination_ip,
-                        destination_port: network.destination_port,
-                        domain: None,
-                    });
-                if network.domain.is_some() {
-                    record.domain.clone_from(&network.domain);
-                }
-                self.output.write_record(&record)?;
-            }
-            _ => {}
+        if event.event_type == EventType::NetworkConnectAttempt
+            && let Some(network) = event.network.as_ref()
+        {
+            self.output.write_record(&AuditRecord {
+                access_time: event.occurred_at.clone(),
+                pid: event.process.pid,
+                destination_ip: network.destination_ip,
+                destination_port: network.destination_port,
+                domain: network.domain.clone(),
+            })?;
         }
         Ok(())
     }
@@ -244,10 +192,6 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
             clean_executable_root(workdir.as_deref())?;
             return Ok(0);
         }
-        Some(CliCommand::Tls(TlsCommand::Generate { cert, key })) => {
-            generate_tls_ca(cert, key)?;
-            return Ok(0);
-        }
         None => {}
     }
     let hook_library = match arguments.hook_library {
@@ -305,13 +249,14 @@ fn clean_executable_root(workdir: Option<&Path>) -> Result<()> {
     let workdir = workdir
         .map(Path::to_path_buf)
         .unwrap_or_else(SandboxConfig::default_workdir);
-    match std::fs::remove_dir_all(&workdir) {
+    let executable_root = workdir.join("root");
+    match std::fs::remove_dir_all(&executable_root) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| {
             format!(
                 "failed to clean sandbox executable root {}",
-                workdir.display()
+                executable_root.display()
             )
         }),
     }

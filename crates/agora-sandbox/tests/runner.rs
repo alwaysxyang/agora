@@ -114,17 +114,19 @@ fn unsupported_enforcement_fails_validation_and_default_tls_ca_is_allowed() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn runner_generates_default_tls_ca_in_the_command_workdir() {
+async fn runner_generates_default_tls_ca_in_the_configured_workdir() {
     let directory = std::env::temp_dir().join(format!(
         "agora-sandbox-default-ca-test-{}",
         uuid::Uuid::new_v4()
     ));
-    std::fs::create_dir_all(&directory).unwrap();
-    let certificate = directory.join("ca/ca.pem");
-    let private_key = directory.join("ca/ca-key.pem");
-    let mut config = SandboxConfig::new(hook_library());
+    let command_workdir = directory.join("command");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&command_workdir).unwrap();
+    let certificate = workdir.join("ca/ca.crt");
+    let private_key = workdir.join("ca/ca.key");
+    let mut config = SandboxConfig::new(hook_library()).with_workdir(&workdir);
     config.network.tls = TlsMode::Auto;
-    let command = SandboxCommand::new("/usr/bin/true").current_dir(&directory);
+    let command = SandboxCommand::new("/usr/bin/true").current_dir(&command_workdir);
 
     let outcome = Sandbox::new(config, NoopCallback)
         .run(command)
@@ -142,6 +144,25 @@ async fn runner_generates_default_tls_ca_in_the_command_workdir() {
             .unwrap()
             .starts_with("-----BEGIN PRIVATE KEY-----")
     );
+    let trust_bundles = std::fs::read_dir(workdir.join("ca"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("trust-bundle-")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(trust_bundles.len(), 1);
+    assert!(
+        rustls_pemfile::certs(&mut std::fs::read(&trust_bundles[0]).unwrap().as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .len()
+            > 1
+    );
+    assert!(!command_workdir.join("ca").exists());
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -539,7 +560,7 @@ async fn injected_hook_routes_a_real_child_connection_through_the_proxy() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn runner_uses_and_reuses_a_persistent_executable_copy() {
+async fn runner_keeps_an_unrestricted_executable_at_its_original_path() {
     let directory = std::env::temp_dir().join(format!(
         "agora-sandbox-executable-test-{}",
         uuid::Uuid::new_v4()
@@ -562,15 +583,12 @@ async fn runner_uses_and_reuses_a_persistent_executable_copy() {
     assert!(outcome.status().success());
     let executable = PathBuf::from(std::fs::read_to_string(&output).unwrap());
     let source = std::env::current_exe().unwrap().canonicalize().unwrap();
-    assert_eq!(
-        executable,
-        workdir.join(source.strip_prefix(Path::new("/")).unwrap())
-    );
-    assert!(executable.is_file(), "prepared executable was not retained");
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(workdir.join("checksums.json")).unwrap()).unwrap();
-    assert_eq!(manifest["version"], 1);
-    assert!(manifest["files"][source.to_string_lossy().as_ref()].is_string());
+    assert_eq!(executable, source);
+    let cached = workdir
+        .join("root")
+        .join(source.strip_prefix(Path::new("/")).unwrap());
+    assert!(!cached.exists());
+    assert!(workdir.join("root/.lock").is_file());
 
     let second_output = directory.join("current-exe-second");
     let second = SandboxCommand::new(std::env::current_exe().unwrap())
@@ -586,6 +604,64 @@ async fn runner_uses_and_reuses_a_persistent_executable_copy() {
     assert_eq!(
         PathBuf::from(std::fs::read_to_string(second_output).unwrap()),
         executable
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_executes_shebang_scripts_through_a_prepared_restricted_interpreter() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-shebang-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let workdir = directory.join("cache");
+    let script = directory.join("client");
+    std::fs::write(
+        &script,
+        b"#!/usr/bin/env sh\nprintf '%s\\n%s\\n' \"$1\" \"$DYLD_INSERT_LIBRARIES\" > \"$2\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config = SandboxConfig::new(hook_library()).with_workdir(&workdir);
+    let direct_output = directory.join("direct-output");
+
+    let direct = Sandbox::new(config.clone(), NoopCallback)
+        .run(
+            SandboxCommand::new(&script)
+                .arg("direct")
+                .arg(&direct_output),
+        )
+        .await
+        .unwrap();
+
+    assert!(direct.status().success());
+    let direct_output = std::fs::read_to_string(direct_output).unwrap();
+    assert!(direct_output.starts_with("direct\n"));
+    assert!(direct_output.contains("libagora_sandbox.dylib"));
+
+    let nested_output = directory.join("nested-output");
+    let command = format!("{} nested {}", script.display(), nested_output.display());
+    let nested = Sandbox::new(config, NoopCallback)
+        .run(SandboxCommand::new("/bin/bash").args(["-c", &command]))
+        .await
+        .unwrap();
+
+    assert!(nested.status().success());
+    let nested_output = std::fs::read_to_string(nested_output).unwrap();
+    assert!(nested_output.starts_with("nested\n"));
+    assert!(nested_output.contains("libagora_sandbox.dylib"));
+    let script = script.canonicalize().unwrap();
+    assert!(workdir.join("root/usr/bin/env").is_file());
+    assert!(workdir.join("root/bin/sh").is_file());
+    assert!(
+        !workdir
+            .join("root")
+            .join(script.strip_prefix(Path::new("/")).unwrap())
+            .exists()
     );
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -666,6 +742,7 @@ async fn runner_injects_the_configured_tls_ca_path() {
     std::fs::write(&private_key, key.serialize_pem()).unwrap();
     let mut config = sandbox_config().with_tls_ca(&certificate, &private_key);
     config.network.tls = TlsMode::Auto;
+    let trust_bundle_directory = config.workdir().join("ca");
     let script = format!(
         "/usr/bin/env -i AGORA_SANDBOX_TEST_TLS_TRUST_ENV='{}' '{}' \
          records_tls_trust_environment --exact --nocapture",
@@ -688,7 +765,19 @@ async fn runner_injects_the_configured_tls_ca_path() {
     assert_eq!(paths.len(), TLS_TRUST_ENVIRONMENT.len());
     assert!(paths.iter().all(|path| !path.as_os_str().is_empty()));
     assert!(paths.iter().all(|path| path == &paths[0]));
-    assert_eq!(paths[0], certificate.canonicalize().unwrap());
+    assert_eq!(paths[0].parent().unwrap(), trust_bundle_directory);
+    assert!(
+        paths[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("trust-bundle-")
+    );
+    let certificates = rustls_pemfile::certs(&mut std::fs::read(&paths[0]).unwrap().as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(certificates.len() > 1);
+    assert_eq!(certificates[0].as_ref(), ca.der().as_ref());
     assert!(certificate.exists());
     std::fs::remove_dir_all(directory).unwrap();
 }

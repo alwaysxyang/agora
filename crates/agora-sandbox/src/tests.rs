@@ -1,6 +1,6 @@
 use super::{
-    Arguments, AuditState, async_main, default_hook_library, exit_status_code, parse_command,
-    signal_exit_code,
+    Arguments, AuditState, async_main, clean_executable_root, default_hook_library,
+    exit_status_code, parse_command, signal_exit_code,
 };
 use agora_sandbox::callback::{
     EVENT_SCHEMA_VERSION, EventResult, EventStatus, EventType, NetworkContext, NetworkEvent,
@@ -62,19 +62,26 @@ fn command_parser_rejects_empty_input_and_preserves_quoted_arguments() {
 }
 
 #[test]
-fn audit_state_ignores_incomplete_events_and_writes_terminal_fallbacks() {
+fn audit_state_writes_attempts_immediately_without_terminal_duplicates() {
     let root = std::env::temp_dir().join(format!("agora-audit-test-{}", Uuid::new_v4()));
     let path = root.join("nested").join("audit.jsonl");
     let mut state = AuditState::new(Some(&path)).unwrap();
 
     state
-        .on_event(&event(EventType::NetworkConnectAttempt, None, true))
+        .on_event(&event(EventType::NetworkConnectAttempt, None, false))
         .unwrap();
     state
         .on_event(&event(
             EventType::NetworkConnectDenied,
             Some("connection"),
-            false,
+            true,
+        ))
+        .unwrap();
+    state
+        .on_event(&event(
+            EventType::NetworkConnectAttempt,
+            Some("connection"),
+            true,
         ))
         .unwrap();
     state
@@ -86,6 +93,7 @@ fn audit_state_ignores_incomplete_events_and_writes_terminal_fallbacks() {
         .unwrap();
 
     let output = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(output.lines().count(), 1);
     assert!(output.contains("example.com"));
     assert!(output.contains("203.0.113.10"));
     std::fs::remove_dir_all(root).unwrap();
@@ -104,6 +112,22 @@ fn default_paths_and_exit_codes_are_stable() {
     assert_eq!(exit_status_code(status), 7);
     assert_eq!(signal_exit_code(15), 143);
     assert_eq!(signal_exit_code(i32::MAX), u8::MAX);
+}
+
+#[test]
+fn clean_reports_when_the_executable_root_is_not_a_directory() {
+    let workdir = std::env::temp_dir().join(format!("agora-clean-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workdir).unwrap();
+    std::fs::write(workdir.join("root"), b"not a directory").unwrap();
+
+    let error = clean_executable_root(Some(&workdir)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("failed to clean sandbox executable root")
+    );
+
+    std::fs::remove_dir_all(workdir).unwrap();
 }
 
 #[tokio::test]

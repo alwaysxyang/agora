@@ -68,27 +68,34 @@ fn sandbox_cli_documents_only_available_options() {
     assert!(!stdout.contains("off, auto, require"));
     assert!(stdout.contains("--tls-ca-cert <TLS_CA_CERT>"));
     assert!(stdout.contains("--tls-ca-key <TLS_CA_KEY>"));
-    assert!(stdout.contains("<workdir>/ca/ca.pem"));
-    assert!(stdout.contains("<workdir>/ca/ca-key.pem"));
+    assert!(stdout.contains("<workdir>/ca/ca.crt"));
+    assert!(stdout.contains("<workdir>/ca/ca.key"));
     assert!(!stdout.contains("--network-enforcement"));
     assert!(stdout.contains("clean"));
-    assert!(stdout.contains("tls"));
+    let removed = std::process::Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .args(["tls", "generate"])
+        .output()
+        .unwrap();
+    assert!(!removed.status.success());
 }
 
 #[test]
-fn sandbox_cli_clean_removes_the_selected_executable_root() {
-    let root = std::env::temp_dir().join(format!(
+fn sandbox_cli_clean_removes_only_the_selected_executable_root() {
+    let workdir = std::env::temp_dir().join(format!(
         "agora-sandbox-cli-clean-test-{}",
         uuid::Uuid::new_v4()
     ));
+    let root = workdir.join("root");
     std::fs::create_dir_all(root.join("usr/bin")).unwrap();
     std::fs::write(root.join("usr/bin/curl"), b"prepared executable").unwrap();
-    std::fs::write(root.join("checksums.json"), b"{}").unwrap();
+    std::fs::write(root.join("usr/bin/checksums.json"), b"{}").unwrap();
+    std::fs::create_dir_all(workdir.join("ca")).unwrap();
+    std::fs::write(workdir.join("ca/ca.crt"), b"certificate").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
         .arg("clean")
         .arg("--workdir")
-        .arg(&root)
+        .arg(&workdir)
         .output()
         .unwrap();
 
@@ -99,6 +106,8 @@ fn sandbox_cli_clean_removes_the_selected_executable_root() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!root.exists());
+    assert!(workdir.join("ca/ca.crt").is_file());
+    std::fs::remove_dir_all(workdir).unwrap();
 }
 
 #[test]
@@ -107,9 +116,12 @@ fn sandbox_cli_clean_uses_the_default_root_and_is_idempotent() {
         "agora-sandbox-cli-clean-home-test-{}",
         uuid::Uuid::new_v4()
     ));
-    let root = home.join(".agora-sandbox/root");
+    let workdir = home.join(".agora-sandbox");
+    let root = workdir.join("root");
     std::fs::create_dir_all(root.join("bin")).unwrap();
     std::fs::write(root.join("bin/tool"), b"prepared executable").unwrap();
+    std::fs::create_dir_all(workdir.join("ca")).unwrap();
+    std::fs::write(workdir.join("ca/ca.crt"), b"certificate").unwrap();
 
     for _ in 0..2 {
         let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
@@ -126,26 +138,37 @@ fn sandbox_cli_clean_uses_the_default_root_and_is_idempotent() {
     }
 
     assert!(!root.exists());
+    assert!(workdir.join("ca/ca.crt").is_file());
     std::fs::remove_dir_all(home).unwrap();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
-fn sandbox_cli_generates_and_overwrites_a_tls_certificate_authority() {
+fn sandbox_cli_auto_generates_reuses_and_replaces_a_configured_tls_ca() {
     let directory = std::env::temp_dir().join(format!(
-        "agora-sandbox-cli-generate-ca-test-{}",
+        "agora-sandbox-cli-auto-ca-test-{}",
         uuid::Uuid::new_v4()
     ));
     let certificate = directory.join("nested/ca.pem");
     let private_key = directory.join("nested/ca-key.pem");
+    let workdir = directory.join("workdir");
 
-    let generated = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
-        .args(["tls", "generate", "--cert"])
-        .arg(&certificate)
-        .arg("--key")
-        .arg(&private_key)
-        .output()
-        .unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+            .arg("--hook-library")
+            .arg(hook_library())
+            .arg("--workdir")
+            .arg(&workdir)
+            .args(["--tls", "auto", "--tls-ca-cert"])
+            .arg(&certificate)
+            .arg("--tls-ca-key")
+            .arg(&private_key)
+            .args(["-c", "/usr/bin/true"])
+            .output()
+            .unwrap()
+    };
 
+    let generated = run();
     assert!(
         generated.status.success(),
         "stdout={}\nstderr={}",
@@ -156,44 +179,33 @@ fn sandbox_cli_generates_and_overwrites_a_tls_certificate_authority() {
     let private_key_pem = std::fs::read_to_string(&private_key).unwrap();
     assert!(certificate_pem.starts_with("-----BEGIN CERTIFICATE-----"));
     assert!(private_key_pem.starts_with("-----BEGIN PRIVATE KEY-----"));
-    let accepted = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
-        .arg("--hook-library")
-        .arg(hook_library())
-        .arg("--workdir")
-        .arg(cli_workdir())
-        .args(["--tls", "auto", "--tls-ca-cert"])
-        .arg(&certificate)
-        .arg("--tls-ca-key")
-        .arg(&private_key)
-        .args(["-c", "/usr/bin/true"])
-        .output()
-        .unwrap();
-    assert!(
-        accepted.status.success(),
-        "stdout={}\nstderr={}",
-        String::from_utf8_lossy(&accepted.stdout),
-        String::from_utf8_lossy(&accepted.stderr)
+    assert_eq!(
+        certificate.metadata().unwrap().permissions().mode() & 0o777,
+        0o600
     );
-    #[cfg(target_os = "macos")]
-    {
-        assert_eq!(
-            certificate.metadata().unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            private_key.metadata().unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
+    assert_eq!(
+        private_key.metadata().unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 
-    let regenerated = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
-        .args(["tls", "generate", "--cert"])
-        .arg(&certificate)
-        .arg("--key")
-        .arg(&private_key)
-        .output()
-        .unwrap();
+    let reused = run();
+    assert!(
+        reused.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&reused.stdout),
+        String::from_utf8_lossy(&reused.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&certificate).unwrap(),
+        certificate_pem
+    );
+    assert_eq!(
+        std::fs::read_to_string(&private_key).unwrap(),
+        private_key_pem
+    );
 
+    std::fs::remove_file(&private_key).unwrap();
+    let regenerated = run();
     assert!(
         regenerated.status.success(),
         "stdout={}\nstderr={}",
@@ -442,7 +454,10 @@ fn run_audited_cli(audit_file: Option<&Path>) -> (Output, SocketAddr) {
 fn audit_records(output: &[u8]) -> Vec<serde_json::Value> {
     String::from_utf8_lossy(output)
         .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter_map(|line| {
+            let record = line.get(line.find('{')?..)?;
+            serde_json::from_str(record).ok()
+        })
         .collect()
 }
 

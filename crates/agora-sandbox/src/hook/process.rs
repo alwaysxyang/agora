@@ -4,7 +4,7 @@ use super::config::{self, CHILD_RUNTIME_ENVIRONMENT, HookConfig};
 use super::dyld::{dyld_interpose, function_from_interpose};
 use super::socket::set_errno;
 use crate::execution::{
-    PrepareResponse, decode_prepare_response, encode_prepare_request, frame_length,
+    PrepareResponse, decode_prepare_response, encode_prepare_request, frame_length, resolve_shebang,
 };
 use std::cell::Cell;
 use std::ffi::{CStr, CString, OsStr};
@@ -50,6 +50,54 @@ impl Drop for ProcessHookGuard {
 
 struct ProcessHookRuntime {
     config: HookConfig,
+}
+
+struct PreparedExecutable {
+    program: CString,
+    arguments: Vec<CString>,
+}
+
+struct ChildArguments {
+    values: Vec<CString>,
+    pointers: Vec<*mut libc::c_char>,
+}
+
+impl ChildArguments {
+    unsafe fn new(
+        arguments: *const *const libc::c_char,
+        prepared: &PreparedExecutable,
+    ) -> Option<Self> {
+        let mut values = Vec::new();
+        let mut current = arguments;
+        if !prepared.arguments.is_empty() {
+            values.push(prepared.program.clone());
+            values.extend(prepared.arguments.iter().cloned());
+            if !current.is_null() && !(unsafe { *current }).is_null() {
+                current = unsafe { current.add(1) };
+            }
+        }
+        if !current.is_null() {
+            while !(unsafe { *current }).is_null() {
+                values.push(CString::new(unsafe { CStr::from_ptr(*current) }.to_bytes()).ok()?);
+                current = unsafe { current.add(1) };
+            }
+        }
+        let mut pointers = values
+            .iter()
+            .map(|value| value.as_ptr().cast_mut())
+            .collect::<Vec<_>>();
+        pointers.push(std::ptr::null_mut());
+        Some(Self { values, pointers })
+    }
+
+    fn as_posix_ptr(&self) -> *const *mut libc::c_char {
+        debug_assert_eq!(self.values.len() + 1, self.pointers.len());
+        self.pointers.as_ptr()
+    }
+
+    fn as_exec_ptr(&self) -> *const *const libc::c_char {
+        self.as_posix_ptr().cast()
+    }
 }
 
 struct ChildEnvironment {
@@ -138,6 +186,27 @@ impl ProcessHookRuntime {
             )),
         }
     }
+
+    fn prepare_executable(&self, executable: &Path) -> std::io::Result<PreparedExecutable> {
+        let program = self.prepare(executable)?;
+        let script = Path::new(OsStr::from_bytes(program.to_bytes()));
+        let Some(shebang) = resolve_shebang(script).map_err(std::io::Error::other)? else {
+            return Ok(PreparedExecutable {
+                program,
+                arguments: Vec::new(),
+            });
+        };
+        let interpreter = self.prepare(&shebang.interpreter)?;
+        let mut arguments = Vec::with_capacity(2);
+        if let Some(argument) = shebang.argument {
+            arguments.push(CString::new(argument.as_bytes())?);
+        }
+        arguments.push(CString::new(program.to_bytes())?);
+        Ok(PreparedExecutable {
+            program: interpreter,
+            arguments,
+        })
+    }
 }
 
 unsafe fn requested_executable(path: *const libc::c_char, search_path: bool) -> Option<PathBuf> {
@@ -171,10 +240,13 @@ unsafe fn requested_executable(path: *const libc::c_char, search_path: bool) -> 
     None
 }
 
-unsafe fn prepared_executable(path: *const libc::c_char, search_path: bool) -> Option<CString> {
+unsafe fn prepared_executable(
+    path: *const libc::c_char,
+    search_path: bool,
+) -> Option<PreparedExecutable> {
     let runtime = ProcessHookRuntime::global()?;
     let executable = unsafe { requested_executable(path, search_path) }?;
-    runtime.prepare(&executable).ok()
+    runtime.prepare_executable(&executable).ok()
 }
 
 #[unsafe(no_mangle)]
@@ -203,13 +275,18 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
     }) else {
         return libc::EACCES;
     };
+    let Some(arguments) =
+        (unsafe { ChildArguments::new(arguments.cast::<*const libc::c_char>(), &prepared) })
+    else {
+        return libc::EACCES;
+    };
     unsafe {
         original(
             pid,
-            prepared.as_ptr(),
+            prepared.program.as_ptr(),
             file_actions,
             attributes,
-            arguments,
+            arguments.as_posix_ptr(),
             environment.as_posix_ptr(),
         )
     }
@@ -241,13 +318,18 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
     }) else {
         return libc::EACCES;
     };
+    let Some(arguments) =
+        (unsafe { ChildArguments::new(arguments.cast::<*const libc::c_char>(), &prepared) })
+    else {
+        return libc::EACCES;
+    };
     unsafe {
         original(
             pid,
-            prepared.as_ptr(),
+            prepared.program.as_ptr(),
             file_actions,
             attributes,
-            arguments,
+            arguments.as_posix_ptr(),
             environment.as_posix_ptr(),
         )
     }
@@ -304,7 +386,17 @@ unsafe fn execute(
         unsafe { set_errno(libc::EACCES) };
         return -1;
     };
-    unsafe { original(prepared.as_ptr(), arguments, environment.as_exec_ptr()) }
+    let Some(arguments) = (unsafe { ChildArguments::new(arguments, &prepared) }) else {
+        unsafe { set_errno(libc::EACCES) };
+        return -1;
+    };
+    unsafe {
+        original(
+            prepared.program.as_ptr(),
+            arguments.as_exec_ptr(),
+            environment.as_exec_ptr(),
+        )
+    }
 }
 
 unsafe fn current_environment() -> *const *const libc::c_char {

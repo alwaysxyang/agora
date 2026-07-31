@@ -1,4 +1,8 @@
-use super::{CACHE_LOCK_FILE, CPU_SUBTYPE_ARM64E, CPU_TYPE_ARM64, ExecutableStore, MACH_64_MAGIC};
+use super::{
+    CACHE_LOCK_FILE, CHECKSUM_MANIFEST_FILE, CHECKSUM_MANIFEST_TEMP_FILE, CPU_SUBTYPE_ARM64E,
+    CPU_TYPE_ARM64, CS_DYLD_RESTRICTED, CS_RUNTIME, ExecutableStore, MACH_64_MAGIC,
+    resolve_shebang,
+};
 use crate::execution::resolve_executable;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -40,7 +44,8 @@ fn executable_store_prepares_and_caches_a_native_copy() {
 
     assert_eq!(first, second);
     assert_eq!(first, directory.join("bin/sh"));
-    assert!(manifest_path(&directory).is_file());
+    assert!(manifest_path(&directory, Path::new("/bin/sh")).is_file());
+    assert!(!directory.join(CHECKSUM_MANIFEST_FILE).exists());
     assert_eq!(
         manifest_checksum(&directory, Path::new("/bin/sh")),
         ExecutableStore::checksum(&Path::new("/bin/sh").canonicalize().unwrap()).unwrap()
@@ -62,6 +67,107 @@ fn executable_store_prepares_and_caches_a_native_copy() {
 
     let reused_store = ExecutableStore::new(directory).unwrap();
     assert_eq!(reused_store.prepare(Path::new("/bin/sh")).unwrap(), first);
+}
+
+#[test]
+fn executable_store_keeps_unrestricted_binaries_and_scripts_at_their_original_paths() {
+    let root = TestDirectory::new();
+    let directory = root.path().join("prepared");
+    let store = ExecutableStore::new(directory.clone()).unwrap();
+    let binary = std::env::current_exe().unwrap().canonicalize().unwrap();
+
+    assert_eq!(store.prepare(&binary).unwrap(), binary);
+
+    let script = root.path().join("client");
+    fs::write(&script, b"#!/usr/bin/env node\r\nconsole.log('ok')\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let script = script.canonicalize().unwrap();
+    let shebang = resolve_shebang(&script).unwrap().unwrap();
+
+    assert_eq!(shebang.interpreter, Path::new("/usr/bin/env"));
+    assert_eq!(shebang.argument.as_deref(), Some(OsStr::new("node")));
+    assert_eq!(store.prepare(&script).unwrap(), script);
+    assert!(!store.destination(&script).unwrap().exists());
+    assert_eq!(fs::read_dir(directory).unwrap().count(), 1);
+}
+
+#[test]
+fn executable_store_copies_hardened_runtime_binaries() {
+    let root = TestDirectory::new();
+    let source = root.path().join("hardened-sh");
+    fs::copy("/bin/sh", &source).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+    let status = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-", "--options", "runtime"])
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_ne!(
+        ExecutableStore::code_signing_flags(&source).unwrap() & CS_DYLD_RESTRICTED,
+        0
+    );
+    let store = ExecutableStore::new(root.path().join("prepared")).unwrap();
+
+    let prepared = store.prepare(&source).unwrap();
+
+    assert_ne!(prepared, source);
+    assert_eq!(
+        ExecutableStore::code_signing_flags(&prepared).unwrap() & CS_DYLD_RESTRICTED,
+        0
+    );
+}
+
+#[test]
+fn code_signing_flags_parser_reads_the_runtime_bit() {
+    assert_eq!(
+        ExecutableStore::parse_code_signing_flags(
+            b"CodeDirectory v=20500 size=42 flags=0x10002(adhoc,runtime) hashes=1+0\n"
+        )
+        .unwrap(),
+        CS_RUNTIME | 2
+    );
+    assert!(ExecutableStore::parse_code_signing_flags(b"unsigned").is_err());
+}
+
+#[test]
+fn shebang_parser_handles_optional_arguments_and_rejects_invalid_interpreters() {
+    let root = TestDirectory::new();
+    let script = root.path().join("script");
+
+    fs::write(&script, b"plain text\n").unwrap();
+    assert!(resolve_shebang(&script).unwrap().is_none());
+
+    fs::write(&script, b"#!  /bin/sh  \t").unwrap();
+    let shebang = resolve_shebang(&script).unwrap().unwrap();
+    assert_eq!(shebang.interpreter, Path::new("/bin/sh"));
+    assert!(shebang.argument.is_none());
+
+    fs::write(&script, b"#!\n").unwrap();
+    assert!(
+        resolve_shebang(&script)
+            .unwrap_err()
+            .to_string()
+            .contains("has no interpreter")
+    );
+
+    fs::write(&script, b"#!env node\n").unwrap();
+    assert!(
+        resolve_shebang(&script)
+            .unwrap_err()
+            .to_string()
+            .contains("interpreter is not absolute")
+    );
+
+    let mut long = b"#!".to_vec();
+    long.resize(super::MAX_SHEBANG_LINE_SIZE, b'x');
+    fs::write(&script, long).unwrap();
+    assert!(
+        resolve_shebang(&script)
+            .unwrap_err()
+            .to_string()
+            .contains("shebang is too long")
+    );
 }
 
 #[test]
@@ -102,7 +208,7 @@ fn executable_store_rewrites_a_single_arm64e_slice() {
     fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
     let store = ExecutableStore::new(root.path().join("prepared")).unwrap();
 
-    let prepared = store.prepare(&source).unwrap();
+    let prepared = store.prepare_copy_for_test(&source).unwrap();
 
     assert_eq!(
         ExecutableStore::architectures(&prepared).unwrap(),
@@ -157,7 +263,7 @@ fn executable_store_rejects_a_slice_incompatible_with_the_build_target() {
     fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
     let store = ExecutableStore::new(root.path().join("prepared")).unwrap();
 
-    let error = store.prepare(&source).unwrap_err();
+    let error = store.prepare_copy_for_test(&source).unwrap_err();
 
     assert!(
         error
@@ -248,7 +354,7 @@ fn executable_store_reports_temporary_directory_creation_failure_without_artifac
 
     assert!(
         store
-            .prepare(&source)
+            .prepare_copy_for_test(&source)
             .unwrap_err()
             .to_string()
             .contains("failed to create sandbox executable mapping directory")
@@ -327,12 +433,39 @@ fn destination_mirrors_the_absolute_source_path() {
 }
 
 #[test]
+fn executable_store_keeps_a_checksum_manifest_in_each_mapped_directory() {
+    let root = TestDirectory::new();
+    let source_a = root.path().join("source-a/tool");
+    let source_b = root.path().join("source-b/tool");
+    fs::create_dir_all(source_a.parent().unwrap()).unwrap();
+    fs::create_dir_all(source_b.parent().unwrap()).unwrap();
+    fs::copy("/bin/sh", &source_a).unwrap();
+    fs::copy("/bin/sh", &source_b).unwrap();
+    fs::set_permissions(&source_a, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&source_b, fs::Permissions::from_mode(0o755)).unwrap();
+    let directory = root.path().join("prepared");
+    let store = ExecutableStore::new(directory.clone()).unwrap();
+
+    store.prepare_copy_for_test(&source_a).unwrap();
+    store.prepare_copy_for_test(&source_b).unwrap();
+
+    let manifest_a = manifest_path(&directory, &source_a);
+    let manifest_b = manifest_path(&directory, &source_b);
+    assert_ne!(manifest_a, manifest_b);
+    assert!(manifest_a.is_file());
+    assert!(manifest_b.is_file());
+    assert!(!directory.join(CHECKSUM_MANIFEST_FILE).exists());
+    assert_eq!(manifest_file_count(&manifest_a), 1);
+    assert_eq!(manifest_file_count(&manifest_b), 1);
+}
+
+#[test]
 fn executable_store_rebuilds_when_the_copy_or_manifest_is_missing() {
     let root = TestDirectory::new();
     let directory = root.path().join("prepared");
     let store = ExecutableStore::new(directory.clone()).unwrap();
     let destination = store.prepare(Path::new("/bin/sh")).unwrap();
-    let manifest = manifest_path(&directory);
+    let manifest = manifest_path(&directory, Path::new("/bin/sh"));
 
     fs::remove_file(&manifest).unwrap();
     fs::write(&destination, b"stale executable").unwrap();
@@ -354,13 +487,13 @@ fn executable_store_rebuilds_when_the_source_checksum_changes() {
     fs::copy("/bin/sh", &source).unwrap();
     fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
     let store = ExecutableStore::new(root.path().join("prepared")).unwrap();
-    let destination = store.prepare(&source).unwrap();
+    let destination = store.prepare_copy_for_test(&source).unwrap();
     let first_checksum = manifest_checksum(store.directory.as_path(), &source);
     let first_copy = fs::read(&destination).unwrap();
 
     fs::copy("/bin/cat", &source).unwrap();
     fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(store.prepare(&source).unwrap(), destination);
+    assert_eq!(store.prepare_copy_for_test(&source).unwrap(), destination);
 
     assert_ne!(
         manifest_checksum(store.directory.as_path(), &source),
@@ -389,7 +522,7 @@ fn executable_store_reports_unreadable_checksum_manifest() {
     let directory = root.path().join("prepared");
     let store = ExecutableStore::new(directory.clone()).unwrap();
     store.prepare(Path::new("/bin/sh")).unwrap();
-    let manifest = manifest_path(&directory);
+    let manifest = manifest_path(&directory, Path::new("/bin/sh"));
     fs::remove_file(&manifest).unwrap();
     fs::create_dir(&manifest).unwrap();
 
@@ -408,7 +541,8 @@ fn executable_store_rejects_invalid_checksum_manifests() {
     let root = TestDirectory::new();
     let directory = root.path().join("prepared");
     let store = ExecutableStore::new(directory.clone()).unwrap();
-    let manifest = manifest_path(&directory);
+    let manifest = manifest_path(&directory, Path::new("/bin/sh"));
+    fs::create_dir_all(manifest.parent().unwrap()).unwrap();
 
     fs::write(&manifest, b"not json").unwrap();
     let malformed = store.prepare(Path::new("/bin/sh")).unwrap_err();
@@ -434,10 +568,12 @@ fn executable_store_reports_checksum_manifest_publication_errors() {
     let root = TestDirectory::new();
     let directory = root.path().join("prepared");
     let store = ExecutableStore::new(directory.clone()).unwrap();
-    fs::create_dir(manifest_path(&directory)).unwrap();
+    let manifest_directory = directory.join("bin");
+    fs::create_dir_all(&manifest_directory).unwrap();
+    fs::create_dir(manifest_directory.join(CHECKSUM_MANIFEST_FILE)).unwrap();
 
     let error = store
-        .write_manifest(&super::ChecksumManifest::default())
+        .write_manifest(&manifest_directory, &super::ChecksumManifest::default())
         .unwrap_err();
 
     assert!(
@@ -446,7 +582,11 @@ fn executable_store_reports_checksum_manifest_publication_errors() {
             .contains("failed to publish sandbox executable checksum manifest"),
         "{error:#}"
     );
-    assert!(!directory.join(".checksums.json.tmp").exists());
+    assert!(
+        !manifest_directory
+            .join(CHECKSUM_MANIFEST_TEMP_FILE)
+            .exists()
+    );
 }
 
 #[test]
@@ -466,7 +606,7 @@ fn executable_store_replaces_invalid_cache_files_and_rejects_non_files() {
     assert_eq!(store.prepare(&source).unwrap(), destination);
     assert!(destination.is_file());
 
-    fs::remove_file(manifest_path(&store.directory)).unwrap();
+    fs::remove_file(manifest_path(&store.directory, &source)).unwrap();
     fs::remove_file(&destination).unwrap();
     fs::create_dir_all(&destination).unwrap();
     assert!(
@@ -478,18 +618,29 @@ fn executable_store_replaces_invalid_cache_files_and_rejects_non_files() {
     );
 }
 
-fn manifest_path(directory: &Path) -> PathBuf {
-    directory.join("checksums.json")
+fn manifest_path(directory: &Path, source: &Path) -> PathBuf {
+    let source = source.canonicalize().unwrap();
+    let relative_parent = source
+        .parent()
+        .unwrap()
+        .strip_prefix(Path::new("/"))
+        .unwrap();
+    directory.join(relative_parent).join(CHECKSUM_MANIFEST_FILE)
 }
 
 fn manifest_checksum(directory: &Path, source: &Path) -> String {
     let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(manifest_path(directory)).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(manifest_path(directory, source)).unwrap()).unwrap();
     assert_eq!(manifest["version"], 1);
     manifest["files"][source.canonicalize().unwrap().to_string_lossy().as_ref()]
         .as_str()
         .unwrap()
         .to_string()
+}
+
+fn manifest_file_count(path: &Path) -> usize {
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    manifest["files"].as_object().unwrap().len()
 }
 
 #[test]

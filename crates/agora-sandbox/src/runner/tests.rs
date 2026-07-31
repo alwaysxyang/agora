@@ -42,7 +42,7 @@ fn sandbox_config_and_command_builders_preserve_runtime_inputs() {
     let expected_workdir = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".agora-sandbox/root");
+        .join(".agora-sandbox");
     assert_eq!(config.workdir(), expected_workdir);
     assert_eq!(
         config.clone().with_workdir("/tmp/agora-cache").workdir(),
@@ -116,7 +116,7 @@ fn command_workdir_resolution_and_disabled_tls_defaults_are_explicit() {
     );
 
     let config = SandboxConfig::new(root.join("unused-hook"));
-    assert!(config.tls_ca_for_workdir(&root).unwrap().is_none());
+    assert!(config.tls_ca_for_workdir().unwrap().is_none());
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -134,7 +134,7 @@ fn sandbox_config_allows_default_tls_ca_for_interception() {
 }
 
 #[test]
-fn sandbox_config_rejects_missing_tls_ca_files() {
+fn configured_tls_ca_reuses_a_complete_pair_and_replaces_a_partial_pair() {
     let root =
         std::env::temp_dir().join(format!("agora-missing-ca-files-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
@@ -142,26 +142,35 @@ fn sandbox_config_rejects_missing_tls_ca_files() {
     let certificate = root.join("ca.pem");
     let private_key = root.join("ca-key.pem");
     std::fs::write(&hook, b"hook").unwrap();
-    std::fs::write(&private_key, b"private key").unwrap();
     let mut config = SandboxConfig::new(&hook).with_tls_ca(&certificate, &private_key);
     config.network.tls = TlsMode::Auto;
 
-    assert!(
-        config
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("TLS CA certificate does not exist")
+    assert!(config.validate().is_ok());
+    let first = config.tls_ca_for_workdir().unwrap().unwrap();
+    let first_certificate = std::fs::read(&first.certificate).unwrap();
+    let first_private_key = std::fs::read(&first.private_key).unwrap();
+    assert!(first_certificate.starts_with(b"-----BEGIN CERTIFICATE-----"));
+    assert!(first_private_key.starts_with(b"-----BEGIN PRIVATE KEY-----"));
+
+    let reused = config.tls_ca_for_workdir().unwrap().unwrap();
+    assert_eq!(
+        std::fs::read(&reused.certificate).unwrap(),
+        first_certificate
+    );
+    assert_eq!(
+        std::fs::read(&reused.private_key).unwrap(),
+        first_private_key
     );
 
-    std::fs::write(&certificate, b"certificate").unwrap();
-    std::fs::remove_file(&private_key).unwrap();
-    assert!(
-        config
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("TLS CA private key does not exist")
+    std::fs::remove_file(&reused.private_key).unwrap();
+    let replaced = config.tls_ca_for_workdir().unwrap().unwrap();
+    assert_ne!(
+        std::fs::read(&replaced.certificate).unwrap(),
+        first_certificate
+    );
+    assert_ne!(
+        std::fs::read(&replaced.private_key).unwrap(),
+        first_private_key
     );
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -193,14 +202,16 @@ fn default_tls_ca_reuses_a_complete_pair_and_replaces_a_partial_pair() {
     std::fs::create_dir_all(&root).unwrap();
     let hook = root.join("hook.dylib");
     std::fs::write(&hook, b"hook").unwrap();
-    let mut config = SandboxConfig::new(&hook);
+    let mut config = SandboxConfig::new(&hook).with_workdir(&root);
     config.network.tls = TlsMode::Auto;
 
-    let first = config.tls_ca_for_workdir(&root).unwrap().unwrap();
+    let first = config.tls_ca_for_workdir().unwrap().unwrap();
+    assert_eq!(first.certificate, root.join("ca/ca.crt"));
+    assert_eq!(first.private_key, root.join("ca/ca.key"));
     let first_certificate = std::fs::read(&first.certificate).unwrap();
     let first_private_key = std::fs::read(&first.private_key).unwrap();
 
-    let reused = config.tls_ca_for_workdir(&root).unwrap().unwrap();
+    let reused = config.tls_ca_for_workdir().unwrap().unwrap();
     assert_eq!(
         std::fs::read(&reused.certificate).unwrap(),
         first_certificate
@@ -211,7 +222,7 @@ fn default_tls_ca_reuses_a_complete_pair_and_replaces_a_partial_pair() {
     );
 
     std::fs::remove_file(&reused.private_key).unwrap();
-    let replaced = config.tls_ca_for_workdir(&root).unwrap().unwrap();
+    let replaced = config.tls_ca_for_workdir().unwrap().unwrap();
     assert_ne!(
         std::fs::read(&replaced.certificate).unwrap(),
         first_certificate
@@ -220,6 +231,55 @@ fn default_tls_ca_reuses_a_complete_pair_and_replaces_a_partial_pair() {
         std::fs::read(&replaced.private_key).unwrap(),
         first_private_key
     );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn tls_trust_bundles_are_stable_per_ca_and_isolated_between_cas() {
+    let root = std::env::temp_dir().join(format!("agora-trust-bundle-{}", uuid::Uuid::new_v4()));
+    let config = SandboxConfig::new(root.join("hook.dylib")).with_workdir(&root);
+
+    let first = config.write_tls_trust_bundle(b"first CA").unwrap();
+    let reused = config.write_tls_trust_bundle(b"first CA").unwrap();
+    let second = config.write_tls_trust_bundle(b"second CA").unwrap();
+
+    assert_eq!(first, reused);
+    assert_ne!(first, second);
+    assert!(first.is_file());
+    assert!(second.is_file());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn tls_trust_bundle_reports_directory_and_write_failures() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!("agora-trust-errors-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("ca"), b"not a directory").unwrap();
+    let config = SandboxConfig::new(root.join("hook.dylib")).with_workdir(&root);
+
+    assert!(
+        config
+            .write_tls_trust_bundle(b"CA")
+            .unwrap_err()
+            .to_string()
+            .contains("failed to create TLS client trust bundle directory")
+    );
+
+    std::fs::remove_file(root.join("ca")).unwrap();
+    std::fs::create_dir(root.join("ca")).unwrap();
+    std::fs::set_permissions(root.join("ca"), std::fs::Permissions::from_mode(0o500)).unwrap();
+    assert!(
+        config
+            .write_tls_trust_bundle(b"CA")
+            .unwrap_err()
+            .to_string()
+            .contains("failed to write TLS client trust bundle")
+    );
+    std::fs::set_permissions(root.join("ca"), std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
 
