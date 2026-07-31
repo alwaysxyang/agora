@@ -561,9 +561,16 @@ async fn runner_uses_and_reuses_a_persistent_executable_copy() {
 
     assert!(outcome.status().success());
     let executable = PathBuf::from(std::fs::read_to_string(&output).unwrap());
-    assert_ne!(executable, std::env::current_exe().unwrap());
-    assert!(executable.starts_with(&workdir));
+    let source = std::env::current_exe().unwrap().canonicalize().unwrap();
+    assert_eq!(
+        executable,
+        workdir.join(source.strip_prefix(Path::new("/")).unwrap())
+    );
     assert!(executable.is_file(), "prepared executable was not retained");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(workdir.join("checksums.json")).unwrap()).unwrap();
+    assert_eq!(manifest["version"], 1);
+    assert!(manifest["files"][source.to_string_lossy().as_ref()].is_string());
 
     let second_output = directory.join("current-exe-second");
     let second = SandboxCommand::new(std::env::current_exe().unwrap())

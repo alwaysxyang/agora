@@ -1,24 +1,39 @@
-# Sandbox Executable Cache
+# Sandbox Executable Root
 
 `agora-sandbox` runs a copied, ad-hoc-signed executable so the process hook can prepare every subsequently executed image through the same controller. Prepared executable copies are persistent and reusable across sandbox runs.
 
 ## Work Directory
 
-`SandboxConfig::new` defaults the executable cache directory to `~/.agora-sandbox/bin`, using the current process's `HOME`. The CLI accepts `--workdir <WORKDIR>` to override it, and the library exposes `SandboxConfig::with_workdir` for the same purpose.
+`SandboxConfig::new` defaults the executable root to `~/.agora-sandbox/root`, using the current process's `HOME`. The CLI accepts `--workdir <WORKDIR>` to override it, and the library exposes `SandboxConfig::with_workdir` for the same purpose.
 
-The sandbox creates the directory and missing parents when execution starts and sets the cache directory mode to `0700`. It does not remove the directory when a run exits.
+The sandbox creates the root and missing parents when execution starts and sets the root mode to `0700`. It does not remove the root or prepared files when a run exits.
 
 ## Cache Entries
 
-A prepared executable is stored as `<workdir>/cache-v1-<identity>/<source-basename>`. The cache directory name is derived from the canonical source file's filesystem identity, size, timestamps, native architecture, and sanitized source name. The executable itself preserves the source basename so process identity and diagnostics do not expose the cache key. An entry with the same identity is reused by later runs. Preparation writes into a unique temporary directory and publishes the signed directory with an atomic rename.
+A prepared executable mirrors its canonical absolute source path beneath the configured root. For example, `/usr/bin/curl` is stored as `<workdir>/usr/bin/curl`. Only an executable that is requested by the initial command or a hooked child process is copied; the sandbox creates its parent directory structure but does not recursively copy the source directory.
 
-The cache retains at most 10 prepared executable directories after cleanup. When more than 10 entries exist, cleanup removes arbitrary excess entries rather than ordering them by age. The `.lock` file, preparation temporary directories, and unrelated files are not counted or removed.
+The root contains one versioned `checksums.json` manifest. Its `files` object maps each canonical source path to the MD5 of that source executable before architecture selection and ad-hoc signing. For example:
+
+```json
+{
+  "version": 1,
+  "files": {
+    "/usr/bin/curl": "d41d8cd98f00b204e9800998ecf8427e"
+  }
+}
+```
+
+A prepared executable is reused only when it exists, remains executable, and its manifest entry matches the current source MD5. A missing executable, missing manifest, missing entry, or mismatched MD5 causes the executable to be copied, processed, and signed again before the manifest is updated. An unreadable, malformed, or unsupported manifest returns an error instead of silently discarding existing records.
+
+Prepared executables and `checksums.json` are persistent. The sandbox does not impose an entry limit and does not automatically prune them.
+
+## Cleaning
+
+`agora-sandbox clean [--workdir <WORKDIR>]` recursively removes the complete executable root. It does not require a command, hook library, audit output, or TLS configuration. When `--workdir` is omitted, it removes `~/.agora-sandbox/root`. A missing root is treated as already clean. The command does not lock, inspect, selectively retain, or recreate any content.
 
 ## Concurrent Runs
 
-Every running sandbox opens `<workdir>/.lock` and holds a shared `flock` for the lifetime of its execution controller. Normal shutdown releases that run's shared lock and attempts to acquire a non-blocking exclusive lock.
-
-If the exclusive lock cannot be acquired because another sandbox still holds a shared lock, the exiting sandbox skips cleanup entirely. If it acquires the exclusive lock, no other sandbox is running against that work directory, so it prunes arbitrary excess cache entries down to 10 and then releases the lock. The lock is also released automatically when a process exits unexpectedly, but unexpected shutdown does not perform cache cleanup.
+Every sandbox opens `<workdir>/.lock`. Executable preparation takes an exclusive `flock` while reading the manifest, checking and publishing one mapped executable, and updating the manifest. The manifest is written to a fixed temporary file and atomically renamed to `checksums.json`. The lock is released immediately after preparation and automatically when a process exits unexpectedly.
 
 ## TLS Certificate Lifecycle
 

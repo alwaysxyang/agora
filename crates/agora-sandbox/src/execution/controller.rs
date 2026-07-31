@@ -91,11 +91,10 @@ impl ExecutionController {
                 _ => {}
             }
         }
-        let cleanup = lock(&self.store).finish();
         if let Some(error) = first_error {
             return Err(error);
         }
-        cleanup
+        Ok(())
     }
 
     #[cfg(test)]

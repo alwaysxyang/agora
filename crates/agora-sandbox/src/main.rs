@@ -41,7 +41,7 @@ struct Arguments {
     #[arg(long)]
     audit_file: Option<PathBuf>,
 
-    /// Directory for prepared executable copies; defaults to ~/.agora-sandbox/bin
+    /// Mapped root for prepared executable copies; defaults to ~/.agora-sandbox/root
     #[arg(long)]
     workdir: Option<PathBuf>,
 
@@ -64,6 +64,13 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum CliCommand {
+    /// Remove every prepared executable from the mapped root
+    Clean {
+        /// Mapped root to remove; defaults to ~/.agora-sandbox/root
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
+
     /// Manage TLS interception material
     #[command(subcommand)]
     Tls(TlsCommand),
@@ -232,9 +239,16 @@ struct AuditRecord {
 }
 
 async fn async_main(arguments: Arguments) -> Result<u8> {
-    if let Some(CliCommand::Tls(TlsCommand::Generate { cert, key })) = arguments.subcommand {
-        generate_tls_ca(cert, key)?;
-        return Ok(0);
+    match arguments.subcommand {
+        Some(CliCommand::Clean { workdir }) => {
+            clean_executable_root(workdir.as_deref())?;
+            return Ok(0);
+        }
+        Some(CliCommand::Tls(TlsCommand::Generate { cert, key })) => {
+            generate_tls_ca(cert, key)?;
+            return Ok(0);
+        }
+        None => {}
     }
     let hook_library = match arguments.hook_library {
         Some(path) => path,
@@ -285,6 +299,22 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
         _ => None,
     };
     Ok(signal.map(signal_exit_code).unwrap_or(1))
+}
+
+fn clean_executable_root(workdir: Option<&Path>) -> Result<()> {
+    let workdir = workdir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(SandboxConfig::default_workdir);
+    match std::fs::remove_dir_all(&workdir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to clean sandbox executable root {}",
+                workdir.display()
+            )
+        }),
+    }
 }
 
 fn parse_command(command: &str) -> Result<SandboxCommand> {

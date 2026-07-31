@@ -71,7 +71,62 @@ fn sandbox_cli_documents_only_available_options() {
     assert!(stdout.contains("<workdir>/ca/ca.pem"));
     assert!(stdout.contains("<workdir>/ca/ca-key.pem"));
     assert!(!stdout.contains("--network-enforcement"));
+    assert!(stdout.contains("clean"));
     assert!(stdout.contains("tls"));
+}
+
+#[test]
+fn sandbox_cli_clean_removes_the_selected_executable_root() {
+    let root = std::env::temp_dir().join(format!(
+        "agora-sandbox-cli-clean-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(root.join("usr/bin")).unwrap();
+    std::fs::write(root.join("usr/bin/curl"), b"prepared executable").unwrap();
+    std::fs::write(root.join("checksums.json"), b"{}").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .arg("clean")
+        .arg("--workdir")
+        .arg(&root)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!root.exists());
+}
+
+#[test]
+fn sandbox_cli_clean_uses_the_default_root_and_is_idempotent() {
+    let home = std::env::temp_dir().join(format!(
+        "agora-sandbox-cli-clean-home-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let root = home.join(".agora-sandbox/root");
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    std::fs::write(root.join("bin/tool"), b"prepared executable").unwrap();
+
+    for _ in 0..2 {
+        let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+            .arg("clean")
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    assert!(!root.exists());
+    std::fs::remove_dir_all(home).unwrap();
 }
 
 #[test]

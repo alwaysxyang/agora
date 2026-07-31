@@ -42,7 +42,7 @@ fn sandbox_config_and_command_builders_preserve_runtime_inputs() {
     let expected_workdir = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".agora-sandbox/bin");
+        .join(".agora-sandbox/root");
     assert_eq!(config.workdir(), expected_workdir);
     assert_eq!(
         config.clone().with_workdir("/tmp/agora-cache").workdir(),

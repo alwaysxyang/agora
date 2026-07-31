@@ -63,10 +63,17 @@ impl SandboxConfig {
         Self {
             network: NetworkConfig::default(),
             hook_library: hook_library.into(),
-            workdir: default_workdir(),
+            workdir: Self::default_workdir(),
             tls_trust_anchor: None,
             tls_ca: None,
         }
+    }
+
+    pub fn default_workdir() -> PathBuf {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".agora-sandbox/root")
     }
 
     pub fn hook_library(&self) -> &Path {
@@ -443,13 +450,6 @@ where
         }
         std::env::join_paths(libraries).context("invalid DYLD_INSERT_LIBRARIES path")
     }
-}
-
-fn default_workdir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".agora-sandbox/bin")
 }
 
 #[cfg(target_os = "macos")]
