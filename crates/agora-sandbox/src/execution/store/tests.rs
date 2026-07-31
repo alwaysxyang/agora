@@ -43,6 +43,10 @@ fn executable_store_prepares_and_caches_a_native_copy() {
 
     assert_eq!(first, second);
     assert!(first.starts_with(&directory));
+    assert_eq!(
+        first.file_name(),
+        Path::new("/bin/sh").canonicalize().unwrap().file_name()
+    );
     assert!(first.is_file());
     assert_ne!(first, Path::new("/bin/sh"));
     assert_eq!(
@@ -205,6 +209,7 @@ fn executable_store_reports_cache_entry_access_errors() {
     let directory = root.path().join("remove-error");
     let mut store = ExecutableStore::new(directory.clone()).unwrap();
     let destination = store.destination(&source, &source.metadata().unwrap());
+    fs::create_dir(destination.parent().unwrap()).unwrap();
     fs::write(&destination, b"invalid").unwrap();
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
     assert!(
@@ -230,7 +235,7 @@ fn executable_store_reports_cache_entry_access_errors() {
 }
 
 #[test]
-fn executable_store_removes_a_temporary_file_after_copy_failure() {
+fn executable_store_reports_temporary_directory_creation_failure_without_artifacts() {
     let root = TestDirectory::new();
     let source = root.path().join("native-sh");
     let architectures = ExecutableStore::architectures(Path::new("/bin/sh")).unwrap();
@@ -255,7 +260,7 @@ fn executable_store_removes_a_temporary_file_after_copy_failure() {
             .prepare(&source)
             .unwrap_err()
             .to_string()
-            .contains("failed to copy executable")
+            .contains("failed to create temporary sandbox executable directory")
     );
     assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
@@ -312,7 +317,7 @@ fn arm64e_rewrite_validates_and_updates_the_mach_header() {
 }
 
 #[test]
-fn destination_names_are_stable_and_sanitized() {
+fn destination_names_are_stable_and_preserve_the_basename() {
     let root = TestDirectory::new();
     let store = ExecutableStore::new(root.path().join("prepared")).unwrap();
     let source = root.path().join("a name!");
@@ -324,9 +329,16 @@ fn destination_names_are_stable_and_sanitized() {
     let second = store.destination(&source, &metadata);
 
     assert_eq!(first, second);
-    let name = first.file_name().unwrap().to_string_lossy();
-    assert!(name.starts_with(CACHE_ENTRY_PREFIX));
-    assert!(name.ends_with("-a_name_"));
+    assert_eq!(first.file_name().unwrap(), "a name!");
+    assert!(
+        first
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(CACHE_ENTRY_PREFIX)
+    );
 }
 
 #[test]
@@ -336,13 +348,18 @@ fn executable_store_replaces_invalid_cache_files_and_rejects_non_files() {
     let mut store = ExecutableStore::new(directory).unwrap();
     let source = Path::new("/bin/sh").canonicalize().unwrap();
     let destination = store.destination(&source, &source.metadata().unwrap());
+    fs::create_dir(destination.parent().unwrap()).unwrap();
     fs::write(&destination, b"invalid").unwrap();
 
     assert_eq!(store.prepare(&source).unwrap(), destination);
     assert_ne!(fs::read(&destination).unwrap(), b"invalid");
 
     fs::remove_file(&destination).unwrap();
-    fs::create_dir(&destination).unwrap();
+    assert_eq!(store.prepare(&source).unwrap(), destination);
+    assert!(destination.is_file());
+
+    fs::remove_dir_all(destination.parent().unwrap()).unwrap();
+    fs::create_dir_all(&destination).unwrap();
     assert!(
         store
             .prepare(&source)
@@ -359,11 +376,7 @@ fn executable_store_prunes_only_after_the_last_running_store_finishes() {
     let mut first = ExecutableStore::new(directory.clone()).unwrap();
     let mut second = ExecutableStore::new(directory.clone()).unwrap();
     for index in 0..CACHE_ENTRY_LIMIT + 2 {
-        fs::write(
-            directory.join(format!("{CACHE_ENTRY_PREFIX}test-{index}")),
-            b"cached",
-        )
-        .unwrap();
+        fs::create_dir(directory.join(format!("{CACHE_ENTRY_PREFIX}test-{index}"))).unwrap();
     }
     fs::write(directory.join("unrelated"), b"keep").unwrap();
 
@@ -381,11 +394,7 @@ fn executable_store_reports_cache_pruning_errors() {
     let directory = root.path().join("prepared");
     let mut store = ExecutableStore::new(directory.clone()).unwrap();
     for index in 0..CACHE_ENTRY_LIMIT + 1 {
-        fs::write(
-            directory.join(format!("{CACHE_ENTRY_PREFIX}test-{index}")),
-            b"cached",
-        )
-        .unwrap();
+        fs::create_dir(directory.join(format!("{CACHE_ENTRY_PREFIX}test-{index}"))).unwrap();
     }
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
 

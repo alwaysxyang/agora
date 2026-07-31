@@ -22,6 +22,7 @@ rustls-native-certs = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
+psl = { workspace = true }
 time = { workspace = true }
 x509-parser = { workspace = true }
 tokio = { workspace = true }

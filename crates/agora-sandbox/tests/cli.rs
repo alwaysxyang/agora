@@ -68,6 +68,8 @@ fn sandbox_cli_documents_only_available_options() {
     assert!(!stdout.contains("off, auto, require"));
     assert!(stdout.contains("--tls-ca-cert <TLS_CA_CERT>"));
     assert!(stdout.contains("--tls-ca-key <TLS_CA_KEY>"));
+    assert!(stdout.contains("<workdir>/ca/ca.pem"));
+    assert!(stdout.contains("<workdir>/ca/ca-key.pem"));
     assert!(!stdout.contains("--network-enforcement"));
     assert!(stdout.contains("tls"));
 }

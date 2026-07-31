@@ -9,16 +9,19 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::IpAddr;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration as StdDuration, Instant};
 use time::{Duration, OffsetDateTime};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 const LEAF_VALIDITY: Duration = Duration::days(1);
 const CLOCK_SKEW: Duration = Duration::minutes(5);
 const CA_VALIDITY: Duration = Duration::days(3650);
+const CERTIFICATE_CACHE_VALIDITY: StdDuration = StdDuration::from_secs(60 * 60);
 
 pub(in crate::network) fn generate_ca(
     certificate_path: &Path,
@@ -119,7 +122,8 @@ impl TlsAuthority {
 
     pub(super) fn issue(&self, identity: &str) -> Result<Arc<IssuedCertificate>> {
         let identity = normalize_identity(identity)?;
-        if let Some(certificate) = lock(&self.cache).get(&identity) {
+        let mut cache = lock(&self.cache);
+        if let Some(certificate) = cache.get(&identity, Instant::now()) {
             return Ok(certificate);
         }
 
@@ -153,7 +157,7 @@ impl TlsAuthority {
         let issued = Arc::new(IssuedCertificate {
             certified_key: Arc::new(certified_key),
         });
-        lock(&self.cache).insert(identity, Arc::clone(&issued));
+        cache.insert(identity, Arc::clone(&issued), Instant::now());
         Ok(issued)
     }
 
@@ -164,6 +168,15 @@ impl TlsAuthority {
     #[cfg(test)]
     pub(super) fn cache_len(&self) -> usize {
         lock(&self.cache).entries.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn expire_for_test(&self, identity: &str) {
+        lock(&self.cache)
+            .entries
+            .get_mut(identity)
+            .expect("certificate must be cached")
+            .expires_at = Instant::now();
     }
 }
 
@@ -184,8 +197,13 @@ impl IssuedCertificate {
 
 struct CertificateCache {
     capacity: usize,
-    entries: HashMap<String, Arc<IssuedCertificate>>,
+    entries: HashMap<String, CachedCertificate>,
     order: VecDeque<String>,
+}
+
+struct CachedCertificate {
+    certificate: Arc<IssuedCertificate>,
+    expires_at: Instant,
 }
 
 impl CertificateCache {
@@ -197,14 +215,29 @@ impl CertificateCache {
         }
     }
 
-    fn get(&mut self, identity: &str) -> Option<Arc<IssuedCertificate>> {
-        let certificate = self.entries.get(identity).cloned()?;
+    fn get(&mut self, identity: &str, now: Instant) -> Option<Arc<IssuedCertificate>> {
+        if self
+            .entries
+            .get(identity)
+            .is_some_and(|certificate| certificate.expires_at <= now)
+        {
+            self.entries.remove(identity);
+            self.remove_from_order(identity);
+            return None;
+        }
+        let certificate = Arc::clone(&self.entries.get(identity)?.certificate);
         self.touch(identity);
         Some(certificate)
     }
 
-    fn insert(&mut self, identity: String, certificate: Arc<IssuedCertificate>) {
-        self.entries.insert(identity.clone(), certificate);
+    fn insert(&mut self, identity: String, certificate: Arc<IssuedCertificate>, now: Instant) {
+        self.entries.insert(
+            identity.clone(),
+            CachedCertificate {
+                certificate,
+                expires_at: now + CERTIFICATE_CACHE_VALIDITY,
+            },
+        );
         self.touch(&identity);
         while self.entries.len() > self.capacity {
             if let Some(oldest) = self.order.pop_front() {
@@ -214,10 +247,14 @@ impl CertificateCache {
     }
 
     fn touch(&mut self, identity: &str) {
+        self.remove_from_order(identity);
+        self.order.push_back(identity.to_string());
+    }
+
+    fn remove_from_order(&mut self, identity: &str) {
         if let Some(index) = self.order.iter().position(|entry| entry == identity) {
             self.order.remove(index);
         }
-        self.order.push_back(identity.to_string());
     }
 }
 
@@ -261,6 +298,18 @@ fn normalize_identity(identity: &str) -> Result<String> {
     let identity = identity.trim().trim_end_matches('.').to_ascii_lowercase();
     if identity.is_empty() {
         bail!("TLS certificate identity must not be empty");
+    }
+    if identity.parse::<IpAddr>().is_ok() {
+        return Ok(identity);
+    }
+    let Some(registrable_domain) = psl::domain_str(&identity) else {
+        return Ok(identity);
+    };
+    if registrable_domain == identity {
+        return Ok(identity);
+    }
+    if let Some((_, parent)) = identity.split_once('.') {
+        return Ok(format!("*.{parent}"));
     }
     Ok(identity)
 }

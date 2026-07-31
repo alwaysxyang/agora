@@ -1,5 +1,5 @@
 use super::{
-    SandboxCommand, SandboxConfig, process_group_exists, signal_process_group,
+    SandboxCommand, SandboxConfig, SandboxOutcome, process_group_exists, signal_process_group,
     wait_for_child_or_service,
 };
 use crate::callback::NoopCallback;
@@ -16,6 +16,22 @@ fn sleeping_child() -> tokio::process::Child {
     command.arg("30").kill_on_drop(true);
     command.as_std_mut().process_group(0);
     command.spawn().unwrap()
+}
+
+#[test]
+fn sandbox_outcome_exposes_status_and_identifiers() {
+    let status = std::process::Command::new("/usr/bin/true")
+        .status()
+        .unwrap();
+    let outcome = SandboxOutcome {
+        status,
+        sandbox_id: "sandbox-id".to_string(),
+        run_id: "run-id".to_string(),
+    };
+
+    assert!(outcome.status().success());
+    assert_eq!(outcome.sandbox_id(), "sandbox-id");
+    assert_eq!(outcome.run_id(), "run-id");
 }
 
 #[test]
@@ -62,7 +78,50 @@ fn sandbox_config_and_command_builders_preserve_runtime_inputs() {
 }
 
 #[test]
-fn sandbox_config_requires_a_tls_ca_for_interception() {
+fn command_workdir_resolution_and_disabled_tls_defaults_are_explicit() {
+    let current = std::env::current_dir().unwrap().canonicalize().unwrap();
+    assert_eq!(
+        SandboxCommand::new("/bin/true")
+            .effective_current_dir()
+            .unwrap(),
+        current
+    );
+    assert_eq!(
+        SandboxCommand::new("/bin/true")
+            .current_dir(".")
+            .effective_current_dir()
+            .unwrap(),
+        current
+    );
+
+    let root = std::env::temp_dir().join(format!("agora-workdir-{}", uuid::Uuid::new_v4()));
+    assert!(
+        SandboxCommand::new("/bin/true")
+            .current_dir(&root)
+            .effective_current_dir()
+            .unwrap_err()
+            .to_string()
+            .contains("failed to resolve sandbox command workdir")
+    );
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("not-a-directory");
+    std::fs::write(&file, b"file").unwrap();
+    assert!(
+        SandboxCommand::new("/bin/true")
+            .current_dir(&file)
+            .effective_current_dir()
+            .unwrap_err()
+            .to_string()
+            .contains("not a directory")
+    );
+
+    let config = SandboxConfig::new(root.join("unused-hook"));
+    assert!(config.tls_ca_for_workdir(&root).unwrap().is_none());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sandbox_config_allows_default_tls_ca_for_interception() {
     let root = std::env::temp_dir().join(format!("agora-missing-ca-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let hook = root.join("hook.dylib");
@@ -70,13 +129,7 @@ fn sandbox_config_requires_a_tls_ca_for_interception() {
     let mut config = SandboxConfig::new(&hook);
     config.network.tls = TlsMode::Auto;
 
-    let error = config.validate().unwrap_err();
-
-    assert!(
-        error
-            .to_string()
-            .contains("requires a CA certificate and private key")
-    );
+    assert!(config.validate().is_ok());
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -131,6 +184,42 @@ fn sandbox_config_preserves_tls_ca_paths() {
         Some((certificate.as_path(), private_key.as_path()))
     );
     assert!(config.validate().is_ok());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn default_tls_ca_reuses_a_complete_pair_and_replaces_a_partial_pair() {
+    let root = std::env::temp_dir().join(format!("agora-default-ca-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let hook = root.join("hook.dylib");
+    std::fs::write(&hook, b"hook").unwrap();
+    let mut config = SandboxConfig::new(&hook);
+    config.network.tls = TlsMode::Auto;
+
+    let first = config.tls_ca_for_workdir(&root).unwrap().unwrap();
+    let first_certificate = std::fs::read(&first.certificate).unwrap();
+    let first_private_key = std::fs::read(&first.private_key).unwrap();
+
+    let reused = config.tls_ca_for_workdir(&root).unwrap().unwrap();
+    assert_eq!(
+        std::fs::read(&reused.certificate).unwrap(),
+        first_certificate
+    );
+    assert_eq!(
+        std::fs::read(&reused.private_key).unwrap(),
+        first_private_key
+    );
+
+    std::fs::remove_file(&reused.private_key).unwrap();
+    let replaced = config.tls_ca_for_workdir(&root).unwrap().unwrap();
+    assert_ne!(
+        std::fs::read(&replaced.certificate).unwrap(),
+        first_certificate
+    );
+    assert_ne!(
+        std::fs::read(&replaced.private_key).unwrap(),
+        first_private_key
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

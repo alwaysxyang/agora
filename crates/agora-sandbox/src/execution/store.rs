@@ -73,16 +73,17 @@ impl ExecutableStore {
             .canonicalize()
             .with_context(|| format!("failed to resolve executable {}", source.display()))?;
         let metadata = Self::validate_source(&source)?;
+        let destination_directory = self.entry_directory(&source, &metadata);
         let destination = self.destination(&source, &metadata);
         match destination.symlink_metadata() {
             Ok(metadata) if metadata.is_file() && metadata.mode() & 0o111 != 0 => {
                 return Ok(destination);
             }
             Ok(metadata) if metadata.is_file() => {
-                fs::remove_file(&destination).with_context(|| {
+                fs::remove_dir_all(&destination_directory).with_context(|| {
                     format!(
                         "failed to replace invalid sandbox executable cache entry {}",
-                        destination.display()
+                        destination_directory.display()
                     )
                 })?;
             }
@@ -92,7 +93,16 @@ impl ExecutableStore {
                     destination.display()
                 );
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if destination_directory.try_exists()? {
+                    fs::remove_dir_all(&destination_directory).with_context(|| {
+                        format!(
+                            "failed to replace incomplete sandbox executable cache entry {}",
+                            destination_directory.display()
+                        )
+                    })?;
+                }
+            }
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
@@ -112,9 +122,21 @@ impl ExecutableStore {
                     Self::native_architecture()
                 )
             })?;
-        let temporary = self
+        let temporary_directory = self
             .directory
             .join(format!(".tmp-{}", Uuid::new_v4().simple()));
+        fs::create_dir(&temporary_directory).with_context(|| {
+            format!(
+                "failed to create temporary sandbox executable directory {}",
+                temporary_directory.display()
+            )
+        })?;
+        fs::set_permissions(&temporary_directory, fs::Permissions::from_mode(0o700))?;
+        let temporary = temporary_directory.join(
+            source
+                .file_name()
+                .unwrap_or_else(|| OsStr::new("executable")),
+        );
         let prepared: Result<PathBuf> = (|| {
             if architectures.len() == 1 {
                 fs::copy(&source, &temporary).with_context(|| {
@@ -154,16 +176,16 @@ impl ExecutableStore {
                 "failed to ad-hoc sign executable copy",
             )?;
             fs::set_permissions(&temporary, fs::Permissions::from_mode(source_mode))?;
-            fs::rename(&temporary, &destination).with_context(|| {
+            fs::rename(&temporary_directory, &destination_directory).with_context(|| {
                 format!(
                     "failed to publish sandbox executable cache entry {}",
-                    destination.display()
+                    destination_directory.display()
                 )
             })?;
             Ok(destination.clone())
         })();
         if prepared.is_err() {
-            let _ = fs::remove_file(&temporary);
+            let _ = fs::remove_dir_all(&temporary_directory);
         }
         prepared
     }
@@ -215,7 +237,7 @@ impl ExecutableStore {
         Ok(metadata)
     }
 
-    fn destination(&self, source: &Path, metadata: &Metadata) -> PathBuf {
+    fn entry_directory(&self, source: &Path, metadata: &Metadata) -> PathBuf {
         let name = source
             .file_name()
             .unwrap_or_else(|| OsStr::new("executable"))
@@ -243,6 +265,14 @@ impl ExecutableStore {
         ))
     }
 
+    fn destination(&self, source: &Path, metadata: &Metadata) -> PathBuf {
+        self.entry_directory(source, metadata).join(
+            source
+                .file_name()
+                .unwrap_or_else(|| OsStr::new("executable")),
+        )
+    }
+
     fn prune(&self) -> Result<()> {
         let mut entries = fs::read_dir(&self.directory)
             .with_context(|| {
@@ -257,7 +287,7 @@ impl ExecutableStore {
                     .file_name()
                     .to_str()
                     .is_some_and(|name| name.starts_with(CACHE_ENTRY_PREFIX))
-                    && entry.file_type().is_ok_and(|file_type| file_type.is_file())
+                    && entry.file_type().is_ok_and(|file_type| file_type.is_dir())
             })
             .collect::<Vec<_>>();
         if entries.len() <= CACHE_ENTRY_LIMIT {
@@ -266,7 +296,7 @@ impl ExecutableStore {
         entries.sort_by_cached_key(|_| Uuid::new_v4());
         let remove = entries.len() - CACHE_ENTRY_LIMIT;
         for entry in entries.into_iter().take(remove) {
-            fs::remove_file(entry.path()).with_context(|| {
+            fs::remove_dir_all(entry.path()).with_context(|| {
                 format!(
                     "failed to prune sandbox executable cache entry {}",
                     entry.path().display()

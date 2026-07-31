@@ -53,11 +53,11 @@ struct Arguments {
     #[arg(long, value_enum, default_value_t = TlsArgument::Off)]
     tls: TlsArgument,
 
-    /// Path to the PEM CA certificate used for TLS interception
+    /// PEM CA certificate; TLS auto defaults to <workdir>/ca/ca.pem
     #[arg(long, requires = "tls_ca_key")]
     tls_ca_cert: Option<PathBuf>,
 
-    /// Path to the PEM CA private key used for TLS interception
+    /// PEM CA private key; TLS auto defaults to <workdir>/ca/ca-key.pem
     #[arg(long, requires = "tls_ca_cert")]
     tls_ca_key: Option<PathBuf>,
 }

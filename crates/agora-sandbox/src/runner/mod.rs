@@ -32,6 +32,8 @@ const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
 const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
 #[cfg(target_os = "macos")]
 const TLS_TRUST_BUNDLE: &str = "AGORA_SANDBOX_TLS_TRUST_BUNDLE";
+const DEFAULT_TLS_CA_CERTIFICATE: &str = "ca/ca.pem";
+const DEFAULT_TLS_CA_PRIVATE_KEY: &str = "ca/ca-key.pem";
 #[cfg(target_os = "macos")]
 const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
     "SSL_CERT_FILE",
@@ -109,9 +111,6 @@ impl SandboxConfig {
 
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
-        if self.network.tls != TlsMode::Off && self.tls_ca.is_none() {
-            bail!("TLS interception requires a CA certificate and private key");
-        }
         #[cfg(not(target_os = "macos"))]
         bail!("the network hook is currently supported only on macOS");
         if !self.hook_library.is_file() {
@@ -152,6 +151,24 @@ impl SandboxConfig {
             }
         }
         Ok(())
+    }
+
+    fn tls_ca_for_workdir(&self, workdir: &Path) -> Result<Option<TlsCaFiles>> {
+        if self.network.tls == TlsMode::Off {
+            return Ok(None);
+        }
+        if let Some(ca) = &self.tls_ca {
+            return Ok(Some(ca.clone()));
+        }
+
+        let ca = TlsCaFiles {
+            certificate: workdir.join(DEFAULT_TLS_CA_CERTIFICATE),
+            private_key: workdir.join(DEFAULT_TLS_CA_PRIVATE_KEY),
+        };
+        if !ca.certificate.is_file() || !ca.private_key.is_file() {
+            crate::network::generate_tls_ca(&ca.certificate, &ca.private_key)?;
+        }
+        Ok(Some(ca))
     }
 }
 
@@ -217,6 +234,27 @@ impl SandboxCommand {
         )
     }
 
+    fn effective_current_dir(&self) -> Result<PathBuf> {
+        let directory = match &self.current_dir {
+            Some(directory) if directory.is_absolute() => directory.clone(),
+            Some(directory) => std::env::current_dir()?.join(directory),
+            None => std::env::current_dir()?,
+        };
+        let directory = directory.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve sandbox command workdir {}",
+                directory.display()
+            )
+        })?;
+        if !directory.is_dir() {
+            bail!(
+                "sandbox command workdir is not a directory: {}",
+                directory.display()
+            );
+        }
+        Ok(directory)
+    }
+
     #[cfg(target_os = "macos")]
     fn set_program(&mut self, program: PathBuf) {
         self.program = program.into_os_string();
@@ -242,6 +280,8 @@ where
     #[cfg(target_os = "macos")]
     pub async fn run(self, mut command: SandboxCommand) -> Result<SandboxOutcome> {
         self.config.validate()?;
+        let workdir = command.effective_current_dir()?;
+        let tls_ca_files = self.config.tls_ca_for_workdir(&workdir)?;
         let hook_library = self.config.hook_library.canonicalize().with_context(|| {
             format!(
                 "failed to resolve sandbox hook library {}",
@@ -258,35 +298,30 @@ where
                     .map(|der| base64::engine::general_purpose::STANDARD.encode(der))
             })
             .transpose()?;
-        let tls_ca = if self.config.network.tls == TlsMode::Off {
-            None
-        } else {
-            self.config
-                .tls_ca
-                .as_ref()
-                .map(|ca| {
-                    let certificate_path = ca.certificate.canonicalize().with_context(|| {
-                        format!(
-                            "failed to resolve TLS CA certificate {}",
-                            ca.certificate.display()
-                        )
-                    })?;
-                    let certificate = std::fs::read(&certificate_path).with_context(|| {
-                        format!(
-                            "failed to read TLS CA certificate {}",
-                            certificate_path.display()
-                        )
-                    })?;
-                    let private_key = std::fs::read(&ca.private_key).with_context(|| {
-                        format!(
-                            "failed to read TLS CA private key {}",
-                            ca.private_key.display()
-                        )
-                    })?;
-                    Ok::<_, anyhow::Error>((certificate, private_key, certificate_path))
-                })
-                .transpose()?
-        };
+        let tls_ca = tls_ca_files
+            .as_ref()
+            .map(|ca| {
+                let certificate_path = ca.certificate.canonicalize().with_context(|| {
+                    format!(
+                        "failed to resolve TLS CA certificate {}",
+                        ca.certificate.display()
+                    )
+                })?;
+                let certificate = std::fs::read(&certificate_path).with_context(|| {
+                    format!(
+                        "failed to read TLS CA certificate {}",
+                        certificate_path.display()
+                    )
+                })?;
+                let private_key = std::fs::read(&ca.private_key).with_context(|| {
+                    format!(
+                        "failed to read TLS CA private key {}",
+                        ca.private_key.display()
+                    )
+                })?;
+                Ok::<_, anyhow::Error>((certificate, private_key, certificate_path))
+            })
+            .transpose()?;
         let sandbox_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
         let mut execution = {

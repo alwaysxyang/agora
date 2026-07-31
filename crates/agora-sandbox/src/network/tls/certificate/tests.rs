@@ -1,4 +1,4 @@
-use super::{TlsAuthority, generate_ca};
+use super::{TlsAuthority, generate_ca, normalize_identity};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 use std::net::{IpAddr, Ipv4Addr};
 #[cfg(unix)]
@@ -66,6 +66,25 @@ fn authority_rejects_malformed_ca_material() {
 }
 
 #[test]
+fn authority_debug_and_input_validation_are_explicit() {
+    let (certificate, key) = test_ca();
+    let authority = TlsAuthority::from_pem(certificate.as_bytes(), key.as_bytes(), 4).unwrap();
+    let debug = format!("{authority:?}");
+
+    assert!(debug.contains("TlsAuthority"));
+    assert!(debug.contains("trust_anchor_der_len"));
+    assert!(debug.contains("cache_capacity: 4"));
+    assert!(
+        TlsAuthority::from_pem(certificate.as_bytes(), key.as_bytes(), 0)
+            .unwrap_err()
+            .to_string()
+            .contains("capacity must be greater than zero")
+    );
+    assert_eq!(normalize_identity("LOCALHOST.").unwrap(), "localhost");
+    assert!(normalize_identity(" . ").is_err());
+}
+
+#[test]
 fn authority_rejects_a_private_key_that_does_not_match_the_ca() {
     let (certificate, _) = test_ca();
     let other_key = KeyPair::generate().unwrap().serialize_pem();
@@ -77,16 +96,26 @@ fn authority_rejects_a_private_key_that_does_not_match_the_ca() {
 }
 
 #[test]
-fn authority_issues_exact_dns_and_ip_subject_alt_names() {
+fn authority_uses_public_suffix_aware_dns_names_and_exact_ip_addresses() {
     let (certificate, key) = test_ca();
     let authority = TlsAuthority::from_pem(certificate.as_bytes(), key.as_bytes(), 4).unwrap();
 
-    let dns = authority.issue("api.example.test").unwrap();
+    let subdomain = authority.issue("www.baidu.com").unwrap();
+    let registrable = authority.issue("foo.co.uk").unwrap();
+    let private_suffix = authority.issue("bar.foo.appspot.com").unwrap();
     let ip = authority.issue("127.0.0.1").unwrap();
 
     assert_eq!(
-        subject_alt_names(dns.certificate_der()),
-        vec!["api.example.test"]
+        subject_alt_names(subdomain.certificate_der()),
+        vec!["*.baidu.com"]
+    );
+    assert_eq!(
+        subject_alt_names(registrable.certificate_der()),
+        vec!["foo.co.uk"]
+    );
+    assert_eq!(
+        subject_alt_names(private_suffix.certificate_der()),
+        vec!["*.foo.appspot.com"]
     );
     assert_eq!(subject_alt_names(ip.certificate_der()), vec!["127.0.0.1"]);
     assert_eq!(authority.trust_anchor_der(), ca_der(&certificate));
@@ -97,13 +126,25 @@ fn authority_reuses_cached_certificates_and_bounds_the_cache() {
     let (certificate, key) = test_ca();
     let authority = TlsAuthority::from_pem(certificate.as_bytes(), key.as_bytes(), 2).unwrap();
 
-    let first = authority.issue("one.example.test").unwrap();
-    let again = authority.issue("one.example.test").unwrap();
-    authority.issue("two.example.test").unwrap();
-    authority.issue("three.example.test").unwrap();
+    let first = authority.issue("one.example.com").unwrap();
+    let again = authority.issue("two.example.com").unwrap();
+    authority.issue("one.example.org").unwrap();
+    authority.issue("one.example.net").unwrap();
 
     assert!(std::sync::Arc::ptr_eq(&first, &again));
     assert_eq!(authority.cache_len(), 2);
+}
+
+#[test]
+fn authority_reissues_expired_cache_entries() {
+    let (certificate, key) = test_ca();
+    let authority = TlsAuthority::from_pem(certificate.as_bytes(), key.as_bytes(), 4).unwrap();
+
+    let first = authority.issue("www.example.com").unwrap();
+    authority.expire_for_test("*.example.com");
+    let second = authority.issue("api.example.com").unwrap();
+
+    assert!(!std::sync::Arc::ptr_eq(&first, &second));
 }
 
 fn test_ca() -> (String, String) {

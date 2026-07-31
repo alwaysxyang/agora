@@ -85,14 +85,22 @@ fn hook_library() -> PathBuf {
     .clone()
 }
 
+#[cfg(target_os = "macos")]
 fn sandbox_config() -> SandboxConfig {
     SandboxConfig::new(hook_library())
         .with_workdir(workspace_root().join("target/agora-sandbox-test-cache/runner"))
 }
 
+#[cfg(target_os = "macos")]
 #[test]
-fn unsupported_enforcement_and_missing_tls_ca_fail_validation() {
-    let hook = PathBuf::from("/tmp/hook.dylib");
+fn unsupported_enforcement_fails_validation_and_default_tls_ca_is_allowed() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-default-ca-validation-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let hook = directory.join("hook.dylib");
+    std::fs::write(&hook, b"hook").unwrap();
     let mut config = SandboxConfig::new(&hook);
     config.network.enforcement = NetworkEnforcement::Strict;
     let error = config.validate().unwrap_err();
@@ -100,12 +108,41 @@ fn unsupported_enforcement_and_missing_tls_ca_fail_validation() {
 
     config.network.enforcement = NetworkEnforcement::Intercept;
     config.network.tls = TlsMode::Auto;
-    let error = config.validate().unwrap_err();
+    assert!(config.validate().is_ok());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_generates_default_tls_ca_in_the_command_workdir() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-default-ca-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let certificate = directory.join("ca/ca.pem");
+    let private_key = directory.join("ca/ca-key.pem");
+    let mut config = SandboxConfig::new(hook_library());
+    config.network.tls = TlsMode::Auto;
+    let command = SandboxCommand::new("/usr/bin/true").current_dir(&directory);
+
+    let outcome = Sandbox::new(config, NoopCallback)
+        .run(command)
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
     assert!(
-        error
-            .to_string()
-            .contains("requires a CA certificate and private key")
+        std::fs::read_to_string(&certificate)
+            .unwrap()
+            .starts_with("-----BEGIN CERTIFICATE-----")
     );
+    assert!(
+        std::fs::read_to_string(&private_key)
+            .unwrap()
+            .starts_with("-----BEGIN PRIVATE KEY-----")
+    );
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(target_os = "macos")]
