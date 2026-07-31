@@ -8,7 +8,7 @@ use crate::execution::{
 };
 use std::cell::Cell;
 use std::ffi::{CStr, CString, OsStr};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -52,9 +52,60 @@ struct ProcessHookRuntime {
     config: HookConfig,
 }
 
+#[derive(Debug)]
 struct PreparedExecutable {
     program: CString,
     arguments: Vec<CString>,
+}
+
+#[derive(Debug)]
+struct PrepareError {
+    errno: libc::c_int,
+    message: String,
+}
+
+impl PrepareError {
+    fn new(errno: libc::c_int, message: impl Into<String>) -> Self {
+        Self {
+            errno,
+            message: message.into(),
+        }
+    }
+
+    fn from_anyhow(error: anyhow::Error, fallback_errno: libc::c_int) -> Self {
+        let errno = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<io::Error>())
+            .map(io_errno)
+            .unwrap_or(fallback_errno);
+        Self::new(errno, format!("{error:#}"))
+    }
+}
+
+impl From<io::Error> for PrepareError {
+    fn from(error: io::Error) -> Self {
+        Self::new(io_errno(&error), error.to_string())
+    }
+}
+
+impl std::fmt::Display for PrepareError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PrepareError {}
+
+fn io_errno(error: &io::Error) -> libc::c_int {
+    error.raw_os_error().unwrap_or(match error.kind() {
+        io::ErrorKind::NotFound => libc::ENOENT,
+        io::ErrorKind::PermissionDenied => libc::EACCES,
+        io::ErrorKind::InvalidInput => libc::EINVAL,
+        io::ErrorKind::InvalidData => libc::EPROTO,
+        io::ErrorKind::TimedOut => libc::ETIMEDOUT,
+        io::ErrorKind::Unsupported => libc::ENOTSUP,
+        _ => libc::EIO,
+    })
 }
 
 struct ChildArguments {
@@ -163,7 +214,7 @@ impl ProcessHookRuntime {
             .as_ref()
     }
 
-    fn prepare(&self, executable: &Path) -> std::io::Result<CString> {
+    fn prepare(&self, executable: &Path) -> Result<CString, PrepareError> {
         let mut stream = TcpStream::connect(self.config.execution_control())?;
         let timeout = Some(Duration::from_secs(30));
         stream.set_read_timeout(timeout)?;
@@ -178,19 +229,21 @@ impl ProcessHookRuntime {
         let mut frame = vec![0_u8; length];
         stream.read_exact(&mut frame)?;
         match decode_prepare_response(&frame)? {
-            PrepareResponse::Ready(path) => CString::new(path.as_os_str().as_bytes())
-                .map_err(|_| std::io::Error::other("prepared executable path contains NUL")),
-            PrepareResponse::Error(message) => Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                message,
-            )),
+            PrepareResponse::Ready(path) => {
+                CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+                    PrepareError::new(libc::EINVAL, "prepared executable path contains NUL")
+                })
+            }
+            PrepareResponse::Error { errno, message } => Err(PrepareError::new(errno, message)),
         }
     }
 
-    fn prepare_executable(&self, executable: &Path) -> std::io::Result<PreparedExecutable> {
+    fn prepare_executable(&self, executable: &Path) -> Result<PreparedExecutable, PrepareError> {
         let program = self.prepare(executable)?;
         let script = Path::new(OsStr::from_bytes(program.to_bytes()));
-        let Some(shebang) = resolve_shebang(script).map_err(std::io::Error::other)? else {
+        let Some(shebang) = resolve_shebang(script)
+            .map_err(|error| PrepareError::from_anyhow(error, libc::ENOEXEC))?
+        else {
             return Ok(PreparedExecutable {
                 program,
                 arguments: Vec::new(),
@@ -199,9 +252,16 @@ impl ProcessHookRuntime {
         let interpreter = self.prepare(&shebang.interpreter)?;
         let mut arguments = Vec::with_capacity(2);
         if let Some(argument) = shebang.argument {
-            arguments.push(CString::new(argument.as_bytes())?);
+            arguments.push(
+                CString::new(argument.as_bytes()).map_err(|_| {
+                    PrepareError::new(libc::EINVAL, "shebang argument contains NUL")
+                })?,
+            );
         }
-        arguments.push(CString::new(program.to_bytes())?);
+        arguments.push(
+            CString::new(program.to_bytes())
+                .map_err(|_| PrepareError::new(libc::EINVAL, "script path contains NUL"))?,
+        );
         Ok(PreparedExecutable {
             program: interpreter,
             arguments,
@@ -243,10 +303,20 @@ unsafe fn requested_executable(path: *const libc::c_char, search_path: bool) -> 
 unsafe fn prepared_executable(
     path: *const libc::c_char,
     search_path: bool,
-) -> Option<PreparedExecutable> {
-    let runtime = ProcessHookRuntime::global()?;
-    let executable = unsafe { requested_executable(path, search_path) }?;
-    runtime.prepare_executable(&executable).ok()
+) -> Result<PreparedExecutable, PrepareError> {
+    let runtime = ProcessHookRuntime::global()
+        .ok_or_else(|| PrepareError::new(libc::EACCES, "sandbox process runtime is unavailable"))?;
+    let executable = unsafe { requested_executable(path, search_path) }.ok_or_else(|| {
+        PrepareError::new(
+            if path.is_null() {
+                libc::EFAULT
+            } else {
+                libc::ENOENT
+            },
+            "requested executable could not be resolved",
+        )
+    })?;
+    runtime.prepare_executable(&executable)
 }
 
 #[unsafe(no_mangle)]
@@ -264,8 +334,9 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
     let Some(_guard) = ProcessHookGuard::enter() else {
         return libc::EACCES;
     };
-    let Some(prepared) = (unsafe { prepared_executable(path, false) }) else {
-        return libc::EACCES;
+    let prepared = match unsafe { prepared_executable(path, false) } {
+        Ok(prepared) => prepared,
+        Err(error) => return error.errno,
     };
     let Some(runtime) = ProcessHookRuntime::global() else {
         return libc::EACCES;
@@ -307,8 +378,9 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
     let Some(_guard) = ProcessHookGuard::enter() else {
         return libc::EACCES;
     };
-    let Some(prepared) = (unsafe { prepared_executable(file, true) }) else {
-        return libc::EACCES;
+    let prepared = match unsafe { prepared_executable(file, true) } {
+        Ok(prepared) => prepared,
+        Err(error) => return error.errno,
     };
     let Some(runtime) = ProcessHookRuntime::global() else {
         return libc::EACCES;
@@ -374,9 +446,12 @@ unsafe fn execute(
         unsafe { set_errno(libc::EACCES) };
         return -1;
     };
-    let Some(prepared) = (unsafe { prepared_executable(path, search_path) }) else {
-        unsafe { set_errno(libc::EACCES) };
-        return -1;
+    let prepared = match unsafe { prepared_executable(path, search_path) } {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            unsafe { set_errno(error.errno) };
+            return -1;
+        }
     };
     let Some(runtime) = ProcessHookRuntime::global() else {
         unsafe { set_errno(libc::EACCES) };

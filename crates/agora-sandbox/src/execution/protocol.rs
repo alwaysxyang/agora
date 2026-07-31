@@ -3,7 +3,7 @@ use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-pub(super) const EXECUTION_PROTOCOL_VERSION: u16 = 1;
+pub(super) const EXECUTION_PROTOCOL_VERSION: u16 = 2;
 pub(super) const MAX_EXECUTION_FRAME_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -15,7 +15,7 @@ pub(crate) struct PrepareRequest {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PrepareResponse {
     Ready(PathBuf),
-    Error(String),
+    Error { errno: i32, message: String },
 }
 
 pub(crate) fn encode_prepare_request(token: &str, executable: &Path) -> io::Result<Vec<u8>> {
@@ -65,7 +65,18 @@ pub(super) fn decode_prepare_request(frame: &[u8]) -> io::Result<PrepareRequest>
 pub(super) fn encode_prepare_response(response: &PrepareResponse) -> io::Result<Vec<u8>> {
     let (status, content) = match response {
         PrepareResponse::Ready(path) => (0_u8, path.as_os_str().as_bytes().to_vec()),
-        PrepareResponse::Error(message) => (1_u8, message.as_bytes().to_vec()),
+        PrepareResponse::Error { errno, message } => {
+            if *errno <= 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid execution response errno",
+                ));
+            }
+            let mut content = Vec::with_capacity(4 + message.len());
+            content.extend_from_slice(&errno.to_be_bytes());
+            content.extend_from_slice(message.as_bytes());
+            (1_u8, content)
+        }
     };
     let content_length = u32::try_from(content.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "response is too large"))?;
@@ -93,11 +104,19 @@ pub(crate) fn decode_prepare_response(frame: &[u8]) -> io::Result<PrepareRespons
         0 => Ok(PrepareResponse::Ready(PathBuf::from(OsString::from_vec(
             frame[7..].to_vec(),
         )))),
-        1 => Ok(PrepareResponse::Error(
-            std::str::from_utf8(&frame[7..])
-                .map_err(|_| invalid_data("execution error is not UTF-8"))?
-                .to_string(),
-        )),
+        1 if content_length >= 4 => {
+            let errno = i32::from_be_bytes(frame[7..11].try_into().unwrap());
+            if errno <= 0 {
+                return Err(invalid_data("invalid execution response errno"));
+            }
+            Ok(PrepareResponse::Error {
+                errno,
+                message: std::str::from_utf8(&frame[11..])
+                    .map_err(|_| invalid_data("execution error is not UTF-8"))?
+                    .to_string(),
+            })
+        }
+        1 => Err(invalid_data("execution error is truncated")),
         _ => Err(invalid_data("invalid execution response status")),
     }
 }

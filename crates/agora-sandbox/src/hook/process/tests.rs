@@ -1,8 +1,8 @@
 use super::{
-    ChildArguments, ChildEnvironment, PreparedExecutable, ProcessHookGuard, ProcessHookRuntime,
-    agora_sandbox_execv, agora_sandbox_execve, agora_sandbox_execvp, agora_sandbox_posix_spawn,
-    agora_sandbox_posix_spawnp, current_environment, execute, prepared_executable,
-    requested_executable,
+    ChildArguments, ChildEnvironment, PrepareError, PreparedExecutable, ProcessHookGuard,
+    ProcessHookRuntime, agora_sandbox_execv, agora_sandbox_execve, agora_sandbox_execvp,
+    agora_sandbox_posix_spawn, agora_sandbox_posix_spawnp, current_environment, execute, io_errno,
+    prepared_executable, requested_executable,
 };
 use crate::hook::config::HookConfig;
 use std::collections::HashMap;
@@ -19,16 +19,17 @@ fn config() -> HookConfig {
 }
 
 fn config_with_control(control: SocketAddr) -> HookConfig {
+    config_with_control_and_token(control, "execution-token")
+}
+
+fn config_with_control_and_token(control: SocketAddr, execution_token: &str) -> HookConfig {
     let control = control.to_string();
     let values = HashMap::from([
         ("AGORA_SANDBOX_TOKEN", "token".to_string()),
         ("AGORA_SANDBOX_PROXY_IPV4", "127.0.0.1:41000".to_string()),
         ("AGORA_SANDBOX_PROXY_IPV6", "[::1]:41001".to_string()),
         ("AGORA_SANDBOX_EXECUTION_CONTROL", control),
-        (
-            "AGORA_SANDBOX_EXECUTION_TOKEN",
-            "execution-token".to_string(),
-        ),
+        ("AGORA_SANDBOX_EXECUTION_TOKEN", execution_token.to_string()),
         (
             "AGORA_SANDBOX_HOOK_LIBRARIES",
             "/tmp/hook.dylib".to_string(),
@@ -62,7 +63,7 @@ fn config_with_tls_bundle() -> HookConfig {
 
 fn response(status: u8, content: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
-    body.extend_from_slice(&1_u16.to_be_bytes());
+    body.extend_from_slice(&2_u16.to_be_bytes());
     body.push(status);
     body.extend_from_slice(&(content.len() as u32).to_be_bytes());
     body.extend_from_slice(content);
@@ -70,6 +71,13 @@ fn response(status: u8, content: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
     frame.extend_from_slice(&body);
     frame
+}
+
+fn error_response(errno: libc::c_int, message: &[u8]) -> Vec<u8> {
+    let mut content = Vec::with_capacity(4 + message.len());
+    content.extend_from_slice(&errno.to_be_bytes());
+    content.extend_from_slice(message);
+    response(1, &content)
 }
 
 fn runtime_with_response(response: Vec<u8>) -> (ProcessHookRuntime, thread::JoinHandle<Vec<u8>>) {
@@ -247,6 +255,39 @@ fn process_hook_guard_blocks_recursion_until_dropped() {
 }
 
 #[test]
+fn preparation_errors_preserve_os_and_semantic_errno_categories() {
+    for (kind, expected) in [
+        (std::io::ErrorKind::NotFound, libc::ENOENT),
+        (std::io::ErrorKind::PermissionDenied, libc::EACCES),
+        (std::io::ErrorKind::InvalidInput, libc::EINVAL),
+        (std::io::ErrorKind::InvalidData, libc::EPROTO),
+        (std::io::ErrorKind::TimedOut, libc::ETIMEDOUT),
+        (std::io::ErrorKind::Unsupported, libc::ENOTSUP),
+        (std::io::ErrorKind::Other, libc::EIO),
+    ] {
+        assert_eq!(io_errno(&std::io::Error::new(kind, "failure")), expected);
+    }
+    assert_eq!(
+        io_errno(&std::io::Error::from_raw_os_error(libc::EBUSY)),
+        libc::EBUSY
+    );
+
+    let converted =
+        PrepareError::from(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"));
+    assert_eq!(converted.errno, libc::ENOENT);
+    assert_eq!(converted.to_string(), "missing");
+
+    let nested = PrepareError::from_anyhow(
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied").into(),
+        libc::EIO,
+    );
+    assert_eq!(nested.errno, libc::EACCES);
+    let fallback = PrepareError::from_anyhow(anyhow::anyhow!("invalid image"), libc::ENOEXEC);
+    assert_eq!(fallback.errno, libc::ENOEXEC);
+    assert_eq!(fallback.to_string(), "invalid image");
+}
+
+#[test]
 fn requested_executable_resolves_direct_and_path_based_programs() {
     let absolute = CString::new("/bin/sh").unwrap();
     let relative = CString::new("./Cargo.toml").unwrap();
@@ -326,6 +367,27 @@ fn process_runtime_prepares_a_shebang_interpreter_and_preserves_the_script() {
 }
 
 #[test]
+fn process_runtime_rejects_a_nul_in_a_shebang_argument() {
+    let directory = std::env::temp_dir().join(format!("agora-hook-script-{}", Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let script = directory.join("client");
+    std::fs::write(&script, b"#!/bin/sh argument\0suffix\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let script = script.canonicalize().unwrap();
+    let (runtime, server) = runtime_with_responses(vec![
+        response(0, script.as_os_str().as_encoded_bytes()),
+        response(0, b"/tmp/prepared-sh"),
+    ]);
+
+    let error = runtime.prepare_executable(&script).unwrap_err();
+
+    assert_eq!(error.errno, libc::EINVAL);
+    assert_eq!(error.to_string(), "shebang argument contains NUL");
+    assert_eq!(server.join().unwrap().len(), 2);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn process_runtime_keeps_a_direct_executable_unchanged() {
     let directory = std::env::temp_dir().join(format!("agora-hook-binary-{}", Uuid::new_v4()));
     std::fs::create_dir(&directory).unwrap();
@@ -349,22 +411,43 @@ fn process_runtime_keeps_a_direct_executable_unchanged() {
 
 #[test]
 fn process_runtime_propagates_denied_and_invalid_responses() {
-    let (runtime, denied_server) = runtime_with_response(response(1, b"denied"));
+    let (runtime, denied_server) =
+        runtime_with_response(error_response(libc::ENOENT, b"missing executable"));
     let denied = runtime.prepare(Path::new("/bin/sh")).unwrap_err();
-    assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
-    assert_eq!(denied.to_string(), "denied");
+    assert_eq!(denied.errno, libc::ENOENT);
+    assert_eq!(denied.to_string(), "missing executable");
     denied_server.join().unwrap();
 
     let (runtime, invalid_server) = runtime_with_response(response(2, b"invalid"));
     assert_eq!(
-        runtime.prepare(Path::new("/bin/sh")).unwrap_err().kind(),
-        std::io::ErrorKind::InvalidData
+        runtime.prepare(Path::new("/bin/sh")).unwrap_err().errno,
+        libc::EPROTO
     );
     invalid_server.join().unwrap();
 
     let (runtime, nul_server) = runtime_with_response(response(0, b"/tmp/a\0b"));
-    assert!(runtime.prepare(Path::new("/bin/sh")).is_err());
+    assert_eq!(
+        runtime.prepare(Path::new("/bin/sh")).unwrap_err().errno,
+        libc::EINVAL
+    );
     nul_server.join().unwrap();
+}
+
+#[test]
+fn process_runtime_rejects_an_oversized_execution_token_before_sending() {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let runtime = ProcessHookRuntime {
+        config: config_with_control_and_token(listener.local_addr().unwrap(), &"x".repeat(65_536)),
+    };
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(stream.read(&mut byte).unwrap(), 0);
+    });
+    let error = runtime.prepare(Path::new("/bin/sh")).unwrap_err();
+
+    assert_eq!(error.errno, libc::EINVAL);
+    server.join().unwrap();
 }
 
 #[test]
@@ -415,7 +498,7 @@ fn process_interposers_fail_closed_during_recursive_entry() {
 #[test]
 fn process_runtime_and_direct_execution_fail_closed_without_configuration() {
     assert!(ProcessHookRuntime::global().is_none());
-    assert!(unsafe { prepared_executable(std::ptr::null(), false) }.is_none());
+    assert!(unsafe { prepared_executable(std::ptr::null(), false) }.is_err());
 
     let _guard = ProcessHookGuard::enter().unwrap();
     assert_eq!(

@@ -57,6 +57,7 @@ impl Default for ChecksumManifest {
 
 pub(super) struct ExecutableStore {
     directory: PathBuf,
+    canonical_directory: PathBuf,
     lock: File,
 }
 
@@ -74,6 +75,12 @@ impl ExecutableStore {
                 directory.display()
             )
         })?;
+        let canonical_directory = directory.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve sandbox executable directory {}",
+                directory.display()
+            )
+        })?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -86,18 +93,42 @@ impl ExecutableStore {
                     directory.display()
                 )
             })?;
-        Ok(Self { directory, lock })
+        Ok(Self {
+            directory,
+            canonical_directory,
+            lock,
+        })
     }
 
     pub(super) fn prepare(&self, source: &Path) -> Result<PathBuf> {
-        let source = source
-            .canonicalize()
-            .with_context(|| format!("failed to resolve executable {}", source.display()))?;
+        let source = self.resolve_source(source)?;
         let metadata = Self::validate_source(&source)?;
         if resolve_shebang(&source)?.is_some() || !Self::requires_copy(&source, &metadata)? {
             return Ok(source);
         }
         self.prepare_copy(&source, &metadata)
+    }
+
+    fn resolve_source(&self, requested: &Path) -> Result<PathBuf> {
+        match requested.canonicalize() {
+            Ok(source) => Ok(source),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let relative = requested
+                    .strip_prefix(&self.directory)
+                    .or_else(|_| requested.strip_prefix(&self.canonical_directory));
+                let Ok(relative) = relative else {
+                    return Err(error).with_context(|| {
+                        format!("failed to resolve executable {}", requested.display())
+                    });
+                };
+                let source = Path::new("/").join(relative);
+                source
+                    .canonicalize()
+                    .with_context(|| format!("failed to resolve executable {}", source.display()))
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to resolve executable {}", requested.display())),
+        }
     }
 
     fn requires_copy(source: &Path, metadata: &Metadata) -> Result<bool> {

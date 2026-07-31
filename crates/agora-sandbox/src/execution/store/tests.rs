@@ -433,6 +433,42 @@ fn destination_mirrors_the_absolute_source_path() {
 }
 
 #[test]
+fn missing_cached_executable_maps_back_to_its_original_source() {
+    let root = TestDirectory::new();
+    let store = ExecutableStore::new(root.path().join("prepared")).unwrap();
+    let cached = store.directory.join("bin/sh");
+    assert!(!cached.exists());
+
+    let prepared = store.prepare(&cached).unwrap();
+
+    assert_eq!(prepared, cached);
+    assert!(prepared.is_file());
+    assert_eq!(
+        manifest_file_count(&manifest_path(&store.directory, Path::new("/bin/sh"))),
+        1
+    );
+}
+
+#[test]
+fn executable_store_preserves_non_missing_resolution_errors() {
+    let root = TestDirectory::new();
+    let store = ExecutableStore::new(root.path().join("prepared")).unwrap();
+    let looped = root.path().join("loop");
+    std::os::unix::fs::symlink(&looped, &looped).unwrap();
+
+    let error = store.resolve_source(&looped).unwrap_err();
+
+    assert_eq!(
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error),
+        Some(libc::ELOOP)
+    );
+    assert!(error.to_string().contains("failed to resolve executable"));
+}
+
+#[test]
 fn executable_store_keeps_a_checksum_manifest_in_each_mapped_directory() {
     let root = TestDirectory::new();
     let source_a = root.path().join("source-a/tool");

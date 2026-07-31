@@ -3,6 +3,7 @@ use super::protocol::{
 };
 use super::store::ExecutableStore;
 use anyhow::{Context, Result};
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -103,6 +104,16 @@ impl ExecutionController {
             anyhow::bail!("injected execution controller failure");
         });
     }
+
+    #[cfg(test)]
+    pub(crate) fn stop_server_for_test(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abort_tasks_for_test(&mut self) {
+        self.tasks.abort_all();
+    }
 }
 
 impl Drop for ExecutionController {
@@ -161,16 +172,23 @@ impl ExecutionServer {
         let frame = Self::read_frame(&mut stream).await?;
         let request = decode_prepare_request(&frame)?;
         let response = if request.token != state.token {
-            PrepareResponse::Error("invalid execution token".to_string())
+            PrepareResponse::Error {
+                errno: libc::EACCES,
+                message: "invalid execution token".to_string(),
+            }
         } else {
             let store = Arc::clone(&state.store);
             let executable = request.executable;
             match tokio::task::spawn_blocking(move || lock(&store).prepare(&executable)).await {
                 Ok(Ok(path)) => PrepareResponse::Ready(path),
-                Ok(Err(error)) => PrepareResponse::Error(format!("{error:#}")),
-                Err(error) => PrepareResponse::Error(format!(
-                    "sandbox executable preparation task failed: {error}"
-                )),
+                Ok(Err(error)) => PrepareResponse::Error {
+                    errno: preparation_errno(&error),
+                    message: format!("{error:#}"),
+                },
+                Err(error) => PrepareResponse::Error {
+                    errno: libc::EIO,
+                    message: format!("sandbox executable preparation task failed: {error}"),
+                },
             }
         };
         stream
@@ -193,4 +211,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn preparation_errno(error: &anyhow::Error) -> i32 {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>()?.raw_os_error())
+        .unwrap_or(libc::EIO)
 }

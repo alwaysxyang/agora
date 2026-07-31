@@ -235,6 +235,37 @@ fn records_current_executable() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn relocated_executable_spawns_its_sibling_and_preserves_missing_errno() {
+    let Some(role) = std::env::var_os("AGORA_SANDBOX_TEST_RELOCATED_SIBLING") else {
+        return;
+    };
+    if role == "sibling" {
+        return;
+    }
+    assert_eq!(role, "primary");
+
+    let missing = Command::new("/missing/agora-executable")
+        .status()
+        .unwrap_err();
+    assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
+
+    let sibling = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sibling");
+    let status = Command::new(sibling)
+        .arg("relocated_executable_spawns_its_sibling_and_preserves_missing_errno")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("AGORA_SANDBOX_TEST_RELOCATED_SIBLING", "sibling")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn records_tls_trust_environment() {
     let Some(output) = std::env::var_os("AGORA_SANDBOX_TEST_TLS_TRUST_ENV") else {
         return;
@@ -605,6 +636,63 @@ async fn runner_keeps_an_unrestricted_executable_at_its_original_path() {
         PathBuf::from(std::fs::read_to_string(second_output).unwrap()),
         executable
     );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_prepares_a_relocated_executable_sibling_on_demand() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-sibling-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source_directory = directory.join("source");
+    let workdir = directory.join("cache");
+    std::fs::create_dir_all(&source_directory).unwrap();
+    let primary = source_directory.join("primary");
+    let sibling = source_directory.join("sibling");
+    for executable in [&primary, &sibling] {
+        std::fs::copy(std::env::current_exe().unwrap(), executable).unwrap();
+        let output = Command::new("/usr/bin/codesign")
+            .args([
+                "--force",
+                "--sign",
+                "-",
+                "--options",
+                "runtime",
+                "--timestamp=none",
+            ])
+            .arg(executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "codesign failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let command = SandboxCommand::new(&primary)
+        .arg("relocated_executable_spawns_its_sibling_and_preserves_missing_errno")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("AGORA_SANDBOX_TEST_RELOCATED_SIBLING", "primary");
+    let config = SandboxConfig::new(hook_library()).with_workdir(&workdir);
+
+    let outcome = Sandbox::new(config, NoopCallback)
+        .run(command)
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    for source in [&primary, &sibling] {
+        let source = source.canonicalize().unwrap();
+        assert!(
+            workdir
+                .join("root")
+                .join(source.strip_prefix(Path::new("/")).unwrap())
+                .is_file()
+        );
+    }
     std::fs::remove_dir_all(directory).unwrap();
 }
 

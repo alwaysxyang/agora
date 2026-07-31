@@ -12,6 +12,8 @@ The sandbox creates the executable root and missing parents when execution start
 
 A prepared non-injectable executable mirrors its canonical absolute source path beneath `<workdir>/root`. For example, `/usr/bin/curl` is stored as `<workdir>/root/usr/bin/curl`. Executables that are neither SIP-restricted nor signed with dyld-restricting flags are returned at their canonical original paths without checksumming, copying, architecture processing, or signing. The sandbox creates the parent directory structure for a copied executable but does not recursively copy the source directory.
 
+When a relocated executable derives a missing sibling path from its own executable location, the execution controller maps that path from `<workdir>/root/<absolute-path>` back to `/<absolute-path>` and prepares the original sibling on demand. Existing cache files continue to resolve directly. This preserves `current_exe`-relative helper discovery without recursively copying or interpreting the executable's source directory.
+
 For a shebang script, the sandbox keeps the script at its canonical original path and launches the interpreter named after `#!` explicitly. The optional shebang argument and script path are inserted before the caller's arguments. The interpreter goes through the same injection check, so `/usr/bin/env` or `/bin/sh` is copied when restricted, while an injectable interpreter such as a Homebrew `node` or `python3` remains at its original path. This preserves hook injection across a restricted shebang interpreter without treating the text script as Mach-O.
 
 Each mapped source directory contains its own versioned `checksums.json` manifest. Its `files` object maps canonical source paths in that directory to the MD5 of each source executable before architecture selection and ad-hoc signing. For example, `<workdir>/root/usr/bin/checksums.json` contains:
@@ -36,6 +38,8 @@ Prepared executables and their directory-local `checksums.json` manifests are pe
 ## Concurrent Runs
 
 Every sandbox opens `<workdir>/root/.lock`. Preparing a non-injectable executable takes an exclusive `flock` while reading the destination directory's manifest, checking and publishing one mapped executable, and updating that manifest. Injectable executables and scripts do not take this lock after their executable metadata, code-signing flags, and shebang have been inspected. Each manifest is written to a fixed temporary file in its mapped directory and atomically renamed to `checksums.json`. The lock is released immediately after preparation and automatically when a process exits unexpectedly.
+
+The versioned execution-preparation protocol returns a structured POSIX errno with every error. Process hooks preserve that errno through `posix_spawn` or `execve`; missing paths therefore remain `ENOENT`, invalid arguments remain `EINVAL`, and policy failures remain `EACCES`. Preparation and protocol failures remain fail-closed and never fall back to executing the unprepared source.
 
 ## Audit Timing
 

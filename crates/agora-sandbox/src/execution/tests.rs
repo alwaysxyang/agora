@@ -64,10 +64,17 @@ fn execution_prepare_protocol_rejects_invalid_frames() {
     assert!(frame_length(0_u32.to_be_bytes()).is_err());
     assert!(frame_length(u32::MAX.to_be_bytes()).is_err());
 
-    let response = encode_prepare_response(&PrepareResponse::Error("denied".to_string())).unwrap();
+    let response = encode_prepare_response(&PrepareResponse::Error {
+        errno: libc::EACCES,
+        message: "denied".to_string(),
+    })
+    .unwrap();
     assert_eq!(
         decode_prepare_response(body(&response)).unwrap(),
-        PrepareResponse::Error("denied".to_string())
+        PrepareResponse::Error {
+            errno: libc::EACCES,
+            message: "denied".to_string(),
+        }
     );
 }
 
@@ -75,11 +82,11 @@ fn execution_prepare_protocol_rejects_invalid_frames() {
 fn execution_prepare_protocol_rejects_malformed_requests() {
     let mut unsupported =
         body(&encode_prepare_request("token", Path::new("/bin/sh")).unwrap()).to_vec();
-    unsupported[1] = 2;
+    unsupported[1] = 3;
     assert!(decode_prepare_request(&unsupported).is_err());
 
-    let mut invalid_lengths = unsupported;
-    invalid_lengths[0..2].copy_from_slice(&1_u16.to_be_bytes());
+    let mut invalid_lengths =
+        body(&encode_prepare_request("token", Path::new("/bin/sh")).unwrap()).to_vec();
     invalid_lengths[2..4].copy_from_slice(&0_u16.to_be_bytes());
     assert!(decode_prepare_request(&invalid_lengths).is_err());
 
@@ -91,7 +98,7 @@ fn execution_prepare_protocol_rejects_malformed_requests() {
 fn execution_prepare_protocol_rejects_malformed_responses() {
     let ready = encode_prepare_response(&PrepareResponse::Ready(PathBuf::from("/bin/sh"))).unwrap();
     let mut unsupported = body(&ready).to_vec();
-    unsupported[1] = 2;
+    unsupported[1] = 3;
     assert!(decode_prepare_response(&unsupported).is_err());
 
     let mut invalid_length = body(&ready).to_vec();
@@ -102,15 +109,32 @@ fn execution_prepare_protocol_rejects_malformed_responses() {
     invalid_status[2] = 2;
     assert!(decode_prepare_response(&invalid_status).is_err());
 
-    let invalid_error = [0, 1, 1, 0, 0, 0, 1, 0xff];
+    let invalid_error = [0, 2, 1, 0, 0, 0, 5, 0, 0, 0, 1, 0xff];
     assert!(decode_prepare_response(&invalid_error).is_err());
+    let truncated_error = [0, 2, 1, 0, 0, 0, 3, 0, 0, 0];
+    assert!(decode_prepare_response(&truncated_error).is_err());
+    let invalid_errno = [0, 2, 1, 0, 0, 0, 4, 0, 0, 0, 0];
+    assert!(decode_prepare_response(&invalid_errno).is_err());
 
     let oversized = OsString::from_vec(vec![b'x'; 64 * 1024]);
     assert!(
         encode_prepare_request("token", Path::new(&oversized)).is_err(),
         "the protocol must reject a body larger than its frame limit"
     );
-    assert!(encode_prepare_response(&PrepareResponse::Error("x".repeat(64 * 1024))).is_err());
+    assert!(
+        encode_prepare_response(&PrepareResponse::Error {
+            errno: libc::EIO,
+            message: "x".repeat(64 * 1024),
+        })
+        .is_err()
+    );
+    assert!(
+        encode_prepare_response(&PrepareResponse::Error {
+            errno: 0,
+            message: "invalid".to_string(),
+        })
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -132,7 +156,10 @@ async fn execution_controller_rejects_an_invalid_token() {
 
     assert_eq!(
         decode_prepare_response(&response).unwrap(),
-        PrepareResponse::Error("invalid execution token".to_string())
+        PrepareResponse::Error {
+            errno: libc::EACCES,
+            message: "invalid execution token".to_string(),
+        }
     );
     controller.shutdown().await.unwrap();
     assert!(directory.join(".lock").is_file());
@@ -179,9 +206,11 @@ async fn execution_controller_returns_preparation_errors_to_the_hook() {
     let mut response = vec![0_u8; frame_length(prefix).unwrap()];
     stream.read_exact(&mut response).await.unwrap();
 
-    let PrepareResponse::Error(message) = decode_prepare_response(&response).unwrap() else {
+    let PrepareResponse::Error { errno, message } = decode_prepare_response(&response).unwrap()
+    else {
         panic!("missing executable must not be prepared");
     };
+    assert_eq!(errno, libc::ENOENT);
     assert!(message.contains("failed to resolve executable"));
     controller.shutdown().await.unwrap();
 }
@@ -199,6 +228,57 @@ async fn execution_controller_reports_a_malformed_hook_request() {
 
     assert!(error.to_string().contains("execution controller failed"));
     controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn execution_controller_reports_clean_stops_and_aborted_tasks() {
+    let root = TestDirectory::new();
+    let mut stopped = ExecutionController::start(root.cache()).await.unwrap();
+    stopped.stop_server_for_test();
+    assert!(
+        stopped
+            .wait_failure()
+            .await
+            .to_string()
+            .contains("stopped unexpectedly")
+    );
+    assert!(
+        stopped
+            .wait_failure()
+            .await
+            .to_string()
+            .contains("no active task")
+    );
+    stopped.shutdown().await.unwrap();
+
+    let mut aborted = ExecutionController::start(root.0.join("aborted-cache"))
+        .await
+        .unwrap();
+    aborted.abort_tasks_for_test();
+    assert!(
+        aborted
+            .wait_failure()
+            .await
+            .to_string()
+            .contains("execution task failed")
+    );
+    aborted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn execution_controller_shutdown_reports_task_failures() {
+    let root = TestDirectory::new();
+    let mut controller = ExecutionController::start(root.cache()).await.unwrap();
+    controller.abort_server_for_test();
+
+    assert!(
+        controller
+            .shutdown()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("injected execution controller failure")
+    );
 }
 
 #[tokio::test]
