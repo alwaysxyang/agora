@@ -1,5 +1,5 @@
 use super::{
-    Arguments, AuditState, async_main, clean_executable_root, default_hook_library,
+    Arguments, AuditState, async_main, clean_executable_cache, default_hook_library,
     exit_status_code, parse_command, signal_exit_code,
 };
 use agora_sandbox::callback::{
@@ -21,7 +21,7 @@ fn event(event_type: EventType, connection_id: Option<&str>, network: bool) -> N
         event_type,
         sandbox_id: "sandbox".to_string(),
         run_id: "run".to_string(),
-        trace_ids: vec!["trace-root".to_string()],
+        trace_id: "trace-root".to_string(),
         connection_id: connection_id.map(ToString::to_string),
         sequence: Some(0),
         process: ProcessContext {
@@ -58,7 +58,7 @@ fn process_event() -> ProcessEvent {
         event_type: EventType::ProcessExecAttempt,
         sandbox_id: "sandbox".to_string(),
         run_id: "run".to_string(),
-        trace_ids: vec!["trace-root".to_string(), "trace-child".to_string()],
+        trace_id: "trace-root, trace-child".to_string(),
         process: ProcessContext {
             pid: 43,
             ppid: 42,
@@ -156,9 +156,11 @@ fn audit_state_writes_process_and_network_records_to_the_same_stream() {
         .collect::<Vec<_>>();
     assert_eq!(records[0]["type"], "process");
     assert_eq!(records[0]["executable"], "/usr/bin/curl");
-    assert_eq!(records[0]["trace_ids"][1], "trace-child");
+    assert_eq!(records[0]["arguments"][0], "curl");
+    assert_eq!(records[0]["arguments"][1], "https://example.com");
+    assert_eq!(records[0]["trace_id"], "trace-root, trace-child");
     assert_eq!(records[1]["type"], "network");
-    assert_eq!(records[1]["trace_ids"][0], "trace-root");
+    assert_eq!(records[1]["trace_id"], "trace-root");
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -178,16 +180,16 @@ fn default_paths_and_exit_codes_are_stable() {
 }
 
 #[test]
-fn clean_reports_when_the_executable_root_is_not_a_directory() {
+fn clean_reports_when_the_executable_cache_is_not_a_directory() {
     let workdir = std::env::temp_dir().join(format!("agora-clean-test-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workdir).unwrap();
-    std::fs::write(workdir.join("root"), b"not a directory").unwrap();
+    std::fs::write(workdir.join("fs"), b"not a directory").unwrap();
 
-    let error = clean_executable_root(Some(&workdir)).unwrap_err();
+    let error = clean_executable_cache(Some(&workdir)).unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("failed to clean sandbox executable root")
+            .contains("failed to clean sandbox executable cache")
     );
 
     std::fs::remove_dir_all(workdir).unwrap();

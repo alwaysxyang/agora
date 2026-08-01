@@ -80,15 +80,17 @@ fn sandbox_cli_documents_only_available_options() {
 }
 
 #[test]
-fn sandbox_cli_clean_removes_only_the_selected_executable_root() {
+fn sandbox_cli_clean_removes_only_the_selected_executable_cache() {
     let workdir = std::env::temp_dir().join(format!(
         "agora-sandbox-cli-clean-test-{}",
         uuid::Uuid::new_v4()
     ));
-    let root = workdir.join("root");
-    std::fs::create_dir_all(root.join("usr/bin")).unwrap();
-    std::fs::write(root.join("usr/bin/curl"), b"prepared executable").unwrap();
-    std::fs::write(root.join("usr/bin/checksums.json"), b"{}").unwrap();
+    let cache = workdir.join("fs");
+    std::fs::create_dir_all(cache.join("usr/bin")).unwrap();
+    std::fs::write(cache.join("usr/bin/curl"), b"prepared executable").unwrap();
+    std::fs::write(cache.join("usr/bin/checksums.json"), b"{}").unwrap();
+    std::fs::create_dir_all(workdir.join("root")).unwrap();
+    std::fs::write(workdir.join("root/legacy"), b"legacy executable").unwrap();
     std::fs::create_dir_all(workdir.join("ca")).unwrap();
     std::fs::write(workdir.join("ca/ca.crt"), b"certificate").unwrap();
 
@@ -105,21 +107,22 @@ fn sandbox_cli_clean_removes_only_the_selected_executable_root() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!root.exists());
+    assert!(!cache.exists());
+    assert!(workdir.join("root/legacy").is_file());
     assert!(workdir.join("ca/ca.crt").is_file());
     std::fs::remove_dir_all(workdir).unwrap();
 }
 
 #[test]
-fn sandbox_cli_clean_uses_the_default_root_and_is_idempotent() {
+fn sandbox_cli_clean_uses_the_default_cache_and_is_idempotent() {
     let home = std::env::temp_dir().join(format!(
         "agora-sandbox-cli-clean-home-test-{}",
         uuid::Uuid::new_v4()
     ));
     let workdir = home.join(".agora-sandbox");
-    let root = workdir.join("root");
-    std::fs::create_dir_all(root.join("bin")).unwrap();
-    std::fs::write(root.join("bin/tool"), b"prepared executable").unwrap();
+    let cache = workdir.join("fs");
+    std::fs::create_dir_all(cache.join("bin")).unwrap();
+    std::fs::write(cache.join("bin/tool"), b"prepared executable").unwrap();
     std::fs::create_dir_all(workdir.join("ca")).unwrap();
     std::fs::write(workdir.join("ca/ca.crt"), b"certificate").unwrap();
 
@@ -137,7 +140,7 @@ fn sandbox_cli_clean_uses_the_default_root_and_is_idempotent() {
         );
     }
 
-    assert!(!root.exists());
+    assert!(!cache.exists());
     assert!(workdir.join("ca/ca.crt").is_file());
     std::fs::remove_dir_all(home).unwrap();
 }
@@ -466,7 +469,11 @@ fn assert_audit_record(record: &serde_json::Value, destination: SocketAddr) {
     assert_eq!(object.len(), 7);
     assert_eq!(record["type"], "network");
     assert!(record["access_time"].as_str().is_some());
-    assert_eq!(record["trace_ids"].as_array().unwrap().len(), 1);
+    assert!(
+        record["trace_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
     assert!(record["pid"].as_u64().is_some_and(|pid| pid > 0));
     assert_eq!(record["destination_ip"], destination.ip().to_string());
     assert_eq!(record["destination_port"], destination.port());

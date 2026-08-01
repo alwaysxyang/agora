@@ -12,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 fn registration() -> RouteRegistration {
     RouteRegistration {
         connection_id: "connection-1".to_string(),
-        trace_ids: vec!["trace-test".to_string()],
+        trace_id: "trace-test".to_string(),
         destination: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
         process: ProcessIdentity {
             pid: 1,

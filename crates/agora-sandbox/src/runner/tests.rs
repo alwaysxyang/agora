@@ -179,8 +179,8 @@ async fn system_curl_completes_the_transparent_tls_chain() {
             Event::Network(_) | Event::Process(_) => None,
         })
         .expect("curl TLS connection event");
-    assert_eq!(process.trace_ids, established.trace_ids);
-    assert!(process.trace_ids.len() >= 2);
+    assert_eq!(process.trace_id, established.trace_id);
+    assert!(process.trace_id.split(',').count() >= 2);
     assert_eq!(
         established.tls.as_ref().map(|tls| tls.outcome),
         Some(TlsOutcome::Terminated)

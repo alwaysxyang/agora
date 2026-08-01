@@ -1,8 +1,8 @@
 use super::ExecutionController;
 use super::protocol::{
-    CommandRequest, PrepareRequest, PrepareResponse, ProcessOperation, decode_prepare_request,
-    decode_prepare_response, encode_prepare_request, encode_prepare_request_with_command,
-    encode_prepare_response, frame_length,
+    CommandRequest, EXECUTION_PROTOCOL_VERSION, PrepareRequest, PrepareResponse, ProcessOperation,
+    TRUNCATED_ARGUMENTS, decode_prepare_request, decode_prepare_response, encode_prepare_request,
+    encode_prepare_request_with_command, encode_prepare_response, frame_length,
 };
 use crate::callback::{Decision, Event, EventType};
 use std::ffi::OsString;
@@ -44,7 +44,7 @@ fn body(frame: &[u8]) -> &[u8] {
 #[test]
 fn execution_prepare_protocol_preserves_paths() {
     let command = CommandRequest {
-        trace_ids: vec!["trace-root".to_string(), "trace-child".to_string()],
+        trace_id: "trace-root, trace-child".to_string(),
         pid: 101,
         ppid: 100,
         process_executable: "/bin/bash".to_string(),
@@ -69,6 +69,33 @@ fn execution_prepare_protocol_preserves_paths() {
     assert_eq!(
         decode_prepare_response(body(&response)).unwrap(),
         PrepareResponse::Ready(PathBuf::from("/tmp/agora/curl"))
+    );
+}
+
+#[test]
+fn execution_prepare_protocol_bounds_oversized_argument_metadata() {
+    let command = CommandRequest {
+        trace_id: "trace-root".to_string(),
+        pid: 101,
+        ppid: 100,
+        process_executable: "/bin/bash".to_string(),
+        executable: "/usr/bin/true".to_string(),
+        arguments: vec![
+            "visible".to_string(),
+            "x".repeat(70 * 1024),
+            "omitted".to_string(),
+        ],
+        current_dir: "/tmp".to_string(),
+        operation: ProcessOperation::Execve,
+    };
+
+    let request =
+        encode_prepare_request_with_command("token", Path::new("/usr/bin/true"), &command).unwrap();
+    let decoded = decode_prepare_request(body(&request)).unwrap();
+
+    assert_eq!(
+        decoded.command.unwrap().arguments,
+        ["visible", TRUNCATED_ARGUMENTS]
     );
 }
 
@@ -98,7 +125,7 @@ fn execution_prepare_protocol_rejects_invalid_frames() {
 fn execution_prepare_protocol_rejects_malformed_requests() {
     let mut unsupported =
         body(&encode_prepare_request("token", Path::new("/bin/sh")).unwrap()).to_vec();
-    unsupported[1] = 3;
+    unsupported[0..2].copy_from_slice(&(EXECUTION_PROTOCOL_VERSION + 1).to_be_bytes());
     assert!(decode_prepare_request(&unsupported).is_err());
 
     let mut invalid_lengths =
@@ -106,7 +133,7 @@ fn execution_prepare_protocol_rejects_malformed_requests() {
     invalid_lengths[2..4].copy_from_slice(&0_u16.to_be_bytes());
     assert!(decode_prepare_request(&invalid_lengths).is_err());
 
-    let invalid_token = [0, 2, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0xff, b'x'];
+    let invalid_token = [0, 4, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0xff, b'x'];
     assert!(decode_prepare_request(&invalid_token).is_err());
 }
 
@@ -114,7 +141,7 @@ fn execution_prepare_protocol_rejects_malformed_requests() {
 fn execution_prepare_protocol_rejects_malformed_responses() {
     let ready = encode_prepare_response(&PrepareResponse::Ready(PathBuf::from("/bin/sh"))).unwrap();
     let mut unsupported = body(&ready).to_vec();
-    unsupported[1] = 3;
+    unsupported[0..2].copy_from_slice(&(EXECUTION_PROTOCOL_VERSION + 1).to_be_bytes());
     assert!(decode_prepare_response(&unsupported).is_err());
 
     let mut invalid_length = body(&ready).to_vec();
@@ -125,11 +152,11 @@ fn execution_prepare_protocol_rejects_malformed_responses() {
     invalid_status[2] = 2;
     assert!(decode_prepare_response(&invalid_status).is_err());
 
-    let invalid_error = [0, 2, 1, 0, 0, 0, 5, 0, 0, 0, 1, 0xff];
+    let invalid_error = [0, 4, 1, 0, 0, 0, 5, 0, 0, 0, 1, 0xff];
     assert!(decode_prepare_response(&invalid_error).is_err());
-    let truncated_error = [0, 2, 1, 0, 0, 0, 3, 0, 0, 0];
+    let truncated_error = [0, 4, 1, 0, 0, 0, 3, 0, 0, 0];
     assert!(decode_prepare_response(&truncated_error).is_err());
-    let invalid_errno = [0, 2, 1, 0, 0, 0, 4, 0, 0, 0, 0];
+    let invalid_errno = [0, 4, 1, 0, 0, 0, 4, 0, 0, 0, 0];
     assert!(decode_prepare_response(&invalid_errno).is_err());
 
     let oversized = OsString::from_vec(vec![b'x'; 64 * 1024]);
@@ -208,7 +235,7 @@ async fn execution_controller_publishes_commands_without_applying_network_decisi
     .await
     .unwrap();
     let command = CommandRequest {
-        trace_ids: vec!["trace-root".to_string(), "trace-child".to_string()],
+        trace_id: "trace-root, trace-child".to_string(),
         pid: 101,
         ppid: 100,
         process_executable: "/bin/bash".to_string(),
@@ -246,7 +273,7 @@ async fn execution_controller_publishes_commands_without_applying_network_decisi
             panic!("expected a process event");
         };
         assert_eq!(event.event_type, EventType::ProcessExecAttempt);
-        assert_eq!(event.trace_ids, command.trace_ids);
+        assert_eq!(event.trace_id, command.trace_id);
         assert_eq!(event.command.arguments, command.arguments);
     }
     controller.shutdown().await.unwrap();
@@ -323,7 +350,7 @@ async fn execution_controller_isolates_an_invalid_command_trace() {
     let root = TestDirectory::new();
     let controller = ExecutionController::start(root.cache()).await.unwrap();
     let command = CommandRequest {
-        trace_ids: vec!["invalid\ntrace".to_string()],
+        trace_id: "invalid\ntrace".to_string(),
         pid: 101,
         ppid: 100,
         process_executable: "/bin/bash".to_string(),
@@ -356,7 +383,7 @@ async fn execution_controller_isolates_an_invalid_command_trace() {
         panic!("an invalid trace must be rejected");
     };
     assert_eq!(errno, libc::EINVAL);
-    assert!(message.contains("invalid command trace ids"));
+    assert!(message.contains("invalid command trace id"));
 
     let prepared = controller.prepare(PathBuf::from("/bin/sh")).await.unwrap();
     assert!(prepared.is_file());

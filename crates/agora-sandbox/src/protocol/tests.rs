@@ -15,7 +15,7 @@ fn connect_request() -> ConnectRequest {
             ppid: 100,
             executable: "/usr/bin/curl".to_string(),
         },
-        trace_ids: vec!["trace-root".to_string(), "trace-curl".to_string()],
+        trace_id: "trace-root, trace-curl".to_string(),
         operation: HookOperation::Connect,
     }
 }
@@ -68,8 +68,8 @@ fn connect_request_round_trips_through_http_headers() {
             .any(|window| window == b"Proxy-Authorization: Bearer token-1")
     );
     assert!(
-        head.windows(b"Agora-Trace-Ids: trace-root, trace-curl".len())
-            .any(|window| window == b"Agora-Trace-Ids: trace-root, trace-curl")
+        head.windows(b"Agora-Trace-Id: trace-root, trace-curl".len())
+            .any(|window| window == b"Agora-Trace-Id: trace-root, trace-curl")
     );
     assert!(body.is_empty());
     let (parsed, consumed) = parse_connect_request_prefix(head).unwrap().unwrap();
@@ -119,7 +119,7 @@ fn connectx_request_round_trips_and_becomes_a_route_registration() {
     assert_eq!(registration.connection_id, "connection-1");
     assert_eq!(registration.destination, request.destination);
     assert_eq!(registration.process, request.process);
-    assert_eq!(registration.trace_ids, request.trace_ids);
+    assert_eq!(registration.trace_id, request.trace_id);
     assert_eq!(registration.operation, HookOperation::Connectx);
 }
 

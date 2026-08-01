@@ -650,7 +650,7 @@ fn executable_store_replaces_invalid_cache_files_and_rejects_non_files() {
             .prepare(&source)
             .unwrap_err()
             .to_string()
-            .contains("root entry is not a file")
+            .contains("cache entry is not a file")
     );
 }
 

@@ -514,7 +514,7 @@ where
             event_type: publication.event_type,
             sandbox_id: self.context.sandbox_id.clone(),
             run_id: self.context.run_id.clone(),
-            trace_ids: registration.trace_ids.clone(),
+            trace_id: registration.trace_id.clone(),
             connection_id: Some(registration.connection_id.clone()),
             sequence: Some(publication.sequence),
             process: Self::process_context(&registration.process),

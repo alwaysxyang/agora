@@ -4,7 +4,7 @@ use std::fmt;
 use std::future::Future;
 use std::net::IpAddr;
 
-pub const EVENT_SCHEMA_VERSION: u16 = 6;
+pub const EVENT_SCHEMA_VERSION: u16 = 7;
 
 pub trait Callback: Send + Sync + 'static {
     fn on_event(&self, event: Event) -> impl Future<Output = Decision> + Send;
@@ -184,7 +184,7 @@ pub struct NetworkEvent {
     pub event_type: EventType,
     pub sandbox_id: String,
     pub run_id: String,
-    pub trace_ids: Vec<String>,
+    pub trace_id: String,
     pub connection_id: Option<String>,
     pub sequence: Option<u64>,
     pub process: ProcessContext,
@@ -211,7 +211,7 @@ impl Serialize for Redacted<'_, NetworkEvent> {
         state.serialize_field("event_type", &event.event_type)?;
         state.serialize_field("sandbox_id", &event.sandbox_id)?;
         state.serialize_field("run_id", &event.run_id)?;
-        state.serialize_field("trace_ids", &event.trace_ids)?;
+        state.serialize_field("trace_id", &event.trace_id)?;
         state.serialize_field("connection_id", &event.connection_id)?;
         state.serialize_field("sequence", &event.sequence)?;
         state.serialize_field("process", &event.process)?;
@@ -272,7 +272,7 @@ pub struct ProcessEvent {
     pub event_type: EventType,
     pub sandbox_id: String,
     pub run_id: String,
-    pub trace_ids: Vec<String>,
+    pub trace_id: String,
     pub process: ProcessContext,
     pub command: CommandContext,
     pub result: EventResult,

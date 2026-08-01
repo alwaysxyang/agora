@@ -1,8 +1,8 @@
 use uuid::Uuid;
 
-pub(crate) const TRACE_IDS_ENVIRONMENT: &str = "AGORA_SANDBOX_TRACE_IDS";
-pub(crate) const TRACE_IDS_HEADER: &str = "Agora-Trace-Ids";
-const MAX_TRACE_IDS: usize = 32;
+pub(crate) const TRACE_ID_ENVIRONMENT: &str = "AGORA_SANDBOX_TRACE_ID";
+pub(crate) const TRACE_ID_HEADER: &str = "Agora-Trace-Id";
+const MAX_TRACE_ENTRIES: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TraceContext {
@@ -26,9 +26,9 @@ impl TraceContext {
     }
 
     pub(crate) fn new(ids: Vec<String>) -> Result<Self, String> {
-        if ids.is_empty() || ids.len() > MAX_TRACE_IDS {
+        if ids.is_empty() || ids.len() > MAX_TRACE_ENTRIES {
             return Err(format!(
-                "trace id chain must contain between 1 and {MAX_TRACE_IDS} entries"
+                "trace id chain must contain between 1 and {MAX_TRACE_ENTRIES} entries"
             ));
         }
         if ids.iter().any(|id| !Self::valid_id(id)) {
@@ -39,15 +39,11 @@ impl TraceContext {
 
     pub(crate) fn child(&self) -> Self {
         let mut ids = self.ids.clone();
-        if ids.len() == MAX_TRACE_IDS {
+        if ids.len() == MAX_TRACE_ENTRIES {
             ids.remove(0);
         }
         ids.push(Uuid::new_v4().to_string());
         Self { ids }
-    }
-
-    pub(crate) fn ids(&self) -> &[String] {
-        &self.ids
     }
 
     pub(crate) fn encode(&self) -> String {

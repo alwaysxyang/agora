@@ -166,14 +166,14 @@ impl ExecutableStore {
         let checksum = Self::checksum(source)?;
         Self::flock(&self.lock, libc::LOCK_EX).with_context(|| {
             format!(
-                "failed to lock sandbox executable root {}",
+                "failed to lock sandbox executable cache {}",
                 self.directory.display()
             )
         })?;
         let prepared = self.prepare_locked(source, metadata, &checksum);
         let unlock = Self::flock(&self.lock, libc::LOCK_UN).with_context(|| {
             format!(
-                "failed to unlock sandbox executable root {}",
+                "failed to unlock sandbox executable cache {}",
                 self.directory.display()
             )
         });
@@ -223,7 +223,7 @@ impl ExecutableStore {
             Ok(metadata) if metadata.is_file() => {}
             Ok(_) => {
                 bail!(
-                    "sandbox executable root entry is not a file: {}",
+                    "sandbox executable cache entry is not a file: {}",
                     destination.display()
                 );
             }
@@ -231,7 +231,7 @@ impl ExecutableStore {
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
-                        "failed to inspect sandbox executable root entry {}",
+                        "failed to inspect sandbox executable cache entry {}",
                         destination.display()
                     )
                 });

@@ -5,8 +5,9 @@ use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-pub(super) const EXECUTION_PROTOCOL_VERSION: u16 = 2;
+pub(crate) const EXECUTION_PROTOCOL_VERSION: u16 = 4;
 pub(super) const MAX_EXECUTION_FRAME_SIZE: usize = 64 * 1024;
+pub(crate) const TRUNCATED_ARGUMENTS: &str = "[truncated]";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PrepareRequest {
@@ -17,7 +18,7 @@ pub(crate) struct PrepareRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CommandRequest {
-    pub(crate) trace_ids: Vec<String>,
+    pub(crate) trace_id: String,
     pub(crate) pid: u32,
     pub(crate) ppid: u32,
     pub(crate) process_executable: String,
@@ -59,10 +60,16 @@ fn encode_request(
     let executable = executable.as_os_str().as_bytes();
     let executable_length = u32::try_from(executable.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "executable path is too long"))?;
+    let fixed_length = 12_usize
+        .checked_add(token.len())
+        .and_then(|length| length.checked_add(executable.len()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "request is too large"))?;
+    let command_budget = MAX_EXECUTION_FRAME_SIZE
+        .checked_sub(fixed_length)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "request is too large"))?;
     let command = command
-        .map(serde_json::to_vec)
-        .transpose()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+        .map(|command| encode_bounded_command(command, command_budget))
+        .transpose()?
         .unwrap_or_default();
     let command_length = u32::try_from(command.len()).map_err(|_| {
         io::Error::new(io::ErrorKind::InvalidInput, "command metadata is too large")
@@ -76,6 +83,39 @@ fn encode_request(
     body.extend_from_slice(executable);
     body.extend_from_slice(&command);
     encode_frame(body)
+}
+
+fn encode_bounded_command(command: &CommandRequest, budget: usize) -> io::Result<Vec<u8>> {
+    let serialize = |command: &CommandRequest| {
+        serde_json::to_vec(command)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+    };
+    let encoded = serialize(command)?;
+    if encoded.len() <= budget {
+        return Ok(encoded);
+    }
+
+    let mut bounded = command.clone();
+    bounded.arguments.clear();
+    for argument in &command.arguments {
+        bounded.arguments.push(argument.clone());
+        bounded.arguments.push(TRUNCATED_ARGUMENTS.to_string());
+        let fits = serialize(&bounded)?.len() <= budget;
+        bounded.arguments.pop();
+        if !fits {
+            bounded.arguments.pop();
+            break;
+        }
+    }
+    bounded.arguments.push(TRUNCATED_ARGUMENTS.to_string());
+    let encoded = serialize(&bounded)?;
+    if encoded.len() > budget {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "command metadata is too large",
+        ));
+    }
+    Ok(encoded)
 }
 
 pub(crate) fn decode_prepare_request(frame: &[u8]) -> io::Result<PrepareRequest> {

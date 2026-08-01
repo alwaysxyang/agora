@@ -16,7 +16,7 @@ fn network_event() -> NetworkEvent {
         event_type: EventType::NetworkConnectAttempt,
         sandbox_id: "sandbox-1".to_string(),
         run_id: "run-1".to_string(),
-        trace_ids: vec!["trace-root".to_string()],
+        trace_id: "trace-root".to_string(),
         connection_id: Some("connection-1".to_string()),
         sequence: Some(0),
         process: ProcessContext {
@@ -57,7 +57,7 @@ fn process_event() -> ProcessEvent {
         event_type: EventType::ProcessExecAttempt,
         sandbox_id: "sandbox-1".to_string(),
         run_id: "run-1".to_string(),
-        trace_ids: vec!["trace-root".to_string(), "trace-child".to_string()],
+        trace_id: "trace-root, trace-child".to_string(),
         process: ProcessContext {
             pid: 101,
             ppid: 100,
@@ -95,7 +95,7 @@ fn callback_event_uses_stable_versioned_json_fields() {
 }
 
 #[test]
-fn process_event_uses_the_same_redacted_event_boundary() {
+fn process_event_preserves_arguments_at_the_redacted_event_boundary() {
     let event = Event::Process(process_event());
     let value = serde_json::to_value(event.redacted()).unwrap();
 
@@ -104,9 +104,11 @@ fn process_event_uses_the_same_redacted_event_boundary() {
     assert_eq!(value["schema_version"], EVENT_SCHEMA_VERSION);
     assert_eq!(value["subsystem"], "process");
     assert_eq!(value["event_type"], "process.exec.attempt");
-    assert_eq!(value["trace_ids"][1], "trace-child");
+    assert_eq!(value["trace_id"], "trace-root, trace-child");
     assert_eq!(value["command"]["executable"], "/usr/bin/curl");
     assert_eq!(value["command"]["operation"], "execve");
+    assert_eq!(value["command"]["arguments"][0], "curl");
+    assert_eq!(value["command"]["arguments"][1], "https://example.com");
 }
 
 #[test]

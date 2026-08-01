@@ -2,7 +2,7 @@ use crate::callback::Callback;
 #[cfg(target_os = "macos")]
 use crate::execution::{ExecutionController, resolve_executable, resolve_shebang};
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
-use crate::trace::{TRACE_IDS_ENVIRONMENT, TraceContext};
+use crate::trace::{TRACE_ID_ENVIRONMENT, TraceContext};
 use anyhow::{Context, Result, bail};
 #[cfg(target_os = "macos")]
 use base64::Engine;
@@ -426,7 +426,7 @@ where
                 }
             };
             let controller = ExecutionController::start_with_callback(
-                self.config.workdir.join("root"),
+                self.config.workdir.join("fs"),
                 sandbox_id.clone(),
                 run_id.clone(),
                 execution_callback,
@@ -521,7 +521,7 @@ where
             .env(EXECUTION_CONTROL, execution_runtime.control().to_string())
             .env(EXECUTION_TOKEN, execution_runtime.token())
             .env(HOOK_LIBRARIES, &injected_libraries)
-            .env(TRACE_IDS_ENVIRONMENT, trace.encode())
+            .env(TRACE_ID_ENVIRONMENT, trace.encode())
             .env("DYLD_INSERT_LIBRARIES", injected_libraries);
         let tls_trust_anchors = tls_trust_anchor_der
             .into_iter()

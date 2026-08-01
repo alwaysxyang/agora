@@ -63,7 +63,7 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum CliCommand {
-    /// Remove every prepared executable from <workdir>/root
+    /// Remove every prepared executable from <workdir>/fs
     Clean {
         /// Sandbox work directory; defaults to ~/.agora-sandbox
         #[arg(long)]
@@ -124,7 +124,7 @@ impl AuditState {
             Event::Network(event) if event.event_type == EventType::NetworkConnectAttempt => {
                 event.network.as_ref().map(|network| AuditRecord::Network {
                     access_time: event.occurred_at.clone(),
-                    trace_ids: event.trace_ids.clone(),
+                    trace_id: event.trace_id.clone(),
                     pid: event.process.pid,
                     destination_ip: network.destination_ip,
                     destination_port: network.destination_port,
@@ -134,7 +134,7 @@ impl AuditState {
             Event::Process(event) if event.event_type == EventType::ProcessExecAttempt => {
                 Some(AuditRecord::Process {
                     access_time: event.occurred_at.clone(),
-                    trace_ids: event.trace_ids.clone(),
+                    trace_id: event.trace_id.clone(),
                     pid: event.process.pid,
                     ppid: event.process.ppid,
                     process_executable: event.process.executable.clone(),
@@ -200,7 +200,7 @@ impl AuditOutput {
 enum AuditRecord {
     Network {
         access_time: String,
-        trace_ids: Vec<String>,
+        trace_id: String,
         pid: u32,
         destination_ip: std::net::IpAddr,
         destination_port: u16,
@@ -208,7 +208,7 @@ enum AuditRecord {
     },
     Process {
         access_time: String,
-        trace_ids: Vec<String>,
+        trace_id: String,
         pid: u32,
         ppid: u32,
         process_executable: String,
@@ -222,7 +222,7 @@ enum AuditRecord {
 async fn async_main(arguments: Arguments) -> Result<u8> {
     match arguments.subcommand {
         Some(CliCommand::Clean { workdir }) => {
-            clean_executable_root(workdir.as_deref())?;
+            clean_executable_cache(workdir.as_deref())?;
             return Ok(0);
         }
         None => {}
@@ -278,18 +278,18 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
     Ok(signal.map(signal_exit_code).unwrap_or(1))
 }
 
-fn clean_executable_root(workdir: Option<&Path>) -> Result<()> {
+fn clean_executable_cache(workdir: Option<&Path>) -> Result<()> {
     let workdir = workdir
         .map(Path::to_path_buf)
         .unwrap_or_else(SandboxConfig::default_workdir);
-    let executable_root = workdir.join("root");
-    match std::fs::remove_dir_all(&executable_root) {
+    let executable_cache = workdir.join("fs");
+    match std::fs::remove_dir_all(&executable_cache) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| {
             format!(
-                "failed to clean sandbox executable root {}",
-                executable_root.display()
+                "failed to clean sandbox executable cache {}",
+                executable_cache.display()
             )
         }),
     }

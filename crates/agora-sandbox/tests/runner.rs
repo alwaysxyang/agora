@@ -266,6 +266,19 @@ fn relocated_executable_spawns_its_sibling_and_preserves_missing_errno() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn process_audit_does_not_reject_a_large_argument() {
+    if std::env::var_os("AGORA_SANDBOX_TEST_LARGE_ARGUMENT").is_none() {
+        return;
+    }
+    let status = Command::new("/usr/bin/true")
+        .arg("x".repeat(70 * 1024))
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn records_tls_trust_environment() {
     let Some(output) = std::env::var_os("AGORA_SANDBOX_TEST_TLS_TRUST_ENV") else {
         return;
@@ -618,10 +631,10 @@ async fn runner_keeps_an_unrestricted_executable_at_its_original_path() {
     let source = std::env::current_exe().unwrap().canonicalize().unwrap();
     assert_eq!(executable, source);
     let cached = workdir
-        .join("root")
+        .join("fs")
         .join(source.strip_prefix(Path::new("/")).unwrap());
     assert!(!cached.exists());
-    assert!(workdir.join("root/.lock").is_file());
+    assert!(workdir.join("fs/.lock").is_file());
 
     let second_output = directory.join("current-exe-second");
     let second = SandboxCommand::new(std::env::current_exe().unwrap())
@@ -690,11 +703,34 @@ async fn runner_prepares_a_relocated_executable_sibling_on_demand() {
         let source = source.canonicalize().unwrap();
         assert!(
             workdir
-                .join("root")
+                .join("fs")
                 .join(source.strip_prefix(Path::new("/")).unwrap())
                 .is_file()
         );
     }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_truncates_large_process_audit_without_rejecting_the_command() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-large-argument-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let command = SandboxCommand::new(std::env::current_exe().unwrap())
+        .arg("process_audit_does_not_reject_a_large_argument")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("AGORA_SANDBOX_TEST_LARGE_ARGUMENT", "1");
+    let config = SandboxConfig::new(hook_library()).with_workdir(directory.join("cache"));
+
+    let outcome = Sandbox::new(config, NoopCallback)
+        .run(command)
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -745,11 +781,11 @@ async fn runner_executes_shebang_scripts_through_a_prepared_restricted_interpret
     assert!(nested_output.starts_with("nested\n"));
     assert!(nested_output.contains("libagora_sandbox.dylib"));
     let script = script.canonicalize().unwrap();
-    assert!(workdir.join("root/usr/bin/env").is_file());
-    assert!(workdir.join("root/bin/sh").is_file());
+    assert!(workdir.join("fs/usr/bin/env").is_file());
+    assert!(workdir.join("fs/bin/sh").is_file());
     assert!(
         !workdir
-            .join("root")
+            .join("fs")
             .join(script.strip_prefix(Path::new("/")).unwrap())
             .exists()
     );

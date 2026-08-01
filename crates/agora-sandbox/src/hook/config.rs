@@ -1,4 +1,4 @@
-use crate::trace::{TRACE_IDS_ENVIRONMENT, TraceContext};
+use crate::trace::{TRACE_ID_ENVIRONMENT, TraceContext};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::OnceLock;
 
@@ -28,7 +28,7 @@ pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 14] = [
     HOOK_LIBRARIES,
     TLS_TRUST_ANCHOR_DER,
     TLS_TRUST_BUNDLE,
-    TRACE_IDS_ENVIRONMENT,
+    TRACE_ID_ENVIRONMENT,
     TLS_CLIENT_TRUST_ENVIRONMENT[0],
     TLS_CLIENT_TRUST_ENVIRONMENT[1],
     TLS_CLIENT_TRUST_ENVIRONMENT[2],
@@ -69,8 +69,8 @@ impl HookConfig {
         let hook_libraries = Self::required(&mut get, HOOK_LIBRARIES)?;
         let tls_trust_anchor_der = get(TLS_TRUST_ANCHOR_DER).filter(|value| !value.is_empty());
         let tls_trust_bundle = get(TLS_TRUST_BUNDLE).filter(|value| !value.is_empty());
-        let trace = TraceContext::parse(&Self::required(&mut get, TRACE_IDS_ENVIRONMENT)?)
-            .map_err(|error| format!("invalid {TRACE_IDS_ENVIRONMENT}: {error}"))?;
+        let trace = TraceContext::parse(&Self::required(&mut get, TRACE_ID_ENVIRONMENT)?)
+            .map_err(|error| format!("invalid {TRACE_ID_ENVIRONMENT}: {error}"))?;
         if !proxy_ipv4.ip().is_loopback() || !matches!(proxy_ipv4.ip(), IpAddr::V4(_)) {
             return Err(format!("{PROXY_IPV4} must be an IPv4 loopback address"));
         }
@@ -148,7 +148,7 @@ impl HookConfig {
             (EXECUTION_CONTROL, self.execution_control.to_string()),
             (EXECUTION_TOKEN, self.execution_token.clone()),
             (HOOK_LIBRARIES, self.hook_libraries.clone()),
-            (TRACE_IDS_ENVIRONMENT, trace.encode()),
+            (TRACE_ID_ENVIRONMENT, trace.encode()),
         ];
         if let Some(anchor) = &self.tls_trust_anchor_der {
             environment.push((TLS_TRUST_ANCHOR_DER, anchor.clone()));

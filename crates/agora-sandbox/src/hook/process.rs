@@ -4,8 +4,9 @@ use super::config::{self, CHILD_RUNTIME_ENVIRONMENT, HookConfig};
 use super::dyld::{dyld_interpose, function_from_interpose};
 use super::socket::set_errno;
 use crate::execution::{
-    CommandRequest, PrepareResponse, ProcessOperation, decode_prepare_response,
-    encode_prepare_request, encode_prepare_request_with_command, frame_length, resolve_shebang,
+    CommandRequest, PrepareResponse, ProcessOperation, TRUNCATED_ARGUMENTS,
+    decode_prepare_response, encode_prepare_request, encode_prepare_request_with_command,
+    frame_length, resolve_shebang,
 };
 use crate::trace::TraceContext;
 use std::cell::Cell;
@@ -16,6 +17,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
+
+const MAX_RECORDED_ARGUMENTS: usize = 256;
 
 type PosixSpawnFn = unsafe extern "C" fn(
     *mut libc::pid_t,
@@ -352,7 +355,7 @@ unsafe fn command_request(
     let mut values = Vec::new();
     if !arguments.is_null() {
         let mut current = arguments;
-        while !(unsafe { *current }).is_null() {
+        while values.len() < MAX_RECORDED_ARGUMENTS && !(unsafe { *current }).is_null() {
             values.push(
                 unsafe { CStr::from_ptr(*current) }
                     .to_string_lossy()
@@ -360,9 +363,12 @@ unsafe fn command_request(
             );
             current = unsafe { current.add(1) };
         }
+        if !(unsafe { *current }).is_null() {
+            values.push(TRUNCATED_ARGUMENTS.to_string());
+        }
     }
     Ok(CommandRequest {
-        trace_ids: trace.ids().to_vec(),
+        trace_id: trace.encode(),
         pid: std::process::id(),
         ppid: unsafe { libc::getppid() as u32 },
         process_executable: std::env::current_exe()?.to_string_lossy().into_owned(),

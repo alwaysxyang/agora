@@ -174,8 +174,8 @@ where
     C: Callback,
 {
     async fn publish_command(&self, command: &CommandRequest) -> Result<()> {
-        TraceContext::new(command.trace_ids.clone())
-            .map_err(|error| anyhow::anyhow!("invalid command trace ids: {error}"))?;
+        let trace = TraceContext::parse(&command.trace_id)
+            .map_err(|error| anyhow::anyhow!("invalid command trace id: {error}"))?;
         let event = Event::Process(ProcessEvent {
             schema_version: EVENT_SCHEMA_VERSION,
             event_id: Uuid::new_v4().to_string(),
@@ -184,7 +184,7 @@ where
             event_type: EventType::ProcessExecAttempt,
             sandbox_id: self.sandbox_id.clone(),
             run_id: self.run_id.clone(),
-            trace_ids: command.trace_ids.clone(),
+            trace_id: trace.encode(),
             process: ProcessContext {
                 pid: command.pid,
                 ppid: command.ppid,

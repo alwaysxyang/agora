@@ -4,7 +4,6 @@ use super::TraceContext;
 fn trace_context_round_trips_an_xff_style_chain() {
     let trace = TraceContext::parse("root, child").unwrap();
 
-    assert_eq!(trace.ids(), ["root", "child"]);
     assert_eq!(trace.encode(), "root, child");
 }
 
@@ -13,8 +12,10 @@ fn child_trace_preserves_its_ancestors() {
     let parent = TraceContext::parse("root, parent").unwrap();
     let child = parent.child();
 
-    assert_eq!(&child.ids()[..2], ["root", "parent"]);
-    assert_eq!(child.ids().len(), 3);
+    let entries = child.encode();
+    let entries = entries.split(", ").collect::<Vec<_>>();
+    assert_eq!(&entries[..2], ["root", "parent"]);
+    assert_eq!(entries.len(), 3);
 }
 
 #[test]
@@ -23,9 +24,11 @@ fn child_trace_bounds_the_forwarded_chain() {
         TraceContext::new((0..32).map(|index| format!("trace-{index}")).collect()).unwrap();
     let child = parent.child();
 
-    assert_eq!(child.ids().len(), 32);
-    assert_eq!(child.ids()[0], "trace-1");
-    assert_ne!(child.ids()[31], "trace-31");
+    let entries = child.encode();
+    let entries = entries.split(", ").collect::<Vec<_>>();
+    assert_eq!(entries.len(), 32);
+    assert_eq!(entries[0], "trace-1");
+    assert_ne!(entries[31], "trace-31");
 }
 
 #[test]

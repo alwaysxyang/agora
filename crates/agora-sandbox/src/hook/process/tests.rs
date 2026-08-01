@@ -4,7 +4,10 @@ use super::{
     agora_sandbox_posix_spawn, agora_sandbox_posix_spawnp, command_request, current_environment,
     execute, io_errno, prepared_executable, requested_executable,
 };
-use crate::execution::{CommandRequest, ProcessOperation, decode_prepare_request};
+use crate::execution::{
+    CommandRequest, EXECUTION_PROTOCOL_VERSION, ProcessOperation, TRUNCATED_ARGUMENTS,
+    decode_prepare_request,
+};
 use crate::hook::config::HookConfig;
 use crate::trace::TraceContext;
 use std::collections::HashMap;
@@ -36,7 +39,7 @@ fn config_with_control_and_token(control: SocketAddr, execution_token: &str) -> 
             "AGORA_SANDBOX_HOOK_LIBRARIES",
             "/tmp/hook.dylib".to_string(),
         ),
-        ("AGORA_SANDBOX_TRACE_IDS", "trace-root".to_string()),
+        ("AGORA_SANDBOX_TRACE_ID", "trace-root".to_string()),
     ]);
     HookConfig::from_getter(|key| values.get(key).cloned()).unwrap()
 }
@@ -56,7 +59,7 @@ fn config_with_tls_bundle() -> HookConfig {
             "AGORA_SANDBOX_HOOK_LIBRARIES",
             "/tmp/hook.dylib".to_string(),
         ),
-        ("AGORA_SANDBOX_TRACE_IDS", "trace-root".to_string()),
+        ("AGORA_SANDBOX_TRACE_ID", "trace-root".to_string()),
         (
             "AGORA_SANDBOX_TLS_TRUST_BUNDLE",
             "/tmp/agora-ca.pem".to_string(),
@@ -71,7 +74,7 @@ fn child_trace() -> TraceContext {
 
 fn command(executable: &Path) -> CommandRequest {
     CommandRequest {
-        trace_ids: child_trace().ids().to_vec(),
+        trace_id: child_trace().encode(),
         pid: 42,
         ppid: 1,
         process_executable: "/bin/bash".to_string(),
@@ -84,7 +87,7 @@ fn command(executable: &Path) -> CommandRequest {
 
 fn response(status: u8, content: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
-    body.extend_from_slice(&2_u16.to_be_bytes());
+    body.extend_from_slice(&EXECUTION_PROTOCOL_VERSION.to_be_bytes());
     body.push(status);
     body.extend_from_slice(&(content.len() as u32).to_be_bytes());
     body.extend_from_slice(content);
@@ -168,7 +171,7 @@ fn child_environment_restores_runtime_values_after_the_caller_clears_them() {
     assert!(
         entries
             .iter()
-            .any(|entry| { entry.starts_with("AGORA_SANDBOX_TRACE_IDS=trace-root, ") })
+            .any(|entry| { entry.starts_with("AGORA_SANDBOX_TRACE_ID=trace-root, ") })
     );
     assert!(entries.contains(&"DYLD_INSERT_LIBRARIES=/tmp/hook.dylib"));
 }
@@ -190,7 +193,7 @@ fn child_arguments_replace_a_script_with_its_prepared_interpreter() {
     ];
     let pointers = [original[0].as_ptr(), original[1].as_ptr(), std::ptr::null()];
     let prepared = PreparedExecutable {
-        program: CString::new("/tmp/root/usr/bin/env").unwrap(),
+        program: CString::new("/tmp/fs/usr/bin/env").unwrap(),
         arguments: vec![
             CString::new("node").unwrap(),
             CString::new("/usr/local/bin/codex").unwrap(),
@@ -207,7 +210,7 @@ fn child_arguments_replace_a_script_with_its_prepared_interpreter() {
     assert_eq!(
         values,
         [
-            "/tmp/root/usr/bin/env",
+            "/tmp/fs/usr/bin/env",
             "node",
             "/usr/local/bin/codex",
             "--version",
@@ -343,7 +346,7 @@ fn requested_executable_resolves_direct_and_path_based_programs() {
 }
 
 #[test]
-fn command_request_records_the_current_process_and_complete_argument_list() {
+fn command_request_records_process_context_and_bounds_argument_count() {
     let arguments = [
         CString::new("curl").unwrap(),
         CString::new("https://example.com").unwrap(),
@@ -365,7 +368,7 @@ fn command_request_records_the_current_process_and_complete_argument_list() {
     }
     .unwrap();
 
-    assert_eq!(request.trace_ids, ["trace-root", "trace-child"]);
+    assert_eq!(request.trace_id, "trace-root, trace-child");
     assert_eq!(request.pid, std::process::id());
     assert_eq!(request.ppid, unsafe { libc::getppid() as u32 });
     assert!(!request.process_executable.is_empty());
@@ -377,16 +380,25 @@ fn command_request_records_the_current_process_and_complete_argument_list() {
     );
     assert_eq!(request.operation, ProcessOperation::Execve);
 
+    let argument = CString::new("secret").unwrap();
+    let mut pointers = vec![argument.as_ptr(); 257];
+    pointers.push(std::ptr::null());
     let request = unsafe {
         command_request(
             Path::new("/bin/true"),
-            std::ptr::null(),
+            pointers.as_ptr(),
             ProcessOperation::Execv,
             &trace,
         )
     }
     .unwrap();
-    assert!(request.arguments.is_empty());
+    assert_eq!(request.arguments.len(), 257);
+    assert!(
+        request.arguments[..256]
+            .iter()
+            .all(|value| value == "secret")
+    );
+    assert_eq!(request.arguments[256], TRUNCATED_ARGUMENTS);
 }
 
 #[test]

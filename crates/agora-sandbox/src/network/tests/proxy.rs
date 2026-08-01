@@ -98,7 +98,7 @@ fn connect_request(
             ppid: 1,
             executable: "/tmp/test-client".to_string(),
         },
-        trace_ids: vec!["trace-test".to_string()],
+        trace_id: "trace-test".to_string(),
         operation: HookOperation::Connect,
     }
 }
@@ -231,7 +231,7 @@ async fn connect_request_relays_bytes_and_emits_ordered_audit_events() {
     let network = events[0].network.as_ref().unwrap();
     assert_eq!(network.destination_ip, destination.ip());
     assert_eq!(network.destination_port, destination.port());
-    assert!(events.iter().all(|event| event.trace_ids == ["trace-test"]));
+    assert!(events.iter().all(|event| event.trace_id == "trace-test"));
 
     fixture.controller.shutdown().await.unwrap();
 }
