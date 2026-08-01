@@ -48,6 +48,10 @@ struct Arguments {
     #[arg(long)]
     workdir: Option<PathBuf>,
 
+    /// Passphrase for a persistent encrypted APFS workspace; visible in process arguments
+    #[arg(long)]
+    filesystem_key: Option<String>,
+
     /// Path to a DER CA certificate trusted by sandboxed SecTrust TLS clients
     #[arg(long)]
     tls_trust_anchor: Option<PathBuf>,
@@ -238,6 +242,9 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
     let mut config = SandboxConfig::new(hook_library);
     if let Some(workdir) = arguments.workdir {
         config = config.with_workdir(workdir);
+    }
+    if let Some(key) = arguments.filesystem_key {
+        config = config.with_encrypted_workspace(key);
     }
     config.network.tls = arguments.tls.into();
     if let Some(anchor) = arguments.tls_trust_anchor {

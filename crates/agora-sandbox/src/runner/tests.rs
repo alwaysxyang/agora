@@ -228,6 +228,12 @@ fn sandbox_config_and_command_builders_preserve_runtime_inputs() {
     );
     assert_eq!(config.tls_trust_anchor(), None);
     assert_eq!(config.tls_ca(), None);
+    let encrypted = config.clone().with_encrypted_workspace("top secret");
+    assert_eq!(
+        encrypted.encrypted_workspace_key(),
+        Some(b"top secret".as_slice())
+    );
+    assert!(!format!("{encrypted:?}").contains("top secret"));
     assert!(
         config
             .validate()

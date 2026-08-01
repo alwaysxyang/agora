@@ -8,6 +8,18 @@
 
 The sandbox creates the executable cache and missing parents when execution starts and sets `<workdir>/fs` mode to `0700`. It does not remove the cache or prepared files when a run exits. The cache may contain only its lock file when a run uses no non-injectable executable. A legacy `<workdir>/root` directory is left untouched.
 
+## Encrypted Workspace
+
+The optional `--filesystem-key <KEY>` CLI argument and `SandboxConfig::with_encrypted_workspace` library method enable a persistent encrypted workspace on macOS. The value is an APFS disk-image passphrase rather than a raw AES key. An empty key, a NUL byte, or a key larger than 64 KiB is rejected. The passphrase is retained in memory with redacted `Debug` output and is sent only to `hdiutil` through its standard input; it is not added to the sandbox child's arguments or environment. The CLI value remains visible in the `agora-sandbox` process arguments and may be retained by shell history, so callers must account for that exposure.
+
+The sandbox stores the AES-256 APFS sparse bundle at `<workdir>/filesystem/workspace.sparsebundle`, its source metadata at `<workdir>/filesystem/workspace.json`, and its temporary mount at `<workdir>/filesystem/mount`. The sparse bundle has a 100 GiB logical capacity and grows on demand. The first run copies the command's canonical current directory into a matching absolute-path mirror inside the encrypted volume. For example, `/Users/example/project` is copied to `<mount>/Users/example/project`. The command then runs with that encrypted mirror as its current directory. The original source directory is not modified, and later runs with the same work directory and key reuse the volume and retain prior changes.
+
+An existing encrypted workspace is bound to its original source directory. A different source or key fails closed instead of recreating or rotating the volume. The sandbox work directory must not be inside the source directory. An exclusive non-blocking lock permits only one encrypted-workspace run per sandbox work directory. The volume is detached after the child and sandbox services stop; a synchronous detach is also attempted if startup or execution exits through an error path.
+
+This first stage provides native filesystem behavior and transparent APFS encryption for accesses relative to the relocated current directory. It is a persistent encrypted snapshot, not a complete overlay filesystem: source changes after initialization are not merged, deletions are not represented as whiteouts, and absolute paths that explicitly refer to the original source are not redirected. The mounted volume is also accessible to the same host user while the run is active. Full lower/upper copy-on-write path virtualization remains a separate filesystem-backend concern.
+
+The encrypted workspace is independent of the executable cache. `agora-sandbox clean` continues to remove only executable copies recorded beneath `<workdir>/fs`; it does not remove the sparse bundle, source metadata, TLS material, or encrypted workspace contents.
+
 ## Cache Entries
 
 A prepared non-injectable executable mirrors its canonical absolute source path beneath `<workdir>/fs`. For example, `/usr/bin/curl` is stored as `<workdir>/fs/usr/bin/curl`. Executables that are neither SIP-restricted nor signed with dyld-restricting flags are returned at their canonical original paths without checksumming, copying, architecture processing, or signing. The sandbox creates the parent directory structure for a copied executable but does not recursively copy the source directory.

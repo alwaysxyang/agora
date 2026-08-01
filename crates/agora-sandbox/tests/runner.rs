@@ -6,6 +6,8 @@ use base64::Engine;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::os::fd::FromRawFd;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -86,6 +88,24 @@ fn hook_library() -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
+fn directory_contains(directory: &Path, needle: &[u8]) -> bool {
+    std::fs::read_dir(directory).unwrap().any(|entry| {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            directory_contains(&path, needle)
+        } else {
+            std::fs::read(path)
+                .map(|contents| {
+                    contents
+                        .windows(needle.len())
+                        .any(|window| window == needle)
+                })
+                .unwrap_or(false)
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
 fn sandbox_config() -> SandboxConfig {
     SandboxConfig::new(hook_library())
         .with_workdir(workspace_root().join("target/agora-sandbox-test-cache/runner"))
@@ -163,6 +183,137 @@ async fn runner_generates_default_tls_ca_in_the_configured_workdir() {
             > 1
     );
     assert!(!command_workdir.join("ca").exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_persists_an_encrypted_workspace_without_modifying_the_source() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-encrypted-workspace-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("input.txt"), b"original\n").unwrap();
+    std::fs::write(
+        source.join("verify.sh"),
+        b"#!/bin/sh\ntest \"$(cat input.txt)\" = original && test \"$(cat output.txt)\" = 'encrypted workspace marker'\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(source.join("verify.sh"))
+        .unwrap()
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(source.join("verify.sh"), permissions).unwrap();
+    let config = SandboxConfig::new(hook_library())
+        .with_workdir(&workdir)
+        .with_encrypted_workspace("correct horse battery staple");
+    let create = SandboxCommand::new("/bin/sh")
+        .args([
+            "-c",
+            "test \"$(cat input.txt)\" = original && case \"$PWD\" in */filesystem/mount/*) ;; *) exit 8 ;; esac && printf 'encrypted workspace marker\\n' > output.txt",
+        ])
+        .current_dir(&source);
+    let created = Sandbox::new(config.clone(), NoopCallback)
+        .run(create)
+        .await
+        .unwrap();
+
+    assert!(created.status().success());
+    assert_eq!(
+        std::fs::read(source.join("input.txt")).unwrap(),
+        b"original\n"
+    );
+    assert!(!source.join("output.txt").exists());
+    assert!(workdir.join("filesystem/workspace.sparsebundle").is_dir());
+    assert!(workdir.join("filesystem/mount").is_dir());
+    assert!(
+        std::fs::read_dir(workdir.join("filesystem/mount"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert!(!directory_contains(
+        &workdir.join("filesystem/workspace.sparsebundle"),
+        b"encrypted workspace marker"
+    ));
+
+    let verify = SandboxCommand::new("./verify.sh").current_dir(&source);
+    let verified = Sandbox::new(config, NoopCallback)
+        .run(verify)
+        .await
+        .unwrap();
+
+    assert!(verified.status().success());
+    assert!(!source.join("output.txt").exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_rejects_a_different_encrypted_workspace_key() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-encrypted-workspace-key-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+
+    let config = SandboxConfig::new(hook_library())
+        .with_workdir(&workdir)
+        .with_encrypted_workspace("original passphrase");
+    let command = SandboxCommand::new("/usr/bin/true").current_dir(&source);
+    assert!(
+        Sandbox::new(config, NoopCallback)
+            .run(command)
+            .await
+            .unwrap()
+            .status()
+            .success()
+    );
+
+    let wrong_config = SandboxConfig::new(hook_library())
+        .with_workdir(&workdir)
+        .with_encrypted_workspace("different passphrase");
+    let error = Sandbox::new(wrong_config, NoopCallback)
+        .run(SandboxCommand::new("/usr/bin/true").current_dir(&source))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("attach encrypted workspace"));
+    assert!(
+        std::fs::read_dir(workdir.join("filesystem/mount"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_rejects_a_sandbox_workdir_inside_the_encrypted_source() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-encrypted-workspace-nesting-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = source.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    let config = SandboxConfig::new(hook_library())
+        .with_workdir(&workdir)
+        .with_encrypted_workspace("passphrase");
+
+    let error = Sandbox::new(config, NoopCallback)
+        .run(SandboxCommand::new("/usr/bin/true").current_dir(&source))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("must not be inside"));
+    assert!(!workdir.exists());
     std::fs::remove_dir_all(directory).unwrap();
 }
 

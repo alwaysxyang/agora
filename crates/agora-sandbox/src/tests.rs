@@ -8,7 +8,6 @@ use agora_sandbox::callback::{
     Subsystem,
 };
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
 use std::process::Command;
 use uuid::Uuid;
 
@@ -165,6 +164,25 @@ fn audit_state_writes_process_and_network_records_to_the_same_stream() {
 }
 
 #[test]
+fn audit_state_reports_an_unusable_output_directory() {
+    let root = std::env::temp_dir().join(format!("agora-audit-error-{}", Uuid::new_v4()));
+    let blocked_parent = root.join("blocked");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(&blocked_parent, b"not a directory").unwrap();
+
+    let error = AuditState::new(Some(&blocked_parent.join("audit.jsonl")))
+        .err()
+        .expect("a file cannot be used as an audit directory");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to create audit directory")
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn default_paths_and_exit_codes_are_stable() {
     assert_eq!(
         default_hook_library().unwrap().file_name().unwrap(),
@@ -196,24 +214,24 @@ fn clean_reports_when_the_executable_cache_is_not_a_directory() {
 }
 
 #[tokio::test]
-async fn async_main_reports_a_missing_hook_before_starting_a_child() {
+async fn async_main_rejects_an_empty_encrypted_workspace_key() {
+    let root = std::env::temp_dir().join(format!("agora-empty-key-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
     let arguments = Arguments {
         command: Some("/bin/true".to_string()),
         subcommand: None,
-        hook_library: Some(PathBuf::from("/missing/agora-hook.dylib")),
+        hook_library: None,
         audit_file: None,
-        workdir: None,
+        workdir: Some(root.clone()),
+        filesystem_key: Some(String::new()),
         tls_trust_anchor: None,
         tls: super::TlsArgument::Off,
         tls_ca_cert: None,
         tls_ca_key: None,
     };
 
-    assert!(
-        async_main(arguments)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("hook library does not exist")
-    );
+    let error = async_main(arguments).await.unwrap_err();
+    assert!(error.to_string().contains("key is empty"));
+
+    std::fs::remove_dir_all(root).unwrap();
 }

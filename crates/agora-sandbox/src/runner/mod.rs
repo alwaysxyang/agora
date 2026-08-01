@@ -1,6 +1,8 @@
 use crate::callback::Callback;
 #[cfg(target_os = "macos")]
 use crate::execution::{ExecutionController, resolve_executable, resolve_shebang};
+#[cfg(target_os = "macos")]
+use crate::filesystem::EncryptedWorkspace;
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
 use crate::trace::{TRACE_ID_ENVIRONMENT, TraceContext};
 use anyhow::{Context, Result, bail};
@@ -8,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 #[cfg(target_os = "macos")]
 use std::fs::OpenOptions;
 #[cfg(target_os = "macos")]
@@ -57,10 +60,30 @@ pub struct SandboxConfig {
     pub network: NetworkConfig,
     hook_library: PathBuf,
     workdir: PathBuf,
+    encrypted_workspace_key: Option<SecretBytes>,
     tls_trust_anchor: Option<PathBuf>,
     tls_ca: Option<TlsCaFiles>,
     #[cfg(test)]
     upstream_tls_roots: Option<Vec<rustls::pki_types::CertificateDer<'static>>>,
+}
+
+#[derive(Clone)]
+struct SecretBytes(Vec<u8>);
+
+impl SecretBytes {
+    fn new(value: impl AsRef<[u8]>) -> Self {
+        Self(value.as_ref().to_vec())
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +98,7 @@ impl SandboxConfig {
             network: NetworkConfig::default(),
             hook_library: hook_library.into(),
             workdir: Self::default_workdir(),
+            encrypted_workspace_key: None,
             tls_trust_anchor: None,
             tls_ca: None,
             #[cfg(test)]
@@ -100,6 +124,17 @@ impl SandboxConfig {
 
     pub fn workdir(&self) -> &Path {
         &self.workdir
+    }
+
+    pub fn with_encrypted_workspace(mut self, key: impl AsRef<[u8]>) -> Self {
+        self.encrypted_workspace_key = Some(SecretBytes::new(key));
+        self
+    }
+
+    pub fn encrypted_workspace_key(&self) -> Option<&[u8]> {
+        self.encrypted_workspace_key
+            .as_ref()
+            .map(SecretBytes::as_bytes)
     }
 
     pub fn with_tls_trust_anchor(mut self, certificate: impl Into<PathBuf>) -> Self {
@@ -147,6 +182,10 @@ impl SandboxConfig {
                 "sandbox hook library does not exist: {}",
                 self.hook_library.display()
             );
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(key) = &self.encrypted_workspace_key {
+            EncryptedWorkspace::validate_passphrase(key.as_bytes())?;
         }
         if let Some(anchor) = &self.tls_trust_anchor
             && !anchor.is_file()
@@ -330,6 +369,15 @@ impl SandboxCommand {
     }
 
     #[cfg(target_os = "macos")]
+    fn set_current_dir(&mut self, current_dir: PathBuf) {
+        self.environment.insert(
+            OsString::from("PWD"),
+            current_dir.as_os_str().to_os_string(),
+        );
+        self.current_dir = Some(current_dir);
+    }
+
+    #[cfg(target_os = "macos")]
     fn set_script_interpreter(
         &mut self,
         interpreter: PathBuf,
@@ -365,7 +413,16 @@ where
     pub async fn run(self, mut command: SandboxCommand) -> Result<SandboxOutcome> {
         self.config.validate()?;
         let callback = std::sync::Arc::new(self.callback);
-        let _ = command.effective_current_dir()?;
+        let source_directory = command.effective_current_dir()?;
+        let mut encrypted_workspace = match self.config.encrypted_workspace_key() {
+            Some(key) => {
+                Some(EncryptedWorkspace::start(&self.config.workdir, &source_directory, key).await?)
+            }
+            None => None,
+        };
+        if let Some(workspace) = &encrypted_workspace {
+            command.set_current_dir(workspace.path().to_path_buf());
+        }
         let tls_ca_files = self.config.tls_ca_for_workdir()?;
         let hook_library = self.config.hook_library.canonicalize().with_context(|| {
             format!(
@@ -428,6 +485,10 @@ where
             )
             .await?;
             let executable = command.resolved_program()?;
+            let executable = encrypted_workspace
+                .as_ref()
+                .and_then(|workspace| workspace.map_source_path(&executable))
+                .unwrap_or(executable);
             let prepared = controller.prepare(executable).await?;
             if let Some(shebang) = resolve_shebang(&prepared)? {
                 let interpreter = controller.prepare(shebang.interpreter).await?;
@@ -566,10 +627,15 @@ where
             .transpose();
         let shutdown = controller.shutdown().await;
         let execution_shutdown = execution.shutdown().await;
+        let filesystem_shutdown = match encrypted_workspace.as_mut() {
+            Some(workspace) => workspace.shutdown().await,
+            None => Ok(()),
+        };
         let status = status?;
         terminal_restore?;
         shutdown?;
         execution_shutdown?;
+        filesystem_shutdown?;
 
         Ok(SandboxOutcome {
             status,

@@ -78,6 +78,8 @@ fn sandbox_cli_documents_only_available_options() {
     assert!(stdout.contains("--hook-library <HOOK_LIBRARY>"));
     assert!(stdout.contains("--audit-file <AUDIT_FILE>"));
     assert!(stdout.contains("--workdir <WORKDIR>"));
+    assert!(stdout.contains("--filesystem-key <FILESYSTEM_KEY>"));
+    assert!(!stdout.contains("--filesystem-key-file"));
     assert!(stdout.contains("--tls-trust-anchor <TLS_TRUST_ANCHOR>"));
     assert!(stdout.contains("--tls <TLS>"));
     assert!(stdout.contains("[possible values: off, auto]"));
