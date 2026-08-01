@@ -33,7 +33,9 @@ Prepared executables and their directory-local `checksums.json` manifests are pe
 
 ## Cleaning
 
-`agora-sandbox clean [--workdir <WORKDIR>]` recursively removes `<workdir>/fs` while retaining the work directory, legacy `<workdir>/root` content, and TLS CA material. It does not require a command, hook library, audit output, or TLS configuration. When `--workdir` is omitted, it removes `~/.agora-sandbox/fs`. A missing cache is treated as already clean. The command does not lock, inspect, selectively retain, or recreate executable-cache content.
+`agora-sandbox clean [--workdir <WORKDIR>]` recursively discovers the directory-local `checksums.json` manifests beneath `<workdir>/fs` and removes only the prepared executable copies recorded by those manifests. It then removes the processed manifests and any mapped directories left empty, while retaining `<workdir>/fs`, its lock file, unregistered filesystem content, the work directory, legacy `<workdir>/root` content, and TLS CA material. Every manifest entry must be an absolute source path whose mapped destination belongs to the manifest's own directory; malformed, unsupported, or cross-directory entries fail the command before any manifest cleanup begins.
+
+The command does not require a sandbox command, hook library, audit output, or TLS configuration. When `--workdir` is omitted, it cleans `~/.agora-sandbox/fs`. A missing cache is treated as already clean. Cleaning takes the same exclusive `<workdir>/fs/.lock` used during executable preparation, so it cannot race a concurrent manifest update.
 
 ## Concurrent Runs
 

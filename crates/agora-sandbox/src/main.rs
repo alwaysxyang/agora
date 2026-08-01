@@ -7,12 +7,16 @@ use agora_sandbox::{
     network::TlsMode,
     runner::{Sandbox, SandboxCommand, SandboxConfig},
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{ColorChoice, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
-use std::fs::{File, OpenOptions};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+use std::path::{Component, Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -63,7 +67,7 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum CliCommand {
-    /// Remove every prepared executable from <workdir>/fs
+    /// Remove prepared executables recorded by <workdir>/fs manifests
     Clean {
         /// Sandbox work directory; defaults to ~/.agora-sandbox
         #[arg(long)]
@@ -283,15 +287,199 @@ fn clean_executable_cache(workdir: Option<&Path>) -> Result<()> {
         .map(Path::to_path_buf)
         .unwrap_or_else(SandboxConfig::default_workdir);
     let executable_cache = workdir.join("fs");
-    match std::fs::remove_dir_all(&executable_cache) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| {
+    ExecutableCacheCleaner::new(executable_cache.clone())
+        .clean()
+        .with_context(|| {
             format!(
                 "failed to clean sandbox executable cache {}",
                 executable_cache.display()
             )
-        }),
+        })
+}
+
+const CACHE_LOCK_FILE: &str = ".lock";
+const CHECKSUM_MANIFEST_FILE: &str = "checksums.json";
+const CHECKSUM_MANIFEST_VERSION: u32 = 1;
+
+#[derive(Deserialize)]
+struct ChecksumManifest {
+    version: u32,
+    files: BTreeMap<String, String>,
+}
+
+struct ManifestCleanup {
+    path: PathBuf,
+    files: Vec<PathBuf>,
+}
+
+struct ExecutableCacheCleaner {
+    root: PathBuf,
+}
+
+impl ExecutableCacheCleaner {
+    fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    fn clean(&self) -> Result<()> {
+        let metadata = match fs::symlink_metadata(&self.root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("failed to inspect executable cache"),
+        };
+        if !metadata.is_dir() {
+            bail!("sandbox executable cache is not a directory");
+        }
+
+        let _lock = self.lock()?;
+        let cleanups = self
+            .manifest_paths()?
+            .into_iter()
+            .map(|path| self.load_cleanup(path))
+            .collect::<Result<Vec<_>>>()?;
+
+        for cleanup in cleanups {
+            self.apply(cleanup)?;
+        }
+        self.prune_empty_directories(&self.root)
+    }
+
+    fn lock(&self) -> Result<File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.root.join(CACHE_LOCK_FILE))
+            .context("failed to open executable cache lock")?;
+        #[cfg(unix)]
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(io::Error::last_os_error()).context("failed to lock executable cache");
+        }
+        Ok(file)
+    }
+
+    fn manifest_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut directories = vec![self.root.clone()];
+        let mut manifests = Vec::new();
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(&directory)
+                .with_context(|| format!("failed to read {}", directory.display()))?
+            {
+                let entry = entry.with_context(|| {
+                    format!("failed to read an entry in {}", directory.display())
+                })?;
+                let file_type = entry.file_type().with_context(|| {
+                    format!("failed to inspect cache entry {}", entry.path().display())
+                })?;
+                if file_type.is_dir() {
+                    directories.push(entry.path());
+                } else if file_type.is_file()
+                    && entry.path().file_name() == Some(OsStr::new(CHECKSUM_MANIFEST_FILE))
+                {
+                    manifests.push(entry.path());
+                }
+            }
+        }
+        manifests.sort();
+        Ok(manifests)
+    }
+
+    fn load_cleanup(&self, path: PathBuf) -> Result<ManifestCleanup> {
+        let contents = fs::read(&path)
+            .with_context(|| format!("failed to read checksum manifest {}", path.display()))?;
+        let manifest: ChecksumManifest = serde_json::from_slice(&contents)
+            .with_context(|| format!("failed to parse checksum manifest {}", path.display()))?;
+        if manifest.version != CHECKSUM_MANIFEST_VERSION {
+            bail!(
+                "unsupported sandbox executable checksum manifest version {}",
+                manifest.version
+            );
+        }
+        let directory = path
+            .parent()
+            .context("checksum manifest has no parent directory")?;
+        let files = manifest
+            .files
+            .keys()
+            .map(|source| self.destination(source, directory))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ManifestCleanup { path, files })
+    }
+
+    fn destination(&self, source: &str, manifest_directory: &Path) -> Result<PathBuf> {
+        let source = Path::new(source);
+        let mut components = source.components();
+        if components.next() != Some(Component::RootDir) {
+            bail!(
+                "checksum manifest path is not absolute: {}",
+                source.display()
+            );
+        }
+        let mut relative = PathBuf::new();
+        for component in components {
+            match component {
+                Component::Normal(component) => relative.push(component),
+                _ => bail!("invalid checksum manifest path: {}", source.display()),
+            }
+        }
+        if relative.as_os_str().is_empty() {
+            bail!("invalid checksum manifest path: {}", source.display());
+        }
+        let destination = self.root.join(relative);
+        if destination.parent() != Some(manifest_directory) {
+            bail!(
+                "checksum manifest entry {} does not belong to {}",
+                source.display(),
+                manifest_directory.display()
+            );
+        }
+        Ok(destination)
+    }
+
+    fn apply(&self, cleanup: ManifestCleanup) -> Result<()> {
+        for path in cleanup.files {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to remove prepared executable {}", path.display())
+                    });
+                }
+            }
+        }
+        fs::remove_file(&cleanup.path).with_context(|| {
+            format!(
+                "failed to remove checksum manifest {}",
+                cleanup.path.display()
+            )
+        })
+    }
+
+    fn prune_empty_directories(&self, directory: &Path) -> Result<()> {
+        let mut children = Vec::new();
+        for entry in fs::read_dir(directory)
+            .with_context(|| format!("failed to read {}", directory.display()))?
+        {
+            let entry = entry
+                .with_context(|| format!("failed to read an entry in {}", directory.display()))?;
+            if entry
+                .file_type()
+                .with_context(|| format!("failed to inspect {}", entry.path().display()))?
+                .is_dir()
+            {
+                children.push(entry.path());
+            }
+        }
+        for child in children {
+            self.prune_empty_directories(&child)?;
+        }
+        if directory != self.root && fs::read_dir(directory)?.next().is_none() {
+            fs::remove_dir(directory)
+                .with_context(|| format!("failed to remove empty {}", directory.display()))?;
+        }
+        Ok(())
     }
 }
 

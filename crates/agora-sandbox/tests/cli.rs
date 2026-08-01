@@ -49,6 +49,22 @@ fn cli_workdir() -> PathBuf {
     workspace_root().join("target/agora-sandbox-test-cache/cli")
 }
 
+fn write_checksum_manifest(directory: &Path, files: &[(&str, &str)]) {
+    let files = files
+        .iter()
+        .map(|(path, checksum)| ((*path).to_string(), (*checksum).to_string()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let manifest = serde_json::json!({
+        "version": 1,
+        "files": files,
+    });
+    std::fs::write(
+        directory.join("checksums.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn sandbox_cli_documents_only_available_options() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
@@ -88,7 +104,14 @@ fn sandbox_cli_clean_removes_only_the_selected_executable_cache() {
     let cache = workdir.join("fs");
     std::fs::create_dir_all(cache.join("usr/bin")).unwrap();
     std::fs::write(cache.join("usr/bin/curl"), b"prepared executable").unwrap();
-    std::fs::write(cache.join("usr/bin/checksums.json"), b"{}").unwrap();
+    std::fs::write(cache.join("usr/bin/user-file"), b"overlay content").unwrap();
+    write_checksum_manifest(&cache.join("usr/bin"), &[("/usr/bin/curl", "source-md5")]);
+    std::fs::create_dir_all(cache.join("Users/bytedance/project")).unwrap();
+    std::fs::write(
+        cache.join("Users/bytedance/project/output.txt"),
+        b"overlay output",
+    )
+    .unwrap();
     std::fs::create_dir_all(workdir.join("root")).unwrap();
     std::fs::write(workdir.join("root/legacy"), b"legacy executable").unwrap();
     std::fs::create_dir_all(workdir.join("ca")).unwrap();
@@ -107,7 +130,11 @@ fn sandbox_cli_clean_removes_only_the_selected_executable_cache() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!cache.exists());
+    assert!(cache.is_dir());
+    assert!(!cache.join("usr/bin/curl").exists());
+    assert!(!cache.join("usr/bin/checksums.json").exists());
+    assert!(cache.join("usr/bin/user-file").is_file());
+    assert!(cache.join("Users/bytedance/project/output.txt").is_file());
     assert!(workdir.join("root/legacy").is_file());
     assert!(workdir.join("ca/ca.crt").is_file());
     std::fs::remove_dir_all(workdir).unwrap();
@@ -123,6 +150,10 @@ fn sandbox_cli_clean_uses_the_default_cache_and_is_idempotent() {
     let cache = workdir.join("fs");
     std::fs::create_dir_all(cache.join("bin")).unwrap();
     std::fs::write(cache.join("bin/tool"), b"prepared executable").unwrap();
+    write_checksum_manifest(&cache.join("bin"), &[("/bin/tool", "tool-md5")]);
+    std::fs::create_dir_all(cache.join("usr/bin")).unwrap();
+    std::fs::write(cache.join("usr/bin/curl"), b"prepared curl").unwrap();
+    write_checksum_manifest(&cache.join("usr/bin"), &[("/usr/bin/curl", "curl-md5")]);
     std::fs::create_dir_all(workdir.join("ca")).unwrap();
     std::fs::write(workdir.join("ca/ca.crt"), b"certificate").unwrap();
 
@@ -140,9 +171,41 @@ fn sandbox_cli_clean_uses_the_default_cache_and_is_idempotent() {
         );
     }
 
-    assert!(!cache.exists());
+    assert!(cache.is_dir());
+    assert!(!cache.join("bin").exists());
+    assert!(!cache.join("usr").exists());
     assert!(workdir.join("ca/ca.crt").is_file());
     std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn sandbox_cli_clean_rejects_manifest_entries_from_another_directory() {
+    let workdir = std::env::temp_dir().join(format!(
+        "agora-sandbox-cli-clean-invalid-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let cache = workdir.join("fs");
+    std::fs::create_dir_all(cache.join("usr/bin")).unwrap();
+    std::fs::create_dir_all(cache.join("bin")).unwrap();
+    std::fs::write(cache.join("bin/tool"), b"must remain").unwrap();
+    write_checksum_manifest(&cache.join("bin"), &[("/bin/tool", "valid-entry")]);
+    write_checksum_manifest(
+        &cache.join("usr/bin"),
+        &[("/bin/tool", "unexpected-directory")],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .arg("clean")
+        .arg("--workdir")
+        .arg(&workdir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(cache.join("bin/tool").is_file());
+    assert!(cache.join("bin/checksums.json").is_file());
+    assert!(cache.join("usr/bin/checksums.json").is_file());
+    std::fs::remove_dir_all(workdir).unwrap();
 }
 
 #[cfg(target_os = "macos")]
