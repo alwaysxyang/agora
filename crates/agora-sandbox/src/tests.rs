@@ -1,12 +1,14 @@
 use super::{
-    Arguments, AuditState, async_main, clean_executable_cache, default_hook_library,
-    exit_status_code, parse_command, signal_exit_code,
+    Arguments, AuditOutput, AuditState, JsonCallback, TlsArgument, async_main,
+    default_hook_library, exit_status_code, parse_command, shutdown_signals, signal_exit_code,
 };
+use agora_core::lifecycle::shutdown::ShutdownGuard;
 use agora_sandbox::callback::{
-    CommandContext, EVENT_SCHEMA_VERSION, Event, EventResult, EventStatus, EventType,
-    NetworkContext, NetworkEvent, NetworkProtocol, ProcessContext, ProcessEvent, ProcessOperation,
-    Subsystem,
+    Callback, CommandContext, Decision, EVENT_SCHEMA_VERSION, Event, EventResult, EventStatus,
+    EventType, NetworkContext, NetworkEvent, NetworkProtocol, ProcessContext, ProcessEvent,
+    ProcessOperation, Subsystem,
 };
+use agora_sandbox::network::TlsMode;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Command;
 use uuid::Uuid;
@@ -182,8 +184,8 @@ fn audit_state_reports_an_unusable_output_directory() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-#[test]
-fn default_paths_and_exit_codes_are_stable() {
+#[tokio::test]
+async fn default_paths_and_exit_codes_are_stable() {
     assert_eq!(
         default_hook_library().unwrap().file_name().unwrap(),
         "libagora_sandbox.dylib"
@@ -195,22 +197,46 @@ fn default_paths_and_exit_codes_are_stable() {
     assert_eq!(exit_status_code(status), 7);
     assert_eq!(signal_exit_code(15), 143);
     assert_eq!(signal_exit_code(i32::MAX), u8::MAX);
+    assert!(matches!(TlsMode::from(TlsArgument::Off), TlsMode::Off));
+    assert!(matches!(TlsMode::from(TlsArgument::Auto), TlsMode::Auto));
+    shutdown_signals(&ShutdownGuard::get()).unwrap();
 }
 
-#[test]
-fn clean_reports_when_the_executable_cache_is_not_a_directory() {
-    let workdir = std::env::temp_dir().join(format!("agora-clean-test-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&workdir).unwrap();
-    std::fs::write(workdir.join("fs"), b"not a directory").unwrap();
+#[tokio::test]
+async fn json_callback_allows_events_after_recording_them() {
+    let root = std::env::temp_dir().join(format!("agora-json-callback-{}", Uuid::new_v4()));
+    let path = root.join("audit.jsonl");
+    let callback = JsonCallback::new(Some(&path)).unwrap();
 
-    let error = clean_executable_cache(Some(&workdir)).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("failed to clean sandbox executable cache")
-    );
+    assert!(matches!(
+        callback.on_event(Event::Process(process_event())).await,
+        Decision::Allow
+    ));
+    let record = std::fs::read_to_string(path).unwrap();
+    assert!(record.contains("\"type\":\"process\""));
+    assert!(record.contains("\"executable\":\"/usr/bin/curl\""));
 
-    std::fs::remove_dir_all(workdir).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn json_callback_allows_events_when_audit_output_fails() {
+    let root = std::env::temp_dir().join(format!("agora-json-callback-error-{}", Uuid::new_v4()));
+    let path = root.join("audit.jsonl");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(&path, b"").unwrap();
+    let callback = JsonCallback {
+        state: std::sync::Mutex::new(AuditState {
+            output: AuditOutput::File(std::fs::File::open(&path).unwrap()),
+        }),
+    };
+
+    assert!(matches!(
+        callback.on_event(Event::Process(process_event())).await,
+        Decision::Allow
+    ));
+
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]

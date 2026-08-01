@@ -33,6 +33,7 @@ fn hook_configuration_requires_all_runtime_values() {
         ("AGORA_SANDBOX_EXECUTION_CONTROL", "127.0.0.1:41002"),
         ("AGORA_SANDBOX_EXECUTION_TOKEN", "execution-token"),
         ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
+        ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs"),
         ("AGORA_SANDBOX_TRACE_ID", "trace-root"),
     ]);
     let config = HookConfig::from_getter(|key| values.get(key).map(ToString::to_string)).unwrap();
@@ -69,6 +70,7 @@ fn hook_configuration_propagates_an_optional_tls_trust_anchor() {
         ("AGORA_SANDBOX_EXECUTION_CONTROL", "127.0.0.1:41002"),
         ("AGORA_SANDBOX_EXECUTION_TOKEN", "execution-token"),
         ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
+        ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs"),
         ("AGORA_SANDBOX_TRACE_ID", "trace-root"),
         ("AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER", "Y2VydGlmaWNhdGU="),
         ("AGORA_SANDBOX_TLS_TRUST_BUNDLE", "/tmp/agora-ca.pem"),
@@ -122,6 +124,7 @@ fn hook_configuration_rejects_invalid_or_non_loopback_proxy_addresses() {
         ("AGORA_SANDBOX_EXECUTION_CONTROL", "127.0.0.1:41002"),
         ("AGORA_SANDBOX_EXECUTION_TOKEN", "execution-token"),
         ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
+        ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs"),
         ("AGORA_SANDBOX_TRACE_ID", "trace-root"),
     ]);
     let parse = |overrides: &[(&str, &str)]| {

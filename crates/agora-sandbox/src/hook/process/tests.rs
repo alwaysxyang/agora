@@ -2,7 +2,7 @@ use super::{
     ChildArguments, ChildEnvironment, PrepareError, PreparedExecutable, ProcessHookGuard,
     ProcessHookRuntime, agora_sandbox_execv, agora_sandbox_execve, agora_sandbox_execvp,
     agora_sandbox_posix_spawn, agora_sandbox_posix_spawnp, command_request, current_environment,
-    execute, io_errno, prepared_executable, requested_executable,
+    execute, io_errno, prepared_executable, requested_executable, with_test_runtime,
 };
 use crate::execution::{
     CommandRequest, EXECUTION_PROTOCOL_VERSION, ProcessOperation, TRUNCATED_ARGUMENTS,
@@ -39,6 +39,7 @@ fn config_with_control_and_token(control: SocketAddr, execution_token: &str) -> 
             "AGORA_SANDBOX_HOOK_LIBRARIES",
             "/tmp/hook.dylib".to_string(),
         ),
+        ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs".to_string()),
         ("AGORA_SANDBOX_TRACE_ID", "trace-root".to_string()),
     ]);
     HookConfig::from_getter(|key| values.get(key).cloned()).unwrap()
@@ -59,6 +60,7 @@ fn config_with_tls_bundle() -> HookConfig {
             "AGORA_SANDBOX_HOOK_LIBRARIES",
             "/tmp/hook.dylib".to_string(),
         ),
+        ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs".to_string()),
         ("AGORA_SANDBOX_TRACE_ID", "trace-root".to_string()),
         (
             "AGORA_SANDBOX_TLS_TRUST_BUNDLE",
@@ -154,6 +156,7 @@ fn runtime_with_responses(
 
 #[test]
 fn child_environment_restores_runtime_values_after_the_caller_clears_them() {
+    assert_eq!(config().filesystem_root(), "/tmp/agora-fs");
     let path = CString::new("PATH=/usr/bin:/bin").unwrap();
     let values = [path.as_ptr(), std::ptr::null()];
 
@@ -182,7 +185,7 @@ fn child_environment_accepts_a_null_source_environment() {
         unsafe { ChildEnvironment::new(std::ptr::null(), &config(), &child_trace()) }.unwrap();
 
     assert!(!environment.as_exec_ptr().is_null());
-    assert_eq!(environment.values.len(), 8);
+    assert_eq!(environment.values.len(), 9);
 }
 
 #[test]
@@ -630,4 +633,136 @@ fn process_runtime_and_direct_execution_fail_closed_without_configuration() {
         },
         -1
     );
+}
+
+#[test]
+fn prepared_execution_distinguishes_null_and_missing_programs() {
+    let runtime = ProcessHookRuntime { config: config() };
+    let missing = CString::new("agora-command-that-does-not-exist").unwrap();
+
+    let null_error = with_test_runtime(&runtime, || unsafe {
+        prepared_executable(
+            std::ptr::null(),
+            false,
+            std::ptr::null(),
+            ProcessOperation::Execve,
+        )
+        .unwrap_err()
+    });
+    assert_eq!(null_error.errno, libc::EFAULT);
+    assert_eq!(
+        null_error.to_string(),
+        "requested executable could not be resolved"
+    );
+
+    let missing_error = with_test_runtime(&runtime, || unsafe {
+        prepared_executable(
+            missing.as_ptr(),
+            true,
+            std::ptr::null(),
+            ProcessOperation::Execvp,
+        )
+        .unwrap_err()
+    });
+    assert_eq!(missing_error.errno, libc::ENOENT);
+    assert_eq!(
+        missing_error.to_string(),
+        "requested executable could not be resolved"
+    );
+}
+
+#[test]
+fn process_spawn_interposers_prepare_and_launch_native_children() {
+    let executable = CString::new("/usr/bin/true").unwrap();
+    let file = CString::new("true").unwrap();
+
+    for (search_path, operation) in [
+        (false, ProcessOperation::PosixSpawn),
+        (true, ProcessOperation::PosixSpawnp),
+    ] {
+        let (runtime, server) = runtime_with_response(response(0, b"/usr/bin/true"));
+        let requested = if search_path { &file } else { &executable };
+        let mut arguments = [requested.as_ptr().cast_mut(), std::ptr::null_mut()];
+        let mut pid = 0;
+        let result = with_test_runtime(&runtime, || unsafe {
+            if search_path {
+                agora_sandbox_posix_spawnp(
+                    &mut pid,
+                    requested.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    arguments.as_mut_ptr(),
+                    std::ptr::null(),
+                )
+            } else {
+                agora_sandbox_posix_spawn(
+                    &mut pid,
+                    requested.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    arguments.as_mut_ptr(),
+                    std::ptr::null(),
+                )
+            }
+        });
+        assert_eq!(result, 0);
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+
+        let request = decode_prepare_request(&server.join().unwrap()).unwrap();
+        assert_eq!(request.command.unwrap().operation, operation);
+    }
+}
+
+#[test]
+fn process_exec_interposers_prepare_before_native_exec_failure() {
+    let directory = std::env::temp_dir().join(format!("agora-exec-hook-{}", Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let invalid = directory.join("not-mach-o");
+    std::fs::write(&invalid, b"not a native executable").unwrap();
+    std::fs::set_permissions(&invalid, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let invalid = invalid.canonicalize().unwrap();
+    let path = CString::new("/bin/true").unwrap();
+    let file = CString::new("true").unwrap();
+
+    for operation in [
+        ProcessOperation::Execve,
+        ProcessOperation::Execv,
+        ProcessOperation::Execvp,
+    ] {
+        let (runtime, server) =
+            runtime_with_response(response(0, invalid.as_os_str().as_encoded_bytes()));
+        let requested = if operation == ProcessOperation::Execvp {
+            &file
+        } else {
+            &path
+        };
+        let arguments = [requested.as_ptr(), std::ptr::null()];
+        unsafe { *libc::__error() = 0 };
+        let result = with_test_runtime(&runtime, || unsafe {
+            match operation {
+                ProcessOperation::Execve => agora_sandbox_execve(
+                    requested.as_ptr(),
+                    arguments.as_ptr(),
+                    current_environment(),
+                ),
+                ProcessOperation::Execv => {
+                    agora_sandbox_execv(requested.as_ptr(), arguments.as_ptr())
+                }
+                ProcessOperation::Execvp => {
+                    agora_sandbox_execvp(requested.as_ptr(), arguments.as_ptr())
+                }
+                _ => unreachable!(),
+            }
+        });
+        assert_eq!(result, -1);
+        assert_eq!(unsafe { *libc::__error() }, libc::ENOEXEC);
+
+        let request = decode_prepare_request(&server.join().unwrap()).unwrap();
+        assert_eq!(request.command.unwrap().operation, operation);
+    }
+
+    std::fs::remove_dir_all(directory).unwrap();
 }

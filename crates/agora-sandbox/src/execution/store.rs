@@ -1,10 +1,9 @@
+use crate::filesystem::{EntryState, Materializer, OverlayStore};
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
 use std::os::macos::fs::MetadataExt as MacMetadataExt;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -23,10 +22,6 @@ const CS_REQUIRE_LV: u32 = 0x0000_2000;
 const CS_RUNTIME: u32 = 0x0001_0000;
 const CS_DYLD_RESTRICTED: u32 = CS_RESTRICT | CS_REQUIRE_LV | CS_RUNTIME;
 const MAX_SHEBANG_LINE_SIZE: usize = 1024;
-const CACHE_LOCK_FILE: &str = ".lock";
-const CHECKSUM_MANIFEST_FILE: &str = "checksums.json";
-const CHECKSUM_MANIFEST_TEMP_FILE: &str = ".checksums.json.tmp";
-const CHECKSUM_MANIFEST_VERSION: u32 = 1;
 
 #[derive(Debug, PartialEq, Eq)]
 struct ArchitectureSelection {
@@ -40,25 +35,8 @@ pub(crate) struct Shebang {
     pub(crate) argument: Option<OsString>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct ChecksumManifest {
-    version: u32,
-    files: BTreeMap<String, String>,
-}
-
-impl Default for ChecksumManifest {
-    fn default() -> Self {
-        Self {
-            version: CHECKSUM_MANIFEST_VERSION,
-            files: BTreeMap::new(),
-        }
-    }
-}
-
 pub(super) struct ExecutableStore {
-    directory: PathBuf,
-    canonical_directory: PathBuf,
-    lock: File,
+    overlay: OverlayStore,
 }
 
 impl ExecutableStore {
@@ -75,60 +53,49 @@ impl ExecutableStore {
                 directory.display()
             )
         })?;
-        let canonical_directory = directory.canonicalize().with_context(|| {
-            format!(
-                "failed to resolve sandbox executable directory {}",
-                directory.display()
-            )
-        })?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(directory.join(CACHE_LOCK_FILE))
-            .with_context(|| {
-                format!(
-                    "failed to open sandbox executable cache lock {}",
-                    directory.display()
-                )
-            })?;
-        Ok(Self {
-            directory,
-            canonical_directory,
-            lock,
-        })
+        let overlay = OverlayStore::new(directory.clone())?;
+        Ok(Self { overlay })
     }
 
     pub(super) fn prepare(&self, source: &Path) -> Result<PathBuf> {
         let source = self.resolve_source(source)?;
         let metadata = Self::validate_source(&source)?;
-        if resolve_shebang(&source)?.is_some() || !Self::requires_copy(&source, &metadata)? {
+        if resolve_shebang(&source)?.is_some() {
             return Ok(source);
         }
-        self.prepare_copy(&source, &metadata)
+        if !self.overlay.is_internal(&source) {
+            if !Self::requires_copy(&source, &metadata)? {
+                return Ok(source);
+            }
+            self.prepare_copy(&source, &metadata)
+        } else if matches!(
+            self.overlay.state(&source)?,
+            Some(EntryState::Cached {
+                materializer: Materializer::Executable,
+                ..
+            })
+        ) {
+            Ok(source)
+        } else {
+            let source = self.prepare_internal_copy(&source, &metadata)?;
+            self.overlay.mark_executable(&source)?;
+            Ok(source)
+        }
     }
 
     fn resolve_source(&self, requested: &Path) -> Result<PathBuf> {
-        match requested.canonicalize() {
-            Ok(source) => Ok(source),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let relative = requested
-                    .strip_prefix(&self.directory)
-                    .or_else(|_| requested.strip_prefix(&self.canonical_directory));
-                let Ok(relative) = relative else {
-                    return Err(error).with_context(|| {
+        self.overlay
+            .visible_path(requested)
+            .and_then(|source| {
+                if self.overlay.is_internal(&source) {
+                    Ok(source)
+                } else {
+                    source.canonicalize().with_context(|| {
                         format!("failed to resolve executable {}", requested.display())
-                    });
-                };
-                let source = Path::new("/").join(relative);
-                source
-                    .canonicalize()
-                    .with_context(|| format!("failed to resolve executable {}", source.display()))
-            }
-            Err(error) => Err(error)
-                .with_context(|| format!("failed to resolve executable {}", requested.display())),
-        }
+                    })
+                }
+            })
+            .with_context(|| format!("failed to resolve executable {}", requested.display()))
     }
 
     fn requires_copy(source: &Path, metadata: &Metadata) -> Result<bool> {
@@ -163,87 +130,6 @@ impl ExecutableStore {
     }
 
     fn prepare_copy(&self, source: &Path, metadata: &Metadata) -> Result<PathBuf> {
-        let checksum = Self::checksum(source)?;
-        Self::flock(&self.lock, libc::LOCK_EX).with_context(|| {
-            format!(
-                "failed to lock sandbox executable cache {}",
-                self.directory.display()
-            )
-        })?;
-        let prepared = self.prepare_locked(source, metadata, &checksum);
-        let unlock = Self::flock(&self.lock, libc::LOCK_UN).with_context(|| {
-            format!(
-                "failed to unlock sandbox executable cache {}",
-                self.directory.display()
-            )
-        });
-        match prepared {
-            Ok(destination) => {
-                unlock?;
-                Ok(destination)
-            }
-            Err(error) => {
-                let _ = unlock;
-                Err(error)
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn prepare_copy_for_test(&self, source: &Path) -> Result<PathBuf> {
-        let source = source
-            .canonicalize()
-            .with_context(|| format!("failed to resolve executable {}", source.display()))?;
-        let metadata = Self::validate_source(&source)?;
-        self.prepare_copy(&source, &metadata)
-    }
-
-    fn prepare_locked(
-        &self,
-        source: &Path,
-        metadata: &Metadata,
-        checksum: &str,
-    ) -> Result<PathBuf> {
-        let destination = self.destination(source)?;
-        let parent = destination
-            .parent()
-            .context("executable destination has no parent")?;
-        let key = source.to_string_lossy().into_owned();
-        let mut manifest = self.load_manifest(parent)?;
-        match destination.symlink_metadata() {
-            Ok(metadata) if metadata.is_file() && metadata.mode() & 0o111 != 0 => {
-                if manifest
-                    .files
-                    .get(&key)
-                    .is_some_and(|cached| cached == checksum)
-                {
-                    return Ok(destination);
-                }
-            }
-            Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => {
-                bail!(
-                    "sandbox executable cache entry is not a file: {}",
-                    destination.display()
-                );
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to inspect sandbox executable cache entry {}",
-                        destination.display()
-                    )
-                });
-            }
-        }
-
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create sandbox executable mapping directory {}",
-                parent.display()
-            )
-        })?;
         let architectures = Self::architectures(source)?;
         let selected = Self::select_architecture(Self::native_architecture(), &architectures)
             .with_context(|| {
@@ -253,61 +139,104 @@ impl ExecutableStore {
                     Self::native_architecture()
                 )
             })?;
-        let temporary_id = Uuid::new_v4().simple();
-        let temporary = parent.join(format!(".agora-executable-{temporary_id}.tmp"));
-        let prepared: Result<PathBuf> = (|| {
-            if architectures.len() == 1 {
-                fs::copy(source, &temporary).with_context(|| {
-                    format!(
-                        "failed to copy executable {} to {}",
-                        source.display(),
-                        temporary.display()
-                    )
-                })?;
-            } else {
-                Self::run_tool(
-                    "/usr/bin/lipo",
-                    [
-                        source.as_os_str(),
-                        OsStr::new("-thin"),
-                        OsStr::new(&selected.slice),
-                        OsStr::new("-output"),
-                        temporary.as_os_str(),
-                    ],
-                    "failed to extract native executable architecture",
-                )?;
-            }
-            let source_mode = metadata.mode();
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(source_mode | 0o200))?;
-            if selected.rewrite_arm64e {
-                Self::rewrite_arm64e_subtype(&temporary)?;
-            }
-            Self::run_tool(
-                "/usr/bin/codesign",
-                [
-                    OsStr::new("--force"),
-                    OsStr::new("--sign"),
-                    OsStr::new("-"),
-                    OsStr::new("--timestamp=none"),
-                    temporary.as_os_str(),
-                ],
-                "failed to ad-hoc sign executable copy",
-            )?;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(source_mode))?;
-            fs::rename(&temporary, &destination).with_context(|| {
+        self.overlay.prepare_executable(source, |temporary| {
+            Self::prepare_executable_contents(
+                source,
+                temporary,
+                metadata,
+                &architectures,
+                &selected,
+            )
+        })
+    }
+
+    fn prepare_internal_copy(&self, source: &Path, metadata: &Metadata) -> Result<PathBuf> {
+        let architectures = Self::architectures(source)?;
+        let selected = Self::select_architecture(Self::native_architecture(), &architectures)
+            .with_context(|| {
                 format!(
-                    "failed to publish sandbox executable {}",
-                    destination.display()
+                    "executable {} is incompatible with sandbox build target {}",
+                    source.display(),
+                    Self::native_architecture()
                 )
             })?;
-            manifest.files.insert(key, checksum.to_string());
-            self.write_manifest(parent, &manifest)?;
-            Ok(destination.clone())
-        })();
-        if prepared.is_err() {
-            let _ = fs::remove_file(&temporary);
+        let parent = source
+            .parent()
+            .context("sandbox executable has no parent")?;
+        let temporary = parent.join(format!(".agora-executable-{}.tmp", Uuid::new_v4().simple()));
+        let result = Self::prepare_executable_contents(
+            source,
+            &temporary,
+            metadata,
+            &architectures,
+            &selected,
+        )
+        .and_then(|()| {
+            fs::rename(&temporary, source).with_context(|| {
+                format!("failed to publish sandbox executable {}", source.display())
+            })
+        });
+        if result.is_err() {
+            let _ = fs::remove_file(temporary);
         }
-        prepared
+        result.map(|()| source.to_path_buf())
+    }
+
+    fn prepare_executable_contents(
+        source: &Path,
+        temporary: &Path,
+        metadata: &Metadata,
+        architectures: &[String],
+        selected: &ArchitectureSelection,
+    ) -> Result<()> {
+        if architectures.len() == 1 {
+            fs::copy(source, temporary).with_context(|| {
+                format!(
+                    "failed to copy executable {} to {}",
+                    source.display(),
+                    temporary.display()
+                )
+            })?;
+        } else {
+            Self::run_tool(
+                "/usr/bin/lipo",
+                [
+                    source.as_os_str(),
+                    OsStr::new("-thin"),
+                    OsStr::new(&selected.slice),
+                    OsStr::new("-output"),
+                    temporary.as_os_str(),
+                ],
+                "failed to extract native executable architecture",
+            )?;
+        }
+        let source_mode = metadata.mode();
+        fs::set_permissions(temporary, fs::Permissions::from_mode(source_mode | 0o200))?;
+        if selected.rewrite_arm64e {
+            Self::rewrite_arm64e_subtype(temporary)?;
+        }
+        Self::run_tool(
+            "/usr/bin/codesign",
+            [
+                OsStr::new("--force"),
+                OsStr::new("--sign"),
+                OsStr::new("-"),
+                OsStr::new("--timestamp=none"),
+                temporary.as_os_str(),
+            ],
+            "failed to ad-hoc sign executable copy",
+        )?;
+        fs::set_permissions(temporary, fs::Permissions::from_mode(source_mode))?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn prepare_copy_for_test(&self, source: &Path) -> Result<PathBuf> {
+        let source = source
+            .canonicalize()
+            .with_context(|| format!("failed to resolve executable {}", source.display()))?;
+        let metadata = Self::validate_source(&source)?;
+        self.prepare_copy(&source, &metadata)
     }
 
     fn validate_source(source: &Path) -> Result<Metadata> {
@@ -323,6 +252,7 @@ impl ExecutableStore {
         Ok(metadata)
     }
 
+    #[cfg(test)]
     fn destination(&self, source: &Path) -> Result<PathBuf> {
         let relative = source.strip_prefix(Path::new("/")).with_context(|| {
             format!(
@@ -330,86 +260,12 @@ impl ExecutableStore {
                 source.display()
             )
         })?;
-        Ok(self.directory.join(relative))
+        Ok(self.overlay.root().join(relative))
     }
 
-    fn load_manifest(&self, directory: &Path) -> Result<ChecksumManifest> {
-        let path = directory.join(CHECKSUM_MANIFEST_FILE);
-        let contents = match fs::read(&path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ChecksumManifest::default());
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to read sandbox executable checksum manifest {}",
-                        path.display()
-                    )
-                });
-            }
-        };
-        let manifest: ChecksumManifest = serde_json::from_slice(&contents).with_context(|| {
-            format!(
-                "failed to parse sandbox executable checksum manifest {}",
-                path.display()
-            )
-        })?;
-        if manifest.version != CHECKSUM_MANIFEST_VERSION {
-            bail!(
-                "unsupported sandbox executable checksum manifest version {}",
-                manifest.version
-            );
-        }
-        Ok(manifest)
-    }
-
-    fn write_manifest(&self, directory: &Path, manifest: &ChecksumManifest) -> Result<()> {
-        let path = directory.join(CHECKSUM_MANIFEST_FILE);
-        let temporary = directory.join(CHECKSUM_MANIFEST_TEMP_FILE);
-        let contents = serde_json::to_vec_pretty(manifest)
-            .context("failed to serialize sandbox executable checksum manifest")?;
-        let written = (|| {
-            fs::write(&temporary, contents).with_context(|| {
-                format!(
-                    "failed to write sandbox executable checksum manifest {}",
-                    temporary.display()
-                )
-            })?;
-            fs::rename(&temporary, &path).with_context(|| {
-                format!(
-                    "failed to publish sandbox executable checksum manifest {}",
-                    path.display()
-                )
-            })?;
-            Ok(())
-        })();
-        if written.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        written
-    }
-
+    #[cfg(test)]
     fn checksum(source: &Path) -> Result<String> {
-        let output = Command::new("/sbin/md5")
-            .arg("-q")
-            .arg(source)
-            .output()
-            .with_context(|| format!("failed to calculate executable MD5 {}", source.display()))?;
-        let checksum = Self::check_output(output, "failed to calculate executable MD5")?;
-        let checksum = checksum.trim();
-        if checksum.len() != 32 || !checksum.bytes().all(|value| value.is_ascii_hexdigit()) {
-            bail!("invalid executable MD5 output for {}", source.display());
-        }
-        Ok(checksum.to_ascii_lowercase())
-    }
-
-    fn flock(file: &File, operation: libc::c_int) -> std::io::Result<()> {
-        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
+        OverlayStore::checksum(source)
     }
 
     fn architectures(source: &Path) -> Result<Vec<String>> {

@@ -1,65 +1,63 @@
-# Sandbox Executable Cache
+# Sandbox Filesystem And Executable Preparation
 
-`agora-sandbox` runs injectable executables and shebang scripts from their original paths. When an executable cannot receive `DYLD_INSERT_LIBRARIES` because either System Integrity Protection enforces its macOS `SF_RESTRICTED` file flag or its code-signing flags require dyld restriction, library validation, or Hardened Runtime, the sandbox runs a copied, ad-hoc-signed native-architecture slice instead. Prepared copies are persistent and reusable across sandbox runs.
+`agora-sandbox` provides a process-tree-scoped, rootless filesystem view on macOS. Supported path operations read through to the host filesystem, while all materialized and modified data is stored in one persistent encrypted APFS volume. The original host paths are never modified. This guarantee applies only to processes that load the Agora hook library; executable preparation fails closed when a process cannot be made injectable.
 
 ## Work Directory
 
-`SandboxConfig::new` defaults the sandbox work directory to `~/.agora-sandbox`, using the current process's `HOME`. The CLI accepts `--workdir <WORKDIR>` to override it, and the library exposes `SandboxConfig::with_workdir` for the same purpose. Prepared executables live under `<workdir>/fs`, while automatically managed TLS CA material lives under `<workdir>/ca`.
+`SandboxConfig::new` defaults the sandbox work directory to `~/.agora-sandbox`, using the current process's `HOME`. The CLI accepts `--workdir <WORKDIR>`, and the library exposes `SandboxConfig::with_workdir`.
 
-The sandbox creates the executable cache and missing parents when execution starts and sets `<workdir>/fs` mode to `0700`. It does not remove the cache or prepared files when a run exits. The cache may contain only its lock file when a run uses no non-injectable executable. A legacy `<workdir>/root` directory is left untouched.
+The AES-256 APFS sparse bundle is stored at `<workdir>/filesystem/fs.sparsebundle` and mounted at `<workdir>/fs`. It has a 100 GiB logical capacity and grows on demand. The encrypted mount mirrors absolute host paths: `/usr/bin/curl` maps to `<workdir>/fs/usr/bin/curl`, and `/Users/example/project/file` maps to `<workdir>/fs/Users/example/project/file`. Automatically managed TLS CA material remains outside the volume under `<workdir>/ca`.
 
-## Encrypted Workspace
+The volume contains a reserved `<workdir>/fs/.agora` control directory for `volume.json`, the overlay lock, and directory metadata. Hooked processes cannot address this namespace, and directory enumeration hides it.
 
-The optional `--filesystem-key <KEY>` CLI argument and `SandboxConfig::with_encrypted_workspace` library method enable a persistent encrypted workspace on macOS. The value is an APFS disk-image passphrase rather than a raw AES key. An empty key, a NUL byte, or a key larger than 64 KiB is rejected. The passphrase is retained in memory with redacted `Debug` output and is sent only to `hdiutil` through its standard input; it is not added to the sandbox child's arguments or environment. The CLI value remains visible in the `agora-sandbox` process arguments and may be retained by shell history, so callers must account for that exposure.
+## Mandatory Encryption
 
-The sandbox stores the AES-256 APFS sparse bundle at `<workdir>/filesystem/workspace.sparsebundle`, its source metadata at `<workdir>/filesystem/workspace.json`, and its temporary mount at `<workdir>/filesystem/mount`. The sparse bundle has a 100 GiB logical capacity and grows on demand. The first run copies the command's canonical current directory into a matching absolute-path mirror inside the encrypted volume. For example, `/Users/example/project` is copied to `<mount>/Users/example/project`. The command then runs with that encrypted mirror as its current directory. The original source directory is not modified, and later runs with the same work directory and key reuse the volume and retain prior changes.
+Every sandbox run requires a filesystem passphrase through `--filesystem-key <KEY>` or `SandboxConfig::with_encrypted_workspace`. An absent, empty, NUL-containing, oversized, or incorrect key fails before the target process starts. There is no plaintext fallback. The passphrase has redacted `Debug` output and is sent to `hdiutil` through standard input; it is not injected into child arguments or environment. A CLI value remains visible in the parent process arguments and may be retained by shell history.
 
-An existing encrypted workspace is bound to its original source directory. A different source or key fails closed instead of recreating or rotating the volume. The sandbox work directory must not be inside the source directory. An exclusive non-blocking lock permits only one encrypted-workspace run per sandbox work directory. The volume is detached after the child and sandbox services stop; a synchronous detach is also attempted if startup or execution exits through an error path.
+The first run creates the sparse bundle and writes a versioned random volume ID and key ID to `<workdir>/fs/.agora/volume.json`. Later runs reuse the same volume. Existing plaintext data in an unmounted `<workdir>/fs` is rejected rather than imported or overwritten. A non-blocking lock at `<workdir>/filesystem/fs.lock` permits only one run or key migration per work directory.
 
-This first stage provides native filesystem behavior and transparent APFS encryption for accesses relative to the relocated current directory. It is a persistent encrypted snapshot, not a complete overlay filesystem: source changes after initialization are not merged, deletions are not represented as whiteouts, and absolute paths that explicitly refer to the original source are not redirected. The mounted volume is also accessible to the same host user while the run is active. Full lower/upper copy-on-write path virtualization remains a separate filesystem-backend concern.
+The volume is detached after the child, network controller, and execution controller stop. Detach retries tolerate the short vnode retention period after running copied Mach-O files, without using forced unmount. A synchronous best-effort detach also runs during error-path destruction.
 
-The encrypted workspace is independent of the executable cache. `agora-sandbox clean` continues to remove only executable copies recorded beneath `<workdir>/fs`; it does not remove the sparse bundle, source metadata, TLS material, or encrypted workspace contents.
+## Copy-On-Write Overlay
 
-## Cache Entries
+The injected hook redirects `open`, `openat`, `fopen`, path metadata checks, access checks, mutations, current-directory operations, and directory enumeration. Returned file descriptors refer to native files in the encrypted APFS volume, so descriptor reads, writes, seeks, locks, `mmap`, and `fsync` retain kernel behavior without interposing `read` or `write`.
 
-A prepared non-injectable executable mirrors its canonical absolute source path beneath `<workdir>/fs`. For example, `/usr/bin/curl` is stored as `<workdir>/fs/usr/bin/curl`. Executables that are neither SIP-restricted nor signed with dyld-restricting flags are returned at their canonical original paths without checksumming, copying, architecture processing, or signing. The sandbox creates the parent directory structure for a copied executable but does not recursively copy the source directory.
+Reads prefer an existing encrypted entry. On a cache miss, a regular host file is copied into the encrypted mirror and marked `cached`. Its host MD5 is checked before reuse; a changed host file refreshes the encrypted cached copy. MD5 is only a change detector, not a security primitive.
 
-When a relocated executable derives a missing sibling path from its own executable location, the execution controller maps that path from `<workdir>/fs/<absolute-path>` back to `/<absolute-path>` and prepares the original sibling on demand. Existing cache files continue to resolve directly. This preserves `current_exe`-relative helper discovery without recursively copying or interpreting the executable's source directory.
+A write-intent open copies an existing host file into the encrypted mirror before opening it and changes the state to `cow`. A newly created file is created only in the encrypted mirror and is also marked `cow`. COW entries remain authoritative and are never replaced when the host changes. Copy-on-write operates at whole-file granularity rather than block granularity.
 
-For a shebang script, the sandbox keeps the script at its canonical original path and launches the interpreter named after `#!` explicitly. The optional shebang argument and script path are inserted before the caller's arguments. The interpreter goes through the same injection check, so `/usr/bin/env` or `/bin/sh` is copied when restricted, while an injectable interpreter such as a Homebrew `node` or `python3` remains at its original path. This preserves hook injection across a restricted shebang interpreter without treating the text script as Mach-O.
+Deletion removes the encrypted entry and records a `whiteout`, which hides any host entry with the same logical path. Rename moves only encrypted state. Directory enumeration lazily merges encrypted and host names, prefers encrypted entries, filters whiteouts, and never creates placeholder files for lower-only names.
 
-Each mapped source directory contains its own versioned `checksums.json` manifest. Its `files` object maps canonical source paths in that directory to the MD5 of each source executable before architecture selection and ad-hoc signing. For example, `<workdir>/fs/usr/bin/checksums.json` contains:
+Each logical directory has one versioned JSON record beneath `<workdir>/fs/.agora/metadata`. Entry names are encoded to support non-UTF-8 names and prevent path traversal. Entry states are `cached`, `cow`, or `whiteout`; cached entries also record their MD5 and whether they were materialized as a regular copy or prepared executable. Metadata and file publication use temporary paths and atomic rename while holding `<workdir>/fs/.agora/overlay.lock`.
 
-```json
-{
-  "version": 1,
-  "files": {
-    "/usr/bin/curl": "d41d8cd98f00b204e9800998ecf8427e"
-  }
-}
+## Executable Preparation
+
+Injectable executables and shebang scripts can run from their visible paths. When SIP file flags, dyld restrictions, library validation, or Hardened Runtime prevent injection, the execution controller copies the compatible native architecture into the encrypted mirror, applies required Mach-O processing, and ad-hoc signs the result. A prepared executable is reused only while its encrypted copy remains executable and its recorded source MD5 matches.
+
+The executable store and general filesystem overlay share the same mirrored tree and metadata. A regular cached file is upgraded through executable preparation before execution. A COW executable is never replaced with its lower host version; if its signature restricts injection, the COW copy is re-signed in place.
+
+For a shebang script, the optional shebang argument and script path are inserted before caller arguments, and the interpreter goes through the same preparation pipeline. Descendant `posix_spawn` and `execve` calls use execution-preparation protocol version 4 and propagate the encrypted-root configuration. Structured POSIX errors remain fail-closed and never fall back to an unprepared executable.
+
+## Key Migration
+
+Normal startup never changes a key. An incorrect key reports that the existing image is unavailable and points callers to the explicit migration command:
+
+```bash
+agora-sandbox migrate-key \
+  --workdir <WORKDIR> \
+  --filesystem-key <OLD_KEY> \
+  --new-filesystem-key <NEW_KEY>
 ```
 
-A prepared non-injectable executable is reused only when it exists, remains executable, and its manifest entry matches the current source MD5. A missing executable, missing manifest, missing entry, or mismatched MD5 causes the executable to be copied, processed, and signed again before the manifest is updated. An unreadable, malformed, or unsupported manifest returns an error instead of silently discarding existing records.
+Migration takes the same exclusive lock, rejects identical keys, changes the APFS passphrase in place with `hdiutil chpass`, verifies the new key by mounting the existing image, rotates the random key ID, and preserves the volume ID and encrypted data. The old key no longer mounts the volume after a successful migration.
 
-Prepared executables and their directory-local `checksums.json` manifests are persistent. The sandbox does not impose an entry limit and does not automatically prune them.
-
-## Cleaning
-
-`agora-sandbox clean [--workdir <WORKDIR>]` recursively discovers the directory-local `checksums.json` manifests beneath `<workdir>/fs` and removes only the prepared executable copies recorded by those manifests. It then removes the processed manifests and any mapped directories left empty, while retaining `<workdir>/fs`, its lock file, unregistered filesystem content, the work directory, legacy `<workdir>/root` content, and TLS CA material. Every manifest entry must be an absolute source path whose mapped destination belongs to the manifest's own directory; malformed, unsupported, or cross-directory entries fail the command before any manifest cleanup begins.
-
-The command does not require a sandbox command, hook library, audit output, or TLS configuration. When `--workdir` is omitted, it cleans `~/.agora-sandbox/fs`. A missing cache is treated as already clean. Cleaning takes the same exclusive `<workdir>/fs/.lock` used during executable preparation, so it cannot race a concurrent manifest update.
-
-## Concurrent Runs
-
-Every sandbox opens `<workdir>/fs/.lock`. Preparing a non-injectable executable takes an exclusive `flock` while reading the destination directory's manifest, checking and publishing one mapped executable, and updating that manifest. Injectable executables and scripts do not take this lock after their executable metadata, code-signing flags, and shebang have been inspected. Each manifest is written to a fixed temporary file in its mapped directory and atomically renamed to `checksums.json`. The lock is released immediately after preparation and automatically when a process exits unexpectedly.
-
-Execution-preparation protocol version 4 returns a structured POSIX errno with every error and carries bounded process audit metadata, including the single XFF-style `trace_id` string. Process hooks preserve error codes through `posix_spawn` or `execve`; missing paths therefore remain `ENOENT`, invalid arguments remain `EINVAL`, and policy failures remain `EACCES`. Preparation and protocol failures remain fail-closed and never fall back to executing the unprepared source.
+The previous `clean` command is removed. The encrypted overlay, prepared executables, metadata, COW files, and whiteouts are persistent. Destructive reset requires explicit removal of the sparse bundle outside normal sandbox startup.
 
 ## Audit Timing
 
-The callback receives a unified `Event` containing either a `NetworkEvent` or a `ProcessEvent`. Event schema version 7 includes process execution attempts and exposes the trace ID chain as one `trace_id` string. Process events are audit-only: the callback decision is ignored for now. Network decisions continue to allow, deny, or proxy a connection.
+The callback receives a unified `Event` containing either a `NetworkEvent` or a `ProcessEvent`. Event schema version 7 includes intercepted descendant process execution attempts and exposes the trace ID chain as one `trace_id` string. The root command is launched directly by the runner and does not emit `process.exec.attempt`. Process events are audit-only: the callback decision is ignored for now. Network decisions continue to allow, deny, or proxy a connection.
 
-The CLI writes compact JSON Lines records to the configured audit destination. Records use `type: "network"` or `type: "process"`. A network record is written as soon as a validated connection attempt has been inspected, so it appears before a long-lived connection closes and includes a normalized domain when HTTP `Host` or TLS SNI supplied one. TLS passthrough exposes the domain but not the encrypted request path or body. A process record includes the resolved executable, argument values, current directory, parent process, and execution operation. The hook records at most 256 arguments. If the argument count or encoded command metadata exceeds the execution protocol budget, the retained argument prefix ends with `[truncated]`. Oversized audit metadata is truncated instead of causing an otherwise valid command to fail.
+The CLI writes compact JSON Lines records to the configured audit destination. Records use `type: "network"` or `type: "process"`. A network record is written as soon as a validated connection attempt has been inspected, so it appears before a long-lived connection closes and includes a normalized domain when HTTP `Host` or TLS SNI supplied one. TLS passthrough exposes the domain but not the encrypted request path or body. A descendant process record includes the resolved executable, argument values, current directory, parent process, and execution operation. The hook records at most 256 arguments. If the argument count or encoded command metadata exceeds the execution protocol budget, the retained argument prefix ends with `[truncated]`. Oversized audit metadata is truncated instead of causing an otherwise valid command to fail.
 
 Every run starts with one trace ID in `AGORA_SANDBOX_TRACE_ID`. A hooked process appends one ID when it starts a descendant and forwards the chain as one comma-separated `trace_id` string, following the `X-Forwarded-For` style. Network CONNECT protocol version 7 requires the same string in `Agora-Trace-Id`, allowing process and network events to be correlated. Event schema version 7 exposes the chain as a single `trace_id` string. A chain contains at most 32 entries; appending to a full chain removes the oldest entry.
 
@@ -71,6 +69,6 @@ The macOS test suite includes a full transparent TLS path using a copied `/bin/b
 
 When TLS interception is enabled, the runner uses the explicitly configured CA paths or defaults to `<workdir>/ca/ca.crt` and `<workdir>/ca/ca.key`. If both files exist, it reuses them. If either file is missing, it generates a new pair at the selected paths and replaces the existing file, if any, as part of that regeneration. CA generation is part of sandbox startup; there is no separate CLI generation subcommand.
 
-The runner publishes a CA-keyed `<workdir>/ca/trust-bundle-<fingerprint>.crt` to file-based client trust environment variables. This bundle contains the sandbox CA followed by the current native system roots, so a TLS connection that is not terminated by the sandbox—such as TLS nested inside an application-managed HTTP proxy tunnel—continues to validate its real peer certificate. Different CA configurations sharing one work directory use different bundle files and do not overwrite each other.
+The runner publishes a CA-keyed `<workdir>/ca/trust-bundle-<fingerprint>.crt` to file-based client trust environment variables. This bundle contains the sandbox CA followed by the current native system roots, so a TLS connection that is not terminated by the sandbox—such as TLS nested inside an application-managed HTTP proxy tunnel—continues to validate its real peer certificate. If macOS cannot read any roots from the native trust store, the loader falls back to `/etc/ssl/cert.pem`; startup remains fail-closed when neither source provides a valid certificate. Different CA configurations sharing one work directory use different bundle files and do not overwrite each other.
 
 Leaf certificates are valid for one day. DNS names are normalized with public-suffix awareness: subdomains use a wildcard for their registrable domain, registrable domains remain exact, and IP addresses remain exact. The certificate authority caches issued leaf certificates in memory for one hour and reuses a cached certificate while it remains valid.

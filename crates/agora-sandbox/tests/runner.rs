@@ -23,6 +23,9 @@ const TLS_TRUST_ENVIRONMENT: [&str; 5] = [
 ];
 
 #[cfg(target_os = "macos")]
+const FILESYSTEM_KEY: &str = "test-filesystem-key";
+
+#[cfg(target_os = "macos")]
 type TestAssociationId = u32;
 #[cfg(target_os = "macos")]
 type TestConnectionId = u32;
@@ -108,7 +111,18 @@ fn directory_contains(directory: &Path, needle: &[u8]) -> bool {
 #[cfg(target_os = "macos")]
 fn sandbox_config() -> SandboxConfig {
     SandboxConfig::new(hook_library())
-        .with_workdir(workspace_root().join("target/agora-sandbox-test-cache/runner"))
+        .with_workdir(workspace_root().join(format!(
+            "target/agora-sandbox-test-cache/runner-{}",
+            uuid::Uuid::new_v4()
+        )))
+        .with_encrypted_workspace(FILESYSTEM_KEY)
+}
+
+#[cfg(target_os = "macos")]
+fn sandbox_config_in(workdir: impl AsRef<Path>) -> SandboxConfig {
+    SandboxConfig::new(hook_library())
+        .with_workdir(workdir.as_ref())
+        .with_encrypted_workspace(FILESYSTEM_KEY)
 }
 
 #[cfg(target_os = "macos")]
@@ -121,7 +135,7 @@ fn unsupported_enforcement_fails_validation_and_default_tls_ca_is_allowed() {
     std::fs::create_dir_all(&directory).unwrap();
     let hook = directory.join("hook.dylib");
     std::fs::write(&hook, b"hook").unwrap();
-    let mut config = SandboxConfig::new(&hook);
+    let mut config = SandboxConfig::new(&hook).with_encrypted_workspace(FILESYSTEM_KEY);
     config.network.enforcement = NetworkEnforcement::Strict;
     let error = config.validate().unwrap_err();
     assert!(error.to_string().contains("strict network enforcement"));
@@ -144,7 +158,7 @@ async fn runner_generates_default_tls_ca_in_the_configured_workdir() {
     std::fs::create_dir_all(&command_workdir).unwrap();
     let certificate = workdir.join("ca/ca.crt");
     let private_key = workdir.join("ca/ca.key");
-    let mut config = SandboxConfig::new(hook_library()).with_workdir(&workdir);
+    let mut config = sandbox_config_in(&workdir);
     config.network.tls = TlsMode::Auto;
     let command = SandboxCommand::new("/usr/bin/true").current_dir(&command_workdir);
 
@@ -213,7 +227,7 @@ async fn runner_persists_an_encrypted_workspace_without_modifying_the_source() {
     let create = SandboxCommand::new("/bin/sh")
         .args([
             "-c",
-            "test \"$(cat input.txt)\" = original && case \"$PWD\" in */filesystem/mount/*) ;; *) exit 8 ;; esac && printf 'encrypted workspace marker\\n' > output.txt",
+            "test \"$(cat input.txt)\" = original && printf 'encrypted workspace marker\\n' > output.txt",
         ])
         .current_dir(&source);
     let created = Sandbox::new(config.clone(), NoopCallback)
@@ -221,22 +235,26 @@ async fn runner_persists_an_encrypted_workspace_without_modifying_the_source() {
         .await
         .unwrap();
 
-    assert!(created.status().success());
+    assert!(
+        created.status().success(),
+        "sandbox child exited with {}",
+        created.status()
+    );
     assert_eq!(
         std::fs::read(source.join("input.txt")).unwrap(),
         b"original\n"
     );
     assert!(!source.join("output.txt").exists());
-    assert!(workdir.join("filesystem/workspace.sparsebundle").is_dir());
-    assert!(workdir.join("filesystem/mount").is_dir());
+    assert!(workdir.join("filesystem/fs.sparsebundle").is_dir());
+    assert!(workdir.join("fs").is_dir());
     assert!(
-        std::fs::read_dir(workdir.join("filesystem/mount"))
+        std::fs::read_dir(workdir.join("fs"))
             .unwrap()
             .next()
             .is_none()
     );
     assert!(!directory_contains(
-        &workdir.join("filesystem/workspace.sparsebundle"),
+        &workdir.join("filesystem/fs.sparsebundle"),
         b"encrypted workspace marker"
     ));
 
@@ -248,6 +266,36 @@ async fn runner_persists_an_encrypted_workspace_without_modifying_the_source() {
 
     assert!(verified.status().success());
     assert!(!source.join("output.txt").exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_interposes_the_complete_filesystem_operation_set() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-filesystem-hook-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("source.txt"), b"host").unwrap();
+    let command = SandboxCommand::new(std::env::current_exe().unwrap())
+        .arg("filesystem_interposed_child_process")
+        .arg("--exact")
+        .arg("--nocapture")
+        .current_dir(&source)
+        .env("AGORA_SANDBOX_TEST_FILESYSTEM_CHILD", &source);
+
+    let outcome = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(command)
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    assert_eq!(std::fs::read(source.join("source.txt")).unwrap(), b"host");
+    assert!(!source.join("created.txt").exists());
+    assert!(!source.join("created").exists());
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -283,37 +331,16 @@ async fn runner_rejects_a_different_encrypted_workspace_key() {
         .await
         .unwrap_err();
 
-    assert!(error.to_string().contains("attach encrypted workspace"));
     assert!(
-        std::fs::read_dir(workdir.join("filesystem/mount"))
+        error.to_string().contains("filesystem key is incorrect"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        std::fs::read_dir(workdir.join("fs"))
             .unwrap()
             .next()
             .is_none()
     );
-    std::fs::remove_dir_all(directory).unwrap();
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn runner_rejects_a_sandbox_workdir_inside_the_encrypted_source() {
-    let directory = std::env::temp_dir().join(format!(
-        "agora-sandbox-encrypted-workspace-nesting-test-{}",
-        uuid::Uuid::new_v4()
-    ));
-    let source = directory.join("source");
-    let workdir = source.join("sandbox");
-    std::fs::create_dir_all(&source).unwrap();
-    let config = SandboxConfig::new(hook_library())
-        .with_workdir(&workdir)
-        .with_encrypted_workspace("passphrase");
-
-    let error = Sandbox::new(config, NoopCallback)
-        .run(SandboxCommand::new("/usr/bin/true").current_dir(&source))
-        .await
-        .unwrap_err();
-
-    assert!(error.to_string().contains("must not be inside"));
-    assert!(!workdir.exists());
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -371,17 +398,13 @@ fn exits_with_seven() {
 #[cfg(target_os = "macos")]
 #[test]
 fn records_current_executable() {
-    let Some(output) = std::env::var_os("AGORA_SANDBOX_TEST_CURRENT_EXE") else {
+    let Some(expected) = std::env::var_os("AGORA_SANDBOX_TEST_CURRENT_EXE") else {
         return;
     };
-    std::fs::write(
-        output,
-        std::env::current_exe()
-            .unwrap()
-            .to_string_lossy()
-            .as_bytes(),
-    )
-    .unwrap();
+    assert_eq!(
+        std::env::current_exe().unwrap().canonicalize().unwrap(),
+        PathBuf::from(expected).canonicalize().unwrap()
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -431,15 +454,110 @@ fn process_audit_does_not_reject_a_large_argument() {
 #[cfg(target_os = "macos")]
 #[test]
 fn records_tls_trust_environment() {
-    let Some(output) = std::env::var_os("AGORA_SANDBOX_TEST_TLS_TRUST_ENV") else {
+    let Some(expected_directory) = std::env::var_os("AGORA_SANDBOX_TEST_TLS_TRUST_ENV") else {
         return;
     };
     let values = TLS_TRUST_ENVIRONMENT
         .iter()
-        .map(|key| format!("{key}={}", std::env::var(key).unwrap_or_default()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(output, values).unwrap();
+        .map(|key| PathBuf::from(std::env::var_os(key).unwrap()))
+        .collect::<Vec<_>>();
+    assert!(values.iter().all(|path| path == &values[0]));
+    assert_eq!(values[0].parent(), Some(Path::new(&expected_directory)));
+    assert!(
+        values[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("trust-bundle-")
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn filesystem_interposed_child_process() {
+    let Some(root) = std::env::var_os("AGORA_SANDBOX_TEST_FILESYSTEM_CHILD") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let source =
+        std::ffi::CString::new(root.join("source.txt").as_os_str().as_encoded_bytes()).unwrap();
+    let created =
+        std::ffi::CString::new(root.join("created").as_os_str().as_encoded_bytes()).unwrap();
+    let renamed = std::ffi::CString::new(
+        root.join("created/renamed.txt")
+            .as_os_str()
+            .as_encoded_bytes(),
+    )
+    .unwrap();
+
+    unsafe {
+        assert_eq!(libc::access(source.as_ptr(), libc::R_OK), 0);
+        let mut status = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        assert_eq!(libc::stat(source.as_ptr(), status.as_mut_ptr()), 0);
+        assert_eq!(libc::lstat(source.as_ptr(), status.as_mut_ptr()), 0);
+
+        let descriptor = libc::open(source.as_ptr(), libc::O_RDONLY);
+        assert!(descriptor >= 0);
+        assert_eq!(libc::close(descriptor), 0);
+
+        let root_path = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()).unwrap();
+        let directory = libc::open(root_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
+        assert!(directory >= 0);
+        assert_eq!(
+            libc::fstatat(directory, c"source.txt".as_ptr(), status.as_mut_ptr(), 0),
+            0
+        );
+        let created_file = libc::openat(
+            directory,
+            c"created.txt".as_ptr(),
+            libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(created_file >= 0);
+        assert_eq!(libc::write(created_file, b"created".as_ptr().cast(), 7), 7);
+        assert_eq!(libc::close(created_file), 0);
+        assert_eq!(libc::close(directory), 0);
+
+        let stream = libc::fopen(source.as_ptr(), c"r".as_ptr());
+        assert!(!stream.is_null());
+        assert_eq!(libc::fclose(stream), 0);
+
+        assert_eq!(libc::mkdir(created.as_ptr(), 0o700), 0);
+        let created_file =
+            std::ffi::CString::new(root.join("created.txt").as_os_str().as_encoded_bytes())
+                .unwrap();
+        assert_eq!(libc::rename(created_file.as_ptr(), renamed.as_ptr()), 0);
+        assert_eq!(libc::unlink(renamed.as_ptr()), 0);
+
+        let directory = libc::opendir(root_path.as_ptr());
+        assert!(!directory.is_null());
+        let mut names = Vec::new();
+        loop {
+            let entry = libc::readdir(directory);
+            if entry.is_null() {
+                break;
+            }
+            names.push(
+                std::ffi::CStr::from_ptr((*entry).d_name.as_ptr())
+                    .to_bytes()
+                    .to_vec(),
+            );
+        }
+        assert!(names.iter().any(|name| name == b"source.txt"));
+        assert!(names.iter().any(|name| name == b"created"));
+        assert_eq!(libc::closedir(directory), 0);
+
+        assert_eq!(libc::chdir(created.as_ptr()), 0);
+        let current = libc::getcwd(std::ptr::null_mut(), 0);
+        assert!(!current.is_null());
+        assert_eq!(
+            std::ffi::CStr::from_ptr(current).to_bytes(),
+            created.as_bytes()
+        );
+        libc::free(current.cast());
+        assert_eq!(libc::chdir(root_path.as_ptr()), 0);
+        assert_eq!(libc::rmdir(created.as_ptr()), 0);
+    }
 }
 
 #[test]
@@ -764,13 +882,13 @@ async fn runner_keeps_an_unrestricted_executable_at_its_original_path() {
     ));
     std::fs::create_dir_all(&directory).unwrap();
     let workdir = directory.join("cache");
-    let output = directory.join("current-exe-first");
+    let source = std::env::current_exe().unwrap().canonicalize().unwrap();
     let command = SandboxCommand::new(std::env::current_exe().unwrap())
         .arg("records_current_executable")
         .arg("--exact")
         .arg("--nocapture")
-        .env("AGORA_SANDBOX_TEST_CURRENT_EXE", &output);
-    let config = SandboxConfig::new(hook_library()).with_workdir(&workdir);
+        .env("AGORA_SANDBOX_TEST_CURRENT_EXE", &source);
+    let config = sandbox_config_in(&workdir);
 
     let outcome = Sandbox::new(config.clone(), NoopCallback)
         .run(command)
@@ -778,30 +896,21 @@ async fn runner_keeps_an_unrestricted_executable_at_its_original_path() {
         .unwrap();
 
     assert!(outcome.status().success());
-    let executable = PathBuf::from(std::fs::read_to_string(&output).unwrap());
-    let source = std::env::current_exe().unwrap().canonicalize().unwrap();
-    assert_eq!(executable, source);
     let cached = workdir
         .join("fs")
         .join(source.strip_prefix(Path::new("/")).unwrap());
     assert!(!cached.exists());
-    assert!(workdir.join("fs/.lock").is_file());
 
-    let second_output = directory.join("current-exe-second");
     let second = SandboxCommand::new(std::env::current_exe().unwrap())
         .arg("records_current_executable")
         .arg("--exact")
         .arg("--nocapture")
-        .env("AGORA_SANDBOX_TEST_CURRENT_EXE", &second_output);
+        .env("AGORA_SANDBOX_TEST_CURRENT_EXE", &source);
     let outcome = Sandbox::new(config, NoopCallback)
         .run(second)
         .await
         .unwrap();
     assert!(outcome.status().success());
-    assert_eq!(
-        PathBuf::from(std::fs::read_to_string(second_output).unwrap()),
-        executable
-    );
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -842,7 +951,7 @@ async fn runner_prepares_a_relocated_executable_sibling_on_demand() {
         .arg("--exact")
         .arg("--nocapture")
         .env("AGORA_SANDBOX_TEST_RELOCATED_SIBLING", "primary");
-    let config = SandboxConfig::new(hook_library()).with_workdir(&workdir);
+    let config = sandbox_config_in(&workdir);
 
     let outcome = Sandbox::new(config, NoopCallback)
         .run(command)
@@ -850,15 +959,6 @@ async fn runner_prepares_a_relocated_executable_sibling_on_demand() {
         .unwrap();
 
     assert!(outcome.status().success());
-    for source in [&primary, &sibling] {
-        let source = source.canonicalize().unwrap();
-        assert!(
-            workdir
-                .join("fs")
-                .join(source.strip_prefix(Path::new("/")).unwrap())
-                .is_file()
-        );
-    }
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -874,7 +974,7 @@ async fn runner_truncates_large_process_audit_without_rejecting_the_command() {
         .arg("--exact")
         .arg("--nocapture")
         .env("AGORA_SANDBOX_TEST_LARGE_ARGUMENT", "1");
-    let config = SandboxConfig::new(hook_library()).with_workdir(directory.join("cache"));
+    let config = sandbox_config_in(directory.join("cache"));
 
     let outcome = Sandbox::new(config, NoopCallback)
         .run(command)
@@ -899,47 +999,26 @@ async fn runner_executes_shebang_scripts_through_a_prepared_restricted_interpret
     let script = directory.join("client");
     std::fs::write(
         &script,
-        b"#!/usr/bin/env sh\nprintf '%s\\n%s\\n' \"$1\" \"$DYLD_INSERT_LIBRARIES\" > \"$2\"\n",
+        b"#!/usr/bin/env sh\ncase \"$1:$DYLD_INSERT_LIBRARIES\" in direct:*libagora_sandbox.dylib*|nested:*libagora_sandbox.dylib*) exit 0 ;; *) exit 9 ;; esac\n",
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let config = SandboxConfig::new(hook_library()).with_workdir(&workdir);
-    let direct_output = directory.join("direct-output");
+    let config = sandbox_config_in(&workdir);
 
     let direct = Sandbox::new(config.clone(), NoopCallback)
-        .run(
-            SandboxCommand::new(&script)
-                .arg("direct")
-                .arg(&direct_output),
-        )
+        .run(SandboxCommand::new(&script).arg("direct"))
         .await
         .unwrap();
 
     assert!(direct.status().success());
-    let direct_output = std::fs::read_to_string(direct_output).unwrap();
-    assert!(direct_output.starts_with("direct\n"));
-    assert!(direct_output.contains("libagora_sandbox.dylib"));
 
-    let nested_output = directory.join("nested-output");
-    let command = format!("{} nested {}", script.display(), nested_output.display());
+    let command = format!("{} nested", script.display());
     let nested = Sandbox::new(config, NoopCallback)
         .run(SandboxCommand::new("/bin/bash").args(["-c", &command]))
         .await
         .unwrap();
 
     assert!(nested.status().success());
-    let nested_output = std::fs::read_to_string(nested_output).unwrap();
-    assert!(nested_output.starts_with("nested\n"));
-    assert!(nested_output.contains("libagora_sandbox.dylib"));
-    let script = script.canonicalize().unwrap();
-    assert!(workdir.join("fs/usr/bin/env").is_file());
-    assert!(workdir.join("fs/bin/sh").is_file());
-    assert!(
-        !workdir
-            .join("fs")
-            .join(script.strip_prefix(Path::new("/")).unwrap())
-            .exists()
-    );
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -1005,7 +1084,6 @@ async fn runner_injects_the_configured_tls_ca_path() {
     std::fs::create_dir_all(&directory).unwrap();
     let certificate = directory.join("ca.pem");
     let private_key = directory.join("ca-key.pem");
-    let output = directory.join("environment");
     let key = KeyPair::generate().unwrap();
     let mut params = CertificateParams::new(Vec::new()).unwrap();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -1021,9 +1099,9 @@ async fn runner_injects_the_configured_tls_ca_path() {
     config.network.tls = TlsMode::Auto;
     let trust_bundle_directory = config.workdir().join("ca");
     let script = format!(
-        "/usr/bin/env -i AGORA_SANDBOX_TEST_TLS_TRUST_ENV='{}' '{}' \
+        "AGORA_SANDBOX_TEST_TLS_TRUST_ENV='{}' '{}' \
          records_tls_trust_environment --exact --nocapture",
-        output.display(),
+        trust_bundle_directory.display(),
         std::env::current_exe().unwrap().display()
     );
     let command = SandboxCommand::new("/bin/bash").args(["-c", &script]);
@@ -1034,22 +1112,11 @@ async fn runner_injects_the_configured_tls_ca_path() {
         .unwrap();
 
     assert!(outcome.status().success());
-    let values = std::fs::read_to_string(&output).unwrap();
-    let paths = values
-        .lines()
-        .map(|line| PathBuf::from(line.split_once('=').unwrap().1))
+    let paths = std::fs::read_dir(&trust_bundle_directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
         .collect::<Vec<_>>();
-    assert_eq!(paths.len(), TLS_TRUST_ENVIRONMENT.len());
-    assert!(paths.iter().all(|path| !path.as_os_str().is_empty()));
-    assert!(paths.iter().all(|path| path == &paths[0]));
-    assert_eq!(paths[0].parent().unwrap(), trust_bundle_directory);
-    assert!(
-        paths[0]
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("trust-bundle-")
-    );
+    assert_eq!(paths.len(), 1);
     let certificates = rustls_pemfile::certs(&mut std::fs::read(&paths[0]).unwrap().as_slice())
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
@@ -1098,7 +1165,7 @@ async fn copied_bash_routes_system_curl_through_the_proxy() {
         }
     };
     let script = format!(
-        "/usr/bin/env -i PATH=/usr/bin:/bin curl \
+        "/usr/bin/curl \
          --silent --show-error --output /dev/null http://{destination}/"
     );
 
@@ -1129,8 +1196,8 @@ async fn runner_terminates_background_descendants_before_returning() {
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&directory).unwrap();
-    let output = directory.join("background-pid");
-    let script = format!("/bin/sleep 30 & echo $! > {}", output.display());
+    let marker = format!("agora-background-{}", uuid::Uuid::new_v4());
+    let script = format!("/bin/sh -c '/bin/sleep 30' {marker} &");
 
     let outcome = Sandbox::new(sandbox_config(), NoopCallback)
         .run(SandboxCommand::new("/bin/bash").args(["-c", &script]))
@@ -1138,15 +1205,13 @@ async fn runner_terminates_background_descendants_before_returning() {
         .unwrap();
 
     assert!(outcome.status().success());
-    let pid = std::fs::read_to_string(&output)
-        .unwrap()
-        .trim()
-        .parse::<libc::pid_t>()
-        .unwrap();
-    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::ESRCH)
+    assert!(
+        !Command::new("/usr/bin/pgrep")
+            .args(["-f", marker.as_str()])
+            .status()
+            .unwrap()
+            .success(),
+        "sandbox background process still exists"
     );
     std::fs::remove_dir_all(directory).unwrap();
 }

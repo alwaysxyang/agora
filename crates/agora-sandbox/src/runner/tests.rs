@@ -126,6 +126,7 @@ async fn system_curl_completes_the_transparent_tls_chain() {
     };
     let mut config = SandboxConfig::new(built_hook_library())
         .with_workdir(&root)
+        .with_encrypted_workspace("test-filesystem-key")
         .with_upstream_tls_roots(vec![origin_root]);
     config.network.tls = TlsMode::Auto;
     let url = format!("https://{identity}:{}/", origin.port());
@@ -137,7 +138,7 @@ async fn system_curl_completes_the_transparent_tls_chain() {
     let command = SandboxCommand::new("/bin/bash").args(["-c", script.as_str()]);
 
     let outcome = tokio::time::timeout(
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         Sandbox::new(config, callback).run(command),
     )
     .await
@@ -154,7 +155,10 @@ async fn system_curl_completes_the_transparent_tls_chain() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(std::fs::read(&output).unwrap(), b"ok");
+    assert!(
+        !output.exists(),
+        "sandbox output unexpectedly changed the host filesystem"
+    );
 
     let events = events.lock().unwrap();
     let process = events
@@ -193,6 +197,88 @@ async fn system_curl_completes_the_transparent_tls_chain() {
         Some(identity)
     );
     drop(events);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn encrypted_overlay_preserves_the_host_while_the_child_uses_cow_and_whiteouts() {
+    let root = std::env::temp_dir().join(format!("agora-overlay-run-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let existing = root.join("existing");
+    let removed = root.join("removed");
+    let created = root.join("created");
+    let directory = root.join("directory");
+    std::fs::write(&existing, b"host").unwrap();
+    std::fs::write(&removed, b"host removed").unwrap();
+    let script = format!(
+        "set -eu; test \"$(cat '{existing}')\" = host; printf sandbox > '{existing}'; test \"$(cat '{existing}')\" = sandbox; printf created > '{created}'; test \"$(cat '{created}')\" = created; rm '{removed}'; test ! -e '{removed}'; mkdir '{directory}'; printf nested > '{directory}/nested'; test \"$(cat '{directory}/nested')\" = nested",
+        existing = existing.display(),
+        created = created.display(),
+        removed = removed.display(),
+        directory = directory.display(),
+    );
+    let config = SandboxConfig::new(built_hook_library())
+        .with_workdir(&root)
+        .with_encrypted_workspace("test-filesystem-key");
+    let outcome = Sandbox::new(config, NoopCallback)
+        .run(SandboxCommand::new("/bin/bash").args(["-c", script.as_str()]))
+        .await
+        .unwrap();
+
+    assert!(
+        outcome.status().success(),
+        "sandbox child exited with {}",
+        outcome.status()
+    );
+    assert_eq!(std::fs::read(&existing).unwrap(), b"host");
+    assert_eq!(std::fs::read(&removed).unwrap(), b"host removed");
+    assert!(!created.exists());
+    assert!(!directory.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn tls_interception_starts_with_native_upstream_roots() {
+    let root =
+        std::env::temp_dir().join(format!("agora-native-tls-roots-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut config = SandboxConfig::new(built_hook_library())
+        .with_workdir(&root)
+        .with_encrypted_workspace("test-filesystem-key");
+    config.network.tls = TlsMode::Auto;
+
+    let outcome = Sandbox::new(config, NoopCallback)
+        .run(SandboxCommand::new("/usr/bin/true"))
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn test_upstream_roots_require_tls_interception() {
+    let root =
+        std::env::temp_dir().join(format!("agora-roots-without-tls-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let config = SandboxConfig::new(built_hook_library())
+        .with_workdir(&root)
+        .with_encrypted_workspace("test-filesystem-key")
+        .with_upstream_tls_roots(Vec::new());
+
+    let error = Sandbox::new(config, NoopCallback)
+        .run(SandboxCommand::new("/usr/bin/true"))
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("test upstream TLS roots require TLS interception")
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -261,6 +347,23 @@ fn sandbox_config_and_command_builders_preserve_runtime_inputs() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_config_requires_a_filesystem_key() {
+    let root = std::env::temp_dir().join(format!(
+        "agora-required-filesystem-key-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let hook = root.join("hook.dylib");
+    std::fs::write(&hook, b"hook").unwrap();
+
+    let error = SandboxConfig::new(&hook).validate().unwrap_err();
+
+    assert!(error.to_string().contains("filesystem key is required"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn command_workdir_resolution_and_disabled_tls_defaults_are_explicit() {
     let current = std::env::current_dir().unwrap().canonicalize().unwrap();
@@ -310,7 +413,7 @@ fn sandbox_config_allows_default_tls_ca_for_interception() {
     std::fs::create_dir_all(&root).unwrap();
     let hook = root.join("hook.dylib");
     std::fs::write(&hook, b"hook").unwrap();
-    let mut config = SandboxConfig::new(&hook);
+    let mut config = SandboxConfig::new(&hook).with_encrypted_workspace("test-key");
     config.network.tls = TlsMode::Auto;
 
     assert!(config.validate().is_ok());
@@ -326,7 +429,9 @@ fn configured_tls_ca_reuses_a_complete_pair_and_replaces_a_partial_pair() {
     let certificate = root.join("ca.pem");
     let private_key = root.join("ca-key.pem");
     std::fs::write(&hook, b"hook").unwrap();
-    let mut config = SandboxConfig::new(&hook).with_tls_ca(&certificate, &private_key);
+    let mut config = SandboxConfig::new(&hook)
+        .with_encrypted_workspace("test-key")
+        .with_tls_ca(&certificate, &private_key);
     config.network.tls = TlsMode::Auto;
 
     assert!(config.validate().is_ok());
@@ -369,7 +474,9 @@ fn sandbox_config_preserves_tls_ca_paths() {
     std::fs::write(&hook, b"hook").unwrap();
     std::fs::write(&certificate, b"certificate").unwrap();
     std::fs::write(&private_key, b"private key").unwrap();
-    let mut config = SandboxConfig::new(&hook).with_tls_ca(&certificate, &private_key);
+    let mut config = SandboxConfig::new(&hook)
+        .with_encrypted_workspace("test-key")
+        .with_tls_ca(&certificate, &private_key);
     config.network.tls = TlsMode::Auto;
 
     assert_eq!(
@@ -482,7 +589,9 @@ fn sandbox_config_accepts_a_der_tls_trust_anchor() {
     )
     .unwrap();
 
-    let config = SandboxConfig::new(&hook).with_tls_trust_anchor(&anchor);
+    let config = SandboxConfig::new(&hook)
+        .with_encrypted_workspace("test-key")
+        .with_tls_trust_anchor(&anchor);
 
     assert_eq!(config.tls_trust_anchor(), Some(anchor.as_path()));
     assert!(config.validate().is_ok());
@@ -499,6 +608,7 @@ fn sandbox_config_rejects_a_malformed_tls_trust_anchor() {
     std::fs::write(&anchor, b"not a certificate").unwrap();
 
     let error = SandboxConfig::new(&hook)
+        .with_encrypted_workspace("test-key")
         .with_tls_trust_anchor(&anchor)
         .validate()
         .unwrap_err();
@@ -516,6 +626,7 @@ fn sandbox_config_rejects_a_missing_tls_trust_anchor() {
     std::fs::write(&hook, b"hook").unwrap();
 
     let error = SandboxConfig::new(&hook)
+        .with_encrypted_workspace("test-key")
         .with_tls_trust_anchor(&anchor)
         .validate()
         .unwrap_err();

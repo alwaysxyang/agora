@@ -8,6 +8,7 @@ const PROXY_IPV6: &str = "AGORA_SANDBOX_PROXY_IPV6";
 const EXECUTION_CONTROL: &str = "AGORA_SANDBOX_EXECUTION_CONTROL";
 const EXECUTION_TOKEN: &str = "AGORA_SANDBOX_EXECUTION_TOKEN";
 const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
+const FILESYSTEM_ROOT: &str = "AGORA_SANDBOX_FILESYSTEM_ROOT";
 const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
 const TLS_TRUST_BUNDLE: &str = "AGORA_SANDBOX_TLS_TRUST_BUNDLE";
 
@@ -19,13 +20,14 @@ const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
     "GIT_SSL_CAINFO",
 ];
 
-pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 14] = [
+pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 15] = [
     TOKEN,
     PROXY_IPV4,
     PROXY_IPV6,
     EXECUTION_CONTROL,
     EXECUTION_TOKEN,
     HOOK_LIBRARIES,
+    FILESYSTEM_ROOT,
     TLS_TRUST_ANCHOR_DER,
     TLS_TRUST_BUNDLE,
     TRACE_ID_ENVIRONMENT,
@@ -44,6 +46,7 @@ pub(super) struct HookConfig {
     execution_control: SocketAddr,
     execution_token: String,
     hook_libraries: String,
+    filesystem_root: String,
     tls_trust_anchor_der: Option<String>,
     tls_trust_bundle: Option<String>,
     trace: TraceContext,
@@ -67,6 +70,7 @@ impl HookConfig {
             .map_err(|error| format!("invalid {EXECUTION_CONTROL}: {error}"))?;
         let execution_token = Self::required(&mut get, EXECUTION_TOKEN)?;
         let hook_libraries = Self::required(&mut get, HOOK_LIBRARIES)?;
+        let filesystem_root = Self::required(&mut get, FILESYSTEM_ROOT)?;
         let tls_trust_anchor_der = get(TLS_TRUST_ANCHOR_DER).filter(|value| !value.is_empty());
         let tls_trust_bundle = get(TLS_TRUST_BUNDLE).filter(|value| !value.is_empty());
         let trace = TraceContext::parse(&Self::required(&mut get, TRACE_ID_ENVIRONMENT)?)
@@ -90,6 +94,7 @@ impl HookConfig {
             execution_control,
             execution_token,
             hook_libraries,
+            filesystem_root,
             tls_trust_anchor_der,
             tls_trust_bundle,
             trace,
@@ -117,6 +122,10 @@ impl HookConfig {
 
     pub(super) fn hook_libraries(&self) -> &str {
         &self.hook_libraries
+    }
+
+    pub(super) fn filesystem_root(&self) -> &str {
+        &self.filesystem_root
     }
 
     pub(super) fn tls_trust_anchor_der(&self) -> Option<&str> {
@@ -148,6 +157,7 @@ impl HookConfig {
             (EXECUTION_CONTROL, self.execution_control.to_string()),
             (EXECUTION_TOKEN, self.execution_token.clone()),
             (HOOK_LIBRARIES, self.hook_libraries.clone()),
+            (FILESYSTEM_ROOT, self.filesystem_root.clone()),
             (TRACE_ID_ENVIRONMENT, trace.encode()),
         ];
         if let Some(anchor) = &self.tls_trust_anchor_der {

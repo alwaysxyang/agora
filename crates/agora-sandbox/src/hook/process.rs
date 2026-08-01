@@ -37,6 +37,8 @@ type ExecveFn = unsafe extern "C" fn(
 
 thread_local! {
     static INSIDE_PROCESS_HOOK: Cell<bool> = const { Cell::new(false) };
+    #[cfg(test)]
+    static TEST_PROCESS_RUNTIME: Cell<*const ProcessHookRuntime> = const { Cell::new(std::ptr::null()) };
 }
 
 struct ProcessHookGuard;
@@ -217,6 +219,13 @@ impl ChildEnvironment {
 
 impl ProcessHookRuntime {
     fn global() -> Option<&'static Self> {
+        #[cfg(test)]
+        {
+            let runtime = TEST_PROCESS_RUNTIME.with(Cell::get);
+            if !runtime.is_null() {
+                return Some(unsafe { &*runtime });
+            }
+        }
         static RUNTIME: OnceLock<Option<ProcessHookRuntime>> = OnceLock::new();
         RUNTIME
             .get_or_init(|| config::global().cloned().map(|config| Self { config }))
@@ -291,6 +300,21 @@ impl ProcessHookRuntime {
     }
 }
 
+#[cfg(test)]
+fn with_test_runtime<T>(runtime: &ProcessHookRuntime, operation: impl FnOnce() -> T) -> T {
+    struct Reset(*const ProcessHookRuntime);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_PROCESS_RUNTIME.with(|current| current.set(self.0));
+        }
+    }
+
+    let previous = TEST_PROCESS_RUNTIME.with(|current| current.replace(runtime));
+    let _reset = Reset(previous);
+    operation()
+}
+
 unsafe fn requested_executable(path: *const libc::c_char, search_path: bool) -> Option<PathBuf> {
     if path.is_null() {
         return None;
@@ -305,14 +329,18 @@ unsafe fn requested_executable(path: *const libc::c_char, search_path: bool) -> 
         });
     }
     let search = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
-    let current = std::env::current_dir().ok()?;
+    let current = || {
+        std::env::current_dir()
+            .or_else(|error| std::env::var_os("PWD").map(PathBuf::from).ok_or(error))
+            .ok()
+    };
     for directory in std::env::split_paths(&search) {
         let directory = if directory.as_os_str().is_empty() {
-            current.clone()
+            current()?
         } else if directory.is_absolute() {
             directory
         } else {
-            current.join(directory)
+            current()?.join(directory)
         };
         let candidate = directory.join(path);
         if candidate.is_file() {
@@ -367,14 +395,28 @@ unsafe fn command_request(
             values.push(TRUNCATED_ARGUMENTS.to_string());
         }
     }
+    let process_executable = std::env::current_exe().map_err(|error| {
+        PrepareError::new(
+            io_errno(&error),
+            format!("failed to resolve current executable: {error}"),
+        )
+    })?;
+    let current_dir = std::env::current_dir()
+        .or_else(|error| std::env::var_os("PWD").map(PathBuf::from).ok_or(error));
+    let current_dir = current_dir.map_err(|error| {
+        PrepareError::new(
+            io_errno(&error),
+            format!("failed to resolve current directory: {error}"),
+        )
+    })?;
     Ok(CommandRequest {
         trace_id: trace.encode(),
         pid: std::process::id(),
         ppid: unsafe { libc::getppid() as u32 },
-        process_executable: std::env::current_exe()?.to_string_lossy().into_owned(),
+        process_executable: process_executable.to_string_lossy().into_owned(),
         executable: executable.to_string_lossy().into_owned(),
         arguments: values,
-        current_dir: std::env::current_dir()?.to_string_lossy().into_owned(),
+        current_dir: current_dir.to_string_lossy().into_owned(),
         operation,
     })
 }

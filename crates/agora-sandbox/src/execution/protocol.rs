@@ -5,6 +5,9 @@ use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+mod tests;
+
 pub(crate) const EXECUTION_PROTOCOL_VERSION: u16 = 4;
 pub(super) const MAX_EXECUTION_FRAME_SIZE: usize = 64 * 1024;
 pub(crate) const TRUNCATED_ARGUMENTS: &str = "[truncated]";

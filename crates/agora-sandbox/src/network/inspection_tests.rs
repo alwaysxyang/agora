@@ -1,5 +1,6 @@
 use super::inspection::{
-    DomainObservation, InspectionObservation, InspectionState, ProtocolInspector, TlsClientHello,
+    DomainObservation, InspectionObservation, InspectionState, MAX_INSPECTION_BYTES,
+    ProtocolInspector, TlsClientHello,
 };
 use crate::callback::DomainSource;
 use rustls::pki_types::ServerName;
@@ -59,6 +60,57 @@ fn non_http_and_non_tls_payload_has_no_domain() {
     assert_eq!(
         inspector.inspect(b"Host: misleading.example\r\n\r\n"),
         InspectionState::Complete(InspectionObservation::default())
+    );
+}
+
+#[test]
+fn inspection_bounds_and_malformed_protocols_finish_without_a_domain() {
+    let mut empty = ProtocolInspector::new();
+    assert_eq!(empty.inspect(b""), InspectionState::Pending);
+
+    let mut oversized = ProtocolInspector::new();
+    assert_eq!(
+        oversized.inspect(&vec![b'A'; MAX_INSPECTION_BYTES + 1]),
+        InspectionState::Complete(InspectionObservation::default())
+    );
+
+    let mut binary = ProtocolInspector::new();
+    assert_eq!(
+        binary.inspect(&[0]),
+        InspectionState::Complete(InspectionObservation::default())
+    );
+
+    let mut malformed_tls = ProtocolInspector::new();
+    assert_eq!(
+        malformed_tls.inspect(b"\x16\x03\x03\x00\x01\xff"),
+        InspectionState::Pending
+    );
+}
+
+#[test]
+fn http_host_normalization_handles_brackets_and_non_port_colons() {
+    let mut bracketed = ProtocolInspector::new();
+    assert_eq!(
+        bracketed.inspect(b"GET / HTTP/1.1\r\nHost: [Example.COM]:443\r\n\r\n"),
+        InspectionState::Complete(InspectionObservation {
+            domain: Some(DomainObservation {
+                domain: "example.com".to_string(),
+                source: DomainSource::HttpHost,
+            }),
+            tls: None,
+        })
+    );
+
+    let mut non_port = ProtocolInspector::new();
+    assert_eq!(
+        non_port.inspect(b"GET / HTTP/1.1\r\nHost: Example.COM:not-a-port\r\n\r\n"),
+        InspectionState::Complete(InspectionObservation {
+            domain: Some(DomainObservation {
+                domain: "example.com:not-a-port".to_string(),
+                source: DomainSource::HttpHost,
+            }),
+            tls: None,
+        })
     );
 }
 

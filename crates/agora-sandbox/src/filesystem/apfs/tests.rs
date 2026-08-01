@@ -1,5 +1,4 @@
-use super::{EncryptedWorkspace, MAX_KEY_SIZE, METADATA_VERSION, WorkspaceMetadata};
-use base64::Engine;
+use super::{EncryptedWorkspace, MAX_KEY_SIZE, METADATA_VERSION, VolumeMetadata};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -7,12 +6,11 @@ fn temporary_directory(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("agora-filesystem-{label}-{}", uuid::Uuid::new_v4()))
 }
 
-fn workspace(source: PathBuf, path: PathBuf, root: &Path) -> EncryptedWorkspace {
-    std::fs::create_dir_all(root).unwrap();
+fn workspace(root: &Path) -> EncryptedWorkspace {
+    let mount_point = root.join("fs");
+    std::fs::create_dir_all(&mount_point).unwrap();
     EncryptedWorkspace {
-        source,
-        path,
-        mount_point: root.join("mount"),
+        mount_point,
         _lock: std::fs::File::create(root.join("lock")).unwrap(),
         mounted: false,
     }
@@ -47,7 +45,13 @@ fn passphrase_validation_rejects_invalid_keys() {
 }
 
 #[test]
-fn mapped_path_mirrors_an_absolute_source() {
+fn filesystem_paths_mirror_absolute_host_paths() {
+    let workdir = Path::new("/tmp/agora-workdir");
+    assert_eq!(EncryptedWorkspace::mount_point(workdir), workdir.join("fs"));
+    assert_eq!(
+        EncryptedWorkspace::image_path(workdir),
+        workdir.join("filesystem/fs.sparsebundle")
+    );
     assert_eq!(
         EncryptedWorkspace::mapped_path(Path::new("/mount"), Path::new("/Users/example/project"))
             .unwrap(),
@@ -66,11 +70,8 @@ fn mapped_path_mirrors_an_absolute_source() {
 }
 
 #[test]
-fn workspace_lock_is_exclusive() {
-    let directory = std::env::temp_dir().join(format!(
-        "agora-filesystem-lock-test-{}",
-        uuid::Uuid::new_v4()
-    ));
+fn filesystem_lock_is_exclusive() {
+    let directory = temporary_directory("lock");
     std::fs::create_dir_all(&directory).unwrap();
 
     let lock = EncryptedWorkspace::lock(&directory).unwrap();
@@ -81,173 +82,178 @@ fn workspace_lock_is_exclusive() {
             .contains("already in use")
     );
     drop(lock);
-    assert!(EncryptedWorkspace::lock(&directory).is_ok());
+    let mut reacquired = None;
+    for _ in 0..20 {
+        match EncryptedWorkspace::lock(&directory) {
+            Ok(lock) => {
+                reacquired = Some(lock);
+                break;
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+    assert!(reacquired.is_some());
 
     std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]
-async fn start_rejects_invalid_sources_and_inconsistent_storage() {
-    let directory = temporary_directory("invalid-layout-test");
+async fn setup_rejects_plaintext_or_invalid_mount_points() {
+    let directory = temporary_directory("invalid-layout");
     std::fs::create_dir_all(&directory).unwrap();
 
-    let missing_source = directory.join("missing-source");
-    assert!(
-        EncryptedWorkspace::start(&directory.join("work-a"), &missing_source, b"passphrase")
-            .await
-            .err()
-            .expect("missing source must fail")
-            .to_string()
-            .contains("failed to resolve encrypted workspace source")
-    );
-
-    let source_file = directory.join("source-file");
-    std::fs::write(&source_file, b"not a directory").unwrap();
-    assert!(
-        EncryptedWorkspace::start(&directory.join("work-b"), &source_file, b"passphrase")
-            .await
-            .err()
-            .expect("file source must fail")
-            .to_string()
-            .contains("source is not a directory")
-    );
-
-    let source = directory.join("source");
-    std::fs::create_dir_all(&source).unwrap();
     let work_file = directory.join("work-file");
     std::fs::write(&work_file, b"not a directory").unwrap();
     assert!(
-        EncryptedWorkspace::start(&work_file, &source, b"passphrase")
+        EncryptedWorkspace::start(&work_file, b"passphrase")
             .await
-            .err()
-            .expect("file workdir must fail")
+            .unwrap_err()
             .to_string()
             .contains("failed to create encrypted filesystem directory")
     );
 
-    let blocked_mount = directory.join("blocked-mount/filesystem");
+    let blocked_mount = directory.join("blocked-mount");
     std::fs::create_dir_all(&blocked_mount).unwrap();
-    std::fs::write(blocked_mount.join("mount"), b"not a directory").unwrap();
+    std::fs::write(blocked_mount.join("fs"), b"not a directory").unwrap();
     assert!(
-        EncryptedWorkspace::start(&directory.join("blocked-mount"), &source, b"passphrase",)
+        EncryptedWorkspace::start(&blocked_mount, b"passphrase")
             .await
-            .err()
-            .expect("file mount point must fail")
+            .unwrap_err()
             .to_string()
-            .contains("failed to create encrypted filesystem mount point")
+            .contains("mount point is not a directory")
     );
 
-    let metadata_only = directory.join("metadata-only/filesystem");
-    std::fs::create_dir_all(&metadata_only).unwrap();
-    std::fs::write(metadata_only.join("workspace.json"), b"{}").unwrap();
+    let plaintext_mount = directory.join("plaintext-mount");
+    std::fs::create_dir_all(plaintext_mount.join("fs")).unwrap();
+    std::fs::write(plaintext_mount.join("fs/file"), b"plaintext").unwrap();
     assert!(
-        EncryptedWorkspace::start(&directory.join("metadata-only"), &source, b"passphrase",)
+        EncryptedWorkspace::start(&plaintext_mount, b"passphrase")
             .await
-            .err()
-            .expect("orphaned metadata must fail")
+            .unwrap_err()
             .to_string()
-            .contains("metadata exists without its disk image")
-    );
-
-    let image_only = directory.join("image-only/filesystem");
-    std::fs::create_dir_all(image_only.join("workspace.sparsebundle")).unwrap();
-    assert!(
-        EncryptedWorkspace::start(&directory.join("image-only"), &source, b"passphrase")
-            .await
-            .err()
-            .expect("orphaned image must fail")
-            .to_string()
-            .contains("disk image exists without metadata")
+            .contains("unencrypted filesystem data exists")
     );
 
     std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
-fn metadata_validation_rejects_corruption_and_other_sources() {
-    let directory = temporary_directory("metadata-test");
-    let source = directory.join("source");
-    std::fs::create_dir_all(&source).unwrap();
-    let workspace = workspace(
-        source.clone(),
-        directory.join("mapped"),
-        &directory.join("state"),
-    );
-    let metadata = directory.join("workspace.json");
+fn volume_metadata_is_initialized_and_validated() {
+    let directory = temporary_directory("metadata");
+    std::fs::create_dir_all(&directory).unwrap();
+    let workspace = workspace(&directory);
 
+    workspace.initialize_volume_metadata().unwrap();
+    workspace.validate_volume_metadata().unwrap();
+    let original = workspace.read_volume_metadata().unwrap();
+    assert_eq!(original.version, METADATA_VERSION);
+    uuid::Uuid::parse_str(&original.volume_id).unwrap();
+    uuid::Uuid::parse_str(&original.key_id).unwrap();
+
+    workspace.update_key_id().unwrap();
+    let updated = workspace.read_volume_metadata().unwrap();
+    assert_eq!(updated.volume_id, original.volume_id);
+    assert_ne!(updated.key_id, original.key_id);
+
+    workspace
+        .write_volume_metadata(&VolumeMetadata {
+            version: METADATA_VERSION + 1,
+            volume_id: updated.volume_id.clone(),
+            key_id: updated.key_id.clone(),
+        })
+        .unwrap();
     assert!(
         workspace
-            .validate_metadata(&metadata)
+            .validate_volume_metadata()
             .unwrap_err()
             .to_string()
-            .contains("failed to read")
+            .contains("unsupported")
     );
-    std::fs::write(&metadata, b"not json").unwrap();
+
+    workspace
+        .write_volume_metadata(&VolumeMetadata {
+            version: METADATA_VERSION,
+            volume_id: "invalid".to_string(),
+            key_id: updated.key_id.clone(),
+        })
+        .unwrap();
     assert!(
         workspace
-            .validate_metadata(&metadata)
+            .validate_volume_metadata()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid encrypted filesystem volume id")
+    );
+
+    workspace
+        .write_volume_metadata(&VolumeMetadata {
+            version: METADATA_VERSION,
+            volume_id: updated.volume_id,
+            key_id: "invalid".to_string(),
+        })
+        .unwrap();
+    assert!(
+        workspace
+            .validate_volume_metadata()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid encrypted filesystem key id")
+    );
+
+    std::fs::write(workspace.volume_metadata_path(), b"not json").unwrap();
+    assert!(
+        workspace
+            .validate_volume_metadata()
             .unwrap_err()
             .to_string()
             .contains("failed to parse")
     );
 
-    let write_metadata = |version, encoded_source: &str| {
-        std::fs::write(
-            &metadata,
-            serde_json::to_vec(&WorkspaceMetadata {
-                version,
-                source: encoded_source.to_string(),
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn volume_metadata_reports_missing_and_unwritable_storage() {
+    let directory = temporary_directory("metadata-errors");
+    std::fs::create_dir_all(&directory).unwrap();
+    let workspace = workspace(&directory);
+
+    assert!(
+        workspace
+            .read_volume_metadata()
+            .unwrap_err()
+            .to_string()
+            .contains("failed to read encrypted filesystem metadata")
+    );
+    assert!(
+        workspace
+            .write_volume_metadata(&VolumeMetadata {
+                version: METADATA_VERSION,
+                volume_id: uuid::Uuid::new_v4().to_string(),
+                key_id: uuid::Uuid::new_v4().to_string(),
             })
-            .unwrap(),
-        )
-        .unwrap();
-    };
-    let encoded_source =
-        base64::engine::general_purpose::STANDARD.encode(source.as_os_str().as_encoded_bytes());
-    write_metadata(METADATA_VERSION + 1, &encoded_source);
-    assert!(
-        workspace
-            .validate_metadata(&metadata)
             .unwrap_err()
             .to_string()
-            .contains("unsupported")
+            .contains("failed to write encrypted filesystem metadata")
     );
-    write_metadata(METADATA_VERSION, "%%%invalid-base64%%%");
+
+    let blocked = directory.join("blocked");
+    std::fs::write(&blocked, b"file").unwrap();
     assert!(
-        workspace
-            .validate_metadata(&metadata)
+        EncryptedWorkspace::prepare_directory(&blocked)
             .unwrap_err()
             .to_string()
-            .contains("invalid encrypted workspace source metadata")
+            .contains("failed to create encrypted filesystem directory")
     );
-    write_metadata(
-        METADATA_VERSION,
-        &base64::engine::general_purpose::STANDARD.encode(b"/different/source"),
-    );
-    assert!(
-        workspace
-            .validate_metadata(&metadata)
-            .unwrap_err()
-            .to_string()
-            .contains("belongs to a different source")
-    );
-    write_metadata(METADATA_VERSION, &encoded_source);
-    workspace.validate_metadata(&metadata).unwrap();
 
     std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]
-async fn helpers_report_io_failures_and_unmounted_shutdown_is_idempotent() {
-    let directory = temporary_directory("helper-errors-test");
+async fn helpers_report_errors_and_unmounted_shutdown_is_idempotent() {
+    let directory = temporary_directory("helpers");
     std::fs::create_dir_all(&directory).unwrap();
-    let source = directory.join("source");
-    std::fs::create_dir_all(&source).unwrap();
-    let mut workspace = workspace(
-        source.clone(),
-        directory.join("mapped"),
-        &directory.join("state"),
-    );
+    let mut workspace = workspace(&directory);
 
     assert!(!EncryptedWorkspace::is_mount_point(&directory).unwrap());
     assert!(EncryptedWorkspace::is_mount_point(&directory.join("missing")).is_err());
@@ -258,20 +264,19 @@ async fn helpers_report_io_failures_and_unmounted_shutdown_is_idempotent() {
     );
     workspace.shutdown().await.unwrap();
     assert_eq!(
-        workspace.map_source_path(&source.join("file")),
-        Some(directory.join("mapped/file"))
+        workspace.map_host_path(Path::new("/tmp/file")).unwrap(),
+        directory.join("fs/tmp/file")
     );
-    assert_eq!(workspace.map_source_path(Path::new("/elsewhere")), None);
     assert!(
         EncryptedWorkspace::lock(&directory.join("missing-parent"))
             .unwrap_err()
             .to_string()
-            .contains("failed to open encrypted workspace lock")
+            .contains("failed to open encrypted filesystem lock")
     );
     assert!(
-        EncryptedWorkspace::run_with_passphrase(
+        EncryptedWorkspace::run_hdiutil(
             &[OsStr::new("invalid-operation")],
-            b"passphrase",
+            b"passphrase\0",
             "run invalid hdiutil operation",
         )
         .await
@@ -284,171 +289,107 @@ async fn helpers_report_io_failures_and_unmounted_shutdown_is_idempotent() {
 }
 
 #[tokio::test]
-async fn initialize_reports_copy_and_metadata_write_failures() {
-    let directory = temporary_directory("initialize-errors-test");
+async fn migration_rejects_missing_images_and_identical_keys() {
+    let directory = temporary_directory("migration-errors");
     std::fs::create_dir_all(&directory).unwrap();
 
-    let missing_source = workspace(
-        directory.join("missing-source"),
-        directory.join("mapped"),
-        &directory.join("missing-state"),
-    );
     assert!(
-        missing_source
-            .initialize(&directory.join("missing.json"))
+        EncryptedWorkspace::migrate_key(&directory, b"same", b"same")
             .await
             .unwrap_err()
             .to_string()
-            .contains("failed to initialize encrypted workspace")
-    );
-
-    let source = directory.join("source");
-    std::fs::create_dir_all(&source).unwrap();
-    std::fs::write(source.join("file"), b"contents").unwrap();
-    let metadata_directory = directory.join("metadata-directory");
-    std::fs::create_dir_all(&metadata_directory).unwrap();
-    let workspace = workspace(
-        source,
-        directory.join("copied"),
-        &directory.join("write-state"),
+            .contains("must differ")
     );
     assert!(
-        workspace
-            .initialize(&metadata_directory)
+        EncryptedWorkspace::migrate_key(&directory, b"old", b"new")
             .await
             .unwrap_err()
             .to_string()
-            .contains("failed to write encrypted workspace metadata")
+            .contains("does not exist")
     );
 
     std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]
-async fn start_recovers_a_stale_mount_and_shutdown_detaches_it() {
-    let directory = temporary_directory("stale-mount-test");
-    let source = directory.join("source");
+async fn encrypted_volume_reuses_its_identity_and_migrates_its_key() {
+    let directory = temporary_directory("lifecycle");
     let workdir = directory.join("workdir");
-    std::fs::create_dir_all(&source).unwrap();
-    std::fs::write(source.join("file"), b"contents").unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
 
-    let mut first = EncryptedWorkspace::start(&workdir, &source, b"passphrase")
+    let mut first = EncryptedWorkspace::start(&workdir, b"old-passphrase")
         .await
         .unwrap();
-    assert!(EncryptedWorkspace::is_mount_point(&first.mount_point).unwrap());
-    first.mounted = false;
+    std::fs::write(first.root().join("persistent"), b"encrypted contents").unwrap();
+    let identity = first.read_volume_metadata().unwrap();
+    first.shutdown().await.unwrap();
     drop(first);
 
-    let mut recovered = EncryptedWorkspace::start(&workdir, &source, b"passphrase")
+    let wrong_key = EncryptedWorkspace::start(&workdir, b"wrong-passphrase")
+        .await
+        .unwrap_err();
+    assert!(
+        wrong_key.to_string().contains("key is incorrect"),
+        "{wrong_key:#}"
+    );
+
+    crate::runner::migrate_filesystem_key(&workdir, b"old-passphrase", b"new-passphrase")
         .await
         .unwrap();
-    assert!(EncryptedWorkspace::is_mount_point(&recovered.mount_point).unwrap());
-    recovered.shutdown().await.unwrap();
-    recovered.shutdown().await.unwrap();
-    assert!(!EncryptedWorkspace::is_mount_point(&recovered.mount_point).unwrap());
+    let mut migrated = EncryptedWorkspace::start(&workdir, b"new-passphrase")
+        .await
+        .unwrap();
+    let migrated_identity = migrated.read_volume_metadata().unwrap();
+    assert_eq!(migrated_identity.volume_id, identity.volume_id);
+    assert_ne!(migrated_identity.key_id, identity.key_id);
+    assert_eq!(
+        std::fs::read(migrated.root().join("persistent")).unwrap(),
+        b"encrypted contents"
+    );
+    migrated.shutdown().await.unwrap();
+    drop(migrated);
+
+    let old_key = EncryptedWorkspace::start(&workdir, b"old-passphrase")
+        .await
+        .unwrap_err();
+    assert!(
+        old_key.to_string().contains("key is incorrect"),
+        "{old_key:#}"
+    );
 
     std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]
-async fn drop_detaches_a_mounted_workspace() {
-    let directory = temporary_directory("drop-detach-test");
-    let source = directory.join("source");
+async fn encrypted_volume_rejects_corrupt_identity_and_detaches_before_returning() {
+    let directory = temporary_directory("corrupt-identity");
     let workdir = directory.join("workdir");
-    std::fs::create_dir_all(&source).unwrap();
-    std::fs::write(source.join("file"), b"contents").unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
 
-    let mount_point = {
-        let workspace = EncryptedWorkspace::start(&workdir, &source, b"passphrase")
-            .await
-            .unwrap();
-        assert!(EncryptedWorkspace::is_mount_point(&workspace.mount_point).unwrap());
-        workspace.mount_point.clone()
-    };
-    assert!(!EncryptedWorkspace::is_mount_point(&mount_point).unwrap());
-
-    std::fs::remove_dir_all(directory).unwrap();
-}
-
-#[tokio::test]
-async fn start_rejects_an_existing_image_without_its_mapped_directory() {
-    let directory = temporary_directory("missing-mapped-directory-test");
-    let source = directory.join("source");
-    let workdir = directory.join("workdir");
-    std::fs::create_dir_all(&source).unwrap();
-    std::fs::write(source.join("file"), b"contents").unwrap();
-
-    let mut workspace = EncryptedWorkspace::start(&workdir, &source, b"passphrase")
+    let mut workspace = EncryptedWorkspace::start(&workdir, b"passphrase")
         .await
         .unwrap();
-    std::fs::remove_dir_all(workspace.path()).unwrap();
+    std::fs::write(
+        workspace.volume_metadata_path(),
+        serde_json::to_vec(&VolumeMetadata {
+            version: METADATA_VERSION,
+            volume_id: "invalid".to_string(),
+            key_id: uuid::Uuid::new_v4().to_string(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
     workspace.shutdown().await.unwrap();
     drop(workspace);
 
-    let error = EncryptedWorkspace::start(&workdir, &source, b"passphrase")
-        .await
-        .err()
-        .expect("missing mapped directory must fail");
     assert!(
-        error
-            .to_string()
-            .contains("encrypted workspace directory is missing")
-    );
-    assert!(!EncryptedWorkspace::is_mount_point(&workdir.join("filesystem/mount")).unwrap());
-
-    std::fs::remove_dir_all(directory).unwrap();
-}
-
-#[tokio::test]
-async fn initialize_reports_an_unusable_destination_parent() {
-    let directory = temporary_directory("initialize-parent-error-test");
-    let source = directory.join("source");
-    let blocked_parent = directory.join("blocked-parent");
-    std::fs::create_dir_all(&source).unwrap();
-    std::fs::write(&blocked_parent, b"not a directory").unwrap();
-    let workspace = workspace(
-        source,
-        blocked_parent.join("mapped"),
-        &directory.join("state"),
-    );
-
-    assert!(
-        workspace
-            .initialize(&directory.join("workspace.json"))
+        EncryptedWorkspace::start(&workdir, b"passphrase")
             .await
             .unwrap_err()
             .to_string()
-            .contains("failed to create encrypted workspace parent")
+            .contains("invalid encrypted filesystem volume id")
     );
+    assert!(!EncryptedWorkspace::is_mount_point(&workdir.join("fs")).unwrap());
 
-    std::fs::remove_dir_all(directory).unwrap();
-}
-
-#[tokio::test]
-async fn start_removes_a_new_image_when_initial_copy_fails() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let directory = temporary_directory("initial-copy-rollback-test");
-    let source = directory.join("source");
-    let workdir = directory.join("workdir");
-    let unreadable = source.join("unreadable");
-    std::fs::create_dir_all(&source).unwrap();
-    std::fs::write(&unreadable, b"contents").unwrap();
-    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-    let error = EncryptedWorkspace::start(&workdir, &source, b"passphrase")
-        .await
-        .err()
-        .expect("an unreadable source must fail initialization");
-    assert!(
-        error
-            .to_string()
-            .contains("failed to initialize encrypted workspace")
-    );
-    assert!(!workdir.join("filesystem/workspace.sparsebundle").exists());
-    assert!(!workdir.join("filesystem/workspace.json").exists());
-    assert!(!EncryptedWorkspace::is_mount_point(&workdir.join("filesystem/mount")).unwrap());
-
-    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }

@@ -39,6 +39,8 @@ const EXECUTION_TOKEN: &str = "AGORA_SANDBOX_EXECUTION_TOKEN";
 #[cfg(target_os = "macos")]
 const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
 #[cfg(target_os = "macos")]
+const FILESYSTEM_ROOT: &str = "AGORA_SANDBOX_FILESYSTEM_ROOT";
+#[cfg(target_os = "macos")]
 const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
 #[cfg(target_os = "macos")]
 const TLS_TRUST_BUNDLE: &str = "AGORA_SANDBOX_TLS_TRUST_BUNDLE";
@@ -184,8 +186,9 @@ impl SandboxConfig {
             );
         }
         #[cfg(target_os = "macos")]
-        if let Some(key) = &self.encrypted_workspace_key {
-            EncryptedWorkspace::validate_passphrase(key.as_bytes())?;
+        match &self.encrypted_workspace_key {
+            Some(key) => EncryptedWorkspace::validate_passphrase(key.as_bytes())?,
+            None => bail!("sandbox filesystem key is required"),
         }
         if let Some(anchor) = &self.tls_trust_anchor
             && !anchor.is_file()
@@ -342,6 +345,7 @@ impl SandboxCommand {
         )
     }
 
+    #[cfg(test)]
     fn effective_current_dir(&self) -> Result<PathBuf> {
         let directory = match &self.current_dir {
             Some(directory) if directory.is_absolute() => directory.clone(),
@@ -366,15 +370,6 @@ impl SandboxCommand {
     #[cfg(target_os = "macos")]
     fn set_program(&mut self, program: PathBuf) {
         self.program = program.into_os_string();
-    }
-
-    #[cfg(target_os = "macos")]
-    fn set_current_dir(&mut self, current_dir: PathBuf) {
-        self.environment.insert(
-            OsString::from("PWD"),
-            current_dir.as_os_str().to_os_string(),
-        );
-        self.current_dir = Some(current_dir);
     }
 
     #[cfg(target_os = "macos")]
@@ -413,16 +408,11 @@ where
     pub async fn run(self, mut command: SandboxCommand) -> Result<SandboxOutcome> {
         self.config.validate()?;
         let callback = std::sync::Arc::new(self.callback);
-        let source_directory = command.effective_current_dir()?;
-        let mut encrypted_workspace = match self.config.encrypted_workspace_key() {
-            Some(key) => {
-                Some(EncryptedWorkspace::start(&self.config.workdir, &source_directory, key).await?)
-            }
-            None => None,
-        };
-        if let Some(workspace) = &encrypted_workspace {
-            command.set_current_dir(workspace.path().to_path_buf());
-        }
+        let key = self
+            .config
+            .encrypted_workspace_key()
+            .context("sandbox filesystem key is required")?;
+        let mut encrypted_workspace = EncryptedWorkspace::start(&self.config.workdir, key).await?;
         let tls_ca_files = self.config.tls_ca_for_workdir()?;
         let hook_library = self.config.hook_library.canonicalize().with_context(|| {
             format!(
@@ -477,7 +467,7 @@ where
                 }
             };
             let controller = ExecutionController::start_with_callback(
-                self.config.workdir.join("fs"),
+                encrypted_workspace.root().to_path_buf(),
                 sandbox_id.clone(),
                 run_id.clone(),
                 execution_callback,
@@ -485,10 +475,6 @@ where
             )
             .await?;
             let executable = command.resolved_program()?;
-            let executable = encrypted_workspace
-                .as_ref()
-                .and_then(|workspace| workspace.map_source_path(&executable))
-                .unwrap_or(executable);
             let prepared = controller.prepare(executable).await?;
             if let Some(shebang) = resolve_shebang(&prepared)? {
                 let interpreter = controller.prepare(shebang.interpreter).await?;
@@ -576,6 +562,7 @@ where
             .env(EXECUTION_CONTROL, execution_runtime.control().to_string())
             .env(EXECUTION_TOKEN, execution_runtime.token())
             .env(HOOK_LIBRARIES, &injected_libraries)
+            .env(FILESYSTEM_ROOT, encrypted_workspace.root())
             .env(TRACE_ID_ENVIRONMENT, trace.encode())
             .env("DYLD_INSERT_LIBRARIES", injected_libraries);
         let tls_trust_anchors = tls_trust_anchor_der
@@ -627,15 +614,14 @@ where
             .transpose();
         let shutdown = controller.shutdown().await;
         let execution_shutdown = execution.shutdown().await;
-        let filesystem_shutdown = match encrypted_workspace.as_mut() {
-            Some(workspace) => workspace.shutdown().await,
-            None => Ok(()),
-        };
+        let filesystem_shutdown = encrypted_workspace.shutdown().await;
         let status = status?;
         terminal_restore?;
         shutdown?;
         execution_shutdown?;
-        filesystem_shutdown?;
+        filesystem_shutdown.with_context(|| {
+            format!("sandbox child exited with status {status} before filesystem shutdown")
+        })?;
 
         Ok(SandboxOutcome {
             status,
@@ -658,6 +644,15 @@ where
         }
         std::env::join_paths(libraries).context("invalid DYLD_INSERT_LIBRARIES path")
     }
+}
+
+#[cfg(target_os = "macos")]
+pub async fn migrate_filesystem_key(
+    workdir: impl AsRef<Path>,
+    old_key: impl AsRef<[u8]>,
+    new_key: impl AsRef<[u8]>,
+) -> Result<()> {
+    EncryptedWorkspace::migrate_key(workdir.as_ref(), old_key.as_ref(), new_key.as_ref()).await
 }
 
 #[cfg(target_os = "macos")]

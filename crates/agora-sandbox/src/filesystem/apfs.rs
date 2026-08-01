@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File, OpenOptions};
@@ -9,112 +8,54 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use uuid::Uuid;
 
 const FILESYSTEM_DIRECTORY: &str = "filesystem";
-const IMAGE_NAME: &str = "workspace.sparsebundle";
-const MOUNT_DIRECTORY: &str = "mount";
-const LOCK_FILE: &str = ".lock";
-const METADATA_FILE: &str = "workspace.json";
+const IMAGE_NAME: &str = "fs.sparsebundle";
+const MOUNT_DIRECTORY: &str = "fs";
+const LOCK_FILE: &str = "fs.lock";
+const CONTROL_DIRECTORY: &str = ".agora";
+const VOLUME_METADATA_FILE: &str = "volume.json";
 const METADATA_VERSION: u32 = 1;
 const IMAGE_CAPACITY: &str = "100g";
 const MAX_KEY_SIZE: usize = 64 * 1024;
+const DETACH_ATTEMPTS: usize = 200;
+const DETACH_RETRY_DELAY: Duration = Duration::from_millis(50);
 
-#[derive(Deserialize, Serialize)]
-struct WorkspaceMetadata {
+#[derive(Debug, Deserialize, Serialize)]
+struct VolumeMetadata {
     version: u32,
-    source: String,
+    volume_id: String,
+    key_id: String,
 }
 
+#[derive(Debug)]
 pub(crate) struct EncryptedWorkspace {
-    source: PathBuf,
-    path: PathBuf,
     mount_point: PathBuf,
     _lock: File,
     mounted: bool,
 }
 
 impl EncryptedWorkspace {
-    pub(crate) async fn start(workdir: &Path, source: &Path, passphrase: &[u8]) -> Result<Self> {
+    pub(crate) async fn start(workdir: &Path, passphrase: &[u8]) -> Result<Self> {
         Self::validate_passphrase(passphrase)?;
-        let source = source.canonicalize().with_context(|| {
-            format!(
-                "failed to resolve encrypted workspace source {}",
-                source.display()
-            )
-        })?;
-        if !source.is_dir() {
-            bail!(
-                "encrypted workspace source is not a directory: {}",
-                source.display()
-            );
-        }
         let workdir = Self::resolved_destination(workdir)?;
-        if workdir.starts_with(&source) {
-            bail!(
-                "sandbox work directory must not be inside encrypted workspace source {}",
-                source.display()
-            );
-        }
-
         let directory = workdir.join(FILESYSTEM_DIRECTORY);
-        fs::create_dir_all(&directory).with_context(|| {
-            format!(
-                "failed to create encrypted filesystem directory {}",
-                directory.display()
-            )
-        })?;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).with_context(|| {
-            format!(
-                "failed to secure encrypted filesystem directory {}",
-                directory.display()
-            )
-        })?;
+        Self::prepare_directory(&directory)?;
         let lock = Self::lock(&directory)?;
-        let image = directory.join(IMAGE_NAME);
-        let metadata = directory.join(METADATA_FILE);
-        let mount_point = directory.join(MOUNT_DIRECTORY);
-        fs::create_dir_all(&mount_point).with_context(|| {
-            format!(
-                "failed to create encrypted filesystem mount point {}",
-                mount_point.display()
-            )
-        })?;
-        if Self::is_mount_point(&mount_point)? {
-            Self::detach(&mount_point)
-                .await
-                .context("failed to detach stale encrypted workspace mount")?;
-        }
-        fs::set_permissions(&mount_point, fs::Permissions::from_mode(0o700)).with_context(
-            || {
-                format!(
-                    "failed to secure encrypted filesystem mount point {}",
-                    mount_point.display()
-                )
-            },
-        )?;
+        let image = Self::image_path(&workdir);
+        let mount_point = Self::mount_point(&workdir);
+        Self::prepare_mount_point(&mount_point).await?;
 
         let image_exists = image.exists();
-        let metadata_exists = metadata.exists();
-        match (image_exists, metadata_exists) {
-            (false, true) => bail!(
-                "encrypted workspace metadata exists without its disk image: {}",
-                metadata.display()
-            ),
-            (true, false) => bail!(
-                "encrypted workspace disk image exists without metadata: {}",
-                image.display()
-            ),
-            _ => {}
-        }
         if !image_exists {
             Self::create_image(&image, passphrase).await?;
         }
 
         let mut workspace = Self {
-            source: source.clone(),
-            path: Self::mapped_path(&mount_point, &source)?,
             mount_point,
             _lock: lock,
             mounted: false,
@@ -126,37 +67,79 @@ impl EncryptedWorkspace {
             return Err(error);
         }
 
-        let initialized = if metadata_exists {
-            workspace.validate_metadata(&metadata)?;
-            if !workspace.path.is_dir() {
-                bail!(
-                    "encrypted workspace directory is missing: {}",
-                    workspace.path.display()
-                );
-            }
-            Ok(())
+        let initialized = if image_exists {
+            workspace.validate_volume_metadata()
         } else {
-            workspace.initialize(&metadata).await
+            workspace.initialize_volume_metadata()
         };
         if let Err(error) = initialized {
             let _ = workspace.shutdown().await;
             if !image_exists {
                 let _ = fs::remove_dir_all(&image);
-                let _ = fs::remove_file(&metadata);
             }
             return Err(error);
         }
         Ok(workspace)
     }
 
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
+    pub(crate) fn root(&self) -> &Path {
+        &self.mount_point
     }
 
-    pub(crate) fn map_source_path(&self, path: &Path) -> Option<PathBuf> {
-        path.strip_prefix(&self.source)
-            .ok()
-            .map(|relative| self.path.join(relative))
+    #[cfg(test)]
+    pub(crate) fn map_host_path(&self, path: &Path) -> Result<PathBuf> {
+        Self::mapped_path(&self.mount_point, path)
+    }
+
+    pub(crate) async fn migrate_key(
+        workdir: &Path,
+        old_passphrase: &[u8],
+        new_passphrase: &[u8],
+    ) -> Result<()> {
+        Self::validate_passphrase(old_passphrase)?;
+        Self::validate_passphrase(new_passphrase)?;
+        if old_passphrase == new_passphrase {
+            bail!("new filesystem key must differ from the current key");
+        }
+        let workdir = Self::resolved_destination(workdir)?;
+        let directory = workdir.join(FILESYSTEM_DIRECTORY);
+        Self::prepare_directory(&directory)?;
+        let lock = Self::lock(&directory)?;
+        let image = Self::image_path(&workdir);
+        if !image.exists() {
+            bail!(
+                "encrypted filesystem image does not exist: {}",
+                image.display()
+            );
+        }
+        let mount_point = Self::mount_point(&workdir);
+        Self::prepare_mount_point(&mount_point).await?;
+        let arguments = [
+            OsStr::new("chpass"),
+            OsStr::new("-oldstdinpass"),
+            OsStr::new("-newstdinpass"),
+            image.as_os_str(),
+        ];
+        let mut input = Vec::with_capacity(old_passphrase.len() + new_passphrase.len() + 2);
+        input.extend_from_slice(old_passphrase);
+        input.push(0);
+        input.extend_from_slice(new_passphrase);
+        input.push(0);
+        Self::run_hdiutil(&arguments, &input, "change encrypted filesystem key").await?;
+
+        let mut workspace = Self {
+            mount_point,
+            _lock: lock,
+            mounted: false,
+        };
+        workspace
+            .attach(&image, new_passphrase)
+            .await
+            .context("filesystem key changed but new key verification failed")?;
+        let migrated = workspace.update_key_id();
+        let shutdown = workspace.shutdown().await;
+        migrated?;
+        shutdown
     }
 
     pub(crate) async fn shutdown(&mut self) -> Result<()> {
@@ -168,29 +151,99 @@ impl EncryptedWorkspace {
         Ok(())
     }
 
-    async fn detach(mount_point: &Path) -> Result<()> {
-        let output = Command::new("/usr/bin/hdiutil")
-            .arg("detach")
-            .arg(mount_point)
-            .output()
-            .await
-            .context("failed to run hdiutil detach")?;
-        if !output.status.success() {
-            bail!(
-                "failed to detach encrypted workspace: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+    pub(crate) fn mount_point(workdir: &Path) -> PathBuf {
+        workdir.join(MOUNT_DIRECTORY)
+    }
+
+    pub(crate) fn image_path(workdir: &Path) -> PathBuf {
+        workdir.join(FILESYSTEM_DIRECTORY).join(IMAGE_NAME)
+    }
+
+    fn volume_metadata_path(&self) -> PathBuf {
+        self.mount_point
+            .join(CONTROL_DIRECTORY)
+            .join(VOLUME_METADATA_FILE)
+    }
+
+    fn prepare_directory(directory: &Path) -> Result<()> {
+        fs::create_dir_all(directory).with_context(|| {
+            format!(
+                "failed to create encrypted filesystem directory {}",
+                directory.display()
+            )
+        })?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!(
+                "failed to secure encrypted filesystem directory {}",
+                directory.display()
+            )
+        })
+    }
+
+    async fn prepare_mount_point(mount_point: &Path) -> Result<()> {
+        if mount_point.exists() && Self::is_mount_point(mount_point)? {
+            Self::detach(mount_point)
+                .await
+                .context("failed to detach stale encrypted filesystem mount")?;
         }
-        Ok(())
+        match fs::symlink_metadata(mount_point) {
+            Ok(metadata) if !metadata.is_dir() => bail!(
+                "encrypted filesystem mount point is not a directory: {}",
+                mount_point.display()
+            ),
+            Ok(_) => {
+                if fs::read_dir(mount_point)?.next().is_some() {
+                    bail!(
+                        "unencrypted filesystem data exists at {}; move or remove it before starting the sandbox",
+                        mount_point.display()
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(mount_point).with_context(|| {
+                    format!(
+                        "failed to create encrypted filesystem mount point {}",
+                        mount_point.display()
+                    )
+                })?;
+            }
+            Err(error) => return Err(error).context("failed to inspect filesystem mount point"),
+        }
+        fs::set_permissions(mount_point, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!(
+                "failed to secure encrypted filesystem mount point {}",
+                mount_point.display()
+            )
+        })
+    }
+
+    async fn detach(mount_point: &Path) -> Result<()> {
+        for attempt in 0..DETACH_ATTEMPTS {
+            let output = Command::new("/usr/bin/hdiutil")
+                .arg("detach")
+                .arg(mount_point)
+                .output()
+                .await
+                .context("failed to run hdiutil detach")?;
+            if output.status.success() {
+                return Ok(());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("Resource busy") || attempt + 1 == DETACH_ATTEMPTS {
+                bail!("failed to detach encrypted filesystem: {}", stderr.trim());
+            }
+            tokio::time::sleep(DETACH_RETRY_DELAY).await;
+        }
+        unreachable!("detach retry loop always returns")
     }
 
     fn is_mount_point(path: &Path) -> Result<bool> {
         let path_bytes = path.as_os_str().as_bytes();
-        let path = CString::new(path_bytes).context("encrypted workspace path contains NUL")?;
+        let path = CString::new(path_bytes).context("encrypted filesystem path contains NUL")?;
         let mut status = MaybeUninit::<libc::statfs>::zeroed();
         if unsafe { libc::statfs(path.as_ptr(), status.as_mut_ptr()) } != 0 {
             return Err(std::io::Error::last_os_error())
-                .context("failed to inspect encrypted workspace mount point");
+                .context("failed to inspect encrypted filesystem mount point");
         }
         let status = unsafe { status.assume_init() };
         let mounted_at = unsafe { CStr::from_ptr(status.f_mntonname.as_ptr()) };
@@ -208,21 +261,21 @@ impl EncryptedWorkspace {
         while !ancestor.exists() {
             let name = ancestor.file_name().with_context(|| {
                 format!(
-                    "encrypted workspace path cannot be resolved: {}",
+                    "encrypted filesystem path cannot be resolved: {}",
                     path.display()
                 )
             })?;
             missing.push(name.to_os_string());
             ancestor = ancestor.parent().with_context(|| {
                 format!(
-                    "encrypted workspace path cannot be resolved: {}",
+                    "encrypted filesystem path cannot be resolved: {}",
                     path.display()
                 )
             })?;
         }
         let mut resolved = ancestor.canonicalize().with_context(|| {
             format!(
-                "failed to resolve encrypted workspace parent {}",
+                "failed to resolve encrypted filesystem parent {}",
                 ancestor.display()
             )
         })?;
@@ -241,12 +294,15 @@ impl EncryptedWorkspace {
             .truncate(false)
             .open(&path)
             .with_context(|| {
-                format!("failed to open encrypted workspace lock {}", path.display())
+                format!(
+                    "failed to open encrypted filesystem lock {}",
+                    path.display()
+                )
             })?;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(std::io::Error::last_os_error()).with_context(|| {
                 format!(
-                    "encrypted workspace is already in use: {}",
+                    "encrypted filesystem is already in use: {}",
                     directory.display()
                 )
             });
@@ -256,13 +312,13 @@ impl EncryptedWorkspace {
 
     pub(crate) fn validate_passphrase(passphrase: &[u8]) -> Result<()> {
         if passphrase.is_empty() {
-            bail!("encrypted workspace key is empty");
+            bail!("encrypted filesystem key is empty");
         }
         if passphrase.len() > MAX_KEY_SIZE {
-            bail!("encrypted workspace key exceeds {MAX_KEY_SIZE} bytes");
+            bail!("encrypted filesystem key exceeds {MAX_KEY_SIZE} bytes");
         }
         if passphrase.contains(&0) {
-            bail!("encrypted workspace key contains a NUL byte");
+            bail!("encrypted filesystem key contains a NUL byte");
         }
         Ok(())
     }
@@ -283,10 +339,12 @@ impl EncryptedWorkspace {
             OsStr::new("-stdinpass"),
             image.as_os_str(),
         ];
-        Self::run_with_passphrase(&arguments, passphrase, "create encrypted workspace").await?;
+        let mut input = passphrase.to_vec();
+        input.push(0);
+        Self::run_hdiutil(&arguments, &input, "create encrypted filesystem").await?;
         fs::set_permissions(image, fs::Permissions::from_mode(0o700)).with_context(|| {
             format!(
-                "failed to secure encrypted workspace image {}",
+                "failed to secure encrypted filesystem image {}",
                 image.display()
             )
         })
@@ -303,14 +361,22 @@ impl EncryptedWorkspace {
             OsStr::new("-stdinpass"),
             image.as_os_str(),
         ];
-        Self::run_with_passphrase(&arguments, passphrase, "attach encrypted workspace").await?;
+        let mut input = passphrase.to_vec();
+        input.push(0);
+        Self::run_hdiutil(&arguments, &input, "attach encrypted filesystem")
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "encrypted filesystem key is incorrect or the image is unavailable; use migrate-key to change an existing key: {error:#}"
+                )
+            })?;
         self.mounted = true;
         Ok(())
     }
 
-    async fn run_with_passphrase(
+    async fn run_hdiutil(
         arguments: &[&OsStr],
-        passphrase: &[u8],
+        input: &[u8],
         operation: &'static str,
     ) -> Result<()> {
         let mut child = Command::new("/usr/bin/hdiutil")
@@ -320,13 +386,12 @@ impl EncryptedWorkspace {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("failed to {operation}"))?;
-        let mut input = child
+        let mut stdin = child
             .stdin
             .take()
             .context("hdiutil passphrase input is unavailable")?;
-        input.write_all(passphrase).await?;
-        input.write_all(&[0]).await?;
-        drop(input);
+        stdin.write_all(input).await?;
+        drop(stdin);
         let output = child
             .wait_with_output()
             .await
@@ -340,80 +405,74 @@ impl EncryptedWorkspace {
         Ok(())
     }
 
-    async fn initialize(&self, metadata_path: &Path) -> Result<()> {
-        let parent = self
-            .path
-            .parent()
-            .context("encrypted workspace path has no parent")?;
-        fs::create_dir_all(parent).with_context(|| {
+    fn initialize_volume_metadata(&self) -> Result<()> {
+        let control = self.mount_point.join(CONTROL_DIRECTORY);
+        fs::create_dir_all(&control).with_context(|| {
             format!(
-                "failed to create encrypted workspace parent {}",
-                parent.display()
+                "failed to create encrypted filesystem control directory {}",
+                control.display()
             )
         })?;
-        let output = Command::new("/usr/bin/ditto")
-            .arg("--noqtn")
-            .arg(&self.source)
-            .arg(&self.path)
-            .output()
-            .await
-            .context("failed to run ditto while initializing encrypted workspace")?;
-        if !output.status.success() {
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700))?;
+        self.write_volume_metadata(&VolumeMetadata {
+            version: METADATA_VERSION,
+            volume_id: Uuid::new_v4().to_string(),
+            key_id: Uuid::new_v4().to_string(),
+        })
+    }
+
+    fn validate_volume_metadata(&self) -> Result<()> {
+        let metadata = self.read_volume_metadata()?;
+        if metadata.version != METADATA_VERSION {
             bail!(
-                "failed to initialize encrypted workspace: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                "unsupported encrypted filesystem metadata version {}",
+                metadata.version
             );
         }
-        let metadata = WorkspaceMetadata {
-            version: METADATA_VERSION,
-            source: base64::engine::general_purpose::STANDARD
-                .encode(self.source.as_os_str().as_bytes()),
-        };
-        let contents = serde_json::to_vec_pretty(&metadata)
-            .context("failed to serialize encrypted workspace metadata")?;
-        fs::write(metadata_path, contents).with_context(|| {
+        Uuid::parse_str(&metadata.volume_id).context("invalid encrypted filesystem volume id")?;
+        Uuid::parse_str(&metadata.key_id).context("invalid encrypted filesystem key id")?;
+        Ok(())
+    }
+
+    fn update_key_id(&self) -> Result<()> {
+        let mut metadata = self.read_volume_metadata()?;
+        metadata.key_id = Uuid::new_v4().to_string();
+        self.write_volume_metadata(&metadata)
+    }
+
+    fn read_volume_metadata(&self) -> Result<VolumeMetadata> {
+        let path = self.volume_metadata_path();
+        let contents = fs::read(&path).with_context(|| {
             format!(
-                "failed to write encrypted workspace metadata {}",
-                metadata_path.display()
+                "failed to read encrypted filesystem metadata {}",
+                path.display()
+            )
+        })?;
+        serde_json::from_slice(&contents).with_context(|| {
+            format!(
+                "failed to parse encrypted filesystem metadata {}",
+                path.display()
             )
         })
     }
 
-    fn validate_metadata(&self, metadata_path: &Path) -> Result<()> {
-        let contents = fs::read(metadata_path).with_context(|| {
+    fn write_volume_metadata(&self, metadata: &VolumeMetadata) -> Result<()> {
+        let path = self.volume_metadata_path();
+        let contents = serde_json::to_vec_pretty(metadata)
+            .context("failed to serialize encrypted filesystem metadata")?;
+        fs::write(&path, contents).with_context(|| {
             format!(
-                "failed to read encrypted workspace metadata {}",
-                metadata_path.display()
+                "failed to write encrypted filesystem metadata {}",
+                path.display()
             )
-        })?;
-        let metadata: WorkspaceMetadata = serde_json::from_slice(&contents).with_context(|| {
-            format!(
-                "failed to parse encrypted workspace metadata {}",
-                metadata_path.display()
-            )
-        })?;
-        if metadata.version != METADATA_VERSION {
-            bail!(
-                "unsupported encrypted workspace metadata version {}",
-                metadata.version
-            );
-        }
-        let source = base64::engine::general_purpose::STANDARD
-            .decode(metadata.source)
-            .context("invalid encrypted workspace source metadata")?;
-        if source != self.source.as_os_str().as_bytes() {
-            bail!(
-                "encrypted workspace belongs to a different source directory: {}",
-                self.source.display()
-            );
-        }
-        Ok(())
+        })
     }
 
+    #[cfg(test)]
     fn mapped_path(mount_point: &Path, source: &Path) -> Result<PathBuf> {
         let relative = source.strip_prefix(Path::new("/")).with_context(|| {
             format!(
-                "encrypted workspace source is not absolute: {}",
+                "filesystem source path is not absolute: {}",
                 source.display()
             )
         })?;
@@ -424,14 +483,20 @@ impl EncryptedWorkspace {
         if !self.mounted {
             return;
         }
-        let status = std::process::Command::new("/usr/bin/hdiutil")
-            .arg("detach")
-            .arg(&self.mount_point)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if status.is_ok_and(|status| status.success()) {
-            self.mounted = false;
+        for attempt in 0..DETACH_ATTEMPTS {
+            let status = std::process::Command::new("/usr/bin/hdiutil")
+                .arg("detach")
+                .arg(&self.mount_point)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if status.is_ok_and(|status| status.success()) {
+                self.mounted = false;
+                return;
+            }
+            if attempt + 1 < DETACH_ATTEMPTS {
+                std::thread::sleep(DETACH_RETRY_DELAY);
+            }
         }
     }
 }

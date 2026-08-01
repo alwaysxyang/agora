@@ -79,7 +79,7 @@ fn process_event() -> ProcessEvent {
 
 #[test]
 fn callback_event_uses_stable_versioned_json_fields() {
-    let event = network_event();
+    let event = Event::Network(network_event());
     let value = serde_json::to_value(event.redacted()).unwrap();
 
     assert_eq!(value["schema_version"], EVENT_SCHEMA_VERSION);

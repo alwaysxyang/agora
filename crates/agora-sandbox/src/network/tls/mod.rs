@@ -3,13 +3,15 @@ mod io;
 
 #[cfg(test)]
 mod io_tests;
+#[cfg(test)]
+mod tests;
 
 pub(super) use certificate::TlsAuthority;
 
 use super::UpstreamConnection;
 use super::inspection::TlsClientHello;
 use super::relay::{RelayOutcome, relay_bidirectional};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 pub(super) use io::PrefixedIo;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -126,15 +128,30 @@ pub(crate) fn native_root_certificates() -> Result<Vec<CertificateDer<'static>>>
     }
 
     let native = rustls_native_certs::load_native_certs();
-    if native.certs.is_empty() {
+    let certificates = if native.certs.is_empty() {
         let details = native
             .errors
             .first()
             .map_or_else(|| "no certificates found".to_string(), ToString::to_string);
-        bail!("failed to load native TLS roots: {details}");
+        load_pem_root_certificates("/etc/ssl/cert.pem")
+            .with_context(|| format!("failed to load native TLS roots: {details}"))?
+    } else {
+        native.certs
+    };
+    let _ = CERTIFICATES.set(certificates.clone());
+    Ok(certificates)
+}
+
+fn load_pem_root_certificates(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let contents = std::fs::read(path)
+        .with_context(|| format!("failed to read fallback TLS roots from {path}"))?;
+    let certificates = rustls_pemfile::certs(&mut contents.as_slice())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to parse fallback TLS roots from {path}"))?;
+    if certificates.is_empty() {
+        bail!("fallback TLS root bundle contains no certificates: {path}");
     }
-    let _ = CERTIFICATES.set(native.certs.clone());
-    Ok(native.certs)
+    Ok(certificates)
 }
 
 pub(in crate::network) struct TlsConnection {

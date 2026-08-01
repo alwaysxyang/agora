@@ -209,7 +209,7 @@ async fn execution_controller_rejects_an_invalid_token() {
 
     assert!(prepared.is_file());
     controller.shutdown().await.unwrap();
-    assert!(directory.join(".lock").is_file());
+    assert!(directory.join(".agora/overlay.lock").is_file());
 }
 
 #[tokio::test]
@@ -503,6 +503,15 @@ async fn execution_controller_shutdown_reports_task_failures() {
             .to_string()
             .contains("injected execution controller failure")
     );
+}
+
+#[tokio::test]
+async fn execution_controller_shutdown_reports_aborted_tasks() {
+    let root = TestDirectory::new();
+    let mut controller = ExecutionController::start(root.cache()).await.unwrap();
+    controller.abort_tasks_for_test();
+
+    assert!(controller.shutdown().await.is_err());
 }
 
 #[tokio::test]
