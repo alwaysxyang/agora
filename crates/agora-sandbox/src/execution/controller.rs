@@ -18,9 +18,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use uuid::Uuid;
+
+const EXECUTION_MAX_CONNECTIONS: usize = 64;
+const EXECUTION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionRuntime {
@@ -213,6 +216,7 @@ where
 {
     listener: TcpListener,
     state: Arc<ExecutionState<C>>,
+    connections: Arc<Semaphore>,
 }
 
 impl<C> ExecutionServer<C>
@@ -220,7 +224,11 @@ where
     C: Callback,
 {
     fn new(listener: TcpListener, state: Arc<ExecutionState<C>>) -> Self {
-        Self { listener, state }
+        Self {
+            listener,
+            state,
+            connections: Arc::new(Semaphore::new(EXECUTION_MAX_CONNECTIONS)),
+        }
     }
 
     async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
@@ -233,12 +241,19 @@ where
                         break;
                     }
                 }
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
                 accepted = self.listener.accept() => {
                     let (stream, _) = accepted.context("sandbox execution accept failed")?;
+                    let Ok(permit) = Arc::clone(&self.connections).try_acquire_owned() else {
+                        drop(stream);
+                        continue;
+                    };
                     let state = Arc::clone(&self.state);
-                    connections.spawn(async move { Self::handle(stream, state).await });
+                    connections.spawn(async move {
+                        let _permit = permit;
+                        Self::handle(stream, state).await
+                    });
                 }
-                Some(_) = connections.join_next(), if !connections.is_empty() => {}
             }
         }
         connections.abort_all();
@@ -247,7 +262,10 @@ where
     }
 
     async fn handle(mut stream: TcpStream, state: Arc<ExecutionState<C>>) -> Result<()> {
-        let frame = Self::read_frame(&mut stream).await?;
+        let frame =
+            tokio::time::timeout(EXECUTION_HANDSHAKE_TIMEOUT, Self::read_frame(&mut stream))
+                .await
+                .context("sandbox execution handshake timed out")??;
         let request = decode_prepare_request(&frame)?;
         let response = if request.token != state.token {
             PrepareResponse::Error {

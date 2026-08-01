@@ -346,6 +346,70 @@ async fn execution_controller_isolates_a_malformed_hook_request() {
 }
 
 #[tokio::test]
+async fn execution_controller_closes_an_idle_handshake() {
+    let root = TestDirectory::new();
+    let controller = ExecutionController::start(root.cache()).await.unwrap();
+    let mut stream = TcpStream::connect(controller.runtime().control())
+        .await
+        .unwrap();
+    let mut byte = [0_u8; 1];
+
+    let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+        .await
+        .expect("idle execution handshake was not closed before the timeout");
+
+    assert_eq!(read.unwrap(), 0);
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn execution_controller_bounds_concurrent_handshakes() {
+    const MAX_CONNECTIONS: usize = 64;
+
+    let root = TestDirectory::new();
+    let controller = ExecutionController::start(root.cache()).await.unwrap();
+    let mut idle = Vec::with_capacity(MAX_CONNECTIONS);
+    for _ in 0..MAX_CONNECTIONS {
+        let mut stream = TcpStream::connect(controller.runtime().control())
+            .await
+            .unwrap();
+        stream.write_all(&[0]).await.unwrap();
+        idle.push(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let request =
+        encode_prepare_request(controller.runtime().token(), Path::new("/bin/sh")).unwrap();
+    let mut rejected = TcpStream::connect(controller.runtime().control())
+        .await
+        .unwrap();
+    rejected.write_all(&request).await.unwrap();
+    let mut byte = [0_u8; 1];
+    let read = tokio::time::timeout(Duration::from_millis(500), rejected.read(&mut byte))
+        .await
+        .expect("connection above the execution limit remained open");
+    assert!(matches!(read, Ok(0) | Err(_)));
+
+    drop(idle.pop());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut admitted = TcpStream::connect(controller.runtime().control())
+        .await
+        .unwrap();
+    admitted.write_all(&request).await.unwrap();
+    let mut prefix = [0_u8; 4];
+    admitted.read_exact(&mut prefix).await.unwrap();
+    let mut response = vec![0_u8; frame_length(prefix).unwrap()];
+    admitted.read_exact(&mut response).await.unwrap();
+    assert!(matches!(
+        decode_prepare_response(&response).unwrap(),
+        PrepareResponse::Ready(_)
+    ));
+
+    drop(idle);
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn execution_controller_isolates_an_invalid_command_trace() {
     let root = TestDirectory::new();
     let controller = ExecutionController::start(root.cache()).await.unwrap();

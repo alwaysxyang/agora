@@ -115,7 +115,12 @@ async fn websocket_once_forwards_events_and_answers_ack_ping_and_close() {
         socket.send(WebSocketMessage::Close(None)).await.unwrap();
     });
     let api = LarkApi::with_base_url(config(), endpoint.base_url()).unwrap();
-    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let (sender, mut receiver) = mpsc::channel::<LarkDelivery>(1);
+    let admitted = tokio::spawn(async move {
+        let (event, acknowledgement) = receiver.recv().await.unwrap().into_parts();
+        assert!(matches!(event, LarkEvent::Message(_)));
+        acknowledgement.send(200).unwrap();
+    });
     let mut connected = false;
 
     api.run_websocket_once(sender, &mut connected)
@@ -123,10 +128,7 @@ async fn websocket_once_forwards_events_and_answers_ack_ping_and_close() {
         .unwrap();
 
     assert!(connected);
-    assert!(matches!(
-        receiver.recv().await.unwrap().unwrap(),
-        LarkEvent::Message(_)
-    ));
+    admitted.await.unwrap();
     server.await.unwrap();
 }
 
@@ -176,7 +178,7 @@ async fn websocket_once_uses_the_configured_proxy_for_http_and_websocket() {
     let mut config = config();
     config.proxy = Some(format!("user:password@{proxy_address}").parse().unwrap());
     let api = LarkApi::with_base_url(config, "http://lark.openapi.test".to_string()).unwrap();
-    let (sender, _) = mpsc::unbounded_channel();
+    let (sender, _) = mpsc::channel(1);
     let mut connected = false;
 
     api.run_websocket_once(sender, &mut connected)
@@ -187,23 +189,29 @@ async fn websocket_once_uses_the_configured_proxy_for_http_and_websocket() {
     server.await.unwrap();
 }
 
-#[test]
-fn websocket_frame_routing_handles_control_unknown_ignore_invalid_and_closed_receivers() {
+#[tokio::test]
+async fn websocket_frame_routing_handles_control_unknown_ignore_invalid_and_closed_receivers() {
     let api = LarkApi::with_base_url(config(), "http://127.0.0.1:1".to_string()).unwrap();
-    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let (sender, mut receiver) = mpsc::channel(1);
 
-    assert!(api.handle_websocket_binary(b"invalid", &sender).is_err());
+    assert!(
+        api.handle_websocket_binary(b"invalid", &sender)
+            .await
+            .is_err()
+    );
 
     let mut control = LarkFrame::ping(42);
     assert_eq!(control.header("type"), Some("ping"));
     assert!(
         api.handle_websocket_binary(&control.encode_to_vec(), &sender)
+            .await
             .unwrap()
             .is_none()
     );
     control.method = 99;
     assert!(
         api.handle_websocket_binary(&control.encode_to_vec(), &sender)
+            .await
             .unwrap()
             .is_none()
     );
@@ -212,6 +220,7 @@ fn websocket_frame_routing_handles_control_unknown_ignore_invalid_and_closed_rec
     not_event.headers = vec![LarkFrameHeader::new("type", "other")];
     assert!(
         api.handle_websocket_binary(&not_event.encode_to_vec(), &sender)
+            .await
             .unwrap()
             .is_none()
     );
@@ -220,6 +229,7 @@ fn websocket_frame_routing_handles_control_unknown_ignore_invalid_and_closed_rec
         event_frame(br#"{"header":{"event_id":"evt_ignore","event_type":"other"}}"#.to_vec());
     let ack = api
         .handle_websocket_binary(&ignored.encode_to_vec(), &sender)
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -230,6 +240,7 @@ fn websocket_frame_routing_handles_control_unknown_ignore_invalid_and_closed_rec
     let invalid = event_frame(br#"{"header":{}}"#.to_vec());
     let ack = api
         .handle_websocket_binary(&invalid.encode_to_vec(), &sender)
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -238,15 +249,25 @@ fn websocket_frame_routing_handles_control_unknown_ignore_invalid_and_closed_rec
     );
 
     let message = event_frame(message_event_payload());
-    api.handle_websocket_binary(&message.encode_to_vec(), &sender)
-        .unwrap();
-    assert!(matches!(
-        receiver.try_recv().unwrap().unwrap(),
-        LarkEvent::Message(_)
-    ));
+    let payload = message.encode_to_vec();
+    let mut handled = Box::pin(api.handle_websocket_binary(&payload, &sender));
+    let delivery = tokio::select! {
+        result = &mut handled => panic!("lark event was acknowledged before admission: {result:?}"),
+        delivery = receiver.recv() => delivery.unwrap(),
+    };
+    let (event, acknowledgement) = delivery.into_parts();
+    assert!(matches!(event, LarkEvent::Message(_)));
+    acknowledgement.send(200).unwrap();
+    let ack = handled.await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&ack.payload).unwrap()["code"],
+        200
+    );
+
     drop(receiver);
     assert!(
         api.handle_websocket_binary(&message.encode_to_vec(), &sender)
+            .await
             .is_err()
     );
 }

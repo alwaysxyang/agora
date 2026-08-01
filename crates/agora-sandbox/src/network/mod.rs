@@ -27,6 +27,8 @@ use relay::RelayOutcome;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+pub(crate) use tls::native_root_certificates;
 use tls::{TlsAuthority, TlsBridge};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};

@@ -1,0 +1,341 @@
+# Agent Channel
+
+Agent Channel is the first concrete subsystem in Agora.
+
+A channel is a task input and run-event output adapter. It is not responsible for agent execution, planning, sandboxing, or artifact storage.
+
+## Responsibilities
+
+A channel implementation should:
+
+- Receive or poll tasks from an external source.
+- Normalize external messages into internal task envelopes.
+- Claim, acknowledge, or checkpoint task delivery where the channel supports it.
+- Publish run events back to the origin.
+- Send channel-native replies for daemon commands without forwarding those commands to an agent.
+- Apply channel-specific chunking, retry, rate limit, and formatting rules.
+
+A channel implementation should not:
+
+- Spawn agent commands directly.
+- Interpret private agent reasoning.
+- Decide global task plans.
+- Own sandbox policy.
+- Store long-term artifact lineage.
+
+## Initial Channels
+
+Planned order:
+
+1. Lark channel for the first end-to-end MVP.
+2. Telegram channel as the second active adapter and boundary validation.
+3. HTTP polling channel for generic integration.
+4. Local channel when a dedicated development adapter becomes useful.
+
+## Lark Channel Shape
+
+The first Lark MVP should receive IM messages through a local long-lived event subscription and send output through an interactive card.
+
+The receive side must be implemented inside `agora-node` as a native WebSocket long connection based on the official Lark/Feishu long-connection documentation and official SDK protocol behavior. It must not depend on local developer CLIs, shell commands, or third-party Lark channel wrapper crates. The channel adapter should request the Lark WebSocket endpoint with the configured app credentials and consume `im.message.receive_v1` events through a capacity-one delivery boundary. It acknowledges a supported event with code `200` only after permission checks and task normalization, including attachment downloads, have completed. A normalization failure is acknowledged with code `500` so Lark can redeliver it. The WebSocket reader waits for this admission result before accepting another supported event, preventing an unbounded local queue.
+
+The Lark implementation lives under `channel/lark/`. `lark_api.rs` owns the concrete Lark transport client, app credentials, shared HTTP client, WebSocket protocol, tenant token acquisition, card sending, and card patching. `channel.rs` owns event parsing, task normalization, receive-loop composition, and the generic `Channel` implementation. `card.rs` owns card state, rendering, and update delivery. `mod.rs` publicly re-exports only the stable `LarkChannel`, `LarkTask`, and `LarkRun` boundary types required by the public `Channel` trait. Lark configuration belongs to the public `config` module. The API client, protocol frames, event payloads, reply targets, receiver, and card implementation are visible only inside `channel::lark`, not to other crate modules.
+
+The Lark receive loop is long-lived. It should log channel startup, connection attempts, successful connections, normal disconnects, and startup or post-connection failures without logging credentials or WebSocket endpoint URLs. If the WebSocket is closed, endpoint bootstrap fails, or the local network is temporarily unavailable, the channel should log the failure and reconnect indefinitely with bounded backoff. A bad or unsupported event payload must not terminate the daemon process.
+
+The transport should classify frames by `header.event_type` before parsing an agent task. `im.message.receive_v1` becomes a message task. Other well-formed event types, including `im.message.message_read_v1`, produce an explicit ignore result that retains the event type, are acknowledged with code `200`, and are neither queued nor logged as errors. Malformed JSON and events without `header.event_type` remain parsing errors.
+
+For supported incoming messages, the Lark channel should log the channel name, session, sender, message id, normalized text, and attachment count before handing the task to the daemon.
+
+Lark HTTP calls, including WebSocket endpoint bootstrap and card API calls, should allow at most 10 idle connections per host, close idle connections after 300 seconds, use a 10-second connect timeout, and use a 60-second total request timeout.
+
+For the first Rust implementation, endpoint bootstrap should call the official long-connection endpoint path `/callback/ws/endpoint` with `AppID` and `AppSecret`, then connect to the returned `wss://...` URL. WebSocket event frames should be decoded from the protobuf frame shape used by the official SDK: headers carry values such as `type`, `message_id`, `trace_id`, `sum`, and `seq`, while the event JSON sits in the frame payload. The ACK should reuse the received event frame headers, add `biz_rt`, and set the payload to a JSON response with HTTP-style `code`.
+
+Expected shape:
+
+```text
+Lark WebSocket message event
+  -> channel normalizes text and image references
+  -> channel downloads referenced message images into neutral task attachments
+daemon finds agents subscribed to the channel
+  -> daemon starts one run per subscribed agent
+first run event
+  -> channel replies to the source message with one interactive card for that agent
+output from one agent
+  -> channel updates that agent's card by message_id
+each agent run completes, fails, or is stopped
+  -> channel performs that agent card's final update
+```
+
+Messages whose trimmed text starts with `/` are node commands, not ordinary agent input. `CommandRuntime` resolves them through an immutable recursive command registry before the daemon opens agent runs. Each registered node may have a default handler, child commands, or both; an exact child match takes precedence over the current node's default handler. `/stop` cancels every active or queued run in the current `(channel_name, session_id)` conversation; `/stop {agent_name}` limits cancellation to that configured agent in the same conversation. `/reset` resets every agent subscribed to the current channel for the command's conversation and does not accept an agent argument. `/ask {agent_name} {prompt...}` routes the prompt only to the named agent subscribed to the current channel. This one invocation bypasses the current frontend conversation's disabled-agent filter without changing its persisted enablement state. `/ask disable {agent_name}` and `/ask enable {agent_name}` control whether one subscribed agent receives subsequent ordinary messages in the current frontend conversation. `/ask list` reports every current subscription and `/ask status {agent_name}` reports one. `/help` lists top-level command entries only. `/{command path} help`, including `/stop help`, `/reset help`, `/ask help`, and `/ask enable help`, is generated from the selected command node; `/ask` without its required default-handler arguments displays the same node help. Unknown commands, unsubscribed agent names, and invalid arguments receive a channel-native reply and must not reach any agent.
+
+The command subsystem owns parsing, validation, generated help, and command execution. `stop`, `reset`, and `ask` each own their command subtree and capture only the concrete shared state they need. `AgentDispatcher` remains responsible for enabled-agent filtering of ordinary input, FIFO admission, agent execution, backend-session mapping, and run-event publication; it exposes no command-specific stop, reset, status, enable, disable, or targeted-ask methods. Daemon composition sees only `CommandRuntime::handle` and its neutral pass-through, reply, or selected-agent dispatch outcome.
+
+Agent enablement is independent of backend session isolation. Its identity is always `(channel_name, channel_session_id, agent_name)`, including when the agent uses `none` isolation. Disabling an agent does not stop or remove existing running or queued tasks and does not delete its backend session; filtering happens before the daemon opens a run for a later ordinary task. A targeted `/ask {agent_name} {prompt...}` is an explicit per-request override and may open a run for that disabled agent, while leaving the denylist row unchanged. If no subscribed agent is enabled, an ordinary message receives a reply that the conversation has no enabled agents instead of being silently dropped.
+
+Channels may also deliver a structured `CommandRequest` separately from message text. A generic request contains a command path plus named string arguments and carries no channel-specific action enum. Interactive command replies may use a neutral `ChannelButton` containing display text, style, and one request. A running agent instead receives an optional `InterruptCallback` through `ChannelRunContext`; this callback targets that exact run and carries no command path or channel presentation metadata. Lark registers the callback behind a private opaque id and renders an `结束任务` button whose callback value uses the reserved `agora_interrupt` field. Telegram currently ignores the optional callback while preserving textual output.
+
+The Lark run card uses this boundary for its `结束任务` button. Each card owns one registration whose opaque id resolves to the callback for exactly one execution ticket's `AgentRunControl`; triggering it is one-shot, removes the registration, and stops only that run. Dropping the card run removes an unused registration. This callback is handled entirely inside the Lark channel and never enters `CommandRuntime`. The Lark `/ask list` card separately uses `ChannelButton` for one `启用` or `禁用` command at the right of each agent row. That request carries the agent name; the ask command applies it to the callback event's channel session and returns a refreshed neutral list. Structured commands are consumed by `CommandRuntime` and must never be forwarded to an agent.
+
+The channel receive loop remains active while agent runs execute so a stop or reset command can be accepted immediately. `ExecutionScheduler` keeps one process-local ticket for every queued or running task and removes it when its run future ends. On Unix, each command-helper invocation runs in its own process group. Cancelling a command-based run drops its execution future and terminates that complete group rather than only the direct backend child. When the direct child exits normally, the helper also terminates residual descendants before draining inherited output pipes, so a descendant cannot keep the run open by retaining stdout or stderr. `/stop` does not remove or change the persisted session mapping.
+
+When a running or queued task is cancelled, the daemon releases that task's execution ticket before publishing its terminal card state. Later tasks for the same `SessionKey` therefore move forward immediately, without waiting for the stopped card's network update to finish.
+
+`/reset` derives the same `SessionKey` used by normal dispatch for each subscribed agent, places a non-run barrier in `ExecutionScheduler` for every affected FIFO, and stops all active or queued runs using those keys before deleting any mapping. New tasks for an affected key wait behind the barrier and therefore cannot resume the old session or race with mapping deletion. Barriers participate in ordering but are not exposed as cancellable agent runs or counted during shutdown. In `session`, only the command's channel-qualified conversation is affected. In `none`, the key is agent-wide, so runs and the shared backend session are reset across all channel conversations for that agent.
+
+Backend session deletion is an optional agent capability. When a mapping exists, the daemon asks the agent to delete the opaque backend session before conditionally removing the SQLite row. `CodexAgent` performs `codex delete --force {session_id}`; the custom command agent reports deletion as unsupported, in which case the daemon still removes the local mapping. If a supported backend deletion fails, the mapping is preserved and the channel receives a reset-failed reply. A successful reset leaves no mapping, so the next task starts a fresh backend session.
+
+Each card must use Lark card JSON 2.0, place components under `body.elements`, and set `config.update_multi` to `true` before and after updates. JSON 2.0 is required so standard Markdown block quotes render instead of displaying the `>` prefix literally; this requires Lark client 7.20 or newer. The initial card should reply to the incoming Lark message through `/open-apis/im/v1/messages/{message_id}/reply` with `msg_type=interactive` and `reply_in_thread=true`. This creates or joins the message thread rooted at the incoming message, so the user's request remains the visible topic context. The returned reply message id becomes the target for later card patches. The channel must not send the initial card as an unrelated chat message.
+
+When multiple agents consume the same incoming message, each agent creates its own card reply in that message thread. All cards therefore share the same user-message topic while remaining independently updateable by reply message id.
+
+The card header is the lifecycle indicator. It contains the agent name and a compact `排队中`, `运行中`, `已完成`, `失败`, `已停止`, or `已中断` status instead of repeating lifecycle prose in the body. The body uses one lightly framed process panel and keeps the final answer visually distinct:
+
+- Keep all `Thinking`, `CommandExecution`, and `Progress` entries available in memory and render them in one native JSON 2.0 `collapsible_panel` titled `任务过程`, with a `grey-50` background, `grey-200` border, `8px` corner radius, and compact body padding. Do not render separate thinking and progress panels. When the rendered process would exceed its 160-element budget, remove the oldest complete phases from that card snapshot, preserve the newest phases, and show the number of omitted phases; this does not discard the in-memory run state.
+- Treat each `Thinking` event as the start of a numbered display phase. Attach subsequent new `CommandExecution` and `Progress` events to that phase until another `Thinking` event arrives. This grouping communicates event order only; it must not be described as an agent-provided causal relationship. Execution received before the first thinking event belongs to an untitled phase rather than fabricated reasoning.
+- Order phases oldest first so new thinking appears at the bottom, and number them sequentially from `01`. Order entries within each phase newest first. Updating an existing command or progress id keeps it in its original phase, updates its status and text, and moves it to the top of that phase.
+- In the `任务过程` header, show the phase count and every nonzero progress status count. Use the same status symbols as the entries: a green check for completed, a blue dot for running, a red cross for failed, and a grey square for stopped.
+- Render each phase as an unframed group inside the single process panel. Prefix its reasoning summary with a compact chronological phase number and matching `✦` marker, both in blue. Separate phases with whitespace instead of nesting additional cards or panels.
+- Render every `CommandExecution` as one compact light console under its phase. A single light-grey outer container must wrap both the toolbar and command block so they read as one component. Put `SHELL` on the left and the semantic-color command status on the right of the toolbar, then render the complete backend command inside the same container as a native fenced `bash` Markdown code block with a `$` prompt. Do not truncate the command or fabricate an ellipsis. The native code block owns monospace syntax presentation and horizontal scrolling for long lines; the outer process panel owns collapse and expansion. Show `Running` while active, `Stopped` after cancellation, and `exit {code}` when the backend supplies a terminal exit code. Keep file changes, plans, intermediate agent messages, and other `Progress` entries outside the console as concise status-marked text. Use a green check for completed entries, a red cross for failed entries, a blue dot for running entries, and a grey square for stopped entries.
+- When a run is waiting behind tasks with the same `(channel_name, session_id, agent_name)` key, render a grey `排队中` header and the placeholder `> 正在排队，前面还有 {ahead} 个任务...`. Refresh `ahead` whenever an earlier task leaves the queue. When the run reaches the front, the daemon publishes `Started` and the card switches to the blue `运行中` state.
+- While a run is active, keep `任务过程` expanded. After a run completes, fails, or is stopped, keep it collapsed by default.
+- Render the final answer in a separate, visually prominent `最终回答` section whose heading starts with a blue vertical marker.
+- On failure, keep the red `失败` lifecycle header and render an always-visible `任务失败` section with a red vertical marker, a safe error category, and retry guidance. Put the category's technical note in a collapsed `技术详情` panel. Do not expose the raw error, command, stack trace, credentials, or other potentially sensitive details in the card; keep the complete error in daemon logs.
+- If answer content already exists when a run fails, preserve it after the failure section but label it `部分回答` instead of `最终回答`.
+- On stop, use a neutral grey `已停止` header, preserve all existing `Thinking` and `Progress` output, mark still-running progress entries as stopped, and show an always-visible `任务已停止` section. Preserve existing answer content as `部分回答`.
+- While a run is queued or running, render one bottom-right danger button labeled `结束任务`. Use a Lark card callback behavior whose value contains `agora_interrupt` and an opaque id owned by that channel instance. Remove the button from completed, failed, stopped, and interrupted snapshots. The Lark app must subscribe to `card.action.trigger` over the same long connection; callback frames are acknowledged promptly, then the channel resolves and invokes the callback without creating a command task.
+- When the node begins a graceful shutdown, send `RunEvent::Interrupted` to every running or queued run before dropping the daemon future. Use an orange `已中断` header, preserve existing output, mark still-running progress entries as stopped, and show `任务已中断` with `Agora Node 即将退出，本次任务已中断，当前输出已保留。` followed by `Node 恢复后，请重新发送消息继续。`. Preserve existing answer content as `部分回答`. Do not expose the raw signal or failure reason in the card; keep it in daemon logs.
+- When token usage is available, render the completed run's `Total`, `Input`, `Output`, and `Reasoning` values as four equal notation-sized columns without a separate usage heading. Keep the compact usage terminology in English: show `cached` input beneath `Input`, use `tokens` as the unit, and identify `Reasoning` as `of output`.
+- Keep the final answer and token usage outside the collapsible panels so they remain visible. Preserve the latest progress entries after completion while keeping the final answer as the primary content.
+
+Before the first agent output arrives, a running card should render one blockquote placeholder, `> 正在等待 Agent 输出...`, so Lark does not display an empty card body. The placeholder disappears as soon as `Thinking`, `Progress`, or `Answer` content is available. Starting or successfully completing a run must not append additional lifecycle prose to the body.
+
+Card updates should use latest-state coalescing rather than a backlog of output patches. The channel should keep only the newest card snapshot, publish ordinary intermediate changes no more often than once every 400 milliseconds, and flush terminal completed, failed, stopped, or interrupted state immediately. The initial reply and terminal flush must report delivery failures to the caller. Intermediate patch failures should be logged and may be superseded by a later snapshot. Because PATCH is idempotent, transient transport failures, HTTP 429 responses, and HTTP 5xx responses are retried up to three times with a short exponential backoff; the non-idempotent initial reply is not retried.
+
+When multiple agents subscribe to the same Lark channel, the daemon should open one channel run per agent. Each run produces an independent card whose content and title identify the replying agent.
+
+Process phases and their `Thinking`, `CommandExecution`, and `Progress` entries remain unbounded in run state, but a rendered Lark snapshot reserves at most 160 nested process elements within the platform's 200-element card limit. When the process exceeds that budget, retain the newest complete phases first, trim the oldest entries from an oversized remaining phase, and prepend a visible notice that earlier process history was omitted. The final answer retains its independent size limit and adds an `输出已截断` marker when user-visible answer content has been dropped.
+
+Reply targets should be derived from incoming channel events, not daemon CLI flags. For `im.message.receive_v1`, the source `message_id` is the reply target. The `chat_id` remains the channel session id and must not be used to send an unrelated initial card.
+
+Structured command replies remain channel-neutral. For `/ask list`, Lark replies in the source message thread with a compact JSON 2.0 `当前对话的 Agent 状态` card, displays the current-conversation scope, and renders exactly one right-aligned `启用` or `禁用` button for each subscribed agent. A button callback patches the original status card using `event.context.open_message_id`; it must not create a new reply for every toggle. `/ask status` and text-based enable or disable commands render a compact single-agent status card without a button. Registry-generated root, node, and leaf help use neutral multiline text replies so every channel can render the same command reference without interactive-card knowledge. Telegram renders the same neutral list or status as text and does not imitate unsupported interactive controls.
+
+The MVP processes `text`, `post`, and `image` messages. A `post` retains its text and every inline `image_key`; an `image` message contributes an image without text. Before dispatch, the Lark channel downloads each image through `/open-apis/im/v1/messages/{message_id}/resources/{image_key}?type=image` and places its MIME type and bytes in a neutral task attachment. A download failure fails that channel receive operation instead of silently dropping the image. Card messages, files, audio, video, and other rich message types remain unsupported.
+
+## Telegram Channel Shape
+
+The Telegram implementation lives under `channel/telegram/`. `telegram_api.rs` owns the concrete Bot API client, token, shared HTTP client, update polling, Rich Message delivery, edits, and rate-limit retry. `channel.rs` owns task normalization, session derivation, command addressing, receive-loop composition, and the generic `Channel` implementation. `rich_message.rs` owns run state, Rich Markdown rendering, coalescing, heartbeat, and terminal delivery. The parent `channel` module can construct and aggregate the Telegram channel boundary types, but the API client and renderer remain private to `channel::telegram`.
+
+The receive side uses `getUpdates` long polling with an in-memory offset. It accepts only text messages from private chats, groups, and supergroups. The update id is the task id. A normal chat uses `chat:{chat_id}` as its channel session; a forum topic uses `chat:{chat_id}:topic:{message_thread_id}`. Commands suffixed with the current bot username, such as `/stop@agora_bot`, are normalized before daemon command routing. Commands explicitly addressed to another bot are ignored.
+
+Each subscribed agent opens an independent Telegram run. In a private chat, ordinary updates use `sendRichMessageDraft`; a heartbeat refreshes an unchanged draft before Telegram's draft lifetime expires, and a terminal event sends exactly one persistent Rich Message. In a group or forum topic, the run sends one persistent Rich Message and applies later snapshots with `editMessageText`. Topic output retains the source `message_thread_id`. The channel coalesces ordinary snapshots and flushes terminal state immediately, so a slow Telegram request does not create an unbounded queue of stale render updates.
+
+Rich Markdown renders one collapsible `任务过程` `<details>` section. Each `Thinking` event starts a numbered phase, and subsequent new `CommandExecution` and `Progress` events remain in that phase until the next thinking event. Updating an existing entry by id keeps it in its original phase. Phases and their entries are rendered oldest first so the latest activity appears at the bottom. Commands use terminal-style `SHELL` blocks with complete escaped command text, status, and an exit code when supplied. The process section stays open while running and collapses after a terminal event. Process state remains unbounded in memory; a Telegram snapshot that approaches platform limits removes the oldest complete phases first and reports the omission while preserving the newest phases, final answer, and usage. The agent's final Markdown answer remains unmodified. Terminal failed, stopped, and interrupted states retain available process and partial-answer content while presenting the same centralized Chinese user-facing copy as Lark. Raw transport failures and credentials stay in local logs. Telegram image and file input, webhook intake, persisted update offsets, and subscription filters beyond conversation-scoped `/ask` controls remain outside this MVP.
+
+All fixed node-authored user-facing copy is centralized under `agora-node/src/i18n/`, with the current catalog in `zh_cn.rs`. Channel renderers own only channel-specific Markdown, card JSON, colors, icons, and layout. Protocol field names, internal validation errors, logs, and agent-produced `Thinking`, `Progress`, and `Answer` text are not localized or rewritten.
+
+## HTTP Channel Shape
+
+HTTP task intake should use polling because it works from local nodes behind NAT and firewalls.
+
+Output should use WebSocket because agent execution is naturally streaming.
+
+Expected shape:
+
+```text
+node -> server: poll tasks
+node -> server: claim task or renew lease
+node -> server: open run event WebSocket
+node -> server: stream run events
+node -> server: complete or fail task
+```
+
+WebSocket messages should be structured run events, not raw terminal bytes.
+
+Example event kinds:
+
+- `run.started`
+- `output.chunk`
+- `output.truncated`
+- `run.completed`
+- `run.failed`
+- `run.cancelled`
+- `heartbeat`
+
+Each event should eventually carry a run id and monotonically increasing sequence number so reconnect and replay can be supported.
+
+## Agent Boundary
+
+Channel adapters should communicate with the daemon in terms of tasks and run events.
+
+`ChannelTaskInput` is the channel-independent receive contract from the top-level `task` module. `Message(TaskContent)` carries text plus zero or more typed attachments; `Command(CommandRequest)` carries a structured command path and named arguments. Attachment bytes are shared when one message task is cloned for multiple subscribed agents. Neither variant contains Lark resource keys, callback payload shapes, cards, or agent backend details.
+
+The daemon should communicate with configured agents in terms of agent tasks, optional opaque backend session ids, streamed output, and completion outcomes. It must not construct backend commands or parse backend protocols. The daemon may persist the neutral association between a channel session and an agent session, but only the agent implementation interprets that backend session id.
+
+Each agent implementation owns its execution strategy. A command-based agent may use `agent::command` for child-process startup, stdin, stdout, stderr, and exit status. Another agent may implement a PTY, sandbox, or network execution strategy without changing the daemon or the command helper.
+
+The command helper is deliberately lower level than an agent. It has no output-format enum and knows nothing about Codex JSONL, session resume, channels, cards, or run events.
+
+## Structured Agent Output
+
+The Agent-to-daemon output boundary should carry semantic, backend-neutral events rather than undifferentiated text. The first event model needs these concepts:
+
+- `Thinking`: a user-visible reasoning summary supplied by the agent backend.
+- `Progress`: an identified operation with concise text and a running, completed, failed, or stopped status. Reusing an id updates an existing operation instead of duplicating it.
+- `CommandExecution`: an identified, complete backend command with a running, completed, failed, or stopped status and an optional backend-reported exit code. The agent adapter must not normalize, sanitize, or truncate the command. Keeping this semantic distinction in the neutral boundary lets each channel choose a terminal-native presentation without parsing agent-authored text.
+- `Answer`: user-facing answer text. Multiple chunks append in order when a backend supports answer deltas.
+- `Usage`: backend-reported input, cached input, output, and reasoning-output token counts for one completed run.
+
+These events describe presentation semantics without exposing Codex, Lark, JSONL, cards, or another adapter's protocol. An agent owns backend event classification. The daemon forwards the neutral event without interpreting its text. A channel owns presentation, truncation, coalescing, and rate limiting.
+
+The boundary must not expose or reconstruct private chain-of-thought. `Thinking` is limited to reasoning summaries or intermediate commentary that the backend explicitly emits for user consumption.
+
+## Autonomy And Dependency Rule
+
+Every agent and every channel is autonomous. An agent and a channel must not import, call, configure, or otherwise depend on each other's implementation.
+
+An agent owns:
+
+- Backend execution strategy.
+- Backend protocol and output decoding.
+- Backend-specific session arguments and session-result classification.
+
+A channel owns:
+
+- External connection and authentication state.
+- Message receipt, acknowledgement, retry, and reconnection.
+- Channel-native sender, conversation, group, and mention identity extraction.
+- Enforcement of the configured channel permission policy before task delivery.
+- Channel-specific reply targets, formatting, rate limits, and updates.
+
+Channel permission enforcement happens before the daemon boundary. Private messages require an allowed sender. Group messages require both an allowed sender and an allowed group, followed by the selected group's optional mention requirement. Missing permission configuration denies all access; `*` is the explicit allow-all value. Exact group rules take precedence over the wildcard group rule. Unauthorized events never create a `ChannelTask`. A denied private message receives the denial reason, observed channel-native identifiers, and a configuration example. A denied group message receives that guidance only when it explicitly mentions the current bot; otherwise it is consumed silently to avoid adding noise to ordinary group conversation. Structured actions use the same identity policy without a mention requirement and retain their denial reply. The shared permission layer provides only structured denial content: channel name, user id, optional group id, reason, and the configuration example. The example keeps the real `channels` and `permission` hierarchy while replacing unrelated existing channel fields with a JSONC `// ...` placeholder; it does not invent channel-specific type, name, or credential fields. Each concrete channel owns the complete presentation. Lark renders its own JSON 2.0 card and Markdown layout; Telegram independently renders Rich Markdown.
+
+The daemon is the composition boundary. It converts a channel task into an agent task and adapts agent output and outcomes into channel run events. Shared contracts at this boundary must stay neutral: they must not expose Lark, Codex, PTY, card, or other adapter-specific details.
+
+The daemon derives a neutral `IsolationScope` from the configured agent mode and channel session. The daemon and local store own the association from `(agent_name, isolation_scope)` to an opaque `agent_session_id`. They do not inspect the backend id or decide how an agent resumes it. The channel and agent implementations remain independent of the store and of each other.
+
+The daemon is a long-running process. A transient channel receive error, closed channel connection, or failed task reply should be logged and isolated to that channel or task; it should not stop the whole daemon. Channel implementations remain responsible for their own external reconnection semantics.
+
+External setup and I/O failures must be returned or logged as errors; the node must not panic while initializing logging, its async runtime, channel HTTP clients, or reply state.
+
+```text
+Channel task
+  -> daemon run
+  -> session-store lookup
+  -> configured agent
+  -> agent-owned execution and output decoding
+  -> session-store update
+  -> channel run event
+```
+
+## Command-Based Agents And Session Resume
+
+The first Codex and custom agent implementations execute one child process per accepted channel message. Task input is written to the child stdin, stdout and stderr are delivered to the agent implementation, and child exit terminates the run.
+
+The child process remains one-shot, while Codex conversation context is associated with the configured isolation scope and survives daemon restarts. In `none`, all channel conversations for one configured agent resolve to one shared scope. In `session`, each `(channel_name, channel_session_id)` resolves to a separate scope. Both modes execute in the configured workspace. A first turn uses `codex exec --json --color never [configured options] -`; a mapped turn uses `codex exec resume --json [configured options] {thread_id} -`. Optional model, effort, and backend `agent_sandbox` settings are owned by `CodexAgent` and applied to both forms. The agent sandbox is distinct from session isolation and Agora's future runtime sandbox.
+
+Codex JSONL output provides the thread id through `thread.started`. `CodexAgent` keeps the event format internal and maps supported events to neutral output:
+
+- Completed `reasoning` items become `Thinking` summaries.
+- Started, updated, and completed command execution items update one `CommandExecution` entry by item id; every update preserves the complete backend command and terminal items retain their optional `exit_code`.
+- File changes, todo lists, and other concise execution milestones become `Progress` entries.
+- The latest pending `agent_message` becomes `Answer` when `turn.completed` arrives.
+- A valid `turn.completed.usage` object becomes `Usage`. Input plus Output forms Total; Cached Input and Reasoning Output are subsets and must not be added again.
+- An earlier `agent_message` followed by more work becomes intermediate progress instead of a final answer.
+
+`CodexAgent` returns a neutral session update containing the thread id discovered from `thread.started` and owns native deletion of that thread when requested. Backend session ids remain opaque outside the agent and must not enter the channel abstraction. The one-shot `codex exec --json` stream does not provide answer token deltas, so the final answer may appear as one update. True answer-delta streaming through Codex app-server is follow-up work.
+
+Raw Codex stderr is backend diagnostic output rather than agent reply content. After classifying backend-specific session errors, `CodexAgent` writes remaining stderr to the local node log and does not publish it to channels. Structured Codex JSONL `error` and `turn.failed` messages remain user-visible agent output.
+
+The same `SessionKey` drives persistence and the process-local FIFO so two tasks cannot concurrently resume one backend session. In `none`, all runs for one configured agent share one key and serialize even when they originate from different channels. In `session`, each channel-qualified conversation has its own key, so different conversations can execute concurrently. A waiting task receives `RunEvent::Queued { ahead }` when admitted and whenever its number of preceding tasks changes. The daemon publishes `RunEvent::Started` only when the task reaches the front.
+
+Mappings are persisted in SQLite at `~/.agora/db/store.db`. If an agent reports that a mapped backend session no longer exists, the daemon conditionally removes that stale mapping, retries the task once without a session, and saves the newly returned session id. Backend-specific missing-session detection stays inside the agent implementation. Persistent PTY execution remains future work.
+
+Current MVP behavior:
+
+- Read stdout and stderr in bounded chunks and let each agent decide what becomes user-visible output.
+- Let each agent decode its own output; Codex captures thread ids and normalizes JSONL reasoning, progress, and answer events.
+- Persist isolation-scope-to-agent-session mappings without exposing backend protocol details to the store or channel.
+- Reply to the source Lark message and patch the resulting card message.
+- Retain all Lark Thinking and Progress entries, order thinking phases oldest first and progress within each phase newest first, and coalesce intermediate card updates.
+- Poll Telegram text updates, preserve forum-topic session boundaries, and stream one independent Rich Message per subscribed agent.
+- Use private-chat Telegram drafts followed by one persistent terminal message, and persistent send/edit delivery in groups and topics.
+- Publish final status from agent completion or execution failure.
+- Route slash commands before agent dispatch, support conversation-scoped `/stop` cancellation with a stopped run event, support barrier-protected `/reset` session deletion, and persist conversation-scoped `/ask` agent controls.
+- Surface same-isolation-scope FIFO position as Queued with a live preceding-task count, then transition to Running when backend execution can start.
+- Before graceful process shutdown, interrupt every running or queued run and wait up to five seconds for terminal channel updates. If a channel supervisor fails, perform the same bounded interruption before propagating that error from `Daemon::run`.
+
+Agent timeouts and an execution-level output limit are follow-up hardening work. Cancellation and graceful shutdown notification are process-local; in-flight run recovery across daemon restarts remains deferred. `SIGKILL`, `abort`, power loss, and other ungraceful termination paths cannot update channel state before exit.
+
+## Trait Style
+
+Agora follows the current Rust style used in this repository:
+
+- Do not use `async_trait`.
+- Prefer `fn method(...) -> impl Future<Output = Result<...>> + Send` for asynchronous trait methods.
+- Prefer enum aggregation for multiple implementations.
+- Keep unstable traits inside `agora-node` until there is real reuse pressure.
+
+Illustrative shape:
+
+```rust
+pub trait Channel {
+    type Task: ChannelTask;
+    type Run: ChannelRun;
+
+    fn name(&self) -> &str;
+
+    fn recv(
+        &mut self,
+    ) -> impl Future<Output = anyhow::Result<Option<Self::Task>>> + Send;
+
+    fn open_run(
+        &self,
+        task: &Self::Task,
+        context: ChannelRunContext,
+    ) -> impl Future<Output = anyhow::Result<Self::Run>> + Send;
+
+    fn reply(
+        &self,
+        task: &Self::Task,
+        reply: ChannelReply,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+}
+
+pub trait ChannelTask {
+    fn task_id(&self) -> &str;
+    fn session_id(&self) -> &str;
+    fn input(&self) -> &ChannelTaskInput;
+}
+
+pub struct ChannelRunContext {
+    pub agent: ChannelAgent,
+    pub interrupt: Option<InterruptCallback>,
+}
+
+pub struct ChannelAgent {
+    pub name: String,
+}
+
+pub trait ChannelRun {
+    fn publish(
+        &self,
+        event: RunEvent,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+}
+
+pub trait Agent {
+    fn run<O>(
+        &self,
+        request: AgentRequest,
+        output: &mut O,
+    ) -> impl Future<Output = anyhow::Result<AgentOutcome>> + Send
+    where
+        O: AgentOutput + Send;
+}
+```
+
+The daemon should depend on this boundary or an enum aggregation of it, such as `ConfiguredChannel`. Channel-specific details such as Lark reply targets, cards, WebSocket event frames, and HTTP polling cursors should stay inside the channel implementation.
+
+A channel run represents the reply/output context for one accepted task and one agent. When multiple agents subscribe to a task, the daemon opens one run per agent. The channel decides whether that run becomes a Lark card, Telegram messages, one HTTP WebSocket stream, or another channel-specific representation.
+
+This is a direction, not a frozen API.

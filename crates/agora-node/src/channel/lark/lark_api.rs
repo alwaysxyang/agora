@@ -1,5 +1,5 @@
 use super::LarkReplyTarget;
-use super::channel::LarkEvent;
+use super::channel::{LarkDelivery, LarkEvent};
 use super::proxy;
 use crate::config::LarkChannelConfig;
 use crate::http;
@@ -71,7 +71,7 @@ impl LarkApi {
 
     pub(super) async fn run_websocket_loop(
         &self,
-        events: mpsc::UnboundedSender<Result<LarkEvent>>,
+        events: mpsc::Sender<LarkDelivery>,
     ) -> Result<()> {
         let mut backoff = LarkReconnectBackoff::default();
         logger::info!("lark channel starting channel={}", self.name);
@@ -103,6 +103,9 @@ impl LarkApi {
                     }
                 }
             }
+            if events.is_closed() {
+                return Err(anyhow!("agora lark receiver closed"));
+            }
 
             let delay = backoff.next_delay();
             logger::info!(
@@ -116,7 +119,7 @@ impl LarkApi {
 
     async fn run_websocket_once(
         &self,
-        events: mpsc::UnboundedSender<Result<LarkEvent>>,
+        events: mpsc::Sender<LarkDelivery>,
         connected: &mut bool,
     ) -> Result<()> {
         let (endpoint_url, client_config) = self.websocket_endpoint().await?;
@@ -149,7 +152,7 @@ impl LarkApi {
                     };
                     match message.context("read lark websocket message failed")? {
                         WebSocketMessage::Binary(payload) => {
-                            if let Some(ack) = self.handle_websocket_binary(&payload, &events)? {
+                            if let Some(ack) = self.handle_websocket_binary(&payload, &events).await? {
                                 socket
                                     .send(WebSocketMessage::Binary(ack.encode_to_vec().into()))
                                     .await
@@ -228,23 +231,23 @@ impl LarkApi {
         })
     }
 
-    fn handle_websocket_binary(
+    async fn handle_websocket_binary(
         &self,
         payload: &[u8],
-        events: &mpsc::UnboundedSender<Result<LarkEvent>>,
+        events: &mpsc::Sender<LarkDelivery>,
     ) -> Result<Option<LarkFrame>> {
         let frame = LarkFrame::decode(payload).context("decode lark websocket frame failed")?;
         match frame.method {
             LARK_FRAME_TYPE_CONTROL => Ok(None),
-            LARK_FRAME_TYPE_DATA => self.handle_data_frame(frame, events),
+            LARK_FRAME_TYPE_DATA => self.handle_data_frame(frame, events).await,
             _ => Ok(None),
         }
     }
 
-    fn handle_data_frame(
+    async fn handle_data_frame(
         &self,
         frame: LarkFrame,
-        events: &mpsc::UnboundedSender<Result<LarkEvent>>,
+        events: &mpsc::Sender<LarkDelivery>,
     ) -> Result<Option<LarkFrame>> {
         if frame.header("type") != Some(LARK_MESSAGE_TYPE_EVENT) {
             return Ok(None);
@@ -256,8 +259,12 @@ impl LarkApi {
                 event
                 @ (LarkEvent::Message(_) | LarkEvent::CardAction(_) | LarkEvent::Interrupt(_)),
             ) => {
-                self.send_event(events, event)?;
-                200
+                let (delivery, acknowledged) = LarkDelivery::new(event);
+                events
+                    .send(delivery)
+                    .await
+                    .map_err(|_| anyhow!("agora lark receiver closed"))?;
+                acknowledged.await.unwrap_or(500)
             }
             Ok(LarkEvent::Ignore { .. }) => 200,
             Err(err) => {
@@ -268,16 +275,6 @@ impl LarkApi {
         Ok(Some(
             frame.into_ack(status_code, started.elapsed().as_millis())?,
         ))
-    }
-
-    fn send_event(
-        &self,
-        events: &mpsc::UnboundedSender<Result<LarkEvent>>,
-        event: LarkEvent,
-    ) -> Result<()> {
-        events
-            .send(Ok(event))
-            .map_err(|_| anyhow!("agora lark receiver closed"))
     }
 
     pub(super) async fn tenant_access_token(&self) -> Result<String> {

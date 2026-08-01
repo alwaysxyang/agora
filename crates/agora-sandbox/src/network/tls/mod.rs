@@ -17,7 +17,7 @@ use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::fmt;
 use std::io as std_io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -29,15 +29,7 @@ pub(in crate::network) struct TlsBridge {
 
 impl TlsBridge {
     pub(in crate::network) fn new(authority: TlsAuthority) -> Result<Self> {
-        let native = rustls_native_certs::load_native_certs();
-        if native.certs.is_empty() {
-            let details = native
-                .errors
-                .first()
-                .map_or_else(|| "no certificates found".to_string(), ToString::to_string);
-            bail!("failed to load native TLS roots: {details}");
-        }
-        Self::with_root_certificates(authority, native.certs)
+        Self::with_root_certificates(authority, native_root_certificates()?)
     }
 
     pub(in crate::network) fn with_root_certificates(
@@ -117,6 +109,32 @@ impl TlsBridge {
             alpn: upstream_alpn.map(|protocol| String::from_utf8_lossy(&protocol).into_owned()),
         })
     }
+}
+
+pub(crate) fn native_root_certificates() -> Result<Vec<CertificateDer<'static>>> {
+    static CERTIFICATES: OnceLock<Vec<CertificateDer<'static>>> = OnceLock::new();
+    static LOAD: Mutex<()> = Mutex::new(());
+
+    if let Some(certificates) = CERTIFICATES.get() {
+        return Ok(certificates.clone());
+    }
+    let _load = LOAD
+        .lock()
+        .map_err(|_| anyhow::anyhow!("native TLS root loader lock poisoned"))?;
+    if let Some(certificates) = CERTIFICATES.get() {
+        return Ok(certificates.clone());
+    }
+
+    let native = rustls_native_certs::load_native_certs();
+    if native.certs.is_empty() {
+        let details = native
+            .errors
+            .first()
+            .map_or_else(|| "no certificates found".to_string(), ToString::to_string);
+        bail!("failed to load native TLS roots: {details}");
+    }
+    let _ = CERTIFICATES.set(native.certs.clone());
+    Ok(native.certs)
 }
 
 pub(in crate::network) struct TlsConnection {

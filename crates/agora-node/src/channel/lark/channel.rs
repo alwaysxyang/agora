@@ -16,7 +16,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -39,6 +39,29 @@ pub(super) enum LarkEvent {
     CardAction(LarkCardActionEvent),
     Interrupt(LarkInterruptEvent),
     Ignore { event_type: String },
+}
+
+#[derive(Debug)]
+pub(super) struct LarkDelivery {
+    event: LarkEvent,
+    acknowledgement: oneshot::Sender<u16>,
+}
+
+impl LarkDelivery {
+    pub(super) fn new(event: LarkEvent) -> (Self, oneshot::Receiver<u16>) {
+        let (acknowledgement, acknowledged) = oneshot::channel();
+        (
+            Self {
+                event,
+                acknowledgement,
+            },
+            acknowledged,
+        )
+    }
+
+    pub(super) fn into_parts(self) -> (LarkEvent, oneshot::Sender<u16>) {
+        (self.event, self.acknowledgement)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -549,6 +572,86 @@ impl LarkChannel {
             _ => "img",
         }
     }
+
+    async fn handle_event(&mut self, event: LarkEvent) -> Result<Option<LarkTask>> {
+        match event {
+            LarkEvent::Message(event) if event.is_supported_message() => {
+                let mentioned = self.message_mentions_bot(&event).await?;
+                let context = if event.chat_type == "p2p" {
+                    AccessContext::private(&event.sender_id)
+                } else {
+                    AccessContext::group(&event.sender_id, &event.chat_id, mentioned)
+                };
+                let target = event.reply_target();
+                let api = self.api.clone();
+                if !self
+                    .permission
+                    .admit(self.name(), &context, move |denial| async move {
+                        let token = api.tenant_access_token().await?;
+                        api.reply_card(&token, &target, &LarkReplyCard::permission_denied(&denial))
+                            .await
+                    })
+                    .await
+                {
+                    return Ok(None);
+                }
+                self.group_sessions
+                    .insert(event.chat_id.clone(), event.chat_type != "p2p");
+                let session_id = event.session_id().to_string();
+                let sender_id = event.sender_id.clone();
+                let message_id = event.message_id.clone();
+                let task = self.task_from_event(event).await?;
+                logger::info!(
+                    "lark message received channel={} session={} sender={} message_id={} input={} attachments={}",
+                    self.name(),
+                    session_id,
+                    sender_id,
+                    message_id,
+                    task.input
+                        .message()
+                        .map(TaskContent::text)
+                        .unwrap_or_default(),
+                    task.input
+                        .message()
+                        .map(|content| content.attachments().len())
+                        .unwrap_or_default()
+                );
+                Ok(Some(task))
+            }
+            LarkEvent::CardAction(event) => {
+                if !self
+                    .admit_action(&event.user_id, &event.session_id, &event.message_id)
+                    .await
+                {
+                    return Ok(None);
+                }
+                logger::info!(
+                    "lark card action received channel={} session={} event_id={}",
+                    self.name(),
+                    event.session_id,
+                    event.id
+                );
+                Ok(Some(LarkTask::from_card_action(event)))
+            }
+            LarkEvent::Interrupt(event) => {
+                if !self
+                    .admit_action(&event.user_id, &event.session_id, &event.message_id)
+                    .await
+                {
+                    return Ok(None);
+                }
+                let triggered = self.interrupts.trigger(&event.callback_id);
+                logger::info!(
+                    "lark interrupt action received channel={} event_id={} triggered={}",
+                    self.name(),
+                    event.id,
+                    triggered
+                );
+                Ok(None)
+            }
+            LarkEvent::Message(_) | LarkEvent::Ignore { .. } => Ok(None),
+        }
+    }
 }
 
 impl Channel for LarkChannel {
@@ -561,88 +664,22 @@ impl Channel for LarkChannel {
 
     async fn recv(&mut self) -> Result<Option<Self::Task>> {
         loop {
-            let Some(event) = self.receiver().next_event().await? else {
+            let Some(delivery) = self.receiver().next_delivery().await? else {
                 return Ok(None);
             };
-            match event {
-                LarkEvent::Message(event) if event.is_supported_message() => {
-                    let mentioned = self.message_mentions_bot(&event).await?;
-                    let context = if event.chat_type == "p2p" {
-                        AccessContext::private(&event.sender_id)
-                    } else {
-                        AccessContext::group(&event.sender_id, &event.chat_id, mentioned)
-                    };
-                    let target = event.reply_target();
-                    let api = self.api.clone();
-                    if !self
-                        .permission
-                        .admit(self.name(), &context, move |denial| async move {
-                            let token = api.tenant_access_token().await?;
-                            api.reply_card(
-                                &token,
-                                &target,
-                                &LarkReplyCard::permission_denied(&denial),
-                            )
-                            .await
-                        })
-                        .await
-                    {
-                        continue;
-                    }
-                    self.group_sessions
-                        .insert(event.chat_id.clone(), event.chat_type != "p2p");
-                    let session_id = event.session_id().to_string();
-                    let sender_id = event.sender_id.clone();
-                    let message_id = event.message_id.clone();
-                    let task = self.task_from_event(event).await?;
-                    logger::info!(
-                        "lark message received channel={} session={} sender={} message_id={} input={} attachments={}",
-                        self.name(),
-                        session_id,
-                        sender_id,
-                        message_id,
-                        task.input
-                            .message()
-                            .map(TaskContent::text)
-                            .unwrap_or_default(),
-                        task.input
-                            .message()
-                            .map(|content| content.attachments().len())
-                            .unwrap_or_default()
-                    );
+            let (event, acknowledgement) = delivery.into_parts();
+            match self.handle_event(event).await {
+                Ok(Some(task)) => {
+                    let _ = acknowledgement.send(200);
                     return Ok(Some(task));
                 }
-                LarkEvent::CardAction(event) => {
-                    if !self
-                        .admit_action(&event.user_id, &event.session_id, &event.message_id)
-                        .await
-                    {
-                        continue;
-                    }
-                    logger::info!(
-                        "lark card action received channel={} session={} event_id={}",
-                        self.name(),
-                        event.session_id,
-                        event.id
-                    );
-                    return Ok(Some(LarkTask::from_card_action(event)));
+                Ok(None) => {
+                    let _ = acknowledgement.send(200);
                 }
-                LarkEvent::Interrupt(event) => {
-                    if !self
-                        .admit_action(&event.user_id, &event.session_id, &event.message_id)
-                        .await
-                    {
-                        continue;
-                    }
-                    let triggered = self.interrupts.trigger(&event.callback_id);
-                    logger::info!(
-                        "lark interrupt action received channel={} event_id={} triggered={}",
-                        self.name(),
-                        event.id,
-                        triggered
-                    );
+                Err(error) => {
+                    let _ = acknowledgement.send(500);
+                    return Err(error);
                 }
-                LarkEvent::Message(_) | LarkEvent::Ignore { .. } => {}
             }
         }
     }
@@ -685,13 +722,13 @@ impl Channel for LarkChannel {
 }
 
 struct LarkWebSocketReceiver {
-    events: mpsc::UnboundedReceiver<Result<LarkEvent>>,
+    events: mpsc::Receiver<LarkDelivery>,
     task: Option<JoinHandle<Result<()>>>,
 }
 
 impl LarkWebSocketReceiver {
     fn spawn(api: LarkApi) -> Self {
-        let (sender, events) = mpsc::unbounded_channel();
+        let (sender, events) = mpsc::channel(1);
         let task = tokio::spawn(async move { api.run_websocket_loop(sender).await });
         Self {
             events,
@@ -699,9 +736,9 @@ impl LarkWebSocketReceiver {
         }
     }
 
-    async fn next_event(&mut self) -> Result<Option<LarkEvent>> {
+    async fn next_delivery(&mut self) -> Result<Option<LarkDelivery>> {
         match self.events.recv().await {
-            Some(event) => event.map(Some),
+            Some(delivery) => Ok(Some(delivery)),
             None => {
                 if let Some(task) = self.task.take() {
                     task.await

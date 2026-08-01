@@ -184,19 +184,13 @@ impl SandboxConfig {
 
     #[cfg(target_os = "macos")]
     fn write_tls_trust_bundle(&self, ca_certificate: &[u8]) -> Result<PathBuf> {
-        let native = rustls_native_certs::load_native_certs();
-        if native.certs.is_empty() {
-            let details = native
-                .errors
-                .first()
-                .map_or_else(|| "no certificates found".to_string(), ToString::to_string);
-            bail!("failed to load native TLS roots for client trust bundle: {details}");
-        }
+        let native = crate::network::native_root_certificates()
+            .context("failed to load native TLS roots for client trust bundle")?;
         let mut bundle = ca_certificate.to_vec();
         if !bundle.ends_with(b"\n") {
             bundle.push(b'\n');
         }
-        for certificate in native.certs {
+        for certificate in native {
             bundle.extend_from_slice(b"-----BEGIN CERTIFICATE-----\n");
             let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.as_ref());
             for line in encoded.as_bytes().chunks(64) {
