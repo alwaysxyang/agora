@@ -1,17 +1,21 @@
+use super::namespace::{self, METADATA_FILE};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
-pub(super) const CONTROL_DIRECTORY: &str = ".agora";
-const METADATA_DIRECTORY: &str = "metadata";
-const METADATA_FILE: &str = "metadata.json";
 const METADATA_VERSION: u32 = 1;
+const METADATA_CACHE_CAPACITY: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,10 +35,73 @@ pub(crate) enum EntryState {
     Whiteout,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct FileAttributes {
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) atime: i64,
+    pub(crate) atime_nsec: i64,
+    pub(crate) mtime: i64,
+    pub(crate) mtime_nsec: i64,
+}
+
+impl FileAttributes {
+    pub(crate) fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            atime: metadata.atime(),
+            atime_nsec: metadata.atime_nsec(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn from_stat(status: &libc::stat) -> Self {
+        Self {
+            mode: u32::from(status.st_mode),
+            uid: status.st_uid,
+            gid: status.st_gid,
+            atime: status.st_atime,
+            atime_nsec: status.st_atime_nsec,
+            mtime: status.st_mtime,
+            mtime_nsec: status.st_mtime_nsec,
+        }
+    }
+
+    pub(crate) fn created_file(mode: u32) -> Self {
+        Self::created(u32::from(libc::S_IFREG), mode)
+    }
+
+    pub(crate) fn created_directory(mode: u32) -> Self {
+        Self::created(u32::from(libc::S_IFDIR), mode)
+    }
+
+    fn created(kind: u32, mode: u32) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        Self {
+            mode: kind | mode & 0o7777,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            atime: i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
+            atime_nsec: i64::from(now.subsec_nanos()),
+            mtime: i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
+            mtime_nsec: i64::from(now.subsec_nanos()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct DirectoryMetadata {
     version: u32,
     entries: BTreeMap<String, EntryState>,
+    #[serde(default)]
+    attributes: BTreeMap<String, FileAttributes>,
 }
 
 impl Default for DirectoryMetadata {
@@ -42,24 +109,59 @@ impl Default for DirectoryMetadata {
         Self {
             version: METADATA_VERSION,
             entries: BTreeMap::new(),
+            attributes: BTreeMap::new(),
         }
     }
 }
 
 pub(super) struct MetadataStore {
-    directory: PathBuf,
+    root: PathBuf,
+    cache: Mutex<HashMap<PathBuf, CachedDirectoryMetadata>>,
+    #[cfg(test)]
+    parse_count: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct CachedDirectoryMetadata {
+    identity: MetadataIdentity,
+    metadata: DirectoryMetadata,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct MetadataIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: i64,
+    modified_nsec: i64,
+}
+
+impl MetadataIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified: metadata.mtime(),
+            modified_nsec: metadata.mtime_nsec(),
+        }
+    }
 }
 
 impl MetadataStore {
     pub(super) fn new(root: &Path) -> Result<Self> {
-        let directory = root.join(CONTROL_DIRECTORY).join(METADATA_DIRECTORY);
-        fs::create_dir_all(&directory).with_context(|| {
+        fs::create_dir_all(root).with_context(|| {
             format!(
-                "failed to create sandbox filesystem metadata directory {}",
-                directory.display()
+                "failed to create sandbox filesystem root {}",
+                root.display()
             )
         })?;
-        Ok(Self { directory })
+        Ok(Self {
+            root: root.to_path_buf(),
+            cache: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            parse_count: AtomicUsize::new(0),
+        })
     }
 
     pub(super) fn state(&self, path: &Path) -> Result<Option<EntryState>> {
@@ -77,13 +179,62 @@ impl MetadataStore {
         self.write(parent, &metadata)
     }
 
+    pub(super) fn set_with_attributes(
+        &self,
+        path: &Path,
+        state: EntryState,
+        attributes: Option<FileAttributes>,
+    ) -> Result<()> {
+        let (parent, name) = Self::split(path)?;
+        let mut metadata = self.load(parent)?;
+        let name = Self::encode(name);
+        metadata.entries.insert(name.clone(), state);
+        match attributes {
+            Some(attributes) => {
+                metadata.attributes.insert(name, attributes);
+            }
+            None => {
+                metadata.attributes.remove(&name);
+            }
+        }
+        self.write(parent, &metadata)
+    }
+
+    pub(super) fn attributes(&self, path: &Path) -> Result<Option<FileAttributes>> {
+        if path == Path::new("/") {
+            return Ok(None);
+        }
+        let (parent, name) = Self::split(path)?;
+        Ok(self
+            .load(parent)?
+            .attributes
+            .get(&Self::encode(name))
+            .cloned())
+    }
+
+    pub(super) fn set_attributes(&self, path: &Path, attributes: FileAttributes) -> Result<()> {
+        if path == Path::new("/") {
+            return Ok(());
+        }
+        let (parent, name) = Self::split(path)?;
+        let mut metadata = self.load(parent)?;
+        let name = Self::encode(name);
+        if metadata.attributes.get(&name) == Some(&attributes) {
+            return Ok(());
+        }
+        metadata.attributes.insert(name, attributes);
+        self.write(parent, &metadata)
+    }
+
     pub(super) fn remove(&self, path: &Path) -> Result<()> {
         if path == Path::new("/") {
             return Ok(());
         }
         let (parent, name) = Self::split(path)?;
         let mut metadata = self.load(parent)?;
-        metadata.entries.remove(&Self::encode(name));
+        let name = Self::encode(name);
+        metadata.entries.remove(&name);
+        metadata.attributes.remove(&name);
         self.write(parent, &metadata)
     }
 
@@ -113,9 +264,10 @@ impl MetadataStore {
 
     fn load(&self, directory: &Path) -> Result<DirectoryMetadata> {
         let path = self.path(directory)?;
-        let contents = match fs::read(&path) {
-            Ok(contents) => contents,
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.cache().remove(&path);
                 return Ok(DirectoryMetadata::default());
             }
             Err(error) => {
@@ -124,8 +276,20 @@ impl MetadataStore {
                 });
             }
         };
+        let identity = MetadataIdentity::from_metadata(&file.metadata()?);
+        if let Some(cached) = self.cache().get(&path)
+            && cached.identity == identity
+        {
+            return Ok(cached.metadata.clone());
+        }
+
+        let mut contents = Vec::with_capacity(usize::try_from(identity.size).unwrap_or(0));
+        file.read_to_end(&mut contents)
+            .with_context(|| format!("failed to read filesystem metadata {}", path.display()))?;
         let metadata: DirectoryMetadata = serde_json::from_slice(&contents)
             .with_context(|| format!("failed to parse filesystem metadata {}", path.display()))?;
+        #[cfg(test)]
+        self.parse_count.fetch_add(1, Ordering::Relaxed);
         if metadata.version != METADATA_VERSION {
             bail!(
                 "unsupported filesystem metadata version {} in {}",
@@ -133,6 +297,17 @@ impl MetadataStore {
                 path.display()
             );
         }
+        let mut cache = self.cache();
+        if cache.len() >= METADATA_CACHE_CAPACITY && !cache.contains_key(&path) {
+            cache.clear();
+        }
+        cache.insert(
+            path,
+            CachedDirectoryMetadata {
+                identity,
+                metadata: metadata.clone(),
+            },
+        );
         Ok(metadata)
     }
 
@@ -140,7 +315,7 @@ impl MetadataStore {
         let path = self.path(directory)?;
         let parent = path.parent().context("metadata path has no parent")?;
         fs::create_dir_all(parent)?;
-        let temporary = parent.join(format!(".{METADATA_FILE}.{}.tmp", Uuid::new_v4().simple()));
+        let temporary = parent.join(format!("{METADATA_FILE}.{}.tmp", Uuid::new_v4().simple()));
         let contents = serde_json::to_vec_pretty(metadata)
             .context("failed to serialize filesystem metadata")?;
         let result = (|| {
@@ -157,7 +332,12 @@ impl MetadataStore {
         if result.is_err() {
             let _ = fs::remove_file(temporary);
         }
+        self.cache().remove(&path);
         result
+    }
+
+    fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, CachedDirectoryMetadata>> {
+        self.cache.lock().unwrap_or_else(|error| error.into_inner())
     }
 
     fn path(&self, directory: &Path) -> Result<PathBuf> {
@@ -167,10 +347,7 @@ impl MetadataStore {
                 directory.display()
             );
         }
-        Ok(self
-            .directory
-            .join(Self::encode(directory.as_os_str()))
-            .join(METADATA_FILE))
+        Ok(namespace::backing_path(&self.root, directory)?.join(METADATA_FILE))
     }
 
     fn encode(value: &OsStr) -> String {
@@ -182,6 +359,11 @@ impl MetadataStore {
             .decode(value)
             .context("invalid encoded filesystem metadata name")?;
         Ok(OsString::from_vec(bytes))
+    }
+
+    #[cfg(test)]
+    fn parse_count(&self) -> usize {
+        self.parse_count.load(Ordering::Relaxed)
     }
 }
 

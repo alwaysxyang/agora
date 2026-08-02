@@ -1,12 +1,17 @@
 #include <fcntl.h>
+#include <errno.h>
+#include <stddef.h>
 #include <stdarg.h>
 #include <sys/types.h>
 
 extern int agora_sandbox_open_with_mode(const char *path, int flags, mode_t mode);
 extern int agora_sandbox_openat_with_mode(int directory, const char *path, int flags, mode_t mode);
+extern const void *agora_sandbox_original_fcntl(void);
+extern void agora_sandbox_track_fcntl_duplicate(int source, int destination);
 
 typedef int (*open_fn)(const char *, int, ...);
 typedef int (*openat_fn)(int, const char *, int, ...);
+typedef int (*fcntl_fn)(int, int, ...);
 
 int agora_sandbox_call_open(const void *function, const char *path, int flags, mode_t mode) {
     open_fn original = (open_fn)function;
@@ -45,4 +50,73 @@ int agora_sandbox_openat_shim(int directory, const char *path, int flags, ...) {
         va_end(arguments);
     }
     return agora_sandbox_openat_with_mode(directory, path, flags, mode);
+}
+
+int agora_sandbox_fcntl_shim(int descriptor, int command, ...) {
+    fcntl_fn original_fcntl = (fcntl_fn)agora_sandbox_original_fcntl();
+    if (original_fcntl == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    int result;
+    switch (command) {
+        case F_GETFD:
+        case F_GETFL:
+        case F_GETOWN:
+        case F_FLUSH_DATA:
+        case F_CHKCLEAN:
+        case F_FULLFSYNC:
+        case F_FREEZE_FS:
+        case F_THAW_FS:
+        case F_GETPROTECTIONCLASS:
+        case F_GETNOSIGPIPE:
+        case F_GETPROTECTIONLEVEL:
+        case F_BARRIERFSYNC:
+        case F_GETLEASE:
+            result = original_fcntl(descriptor, command);
+            break;
+        case F_DUPFD:
+        case F_DUPFD_CLOEXEC:
+        case F_SETFD:
+        case F_SETFL:
+        case F_SETOWN:
+        case F_RDAHEAD:
+        case F_NOCACHE:
+        case F_GLOBAL_NOCACHE:
+        case F_NODIRECT:
+        case F_SETPROTECTIONCLASS:
+        case F_SETNOSIGPIPE:
+        case F_SINGLE_WRITER:
+        case F_SETBACKINGSTORE:
+        case F_SETLEASE:
+        case F_NOCACHE_EXT: {
+            va_list arguments;
+            va_start(arguments, command);
+            int argument = va_arg(arguments, int);
+            va_end(arguments);
+            result = original_fcntl(descriptor, command, argument);
+            break;
+        }
+        case F_SETSIZE: {
+            va_list arguments;
+            va_start(arguments, command);
+            off_t argument = va_arg(arguments, off_t);
+            va_end(arguments);
+            result = original_fcntl(descriptor, command, argument);
+            break;
+        }
+        default: {
+            va_list arguments;
+            va_start(arguments, command);
+            void *argument = va_arg(arguments, void *);
+            va_end(arguments);
+            result = original_fcntl(descriptor, command, argument);
+            break;
+        }
+    }
+    if (result >= 0 && (command == F_DUPFD || command == F_DUPFD_CLOEXEC)) {
+        agora_sandbox_track_fcntl_duplicate(descriptor, result);
+    }
+    return result;
 }

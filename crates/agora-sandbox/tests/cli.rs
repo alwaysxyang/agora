@@ -21,13 +21,16 @@ fn workspace_root() -> PathBuf {
 fn hook_library() -> PathBuf {
     static HOOK: OnceLock<PathBuf> = OnceLock::new();
     HOOK.get_or_init(|| {
+        if std::env::var_os("CARGO_LLVM_COV").is_some() {
+            let library = std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("libagora_sandbox.dylib");
+            assert!(library.is_file(), "missing {}", library.display());
+            return library;
+        }
         let workspace = workspace_root();
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "agora-sandbox", "--lib"])
-            .current_dir(&workspace)
-            .status()
-            .unwrap();
-        assert!(status.success());
         let target = std::env::var_os("CARGO_TARGET_DIR")
             .map(PathBuf::from)
             .map(|path| {
@@ -37,7 +40,15 @@ fn hook_library() -> PathBuf {
                     workspace.join(path)
                 }
             })
-            .unwrap_or_else(|| workspace.join("target"));
+            .unwrap_or_else(|| workspace.join("target"))
+            .join("hook");
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "-p", "agora-sandbox", "--lib", "--target-dir"])
+            .arg(&target)
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        assert!(status.success());
         let library = target.join("debug/libagora_sandbox.dylib");
         assert!(library.is_file(), "missing {}", library.display());
         library
@@ -140,7 +151,6 @@ fn sandbox_cli_runs_with_the_default_plain_filesystem_and_no_key() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(workdir.join("fs").is_dir());
-    assert!(!workdir.join("filesystem/fs.sparsebundle").exists());
     std::fs::remove_dir_all(workdir).unwrap();
 }
 
@@ -439,6 +449,7 @@ fn sandbox_cli_injects_the_configured_tls_trust_anchor() {
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&directory).unwrap();
+    let workdir = directory.join("workdir");
     let anchor = directory.join("ca.der");
     let leaf = directory.join("leaf.der");
     std::fs::write(
@@ -464,7 +475,7 @@ fn sandbox_cli_injects_the_configured_tls_trust_anchor() {
         .arg("--hook-library")
         .arg(hook_library())
         .arg("--workdir")
-        .arg(&directory)
+        .arg(&workdir)
         .arg("--tls-trust-anchor")
         .arg(&anchor)
         .arg("-c")

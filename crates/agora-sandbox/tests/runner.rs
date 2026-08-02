@@ -6,7 +6,7 @@ use agora_sandbox::runner::{Sandbox, SandboxCommand, SandboxConfig};
 #[cfg(target_os = "macos")]
 use base64::Engine;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, UdpSocket};
 use std::os::fd::FromRawFd;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
@@ -68,13 +68,16 @@ fn workspace_root() -> PathBuf {
 fn hook_library() -> PathBuf {
     static HOOK: OnceLock<PathBuf> = OnceLock::new();
     HOOK.get_or_init(|| {
+        if std::env::var_os("CARGO_LLVM_COV").is_some() {
+            let library = std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("libagora_sandbox.dylib");
+            assert!(library.is_file(), "missing {}", library.display());
+            return library;
+        }
         let workspace = workspace_root();
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "agora-sandbox", "--lib"])
-            .current_dir(&workspace)
-            .status()
-            .unwrap();
-        assert!(status.success());
         let target = std::env::var_os("CARGO_TARGET_DIR")
             .map(PathBuf::from)
             .map(|path| {
@@ -84,7 +87,15 @@ fn hook_library() -> PathBuf {
                     workspace.join(path)
                 }
             })
-            .unwrap_or_else(|| workspace.join("target"));
+            .unwrap_or_else(|| workspace.join("target"))
+            .join("hook");
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "-p", "agora-sandbox", "--lib", "--target-dir"])
+            .arg(&target)
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        assert!(status.success());
         let library = target.join("debug/libagora_sandbox.dylib");
         assert!(library.is_file(), "missing {}", library.display());
         library
@@ -190,14 +201,7 @@ async fn runner_generates_default_tls_ca_in_the_configured_workdir() {
                 .starts_with("trust-bundle-")
         })
         .collect::<Vec<_>>();
-    assert_eq!(trust_bundles.len(), 1);
-    assert!(
-        rustls_pemfile::certs(&mut std::fs::read(&trust_bundles[0]).unwrap().as_slice())
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .len()
-            > 1
-    );
+    assert!(trust_bundles.is_empty());
     assert!(!command_workdir.join("ca").exists());
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -247,16 +251,10 @@ async fn runner_persists_an_encrypted_workspace_without_modifying_the_source() {
         b"original\n"
     );
     assert!(!source.join("output.txt").exists());
-    assert!(workdir.join("filesystem/fs.sparsebundle").is_dir());
+    assert!(!workdir.join("filesystem").exists());
     assert!(workdir.join("fs").is_dir());
-    assert!(
-        std::fs::read_dir(workdir.join("fs"))
-            .unwrap()
-            .next()
-            .is_none()
-    );
     assert!(!directory_contains(
-        &workdir.join("filesystem/fs.sparsebundle"),
+        &workdir.join("fs"),
         b"encrypted workspace marker"
     ));
 
@@ -268,6 +266,65 @@ async fn runner_persists_an_encrypted_workspace_without_modifying_the_source() {
 
     assert!(verified.status().success());
     assert!(!source.join("output.txt").exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn encrypted_workspace_remains_ciphertext_while_the_child_is_running() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-runtime-ciphertext-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    let output = source.join("runtime-secret.txt");
+    let marker = format!("runtime-secret-{}", uuid::Uuid::new_v4());
+    std::fs::create_dir_all(&source).unwrap();
+
+    let closed = Arc::new(tokio::sync::Notify::new());
+    let callback = {
+        let closed = Arc::clone(&closed);
+        let output = output.to_string_lossy().into_owned();
+        move |event| {
+            if matches!(
+                event,
+                Event::File(ref event)
+                    if event.event_type == EventType::FilesystemClose
+                        && event.file.path == output
+            ) {
+                closed.notify_one();
+            }
+            std::future::ready(Decision::Allow)
+        }
+    };
+    let config = SandboxConfig::new(hook_library())
+        .with_workdir(&workdir)
+        .with_encrypted_workspace(FILESYSTEM_KEY);
+    let script = format!(
+        "printf '%s' '{marker}' > '{}'; sleep 2; test \"$(cat '{}')\" = '{marker}'",
+        output.display(),
+        output.display()
+    );
+    let run = tokio::spawn(
+        Sandbox::new(config, callback).run(
+            SandboxCommand::new("/bin/bash")
+                .args(["-c", script.as_str()])
+                .current_dir(&source),
+        ),
+    );
+
+    tokio::time::timeout(Duration::from_secs(30), closed.notified())
+        .await
+        .expect("sandbox child did not close the encrypted output file");
+    assert!(
+        !directory_contains(&workdir, marker.as_bytes()),
+        "sandbox backing storage exposed plaintext while the child was running"
+    );
+
+    let outcome = run.await.unwrap().unwrap();
+    assert!(outcome.status().success());
+    assert!(!output.exists());
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -310,8 +367,6 @@ async fn runner_persists_a_plain_workspace_without_modifying_the_source() {
         std::fs::read(&persisted).unwrap(),
         b"plain workspace marker\n"
     );
-    assert!(!workdir.join("filesystem/fs.sparsebundle").exists());
-
     let verify = SandboxCommand::new("/bin/sh")
         .args([
             "-c",
@@ -348,7 +403,7 @@ async fn runner_rejects_concurrent_plain_sandboxes_in_the_same_workdir() {
                 .current_dir(&source),
         ),
     );
-    let lock = workdir.join("filesystem/fs.lock");
+    let lock = workdir.join("fs/.fs.lock");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !lock.exists() {
         assert!(
@@ -380,6 +435,11 @@ async fn runner_interposes_the_complete_filesystem_operation_set() {
     let workdir = directory.join("sandbox");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("source.txt"), b"host").unwrap();
+    std::fs::set_permissions(
+        source.join("source.txt"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
     let command = SandboxCommand::new(std::env::current_exe().unwrap())
         .arg("filesystem_interposed_child_process")
         .arg("--exact")
@@ -422,6 +482,16 @@ async fn runner_interposes_the_complete_filesystem_operation_set() {
             && !event.trace_id.is_empty()
     }));
     assert_eq!(std::fs::read(source.join("source.txt")).unwrap(), b"host");
+    assert_eq!(
+        source
+            .join("source.txt")
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
     for path in [
         "created.txt",
         "creat.txt",
@@ -471,12 +541,7 @@ async fn runner_rejects_a_different_encrypted_workspace_key() {
         error.to_string().contains("filesystem key is incorrect"),
         "unexpected error: {error:#}"
     );
-    assert!(
-        std::fs::read_dir(workdir.join("fs"))
-            .unwrap()
-            .next()
-            .is_none()
-    );
+    assert!(workdir.join("fs/.key.json").is_file());
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -590,7 +655,7 @@ fn process_audit_does_not_reject_a_large_argument() {
 #[cfg(target_os = "macos")]
 #[test]
 fn records_tls_trust_environment() {
-    let Some(expected_directory) = std::env::var_os("AGORA_SANDBOX_TEST_TLS_TRUST_ENV") else {
+    let Some(private_workdir) = std::env::var_os("AGORA_SANDBOX_TEST_TLS_TRUST_ENV") else {
         return;
     };
     let values = TLS_TRUST_ENVIRONMENT
@@ -598,7 +663,8 @@ fn records_tls_trust_environment() {
         .map(|key| PathBuf::from(std::env::var_os(key).unwrap()))
         .collect::<Vec<_>>();
     assert!(values.iter().all(|path| path == &values[0]));
-    assert_eq!(values[0].parent(), Some(Path::new(&expected_directory)));
+    assert!(values[0].is_file());
+    assert!(!values[0].starts_with(private_workdir));
     assert!(
         values[0]
             .file_name()
@@ -631,8 +697,13 @@ fn filesystem_interposed_child_process() {
         std::ffi::CString::new(root.join("spawn.txt").as_os_str().as_encoded_bytes()).unwrap();
 
     unsafe {
+        assert_eq!(libc::access(std::ptr::null(), libc::R_OK), -1);
+        assert_eq!(libc::open(std::ptr::null(), libc::O_RDONLY), -1);
+
         assert_eq!(libc::access(source.as_ptr(), libc::R_OK), 0);
         let mut status = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        assert_eq!(libc::stat(std::ptr::null(), status.as_mut_ptr()), -1);
+        assert_eq!(libc::lstat(std::ptr::null(), status.as_mut_ptr()), -1);
         assert_eq!(libc::stat(source.as_ptr(), status.as_mut_ptr()), 0);
         assert_eq!(libc::lstat(source.as_ptr(), status.as_mut_ptr()), 0);
 
@@ -659,24 +730,25 @@ fn filesystem_interposed_child_process() {
         assert_eq!(libc::fchmod(created_file, 0o640), 0);
         assert_eq!(libc::fchown(created_file, !0, !0), 0);
         assert_eq!(libc::close(created_file), 0);
-
         let creat_file = libc::creat(creat.as_ptr(), 0o600);
         assert!(creat_file >= 0);
         assert_eq!(libc::write(creat_file, b"creat".as_ptr().cast(), 5), 5);
         assert_eq!(libc::close(creat_file), 0);
         assert_eq!(libc::truncate(creat.as_ptr(), 2), 0);
 
-        assert_eq!(libc::chmod(source.as_ptr(), 0o600), -1);
-        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(libc::chmod(source.as_ptr(), 0o600), 0);
+        assert_eq!(libc::stat(source.as_ptr(), status.as_mut_ptr()), 0);
+        assert_eq!(u32::from((*status.as_ptr()).st_mode) & 0o777, 0o600);
         assert_eq!(libc::chown(source.as_ptr(), !0, !0), -1);
         assert_eq!(*libc::__error(), libc::ENOTSUP);
         assert_eq!(libc::lchown(source.as_ptr(), !0, !0), -1);
         assert_eq!(*libc::__error(), libc::ENOTSUP);
         assert_eq!(
-            libc::fchmodat(directory, c"source.txt".as_ptr(), 0o600, 0),
-            -1
+            libc::fchmodat(directory, c"source.txt".as_ptr(), 0o640, 0),
+            0
         );
-        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(libc::stat(source.as_ptr(), status.as_mut_ptr()), 0);
+        assert_eq!(u32::from((*status.as_ptr()).st_mode) & 0o777, 0o640);
         assert_eq!(
             libc::fchownat(directory, c"source.txt".as_ptr(), !0, !0, 0),
             -1
@@ -756,7 +828,7 @@ fn filesystem_interposed_child_process() {
                 libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
                 0o600,
             ),
-            0
+            libc::ENOTSUP
         );
         let mut child = 0;
         let arguments = [c"/usr/bin/true".as_ptr().cast_mut(), std::ptr::null_mut()];
@@ -775,11 +847,29 @@ fn filesystem_interposed_child_process() {
         assert_eq!(libc::waitpid(child, &mut child_status, 0), child);
         assert_eq!(child_status, 0);
         assert_eq!(libc::posix_spawn_file_actions_destroy(&mut actions), 0);
+
+        assert_eq!(
+            libc::openat(-1, c"missing.txt".as_ptr(), libc::O_RDONLY),
+            -1
+        );
+        assert_eq!(
+            libc::fstatat(-1, c"missing.txt".as_ptr(), status.as_mut_ptr(), 0),
+            -1
+        );
         assert_eq!(libc::close(directory), 0);
 
+        assert!(libc::fopen(source.as_ptr(), std::ptr::null()).is_null());
         let stream = libc::fopen(source.as_ptr(), c"r".as_ptr());
         assert!(!stream.is_null());
         assert_eq!(libc::fclose(stream), 0);
+
+        let appended =
+            std::ffi::CString::new(root.join("appended.txt").as_os_str().as_encoded_bytes())
+                .unwrap();
+        let stream = libc::fopen(appended.as_ptr(), c"a+".as_ptr());
+        assert!(!stream.is_null());
+        assert_eq!(libc::fclose(stream), 0);
+        assert_eq!(libc::unlink(appended.as_ptr()), 0);
 
         assert_eq!(libc::mkdir(created.as_ptr(), 0o700), 0);
         assert_eq!(libc::rename(creat.as_ptr(), renamed.as_ptr()), 0);
@@ -803,7 +893,17 @@ fn filesystem_interposed_child_process() {
         assert!(names.iter().any(|name| name == b"created"));
         assert_eq!(libc::closedir(directory), 0);
 
+        assert!(libc::opendir(std::ptr::null()).is_null());
+        assert_eq!(libc::mkdir(std::ptr::null(), 0o700), -1);
+        assert_eq!(libc::rename(std::ptr::null(), renamed.as_ptr()), -1);
+        assert_eq!(libc::unlink(std::ptr::null()), -1);
+        assert_eq!(libc::rmdir(std::ptr::null()), -1);
+        assert_eq!(libc::chdir(std::ptr::null()), -1);
+
         assert_eq!(libc::chdir(created.as_ptr()), 0);
+        assert!(libc::getcwd(std::ptr::null_mut(), 1).is_null());
+        let mut small = [0_i8; 1];
+        assert!(libc::getcwd(small.as_mut_ptr(), small.len()).is_null());
         let current = libc::getcwd(std::ptr::null_mut(), 0);
         assert!(!current.is_null());
         assert_eq!(
@@ -813,6 +913,114 @@ fn filesystem_interposed_child_process() {
         libc::free(current.cast());
         assert_eq!(libc::chdir(root_path.as_ptr()), 0);
         assert_eq!(libc::rmdir(created.as_ptr()), 0);
+    }
+
+    exercise_interposed_process_symbols();
+}
+
+#[cfg(target_os = "macos")]
+fn exercise_interposed_process_symbols() {
+    type PosixSpawnFn = unsafe extern "C" fn(
+        *mut libc::pid_t,
+        *const libc::c_char,
+        *const libc::posix_spawn_file_actions_t,
+        *const libc::posix_spawnattr_t,
+        *const *mut libc::c_char,
+        *const *mut libc::c_char,
+    ) -> libc::c_int;
+    type ExecveFn = unsafe extern "C" fn(
+        *const libc::c_char,
+        *const *const libc::c_char,
+        *const *const libc::c_char,
+    ) -> libc::c_int;
+    type ExecvFn =
+        unsafe extern "C" fn(*const libc::c_char, *const *const libc::c_char) -> libc::c_int;
+
+    unsafe fn symbol(name: &std::ffi::CStr) -> *mut libc::c_void {
+        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+        assert!(!symbol.is_null(), "missing interposed symbol {name:?}");
+        symbol
+    }
+
+    let true_path = c"/usr/bin/true";
+    let true_name = c"true";
+    let mut direct_arguments = [true_path.as_ptr().cast_mut(), std::ptr::null_mut()];
+    let mut searched_arguments = [true_name.as_ptr().cast_mut(), std::ptr::null_mut()];
+
+    for (name, executable, arguments) in [
+        (
+            c"agora_sandbox_posix_spawn",
+            true_path,
+            direct_arguments.as_mut_ptr(),
+        ),
+        (
+            c"agora_sandbox_posix_spawnp",
+            true_name,
+            searched_arguments.as_mut_ptr(),
+        ),
+    ] {
+        let spawn = unsafe { std::mem::transmute::<*mut libc::c_void, PosixSpawnFn>(symbol(name)) };
+        let mut pid = 0;
+        assert_eq!(
+            unsafe {
+                spawn(
+                    &mut pid,
+                    executable.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    arguments,
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    for operation in ["execve", "execv", "execvp"] {
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            let result = match operation {
+                "execve" => {
+                    let exec = unsafe {
+                        std::mem::transmute::<*mut libc::c_void, ExecveFn>(symbol(
+                            c"agora_sandbox_execve",
+                        ))
+                    };
+                    let arguments = [true_path.as_ptr(), std::ptr::null()];
+                    let environment = unsafe { *libc::_NSGetEnviron() };
+                    unsafe { exec(true_path.as_ptr(), arguments.as_ptr(), environment.cast()) }
+                }
+                "execv" => {
+                    let exec = unsafe {
+                        std::mem::transmute::<*mut libc::c_void, ExecvFn>(symbol(
+                            c"agora_sandbox_execv",
+                        ))
+                    };
+                    let arguments = [true_path.as_ptr(), std::ptr::null()];
+                    unsafe { exec(true_path.as_ptr(), arguments.as_ptr()) }
+                }
+                "execvp" => {
+                    let exec = unsafe {
+                        std::mem::transmute::<*mut libc::c_void, ExecvFn>(symbol(
+                            c"agora_sandbox_execvp",
+                        ))
+                    };
+                    let arguments = [true_name.as_ptr(), std::ptr::null()];
+                    unsafe { exec(true_name.as_ptr(), arguments.as_ptr()) }
+                }
+                _ => unreachable!(),
+            };
+            unsafe { libc::_exit(if result == -1 { 126 } else { 127 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 }
 
@@ -832,6 +1040,71 @@ fn intercepted_child_process() {
     let mut echoed = [0_u8; 6];
     stream.read_exact(&mut echoed).unwrap();
     assert_eq!(&echoed, b"hooked");
+
+    let destination = destination.to_string().parse::<SocketAddrV4>().unwrap();
+    let datagram = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    datagram.connect(destination).unwrap();
+
+    let address = libc::sockaddr_in {
+        sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+        sin_family: libc::AF_INET as u8,
+        sin_port: destination.port().to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(destination.ip().octets()),
+        },
+        sin_zero: [0; 8],
+    };
+    assert_eq!(
+        unsafe {
+            libc::connect(
+                -1,
+                std::ptr::addr_of!(address).cast(),
+                std::mem::size_of_val(&address) as libc::socklen_t,
+            )
+        },
+        -1
+    );
+
+    let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    assert!(socket >= 0);
+    let endpoints = TestSocketEndpoints {
+        source_interface: 0,
+        source_address: std::ptr::null(),
+        source_address_length: 0,
+        destination_address: std::ptr::addr_of!(address).cast(),
+        destination_address_length: std::mem::size_of_val(&address) as libc::socklen_t,
+    };
+    assert_eq!(
+        unsafe {
+            connectx(
+                socket,
+                std::ptr::addr_of!(endpoints),
+                0,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    unsafe { libc::close(socket) };
+    assert_eq!(
+        unsafe {
+            connectx(
+                -1,
+                std::ptr::addr_of!(endpoints),
+                0,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        -1
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -1353,11 +1626,11 @@ async fn runner_injects_the_configured_tls_ca_path() {
     std::fs::write(&private_key, key.serialize_pem()).unwrap();
     let mut config = sandbox_config().with_tls_ca(&certificate, &private_key);
     config.network.tls = TlsMode::Auto;
-    let trust_bundle_directory = config.workdir().join("ca");
+    let private_workdir = config.workdir().to_path_buf();
     let script = format!(
         "AGORA_SANDBOX_TEST_TLS_TRUST_ENV='{}' '{}' \
          records_tls_trust_environment --exact --nocapture",
-        trust_bundle_directory.display(),
+        private_workdir.display(),
         std::env::current_exe().unwrap().display()
     );
     let command = SandboxCommand::new("/bin/bash").args(["-c", &script]);
@@ -1368,16 +1641,6 @@ async fn runner_injects_the_configured_tls_ca_path() {
         .unwrap();
 
     assert!(outcome.status().success());
-    let paths = std::fs::read_dir(&trust_bundle_directory)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect::<Vec<_>>();
-    assert_eq!(paths.len(), 1);
-    let certificates = rustls_pemfile::certs(&mut std::fs::read(&paths[0]).unwrap().as_slice())
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert!(certificates.len() > 1);
-    assert_eq!(certificates[0].as_ref(), ca.der().as_ref());
     assert!(certificate.exists());
     std::fs::remove_dir_all(directory).unwrap();
 }

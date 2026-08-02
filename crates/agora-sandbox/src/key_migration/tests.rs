@@ -20,7 +20,7 @@ fn non_interactive_progress_lists_stage_percentages() {
     let mut display = ProgressDisplay::new(&mut output, false, false);
 
     display
-        .render(FilesystemKeyMigrationProgress::ChangingPassphrase)
+        .render(FilesystemKeyMigrationProgress::ReencryptingFiles)
         .unwrap();
     display
         .render(FilesystemKeyMigrationProgress::Completed)
@@ -28,7 +28,7 @@ fn non_interactive_progress_lists_stage_percentages() {
 
     let output = String::from_utf8(output).unwrap();
     assert!(output.contains("40%"));
-    assert!(output.contains("Changing filesystem key"));
+    assert!(output.contains("Re-encrypting filesystem files"));
     assert!(output.contains("100%"));
     assert!(output.contains("Migration complete"));
 }
@@ -63,7 +63,7 @@ fn interactive_progress_uses_color_and_refreshes_one_line() {
     let mut display = ProgressDisplay::new(&mut output, true, true);
 
     display
-        .render(FilesystemKeyMigrationProgress::ChangingPassphrase)
+        .render(FilesystemKeyMigrationProgress::ReencryptingFiles)
         .unwrap();
     display
         .render(FilesystemKeyMigrationProgress::Completed)

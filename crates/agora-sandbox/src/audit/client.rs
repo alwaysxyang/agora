@@ -22,6 +22,7 @@ impl AuditClient {
     }
 
     pub(crate) fn publish(&self, event: AuditEventRequest) -> Result<(), AuditError> {
+        let request = encode_request(&self.token, event).map_err(AuditError::from_io)?;
         let mut stream = TcpStream::connect(self.control).map_err(AuditError::from_io)?;
         stream
             .set_read_timeout(Some(AUDIT_CLIENT_TIMEOUT))
@@ -29,9 +30,7 @@ impl AuditClient {
         stream
             .set_write_timeout(Some(AUDIT_CLIENT_TIMEOUT))
             .map_err(AuditError::from_io)?;
-        stream
-            .write_all(&encode_request(&self.token, event).map_err(AuditError::from_io)?)
-            .map_err(AuditError::from_io)?;
+        stream.write_all(&request).map_err(AuditError::from_io)?;
         let mut prefix = [0_u8; 4];
         stream
             .read_exact(&mut prefix)

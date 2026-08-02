@@ -46,7 +46,7 @@ struct Arguments {
     #[arg(long)]
     workdir: Option<PathBuf>,
 
-    /// Passphrase for a persistent encrypted APFS workspace; visible in process arguments
+    /// Passphrase for the persistent encrypted filesystem; visible in process arguments
     #[arg(long)]
     filesystem_key: Option<String>,
 

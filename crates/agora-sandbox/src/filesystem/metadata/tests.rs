@@ -1,6 +1,9 @@
-use super::{DirectoryMetadata, EntryState, METADATA_VERSION, Materializer, MetadataStore};
+use super::{
+    DirectoryMetadata, EntryState, FileAttributes, METADATA_VERSION, Materializer, MetadataStore,
+};
 use std::collections::BTreeMap;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 #[test]
@@ -29,10 +32,59 @@ fn metadata_round_trips_cached_cow_and_whiteout_states() {
     ));
     assert_eq!(store.state(cow).unwrap(), Some(EntryState::Cow));
     assert_eq!(store.state(whiteout).unwrap(), Some(EntryState::Whiteout));
+    let attributes = FileAttributes::created_file(0o640);
+    store
+        .set_with_attributes(cow, EntryState::Cow, Some(attributes.clone()))
+        .unwrap();
+    assert_eq!(store.attributes(cow).unwrap(), Some(attributes));
     assert_eq!(store.entries(Path::new("/tmp")).unwrap().len(), 3);
 
     store.remove(cached).unwrap();
     assert_eq!(store.state(cached).unwrap(), None);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unchanged_metadata_is_parsed_once() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let path = Path::new("/tmp/cached");
+    store.set(path, EntryState::Cow).unwrap();
+
+    assert_eq!(store.state(path).unwrap(), Some(EntryState::Cow));
+    assert_eq!(store.state(path).unwrap(), Some(EntryState::Cow));
+    assert_eq!(store.parse_count(), 1);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unchanged_attributes_do_not_rewrite_metadata() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let directory = Path::new("/tmp");
+    let path = directory.join("cached");
+    let attributes = FileAttributes::created_file(0o640);
+    store.set_attributes(&path, attributes.clone()).unwrap();
+    let metadata_path = store.path(directory).unwrap();
+    let identity = std::fs::metadata(&metadata_path).unwrap().ino();
+
+    store.set_attributes(&path, attributes).unwrap();
+
+    assert_eq!(std::fs::metadata(metadata_path).unwrap().ino(), identity);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_is_stored_next_to_its_mirrored_directory() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+
+    assert_eq!(
+        store.path(Path::new("/usr/bin")).unwrap(),
+        root.join("usr/bin/.metadata")
+    );
+
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -75,6 +127,7 @@ fn metadata_rejects_invalid_paths_and_records() {
         serde_json::to_vec(&DirectoryMetadata {
             version: METADATA_VERSION + 1,
             entries: Default::default(),
+            attributes: Default::default(),
         })
         .unwrap(),
     )
@@ -121,6 +174,7 @@ fn metadata_rejects_invalid_encoded_names() {
         serde_json::to_vec(&DirectoryMetadata {
             version: METADATA_VERSION,
             entries: BTreeMap::from([("*".to_string(), EntryState::Cow)]),
+            attributes: Default::default(),
         })
         .unwrap(),
     )
@@ -138,9 +192,10 @@ fn metadata_rejects_invalid_encoded_names() {
 }
 
 #[test]
-fn metadata_creation_reports_a_blocked_control_directory() {
+fn metadata_store_rejects_a_file_as_its_root() {
     let root = tempfile();
-    std::fs::write(root.join(super::CONTROL_DIRECTORY), b"blocked").unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::write(&root, b"blocked").unwrap();
 
     assert!(
         MetadataStore::new(&root)
@@ -150,7 +205,7 @@ fn metadata_creation_reports_a_blocked_control_directory() {
             .contains("failed to create")
     );
 
-    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_file(root).unwrap();
 }
 
 #[test]

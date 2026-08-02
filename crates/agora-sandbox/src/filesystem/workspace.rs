@@ -2,16 +2,16 @@ use super::{EncryptedWorkspace, FilesystemMode};
 use anyhow::{Context, Result, bail};
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-const FILESYSTEM_DIRECTORY: &str = "filesystem";
 const ROOT_DIRECTORY: &str = "fs";
-const LOCK_FILE: &str = "fs.lock";
+const LOCK_FILE: &str = ".fs.lock";
+const KEY_FILE: &str = ".key.json";
 
 #[derive(Debug)]
 pub(crate) enum FilesystemWorkspace {
-    Encrypted(EncryptedWorkspace),
+    Encrypted(Box<EncryptedWorkspace>),
     Plain(PlainWorkspace),
 }
 
@@ -24,6 +24,7 @@ impl FilesystemWorkspace {
         match (mode, encrypted_key) {
             (FilesystemMode::Encrypted, Some(key)) => EncryptedWorkspace::start(workdir, key)
                 .await
+                .map(Box::new)
                 .map(Self::Encrypted),
             (FilesystemMode::Encrypted, None) => bail!("sandbox filesystem key is required"),
             (FilesystemMode::Plain, None) => PlainWorkspace::start(workdir).map(Self::Plain),
@@ -46,6 +47,20 @@ impl FilesystemWorkspace {
             Self::Plain(_) => Ok(()),
         }
     }
+
+    pub(crate) fn encrypted_key(&self) -> Option<&[u8]> {
+        match self {
+            Self::Encrypted(workspace) => Some(workspace.key()),
+            Self::Plain(_) => None,
+        }
+    }
+
+    pub(crate) fn encrypted_salt(&self) -> Option<&[u8]> {
+        match self {
+            Self::Encrypted(workspace) => Some(workspace.salt()),
+            Self::Plain(_) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -57,11 +72,15 @@ pub(crate) struct PlainWorkspace {
 impl PlainWorkspace {
     fn start(workdir: &Path) -> Result<Self> {
         let workdir = EncryptedWorkspace::resolved_destination(workdir)?;
-        let directory = workdir.join(FILESYSTEM_DIRECTORY);
-        Self::prepare_directory(&directory, "filesystem state")?;
-        let lock = Self::lock(&directory)?;
         let root = workdir.join(ROOT_DIRECTORY);
         Self::prepare_directory(&root, "plain filesystem root")?;
+        if root.join(KEY_FILE).exists() {
+            bail!(
+                "encrypted filesystem state exists at {}; use encrypted filesystem mode",
+                root.display()
+            );
+        }
+        let lock = Self::lock(&root)?;
         Ok(Self { root, _lock: lock })
     }
 
@@ -86,6 +105,7 @@ impl PlainWorkspace {
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(0o600)
             .open(&path)
             .with_context(|| format!("failed to open filesystem lock {}", path.display()))?;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {

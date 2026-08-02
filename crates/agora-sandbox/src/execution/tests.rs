@@ -167,7 +167,7 @@ async fn execution_controller_rejects_an_invalid_token() {
 
     assert!(prepared.is_file());
     controller.shutdown().await.unwrap();
-    assert!(directory.join(".agora/overlay.lock").is_file());
+    assert!(directory.join(".vfs.lock").is_file());
 }
 
 #[tokio::test]

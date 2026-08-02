@@ -1,6 +1,6 @@
 use super::{
-    FilesystemMode, Sandbox, SandboxCommand, SandboxConfig, SandboxOutcome, process_group_exists,
-    signal_process_group, wait_for_child_or_service,
+    FilesystemMode, Sandbox, SandboxCommand, SandboxConfig, SandboxOutcome, SecretBytes,
+    process_group_exists, signal_process_group, terminate_process_group, wait_for_child_or_service,
 };
 use crate::audit::AuditController;
 use crate::callback::{Decision, Event, EventType, NoopCallback, TlsOutcome};
@@ -8,9 +8,10 @@ use crate::execution::ExecutionController;
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
 use base64::Engine;
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 fn sleeping_child() -> tokio::process::Child {
@@ -22,28 +23,45 @@ fn sleeping_child() -> tokio::process::Child {
 
 #[cfg(target_os = "macos")]
 fn built_hook_library() -> PathBuf {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    let status = std::process::Command::new(env!("CARGO"))
-        .args(["build", "-p", "agora-sandbox", "--lib"])
-        .current_dir(workspace)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .map(|path| {
-            if path.is_absolute() {
-                path
-            } else {
-                workspace.join(path)
-            }
-        })
-        .unwrap_or_else(|| workspace.join("target"));
-    target.join("debug/libagora_sandbox.dylib")
+    static HOOK: OnceLock<PathBuf> = OnceLock::new();
+    HOOK.get_or_init(|| {
+        if std::env::var_os("CARGO_LLVM_COV").is_some() {
+            let library = std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("libagora_sandbox.dylib");
+            assert!(library.is_file(), "missing {}", library.display());
+            return library;
+        }
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    workspace.join(path)
+                }
+            })
+            .unwrap_or_else(|| workspace.join("target"))
+            .join("hook");
+        let status = std::process::Command::new(env!("CARGO"))
+            .args(["build", "-p", "agora-sandbox", "--lib", "--target-dir"])
+            .arg(&target)
+            .current_dir(workspace)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let library = target.join("debug/libagora_sandbox.dylib");
+        assert!(library.is_file(), "missing {}", library.display());
+        library
+    })
+    .clone()
 }
 
 #[cfg(target_os = "macos")]
@@ -115,8 +133,10 @@ async fn system_curl_completes_the_transparent_tls_chain() {
     let identity = "origin.agora.test";
     let (origin, origin_root, origin_task) = local_https_origin(identity).await;
     let root = std::env::temp_dir().join(format!("agora-curl-tls-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&root).unwrap();
-    let output = root.join("response.txt");
+    let source = root.join("source");
+    let workdir = root.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    let output = source.join("response.txt");
     let events = Arc::new(Mutex::new(Vec::new()));
     let callback = {
         let events = Arc::clone(&events);
@@ -126,7 +146,7 @@ async fn system_curl_completes_the_transparent_tls_chain() {
         }
     };
     let mut config = SandboxConfig::new(built_hook_library())
-        .with_workdir(&root)
+        .with_workdir(&workdir)
         .with_encrypted_workspace("test-filesystem-key")
         .with_upstream_tls_roots(vec![origin_root]);
     config.network.tls = TlsMode::Auto;
@@ -205,11 +225,13 @@ async fn system_curl_completes_the_transparent_tls_chain() {
 #[tokio::test]
 async fn encrypted_overlay_preserves_the_host_while_the_child_uses_cow_and_whiteouts() {
     let root = std::env::temp_dir().join(format!("agora-overlay-run-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&root).unwrap();
-    let existing = root.join("existing");
-    let removed = root.join("removed");
-    let created = root.join("created");
-    let directory = root.join("directory");
+    let source = root.join("source");
+    let workdir = root.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    let existing = source.join("existing");
+    let removed = source.join("removed");
+    let created = source.join("created");
+    let directory = source.join("directory");
     std::fs::write(&existing, b"host").unwrap();
     std::fs::write(&removed, b"host removed").unwrap();
     let script = format!(
@@ -228,7 +250,7 @@ async fn encrypted_overlay_preserves_the_host_while_the_child_uses_cow_and_white
         }
     };
     let config = SandboxConfig::new(built_hook_library())
-        .with_workdir(&root)
+        .with_workdir(&workdir)
         .with_encrypted_workspace("test-filesystem-key");
     let outcome = Sandbox::new(config, callback)
         .run(SandboxCommand::new("/bin/bash").args(["-c", script.as_str()]))
@@ -417,6 +439,29 @@ fn sandbox_config_allows_an_explicit_plain_workspace_without_a_key() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_config_rejects_an_encrypted_key_in_plain_mode() {
+    let root = std::env::temp_dir().join(format!(
+        "agora-plain-filesystem-key-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let hook = root.join("hook.dylib");
+    std::fs::write(&hook, b"hook").unwrap();
+    let mut config = SandboxConfig::new(&hook).with_plain_workspace();
+    config.encrypted_workspace_key = Some(SecretBytes::new("unexpected"));
+
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be used with plain filesystem mode")
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn command_workdir_resolution_and_disabled_tls_defaults_are_explicit() {
     let current = std::env::current_dir().unwrap().canonicalize().unwrap();
@@ -584,9 +629,9 @@ fn tls_trust_bundles_are_stable_per_ca_and_isolated_between_cas() {
     let root = std::env::temp_dir().join(format!("agora-trust-bundle-{}", uuid::Uuid::new_v4()));
     let config = SandboxConfig::new(root.join("hook.dylib")).with_workdir(&root);
 
-    let first = config.write_tls_trust_bundle(b"first CA").unwrap();
-    let reused = config.write_tls_trust_bundle(b"first CA").unwrap();
-    let second = config.write_tls_trust_bundle(b"second CA").unwrap();
+    let first = config.write_tls_trust_bundle(&root, b"first CA").unwrap();
+    let reused = config.write_tls_trust_bundle(&root, b"first CA").unwrap();
+    let second = config.write_tls_trust_bundle(&root, b"second CA").unwrap();
 
     assert_eq!(first, reused);
     assert_ne!(first, second);
@@ -607,7 +652,7 @@ fn tls_trust_bundle_reports_directory_and_write_failures() {
 
     assert!(
         config
-            .write_tls_trust_bundle(b"CA")
+            .write_tls_trust_bundle(&root, b"CA")
             .unwrap_err()
             .to_string()
             .contains("failed to create TLS client trust bundle directory")
@@ -618,7 +663,7 @@ fn tls_trust_bundle_reports_directory_and_write_failures() {
     std::fs::set_permissions(root.join("ca"), std::fs::Permissions::from_mode(0o500)).unwrap();
     assert!(
         config
-            .write_tls_trust_bundle(b"CA")
+            .write_tls_trust_bundle(&root, b"CA")
             .unwrap_err()
             .to_string()
             .contains("failed to write TLS client trust bundle")
@@ -800,4 +845,101 @@ async fn execution_controller_failure_terminates_the_child_process() {
     assert!(execution.shutdown().await.is_ok());
     audit.shutdown().await.unwrap();
     std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[tokio::test]
+async fn audit_controller_failure_terminates_the_child_process() {
+    let workdir = std::env::temp_dir().join(format!(
+        "agora-audit-failure-cache-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut controller = NetworkController::start(
+        NetworkConfig::default(),
+        NetworkRunContext::new("sandbox", "run"),
+        NoopCallback,
+    )
+    .await
+    .unwrap();
+    let mut child = sleeping_child();
+    let mut execution = ExecutionController::start(workdir.clone()).await.unwrap();
+    let mut audit = AuditController::start(
+        "sandbox".to_string(),
+        "run".to_string(),
+        NoopCallback,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    audit.abort_server_for_test();
+    let process_group = child.id().unwrap() as libc::pid_t;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_for_child_or_service(
+            &mut child,
+            process_group,
+            &mut controller,
+            &mut execution,
+            &mut audit,
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("sandbox audit controller failed")
+    );
+    assert!(child.try_wait().unwrap().is_some());
+    controller.shutdown().await.unwrap();
+    execution.shutdown().await.unwrap();
+    assert!(audit.shutdown().await.is_ok());
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn child_spawn_failure_shuts_down_started_services() {
+    let root = std::env::temp_dir().join(format!(
+        "agora-child-spawn-failure-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let hook = root.join("hook.dylib");
+    std::fs::write(&hook, b"hook").unwrap();
+    let config = SandboxConfig::new(&hook)
+        .with_workdir(&root)
+        .with_plain_workspace();
+    let invalid_argument = std::ffi::OsString::from_vec(b"invalid\0argument".to_vec());
+
+    let error = Sandbox::new(config, NoopCallback)
+        .run(SandboxCommand::new("/usr/bin/true").arg(invalid_argument))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("failed to start sandbox child"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn termination_kills_a_process_group_that_ignores_sigterm() {
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .args(["-c", "trap '' TERM; while :; do :; done"])
+        .kill_on_drop(true);
+    command.as_std_mut().process_group(0);
+    let mut child = command.spawn().unwrap();
+    let process_group = child.id().unwrap() as libc::pid_t;
+    assert_eq!(unsafe { libc::getpgid(process_group) }, process_group);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    terminate_process_group(&mut child, process_group)
+        .await
+        .unwrap();
+
+    assert!(child.try_wait().unwrap().is_some());
+    assert!(!process_group_exists(process_group).unwrap());
 }

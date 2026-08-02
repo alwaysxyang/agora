@@ -1,0 +1,101 @@
+use anyhow::{Context, Result, bail};
+use base64::Engine;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Component, Path, PathBuf};
+
+pub(super) const METADATA_FILE: &str = ".metadata";
+pub(super) const FILESYSTEM_LOCK_FILE: &str = ".fs.lock";
+pub(super) const KEY_FILE: &str = ".key.json";
+pub(super) const VFS_LOCK_FILE: &str = ".vfs.lock";
+pub(super) const FILE_LOCK_DIRECTORY: &str = ".locks";
+pub(super) const REKEY_JOURNAL_FILE: &str = ".rekey.json";
+const ESCAPED_PREFIX: &[u8] = b".agora-entry-";
+
+pub(super) fn backing_path(root: &Path, logical: &Path) -> Result<PathBuf> {
+    let logical = normalize(logical)?;
+    let mut destination = root.to_path_buf();
+    for component in logical.components() {
+        if let Component::Normal(name) = component {
+            destination.push(encode_name(name));
+        }
+    }
+    Ok(destination)
+}
+
+pub(super) fn logical_path(root: &Path, backing: &Path) -> Result<PathBuf> {
+    let relative = backing
+        .strip_prefix(root)
+        .with_context(|| format!("path is not inside filesystem root: {}", backing.display()))?;
+    let mut logical = PathBuf::from("/");
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            bail!("invalid filesystem backing path: {}", backing.display());
+        };
+        logical.push(decode_name(name)?);
+    }
+    Ok(logical)
+}
+
+pub(super) fn encode_name(name: &OsStr) -> OsString {
+    let bytes = name.as_bytes();
+    if is_reserved(bytes) || bytes.starts_with(ESCAPED_PREFIX) {
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let mut physical = ESCAPED_PREFIX.to_vec();
+        physical.extend_from_slice(encoded.as_bytes());
+        OsString::from_vec(physical)
+    } else {
+        name.to_os_string()
+    }
+}
+
+pub(super) fn decode_name(name: &OsStr) -> Result<OsString> {
+    let bytes = name.as_bytes();
+    let Some(encoded) = bytes.strip_prefix(ESCAPED_PREFIX) else {
+        return Ok(name.to_os_string());
+    };
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .context("invalid escaped filesystem entry name")?;
+    Ok(OsString::from_vec(decoded))
+}
+
+pub(super) fn is_control_name(name: &OsStr) -> bool {
+    let name = name.as_bytes();
+    is_reserved(name)
+        || name.starts_with(b".metadata.")
+        || name.starts_with(b".key.json.")
+        || name.starts_with(b".rekey.json.")
+        || name.starts_with(b".agora-encrypted-")
+        || name.starts_with(b".agora-rekey-")
+}
+
+pub(super) fn normalize(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("filesystem path is not absolute: {}", path.display());
+    }
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(value) => normalized.push(value),
+            Component::Prefix(_) => bail!("unsupported filesystem path: {}", path.display()),
+        }
+    }
+    Ok(normalized)
+}
+
+fn is_reserved(name: &[u8]) -> bool {
+    name == METADATA_FILE.as_bytes()
+        || name == FILESYSTEM_LOCK_FILE.as_bytes()
+        || name == KEY_FILE.as_bytes()
+        || name == VFS_LOCK_FILE.as_bytes()
+        || name == FILE_LOCK_DIRECTORY.as_bytes()
+        || name == REKEY_JOURNAL_FILE.as_bytes()
+}
+
+#[cfg(test)]
+mod tests;

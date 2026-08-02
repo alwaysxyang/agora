@@ -1,140 +1,77 @@
-# Encrypted Filesystem Overlay
+# Rootless Encrypted Overlay Filesystem
 
 ## Goal
 
-`agora-sandbox` provides one rootless filesystem view for every injectable process in a sandbox run. The view mirrors absolute host paths beneath `<workdir>/fs`, reads through to the host filesystem on cache misses, preserves sandbox writes through copy-on-write, and never modifies the host filesystem. Plaintext storage is the default; encrypted APFS storage is available through an explicit mode selection.
+Provide one rootless filesystem view for injectable macOS process trees. Reads fall through to host paths, writes remain isolated under `<workdir>/fs`, and encrypted mode keeps every persistent business file as ciphertext for the entire run.
 
-The implementation is process-tree scoped. It applies only to processes that successfully load the Agora hook library. A process that cannot be prepared for injection is rejected instead of running outside the filesystem view.
+## Decisions
 
-## Storage Layout
+- `<workdir>/fs` is the only persistent backing tree.
+- The implementation does not use filesystem images, mounts, FUSE, `chroot`, or privileged helpers.
+- Plain mode stores upper files directly.
+- Encrypted mode stores upper files as chunked AES-256-GCM data and exposes their plaintext only through anonymous descriptors.
+- VFS policy and cryptography are independent from libc interposition.
+- Control files live beside mirrored data but are hidden and physically unreachable from the sandbox.
+- Logical business files may use control-like names through physical name encoding.
+- Copy-on-write and whiteouts operate at whole-file granularity.
+- Runtime executable copies and trust bundles are per-run temporary files outside the work directory.
 
-The APFS AES-256 sparse bundle is stored outside its mount point:
+## Persistent Layout
 
 ```text
 <workdir>/
-├── filesystem/
-│   ├── fs.sparsebundle
-│   └── fs.lock
-└── fs/                         # encrypted APFS mount or explicit plaintext root
-    ├── .agora/
-    │   ├── volume.json
-    │   ├── overlay.lock
-    │   └── metadata/           # one metadata.json per mirrored host directory
-    ├── usr/bin/curl
-    ├── tmp/example
-    └── Users/example/project/...
+├── ca/
+└── fs/
+    ├── .fs.lock
+    ├── .key.json          # encrypted mode only
+    ├── .vfs.lock
+    ├── .locks/            # stable per-logical-file locks
+    ├── .rekey.json        # present only during recoverable key migration
+    └── <mirrored path>/
+        ├── .metadata
+        └── <business files>
 ```
 
-There are no separate executable, upper, and metadata data trees. Cached host files, prepared executables, and copy-on-write files share the same mirrored tree. The reserved `.agora` control directory is hidden from sandboxed directory enumeration and cannot be addressed by sandboxed processes.
+`.fs.lock` guards the whole work directory. `.vfs.lock` guards short VFS publication and metadata transactions. A fresh descriptor is opened for each lock acquisition so the lock remains effective across threads and forked descendants. `.locks` contains stable files keyed by normalized logical path; encrypted upper readers hold shared locks and writers hold exclusive locks for the lifetime of their open-file description. Direct lower readers do not create a file lease. `.key.json` stores only a version, salt, and derived key identifier. `.metadata` stores entry state and logical file attributes for its own logical directory.
 
-An absolute host path `/tmp/example` maps to `<workdir>/fs/tmp/example`. Relative paths are resolved against the process's logical host current directory before mapping.
+## Read And Write Flow
 
-## Storage Modes
+1. Normalize the logical absolute path, resolve existing path components without following a path into the private work directory, and reject physical work-directory aliases.
+2. Resolve reserved logical names to encoded physical names.
+3. Consult the parent directory's `.metadata`.
+4. Prefer authoritative `cow` upper data, reject `whiteout`, and otherwise return the lower host path directly. A non-authoritative `cached` entry does not shadow lower for normal reads.
+5. On write intent, acquire the logical file's exclusive lock and copy lower data into upper before opening it. Newly created files start in upper.
+6. For an encrypted upper read, acquire the logical file's shared lock before creating a view. Direct lower reads do not create a VFS lock.
+7. In encrypted mode, verify and decrypt upper regular data into an anonymous descriptor.
+8. Duplicate descriptors, including `fcntl(F_DUPFD*)`, share one open-file record and lock lease.
+9. On write intent, stage metadata without making it authoritative until open succeeds.
+10. On `fsync` or last tracked close, encrypt the descriptor into a temporary ciphertext and atomically rename it into place.
+11. Release the per-file lock only after the last tracked descriptor closes.
 
-Plaintext mode is the default and uses an ordinary persistent `<workdir>/fs` directory without a filesystem key.
+At no point does encrypted mode publish a named plaintext business file beneath the work directory.
 
-Encrypted mode is selected explicitly with `--filesystem encrypted --filesystem-key <KEY>` or `SandboxConfig::with_encrypted_workspace`. An absent, empty, invalid, or incorrect key fails closed before the target process starts. Plaintext mode rejects a filesystem key and is not a fallback for an encrypted startup failure. The overlay behavior is identical, but plaintext mode does not encrypt data at rest.
+## Directory And Metadata Flow
 
-Both modes acquire `<workdir>/filesystem/fs.lock`. Runs using the same work directory are mutually exclusive, while runs using different work directories can proceed concurrently.
+Directories are ordinary owner-accessible backing directories so the controller can maintain them. Their requested mode is retained where possible, with owner management bits forced on physically. Directory enumeration merges lower and upper entries, applies whiteouts, decodes logical aliases, and filters controls.
 
-The key is an APFS disk-image passphrase. It is sent to `hdiutil` through standard input and is not injected into child arguments or environment. The CLI value remains visible in the parent process arguments and may be retained by shell history.
+Cached entries carry lower MD5, materializer type, and logical file attributes, but remain non-authoritative for normal reads. COW entries remain authoritative and retain logical mode and timestamps independently from the physical `0600` ciphertext container. Explicit materializers refresh their own cached entries when lower changes. Logical permission overrides are also stored in metadata and are enforced by intercepted stat, access, and open operations without changing lower permissions. Rename validates the operation before materialization, preserves ordinary symlinks, and then updates only upper state; rename and removal never mutate lower data.
 
-After a successful mount, `<workdir>/fs/.agora/volume.json` records a version, random volume ID, and random key ID. These IDs are identifiers, not passphrase hashes. An existing image that cannot be mounted reports that the key is incorrect and directs the caller to the explicit key migration command. It is never recreated automatically.
+## Key Lifecycle
 
-## Directory Metadata
+The first encrypted run creates `.key.json`. A later run derives the cipher and compares the key identifier before child startup. Keys cannot change implicitly.
 
-Each mirrored host directory has one control record under the hidden metadata tree. Entry names are encoded so non-UTF-8 host names are supported and cannot escape the metadata directory.
+`migrate-key` acquires `.fs.lock`, prepares and verifies replacement ciphertext for every business file, and writes `.rekey.json` before publication. Each replacement keeps a recoverable old copy until `.key.json` has switched to the new key. Startup reads the journal and deterministically rolls back an old-key transaction or completes cleanup for a committed new-key transaction. The UI reports stage percentages because migration does not expose byte-level progress.
 
-```json
-{
-  "version": 1,
-  "entries": {
-    "Y29uZmlnLmpzb24=": {
-      "state": "cached",
-      "checksum": "d41d8cd98f00b204e9800998ecf8427e",
-      "materializer": "copy"
-    },
-    "Y3VybA==": {
-      "state": "cached",
-      "checksum": "d41d8cd98f00b204e9800998ecf8427e",
-      "materializer": "executable"
-    },
-    "bm90ZXMudHh0": {
-      "state": "cow"
-    },
-    "ZGVsZXRlZC50eHQ=": {
-      "state": "whiteout"
-    }
-  }
-}
-```
+## Security Boundary
 
-MD5 is used only for source-change detection; it is not a security primitive.
+The design is rootless and requires no mount permission. Its boundary is only as strong as hook coverage. Non-injectable processes, direct syscalls, and uncatchable termination are explicit limitations. The host user can inspect control metadata and ciphertext but not a named plaintext backing file during normal operation.
 
-- `cached`: The file is an unchanged materialization of the host file. The source MD5 is checked before reuse. A mismatch refreshes the file atomically.
-- `cow`: The file was created or modified by the sandbox. It is authoritative and is never overwritten when the host file changes.
-- `whiteout`: The sandbox deleted the path. Host fallback is blocked until the sandbox explicitly creates the path again.
-- `materializer = copy`: Refresh by copying the host file and preserving its supported metadata.
-- `materializer = executable`: Refresh by running the executable preparation pipeline, including architecture selection and ad-hoc signing.
+The runtime fails closed when key validation, metadata parsing, decryption authentication, audit delivery, executable preparation, or supported VFS mapping fails.
 
-Metadata and file publication are serialized by the filesystem root's overlay lock. Files and metadata are written to temporary paths within the selected root and atomically renamed.
+## Current Limitations
 
-## Path Resolution And Copy-On-Write
-
-The hook intercepts path-based filesystem entry points rather than `read` and `write`. This includes open and create, metadata and access checks, truncate, deletion, rename, directory creation, current-directory operations, and directory enumeration, including their supported `*at` forms. Tracked directory descriptors resolve through their logical path. File descriptors returned by an intercepted open point at files in the selected sandbox tree, so normal descriptor reads, writes, seeks, locks, `mmap`, and `fsync` retain native kernel behavior. Descriptor-based truncate, permission, and ownership changes require a regular file in the selected root. Path permission/ownership changes, hard-link and symlink creation, and `clonefile`/`copyfile` are interposed but fail with `ENOTSUP` while the runtime is active.
-
-Intercepted `open`, `openat`, and `fopen` attempts publish the logical path and structured open mode through the sandbox audit callback. Successful opens associate that context with the native descriptor; intercepted `close` and `fclose` publish the matching close event and release the association after native close succeeds. File events carry the inherited trace chain used by process and network events.
-
-For a read:
-
-1. Resolve the logical absolute host path.
-2. Reject access to the reserved `.agora` control namespace.
-3. If metadata records a whiteout, return `ENOENT`.
-4. If metadata records a COW file, open the sandbox copy.
-5. If metadata records a cached file, compare its source MD5 and refresh it when changed.
-6. If no entry exists, materialize the host file into the sandbox tree, record it as cached, and open the sandbox copy.
-
-For a write-intent open (`O_WRONLY`, `O_RDWR`, `O_APPEND`, `O_TRUNC`, or creation):
-
-1. Materialize the host file first when no sandbox copy exists.
-2. Invoke the native open on the mirrored path and change its state to `cow` only after that open succeeds.
-3. Create a new sandbox file and mark it `cow` only after its native open succeeds when neither view contains the path.
-
-`posix_spawn_file_actions_addopen` records the mirrored path without executing the action. Pending write state is committed immediately before `posix_spawn` or `posix_spawnp` uses the actions, and destroying unused actions discards the pending state.
-
-This is file-level copy-on-write. The first write-intent open copies the complete host file; it does not copy individual blocks lazily.
-
-Deleting a path removes its sandbox copy and records a whiteout. Renaming moves the sandbox entry and its state without modifying either host path, after enforcing same-path, type, descendant, and non-empty-directory rules. Directory reads merge host and sandbox names, remove whiteouts, prefer sandbox entries, and hide `.agora`.
-
-## Process Integration
-
-The runner prepares the selected filesystem root before starting the execution controller. Encrypted mode mounts its APFS volume; plaintext mode prepares the ordinary root directory. The executable store writes prepared system binaries into the same mirrored tree and publishes directory metadata with `materializer = executable`.
-
-The runner injects the selected root path into the hook environment. `posix_spawn` and `execve` continue to prepare descendants and propagate the same root. Hook-internal paths, control sockets, the hook library, and paths already beneath the root bypass virtualization to prevent recursion.
-
-The original current directory remains the process's logical current directory. Path hooks resolve relative paths against it and redirect the resulting absolute paths into the selected sandbox tree.
-
-## Key Migration
-
-The CLI exposes an explicit command:
-
-```bash
-agora-sandbox migrate-key \
-  --workdir <WORKDIR>
-```
-
-The command reads the current and replacement keys interactively as visible text and reports milestone-based percentage progress. Migration takes the same exclusive filesystem lock as sandbox startup, requires the image to be detached, rejects identical keys, verifies the old key, and uses `hdiutil chpass` to change the passphrase in place. It then mounts with the new key, generates a new random key ID in `volume.json`, verifies the result, and detaches the image. Existing encrypted data is preserved, and a failed normal startup never attempts migration.
-
-The previous `clean` command is removed. The encrypted filesystem is persistent; deleting the entire sparse bundle is the explicit destructive reset operation and is not performed by sandbox startup.
-
-## Failure Behavior
-
-All filesystem setup and path-virtualization failures are fail-closed. The target process is not started when its selected filesystem root cannot be created, mounted when required, validated, or locked. An intercepted operation returns an appropriate POSIX error instead of falling back to a host write.
-
-The sparse bundle is detached on normal completion, startup rollback, service failure, and best-effort synchronous drop. A watchdog inherits the filesystem lock while the image is mounted and retries a normal detach when controller death closes its liveness pipe. The mounted plaintext view remains accessible to the same host user while the sandbox is running; encryption protects data at rest.
-
-## Verification
-
-Tests cover encrypted-key validation, explicit plaintext selection, encrypted-volume identity, wrong-key errors, key migration, directory metadata transitions, source checksum refresh, COW preservation across host changes, whiteouts, write-intent copy-up, directory merge behavior, executable refresh, process-tree propagation, same-workdir exclusion, and cleanup after failures.
-
-The macOS integration path verifies that a copied shell can read, modify, delete, and recreate files through the overlay while the original host files remain unchanged.
+- Encrypted deferred `posix_spawn_file_actions_addopen` is unsupported.
+- Ownership changes, links, and native copy/clone operations are unsupported while hooked. Permission changes are logical overlay metadata only.
+- Unsynchronized writes may be lost on uncatchable process termination.
+- File content is serialized per logical path. Multiple readers may coexist, while a writer excludes readers and other writers until its last descriptor closes.
+- This is not a kernel namespace and does not hide host paths from an unhooked executable.

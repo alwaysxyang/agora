@@ -1,18 +1,19 @@
 use super::{
-    DirectoryCursor, FilesystemHookGuard, FilesystemHookRuntime, PathIntent,
+    DirectoryCursor, FilesystemHookGuard, FilesystemHookRuntime,
     agora_sandbox_access as sandbox_access, agora_sandbox_chdir as sandbox_chdir,
     agora_sandbox_chmod as sandbox_chmod, agora_sandbox_chown as sandbox_chown,
     agora_sandbox_clonefile as sandbox_clonefile, agora_sandbox_clonefileat as sandbox_clonefileat,
     agora_sandbox_close as sandbox_close, agora_sandbox_closedir as sandbox_closedir,
     agora_sandbox_copyfile as sandbox_copyfile, agora_sandbox_creat as sandbox_creat,
-    agora_sandbox_fchmod as sandbox_fchmod, agora_sandbox_fchmodat as sandbox_fchmodat,
-    agora_sandbox_fchown as sandbox_fchown, agora_sandbox_fchownat as sandbox_fchownat,
-    agora_sandbox_fclose as sandbox_fclose, agora_sandbox_fopen as sandbox_fopen,
-    agora_sandbox_fstatat as sandbox_fstatat, agora_sandbox_ftruncate as sandbox_ftruncate,
-    agora_sandbox_getcwd as sandbox_getcwd, agora_sandbox_lchown as sandbox_lchown,
-    agora_sandbox_link as sandbox_link, agora_sandbox_linkat as sandbox_linkat,
-    agora_sandbox_lstat as sandbox_lstat, agora_sandbox_mkdir as sandbox_mkdir,
-    agora_sandbox_mkdirat as sandbox_mkdirat,
+    agora_sandbox_dup as sandbox_dup, agora_sandbox_fchmod as sandbox_fchmod,
+    agora_sandbox_fchmodat as sandbox_fchmodat, agora_sandbox_fchown as sandbox_fchown,
+    agora_sandbox_fchownat as sandbox_fchownat, agora_sandbox_fclose as sandbox_fclose,
+    agora_sandbox_fopen as sandbox_fopen, agora_sandbox_fstat as sandbox_fstat,
+    agora_sandbox_fstatat as sandbox_fstatat, agora_sandbox_fsync as sandbox_fsync,
+    agora_sandbox_ftruncate as sandbox_ftruncate, agora_sandbox_getcwd as sandbox_getcwd,
+    agora_sandbox_lchown as sandbox_lchown, agora_sandbox_link as sandbox_link,
+    agora_sandbox_linkat as sandbox_linkat, agora_sandbox_lstat as sandbox_lstat,
+    agora_sandbox_mkdir as sandbox_mkdir, agora_sandbox_mkdirat as sandbox_mkdirat,
     agora_sandbox_open_with_mode as sandbox_open_with_mode,
     agora_sandbox_openat_with_mode as sandbox_openat_with_mode,
     agora_sandbox_opendir as sandbox_opendir,
@@ -32,7 +33,7 @@ use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -49,7 +50,7 @@ impl Fixture {
             std::env::temp_dir().join(format!("agora-filesystem-hook-{}", uuid::Uuid::new_v4()));
         let lower = directory.join("lower");
         std::fs::create_dir_all(&lower).unwrap();
-        let runtime = FilesystemHookRuntime::new(directory.join("fs")).unwrap();
+        let runtime = FilesystemHookRuntime::new(directory.join("workdir/fs")).unwrap();
         Self {
             directory,
             lower,
@@ -106,10 +107,7 @@ fn read_and_write_mapping_use_the_encrypted_overlay() {
     std::fs::write(&lower, b"host").unwrap();
     let path = Fixture::c_path(&lower);
 
-    let read = fixture
-        .runtime
-        .map(path.as_ptr(), libc::AT_FDCWD, PathIntent::Read)
-        .unwrap();
+    let read = fixture.runtime.map(path.as_ptr(), libc::AT_FDCWD).unwrap();
     assert_eq!(
         std::fs::read(Path::new(read.to_str().unwrap())).unwrap(),
         b"host"
@@ -117,40 +115,47 @@ fn read_and_write_mapping_use_the_encrypted_overlay() {
 
     let write = fixture
         .runtime
-        .map(
-            path.as_ptr(),
-            libc::AT_FDCWD,
-            PathIntent::Write { create: false },
-        )
+        .filesystem
+        .prepare_write(&lower, false)
         .unwrap();
-    std::fs::write(Path::new(write.to_str().unwrap()), b"sandbox").unwrap();
+    std::fs::write(write, b"sandbox").unwrap();
     assert_eq!(std::fs::read(&lower).unwrap(), b"host");
     assert_eq!(
-        fixture.runtime.overlay.state_for_test(&lower).unwrap(),
+        fixture.runtime.filesystem.state_for_test(&lower).unwrap(),
         Some(EntryState::Cow)
     );
 }
 
 #[test]
-fn mapped_absolute_paths_are_returned_to_the_logical_namespace() {
+fn lower_read_paths_remain_directly_addressable_by_the_sandbox() {
     let fixture = Fixture::new();
     let logical = fixture.lower.join("file");
     std::fs::write(&logical, b"host").unwrap();
     let lower = Fixture::c_path(&logical);
-    let mapped = fixture
-        .runtime
-        .map(lower.as_ptr(), libc::AT_FDCWD, PathIntent::Read)
-        .unwrap();
+    let mapped = fixture.runtime.map(lower.as_ptr(), libc::AT_FDCWD).unwrap();
 
-    assert_eq!(
-        unsafe {
-            fixture
-                .runtime
-                .logical_path(mapped.as_ptr(), libc::AT_FDCWD)
-        }
-        .unwrap(),
-        logical
-    );
+    let resolved = unsafe {
+        fixture
+            .runtime
+            .logical_path(mapped.as_ptr(), libc::AT_FDCWD)
+    }
+    .unwrap();
+    assert_eq!(resolved, logical);
+}
+
+#[test]
+fn external_symlink_aliases_cannot_address_private_workspace_paths() {
+    let fixture = Fixture::new();
+    let private = fixture.directory.join("workdir/private");
+    std::fs::create_dir_all(&private).unwrap();
+    std::fs::write(private.join("secret"), b"secret").unwrap();
+    let alias = fixture.directory.join("workspace-alias");
+    symlink(fixture.directory.join("workdir"), &alias).unwrap();
+    let alias = Fixture::c_path(&alias.join("private/secret"));
+
+    let error =
+        unsafe { fixture.runtime.logical_path(alias.as_ptr(), libc::AT_FDCWD) }.unwrap_err();
+    assert_eq!(error_errno(&error), libc::EACCES);
 }
 
 #[test]
@@ -162,20 +167,20 @@ fn open_flags_select_read_create_and_write_intents() {
 
     let read = fixture
         .runtime
-        .prepare_open(path.as_ptr(), libc::AT_FDCWD, libc::O_RDONLY)
+        .prepare_open(path.as_ptr(), libc::AT_FDCWD, libc::O_RDONLY, 0)
         .unwrap();
     assert_eq!(read.file.path, lower.to_string_lossy());
     assert_eq!(read.file.mode.access, crate::callback::FileAccessMode::Read);
     assert!(!read.file.mode.create);
     let _read = fixture.runtime.map_open(read).unwrap();
-    assert!(matches!(
-        fixture.runtime.overlay.state_for_test(&lower).unwrap(),
-        Some(EntryState::Cached { .. })
-    ));
+    assert_eq!(
+        fixture.runtime.filesystem.state_for_test(&lower).unwrap(),
+        None
+    );
 
     let write = fixture
         .runtime
-        .prepare_open(path.as_ptr(), libc::AT_FDCWD, libc::O_WRONLY)
+        .prepare_open(path.as_ptr(), libc::AT_FDCWD, libc::O_WRONLY, 0)
         .unwrap();
     assert_eq!(
         write.file.mode.access,
@@ -183,12 +188,12 @@ fn open_flags_select_read_create_and_write_intents() {
     );
     let mut write = fixture.runtime.map_open(write).unwrap();
     assert!(matches!(
-        fixture.runtime.overlay.state_for_test(&lower).unwrap(),
+        fixture.runtime.filesystem.state_for_test(&lower).unwrap(),
         Some(EntryState::Cached { .. })
     ));
     fixture.runtime.commit_open(&mut write).unwrap();
     assert_eq!(
-        fixture.runtime.overlay.state_for_test(&lower).unwrap(),
+        fixture.runtime.filesystem.state_for_test(&lower).unwrap(),
         Some(EntryState::Cow)
     );
 
@@ -199,6 +204,7 @@ fn open_flags_select_read_create_and_write_intents() {
             Fixture::c_path(&created).as_ptr(),
             libc::AT_FDCWD,
             libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND | libc::O_EXCL,
+            0o640,
         )
         .unwrap();
     assert_eq!(
@@ -211,14 +217,273 @@ fn open_flags_select_read_create_and_write_intents() {
     assert!(prepared.file.mode.exclusive);
     let mut prepared = fixture.runtime.map_open(prepared).unwrap();
     assert_eq!(
-        fixture.runtime.overlay.state_for_test(&created).unwrap(),
+        fixture.runtime.filesystem.state_for_test(&created).unwrap(),
         None
     );
     fixture.runtime.commit_open(&mut prepared).unwrap();
     assert_eq!(
-        fixture.runtime.overlay.state_for_test(&created).unwrap(),
+        fixture.runtime.filesystem.state_for_test(&created).unwrap(),
         Some(EntryState::Cow)
     );
+}
+
+#[test]
+fn encrypted_descriptors_keep_backing_ciphertext_and_write_back_on_last_close() {
+    let fixture = Fixture::new();
+    let runtime = FilesystemHookRuntime::new_encrypted(
+        fixture.directory.join("encrypted-workdir/fs"),
+        b"test-key",
+        b"0123456789abcdef",
+    )
+    .unwrap();
+    let logical = fixture.lower.join("secret.txt");
+    let path = Fixture::c_path(&logical);
+    let marker = b"runtime plaintext marker";
+
+    with_test_runtime(&runtime, || unsafe {
+        let descriptor = super::agora_sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(descriptor >= 0);
+        assert_eq!(
+            libc::write(descriptor, marker.as_ptr().cast(), marker.len()),
+            marker.len() as isize
+        );
+        let duplicate = sandbox_dup(descriptor);
+        assert!(duplicate >= 0);
+        assert_eq!(sandbox_fsync(duplicate), 0);
+        assert_eq!(sandbox_close(descriptor), 0);
+        assert_eq!(sandbox_close(duplicate), 0);
+    });
+
+    assert!(!logical.exists());
+    assert!(!directory_contains_for_test(
+        runtime.filesystem.root(),
+        marker
+    ));
+    with_test_runtime(&runtime, || unsafe {
+        let descriptor = super::agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(descriptor >= 0);
+        let mut restored = vec![0_u8; marker.len()];
+        assert_eq!(
+            libc::read(descriptor, restored.as_mut_ptr().cast(), restored.len()),
+            restored.len() as isize
+        );
+        assert_eq!(restored, marker);
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+}
+
+#[test]
+fn fcntl_descriptor_duplicates_share_encrypted_writeback_state() {
+    let fixture = Fixture::new();
+    let runtime = FilesystemHookRuntime::new_encrypted(
+        fixture.directory.join("fcntl-workdir/fs"),
+        b"test-key",
+        b"0123456789abcdef",
+    )
+    .unwrap();
+    let logical = fixture.lower.join("fcntl-secret.txt");
+    let path = Fixture::c_path(&logical);
+
+    with_test_runtime(&runtime, || unsafe {
+        let descriptor = super::agora_sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(descriptor >= 0);
+        assert_eq!(libc::write(descriptor, b"first".as_ptr().cast(), 5), 5);
+        let duplicate = super::agora_sandbox_fcntl_shim(descriptor, libc::F_DUPFD_CLOEXEC, 0);
+        assert!(duplicate >= 0);
+        assert_eq!(sandbox_close(descriptor), 0);
+        assert_eq!(libc::write(duplicate, b" second".as_ptr().cast(), 7), 7);
+        assert_eq!(sandbox_close(duplicate), 0);
+
+        let reopened = super::agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(reopened >= 0);
+        let mut contents = [0_u8; 12];
+        assert_eq!(libc::read(reopened, contents.as_mut_ptr().cast(), 12), 12);
+        assert_eq!(&contents, b"first second");
+        assert_eq!(sandbox_close(reopened), 0);
+    });
+}
+
+#[test]
+fn encrypted_stat_reports_plaintext_file_size() {
+    let fixture = Fixture::new();
+    let runtime = FilesystemHookRuntime::new_encrypted(
+        fixture.directory.join("encrypted-stat-workdir/fs"),
+        b"test-key",
+        b"0123456789abcdef",
+    )
+    .unwrap();
+    let logical = fixture.lower.join("secret.txt");
+    let path = Fixture::c_path(&logical);
+    let marker = b"plaintext-size";
+
+    with_test_runtime(&runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(descriptor >= 0);
+        assert_eq!(
+            libc::write(descriptor, marker.as_ptr().cast(), marker.len()),
+            marker.len() as isize
+        );
+        assert_eq!(sandbox_fchmod(descriptor, 0o640), 0);
+        let mut descriptor_status = std::mem::zeroed::<libc::stat>();
+        assert_eq!(sandbox_fstat(descriptor, &mut descriptor_status), 0);
+        assert_eq!(u32::from(descriptor_status.st_mode) & 0o777, 0o640);
+        assert_eq!(sandbox_close(descriptor), 0);
+
+        let mut status = std::mem::zeroed::<libc::stat>();
+        assert_eq!(sandbox_stat(path.as_ptr(), &mut status), 0);
+        assert_eq!(status.st_size, marker.len() as libc::off_t);
+        assert_eq!(u32::from(status.st_mode) & 0o777, 0o640);
+        assert_eq!(sandbox_access(path.as_ptr(), libc::R_OK), 0);
+        assert_eq!(sandbox_access(path.as_ptr(), libc::X_OK), -1);
+        assert_eq!(*libc::__error(), libc::EACCES);
+        assert_eq!(sandbox_lstat(path.as_ptr(), &mut status), 0);
+        assert_eq!(status.st_size, marker.len() as libc::off_t);
+        assert_eq!(
+            sandbox_fstatat(libc::AT_FDCWD, path.as_ptr(), &mut status, 0),
+            0
+        );
+        assert_eq!(status.st_size, marker.len() as libc::off_t);
+    });
+}
+
+#[test]
+fn lower_read_descriptors_keep_metadata_mutations_inside_the_sandbox() {
+    let fixture = Fixture::new();
+    let lower = fixture.lower.join("lower-read-only");
+    std::fs::write(&lower, b"host").unwrap();
+    std::fs::set_permissions(&lower, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let path = Fixture::c_path(&lower);
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(descriptor >= 0);
+        assert_eq!(sandbox_fchmod(descriptor, 0o600), 0);
+        let mut status = std::mem::zeroed::<libc::stat>();
+        assert_eq!(sandbox_fstat(descriptor, &mut status), 0);
+        assert_eq!(u32::from(status.st_mode) & 0o777, 0o600);
+        assert_eq!(sandbox_fchown(descriptor, !0, !0), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(sandbox_ftruncate(descriptor, 0), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+
+    assert_eq!(std::fs::read(&lower).unwrap(), b"host");
+    assert_eq!(
+        lower.metadata().unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+}
+
+#[test]
+fn stat_follows_overlay_symlinks_while_lstat_reports_the_link() {
+    let fixture = Fixture::new();
+    let target = fixture.lower.join("target");
+    let link = fixture.lower.join("link");
+    std::fs::write(&target, b"host").unwrap();
+    symlink(&target, &link).unwrap();
+    let target_path = Fixture::c_path(&target);
+    let link_path = Fixture::c_path(&link);
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor =
+            sandbox_open_with_mode(target_path.as_ptr(), libc::O_WRONLY | libc::O_TRUNC, 0);
+        assert!(descriptor >= 0);
+        assert_eq!(libc::write(descriptor, b"sandbox".as_ptr().cast(), 7), 7);
+        assert_eq!(sandbox_close(descriptor), 0);
+
+        let descriptor = sandbox_open_with_mode(link_path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(descriptor >= 0);
+        let mut contents = [0_u8; 7];
+        assert_eq!(
+            libc::read(descriptor, contents.as_mut_ptr().cast(), contents.len()),
+            7
+        );
+        assert_eq!(contents, *b"sandbox");
+        assert_eq!(sandbox_close(descriptor), 0);
+
+        let mut status = std::mem::zeroed::<libc::stat>();
+        assert_eq!(sandbox_stat(link_path.as_ptr(), &mut status), 0);
+        assert_eq!(status.st_size, 7);
+        assert_eq!(status.st_mode & libc::S_IFMT, libc::S_IFREG);
+        assert_eq!(sandbox_lstat(link_path.as_ptr(), &mut status), 0);
+        assert_eq!(status.st_mode & libc::S_IFMT, libc::S_IFLNK);
+    });
+}
+
+#[test]
+fn encrypted_control_paths_are_denied_but_logical_control_names_are_isolated() {
+    let fixture = Fixture::new();
+    let runtime = FilesystemHookRuntime::new_encrypted(
+        fixture.directory.join("encrypted-workdir/fs"),
+        b"test-key",
+        b"0123456789abcdef",
+    )
+    .unwrap();
+    let physical = Fixture::c_path(&runtime.filesystem.root().join(".metadata"));
+    let logical = fixture.lower.join(".metadata");
+    let logical = Fixture::c_path(&logical);
+
+    with_test_runtime(&runtime, || unsafe {
+        assert_eq!(
+            super::agora_sandbox_open_with_mode(physical.as_ptr(), libc::O_RDONLY, 0),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::EACCES);
+
+        let descriptor = super::agora_sandbox_open_with_mode(
+            logical.as_ptr(),
+            libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(descriptor >= 0);
+        assert_eq!(libc::write(descriptor, b"logical".as_ptr().cast(), 7), 7);
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+
+    let parent = runtime
+        .filesystem
+        .root()
+        .join(fixture.lower.strip_prefix("/").unwrap());
+    assert!(parent.join(".metadata").is_file());
+    assert!(
+        std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".agora-entry-"))
+    );
+}
+
+fn directory_contains_for_test(directory: &Path, needle: &[u8]) -> bool {
+    std::fs::read_dir(directory).unwrap().any(|entry| {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            directory_contains_for_test(&path, needle)
+        } else {
+            std::fs::read(path)
+                .map(|contents| {
+                    contents
+                        .windows(needle.len())
+                        .any(|window| window == needle)
+                })
+                .unwrap_or(false)
+        }
+    })
 }
 
 #[test]
@@ -240,9 +505,9 @@ fn mutations_update_only_the_overlay_view() {
         )
         .unwrap();
     assert_eq!(std::fs::read(&source).unwrap(), b"host");
-    assert!(fixture.runtime.overlay.prepare_read(&source).is_err());
+    assert!(fixture.runtime.filesystem.prepare_read(&source).is_err());
     assert_eq!(
-        std::fs::read(fixture.runtime.overlay.prepare_read(&target).unwrap()).unwrap(),
+        std::fs::read(fixture.runtime.filesystem.prepare_read(&target).unwrap()).unwrap(),
         b"host"
     );
 
@@ -250,19 +515,19 @@ fn mutations_update_only_the_overlay_view() {
         .runtime
         .remove(libc::AT_FDCWD, target_path.as_ptr(), false)
         .unwrap();
-    assert!(fixture.runtime.overlay.prepare_read(&target).is_err());
+    assert!(fixture.runtime.filesystem.prepare_read(&target).is_err());
 }
 
 #[test]
 fn the_control_namespace_is_not_addressable_through_the_mapped_root() {
     let fixture = Fixture::new();
-    let control = fixture.runtime.overlay.root().join(".agora/volume.json");
+    let control = fixture.runtime.filesystem.root().join(".vfs.lock");
     let control = Fixture::c_path(&control);
 
     assert!(
         fixture
             .runtime
-            .map(control.as_ptr(), libc::AT_FDCWD, PathIntent::Read)
+            .map(control.as_ptr(), libc::AT_FDCWD)
             .is_err()
     );
 }
@@ -275,16 +540,16 @@ fn directory_cursor_prefers_upper_entries_and_hides_whiteouts() {
     std::fs::write(lower.join("removed"), b"host").unwrap();
     fixture
         .runtime
-        .overlay
+        .filesystem
         .remove(&lower.join("removed"), false)
         .unwrap();
-    let view = fixture.runtime.overlay.directory_view(&lower).unwrap();
+    let view = fixture.runtime.filesystem.directory_view(&lower).unwrap();
     let mut cursor = DirectoryCursor::new(None, &view);
 
-    assert!(cursor.include(b"same", false));
-    assert!(!cursor.include(b"same", true));
-    assert!(!cursor.include(b"removed", true));
-    assert!(cursor.include(b"lower-only", true));
+    assert_eq!(cursor.include(b"same", false).unwrap(), b"same");
+    assert!(cursor.include(b"same", true).is_none());
+    assert!(cursor.include(b"removed", true).is_none());
+    assert_eq!(cursor.include(b"lower-only", true).unwrap(), b"lower-only");
 }
 
 #[test]
@@ -333,7 +598,7 @@ fn logical_current_directory_drives_relative_path_resolution() {
         .runtime
         .prepare_change_directory(directory_path.as_ptr())
         .unwrap();
-    assert!(Path::new(mapped.to_str().unwrap()).starts_with(fixture.runtime.overlay.root()));
+    assert!(Path::new(mapped.to_str().unwrap()).starts_with(fixture.runtime.filesystem.root()));
     fixture.runtime.set_current_directory(logical);
 
     with_test_runtime(&fixture.runtime, || unsafe {
@@ -480,12 +745,34 @@ fn failed_native_opens_do_not_commit_staged_writes() {
         (&open_file, b"open".as_slice()),
         (&fopen_file, b"fopen".as_slice()),
     ] {
-        assert!(matches!(
-            fixture.runtime.overlay.state_for_test(file).unwrap(),
-            Some(EntryState::Cached { .. })
-        ));
+        assert_eq!(
+            fixture.runtime.filesystem.state_for_test(file).unwrap(),
+            None
+        );
         assert_eq!(std::fs::read(file).unwrap(), contents);
     }
+}
+
+#[test]
+fn native_permission_failure_keeps_a_cached_entry_non_authoritative() {
+    let fixture = Fixture::new();
+    let file = fixture.lower.join("read-only");
+    std::fs::write(&file, b"host").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        assert_eq!(
+            sandbox_open_with_mode(Fixture::c_path(&file).as_ptr(), libc::O_WRONLY, 0),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::EACCES);
+    });
+
+    assert!(matches!(
+        fixture.runtime.filesystem.state_for_test(&file).unwrap(),
+        Some(EntryState::Cached { .. })
+    ));
+    assert_eq!(std::fs::read(&file).unwrap(), b"host");
 }
 
 #[test]
@@ -504,7 +791,7 @@ fn filesystem_interposers_apply_cow_metadata_and_merged_directory_views() {
     std::fs::write(
         fixture
             .runtime
-            .overlay
+            .filesystem
             .prepare_write(&directory.join("upper"), true)
             .unwrap(),
         b"upper",
@@ -512,7 +799,7 @@ fn filesystem_interposers_apply_cow_metadata_and_merged_directory_views() {
     .unwrap();
     fixture
         .runtime
-        .overlay
+        .filesystem
         .remove(&directory.join("hidden"), false)
         .unwrap();
 
@@ -586,7 +873,7 @@ fn filesystem_interposers_apply_cow_metadata_and_merged_directory_views() {
 
     assert_eq!(std::fs::read(&writable).unwrap(), b"host");
     assert_eq!(
-        std::fs::read(fixture.runtime.overlay.prepare_read(&writable).unwrap()).unwrap(),
+        std::fs::read(fixture.runtime.filesystem.prepare_read(&writable).unwrap()).unwrap(),
         b"sandbox"
     );
     assert_eq!(std::fs::read(&rename_from).unwrap(), b"rename");
@@ -701,7 +988,7 @@ fn filesystem_interposers_cover_relative_allocation_and_error_paths() {
 
     assert_eq!(unsafe { libc::close(directory_descriptor) }, 0);
     assert_eq!(
-        fixture.runtime.overlay.state_for_test(&created).unwrap(),
+        fixture.runtime.filesystem.state_for_test(&created).unwrap(),
         Some(EntryState::Cow)
     );
     assert!(FilesystemHookRuntime::global().is_none());
@@ -738,8 +1025,7 @@ fn mutation_interposers_keep_path_and_spawn_action_writes_in_the_overlay() {
         assert!(directory_descriptor >= 0);
         assert_eq!(sandbox_ftruncate(directory_descriptor, 0), -1);
         assert_eq!(*libc::__error(), libc::ENOTSUP);
-        assert_eq!(sandbox_fchmod(directory_descriptor, 0o700), -1);
-        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(sandbox_fchmod(directory_descriptor, 0o700), 0);
         assert_eq!(sandbox_fchown(directory_descriptor, !0, !0), -1);
         assert_eq!(*libc::__error(), libc::ENOTSUP);
         let created_path = Fixture::c_path(&created);
@@ -751,15 +1037,26 @@ fn mutation_interposers_keep_path_and_spawn_action_writes_in_the_overlay() {
         assert_eq!(sandbox_ftruncate(descriptor, 3), 0);
         assert_eq!(sandbox_close(descriptor), 0);
 
-        assert_eq!(sandbox_chmod(existing_path.as_ptr(), 0o600), -1);
-        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(sandbox_chmod(existing_path.as_ptr(), 0o600), 0);
+        let mut status = std::mem::zeroed::<libc::stat>();
+        assert_eq!(sandbox_stat(existing_path.as_ptr(), &mut status), 0);
+        assert_eq!(u32::from(status.st_mode) & 0o777, 0o600);
+        assert_eq!(
+            existing.metadata().unwrap().permissions().mode() & 0o777,
+            0o644
+        );
         assert_eq!(sandbox_chown(existing_path.as_ptr(), !0, !0), -1);
         assert_eq!(*libc::__error(), libc::ENOTSUP);
         assert_eq!(
-            sandbox_fchmodat(directory_descriptor, c"existing".as_ptr(), 0o600, 0),
-            -1
+            sandbox_fchmodat(directory_descriptor, c"existing".as_ptr(), 0o640, 0),
+            0
         );
-        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(sandbox_stat(existing_path.as_ptr(), &mut status), 0);
+        assert_eq!(u32::from(status.st_mode) & 0o777, 0o640);
+        assert_eq!(
+            existing.metadata().unwrap().permissions().mode() & 0o777,
+            0o644
+        );
         assert_eq!(
             sandbox_fchownat(directory_descriptor, c"existing".as_ptr(), !0, !0, 0),
             -1
@@ -768,8 +1065,7 @@ fn mutation_interposers_keep_path_and_spawn_action_writes_in_the_overlay() {
         assert_eq!(sandbox_truncate(existing_path.as_ptr(), 2), 0);
         assert_eq!(sandbox_ftruncate(untracked_descriptor, 1), -1);
         assert_eq!(*libc::__error(), libc::EPERM);
-        assert_eq!(sandbox_chmod(directory_path.as_ptr(), 0o700), -1);
-        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(sandbox_chmod(directory_path.as_ptr(), 0o700), 0);
         assert_eq!(
             sandbox_fchmodat(
                 directory_descriptor,
@@ -777,9 +1073,8 @@ fn mutation_interposers_keep_path_and_spawn_action_writes_in_the_overlay() {
                 0o600,
                 libc::AT_SYMLINK_NOFOLLOW,
             ),
-            -1
+            0
         );
-        assert_eq!(*libc::__error(), libc::ENOTSUP);
         assert_eq!(
             sandbox_fchownat(
                 directory_descriptor,
@@ -841,7 +1136,7 @@ fn mutation_interposers_keep_path_and_spawn_action_writes_in_the_overlay() {
         assert!(
             fixture
                 .runtime
-                .overlay
+                .filesystem
                 .prepare_read(&created)
                 .unwrap()
                 .exists()
@@ -923,13 +1218,21 @@ fn mutation_interposers_keep_path_and_spawn_action_writes_in_the_overlay() {
             0
         );
         assert_eq!(
-            fixture.runtime.overlay.state_for_test(&deferred).unwrap(),
+            fixture
+                .runtime
+                .filesystem
+                .state_for_test(&deferred)
+                .unwrap(),
             None
         );
         let copied_actions = actions;
         commit_spawn_file_actions(&copied_actions).unwrap();
         assert_eq!(
-            fixture.runtime.overlay.state_for_test(&deferred).unwrap(),
+            fixture
+                .runtime
+                .filesystem
+                .state_for_test(&deferred)
+                .unwrap(),
             Some(EntryState::Cow)
         );
         assert_eq!(sandbox_spawn_actions_destroy(&mut actions), 0);
@@ -950,7 +1253,7 @@ fn mutation_interposers_keep_path_and_spawn_action_writes_in_the_overlay() {
         assert_eq!(
             fixture
                 .runtime
-                .overlay
+                .filesystem
                 .state_for_test(&unused_action)
                 .unwrap(),
             None
@@ -980,14 +1283,14 @@ fn mutation_interposers_keep_path_and_spawn_action_writes_in_the_overlay() {
         assert!(!path.exists(), "host path was changed: {}", path.display());
     }
     assert_eq!(
-        std::fs::read(fixture.runtime.overlay.prepare_read(&existing).unwrap()).unwrap(),
+        std::fs::read(fixture.runtime.filesystem.prepare_read(&existing).unwrap()).unwrap(),
         b"or"
     );
-    assert!(fixture.runtime.overlay.prepare_read(&renamed).is_err());
+    assert!(fixture.runtime.filesystem.prepare_read(&renamed).is_err());
     assert!(
         fixture
             .runtime
-            .overlay
+            .filesystem
             .prepare_directory(&directory)
             .is_ok()
     );

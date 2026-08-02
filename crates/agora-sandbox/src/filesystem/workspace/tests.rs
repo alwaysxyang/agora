@@ -1,4 +1,5 @@
 use super::{FilesystemMode, FilesystemWorkspace, PlainWorkspace};
+use std::os::unix::fs::PermissionsExt;
 
 fn temporary_directory(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("agora-workspace-{name}-{}", uuid::Uuid::new_v4()))
@@ -13,6 +14,17 @@ async fn plain_workspace_is_persistent_and_exclusive() {
     assert_eq!(
         workspace.root().file_name(),
         Some(std::ffi::OsStr::new("fs"))
+    );
+    assert_eq!(
+        workspace
+            .root()
+            .join(".fs.lock")
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
     );
     std::fs::write(workspace.root().join("marker"), b"persisted").unwrap();
 

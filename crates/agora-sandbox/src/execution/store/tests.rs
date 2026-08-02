@@ -11,6 +11,7 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
 struct TestDirectory(PathBuf);
@@ -31,6 +32,37 @@ impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn code_signing_flags_are_cached_for_an_unchanged_executable() {
+    let root = TestDirectory::new();
+    let executable = root.path().join("executable");
+    fs::write(&executable, b"first").unwrap();
+    let inspections = AtomicUsize::new(0);
+
+    let metadata = executable.metadata().unwrap();
+    let first = ExecutableStore::cached_code_signing_flags(&metadata, || {
+        inspections.fetch_add(1, Ordering::Relaxed);
+        Ok(7)
+    })
+    .unwrap();
+    let cached = ExecutableStore::cached_code_signing_flags(&metadata, || {
+        inspections.fetch_add(1, Ordering::Relaxed);
+        Ok(9)
+    })
+    .unwrap();
+
+    fs::write(&executable, b"changed contents").unwrap();
+    let changed =
+        ExecutableStore::cached_code_signing_flags(&executable.metadata().unwrap(), || {
+            inspections.fetch_add(1, Ordering::Relaxed);
+            Ok(11)
+        })
+        .unwrap();
+
+    assert_eq!((first, cached, changed), (7, 7, 11));
+    assert_eq!(inspections.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -72,20 +104,15 @@ fn executable_store_prepares_and_caches_a_native_copy() {
 }
 
 #[test]
-fn executable_store_upgrades_a_read_cache_before_execution() {
+fn executable_store_keeps_normal_reads_on_lower_before_execution() {
     let root = TestDirectory::new();
     let store = ExecutableStore::new(root.path().join("prepared")).unwrap();
     let source = Path::new("/bin/cat").canonicalize().unwrap();
-    let cached = store.overlay.prepare_read(&source).unwrap();
-    assert!(matches!(
-        store.overlay.state(&source).unwrap(),
-        Some(EntryState::Cached {
-            materializer: Materializer::Copy,
-            ..
-        })
-    ));
+    assert_eq!(store.overlay.prepare_read(&source).unwrap(), source);
+    assert_eq!(store.overlay.state(&source).unwrap(), None);
 
-    assert_eq!(store.prepare(&source).unwrap(), cached);
+    let cached = store.prepare(&source).unwrap();
+    assert_ne!(cached, source);
     assert!(matches!(
         store.overlay.state(&source).unwrap(),
         Some(EntryState::Cached {
@@ -365,7 +392,7 @@ fn executable_store_reports_directory_creation_errors() {
 fn executable_store_reports_cache_entry_access_errors() {
     let root = TestDirectory::new();
     let lock_directory = root.path().join("lock-directory");
-    fs::create_dir_all(lock_directory.join(".agora/overlay.lock")).unwrap();
+    fs::create_dir_all(lock_directory.join(".vfs.lock")).unwrap();
     assert!(
         ExecutableStore::new(lock_directory)
             .err()

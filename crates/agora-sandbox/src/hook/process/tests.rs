@@ -42,6 +42,7 @@ fn config_with_control_and_token(control: SocketAddr, execution_token: &str) -> 
             "/tmp/hook.dylib".to_string(),
         ),
         ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs".to_string()),
+        ("AGORA_SANDBOX_FILESYSTEM_MODE", "plain".to_string()),
         ("AGORA_SANDBOX_TRACE_ID", "trace-root".to_string()),
     ]);
     HookConfig::from_getter(|key| values.get(key).cloned()).unwrap()
@@ -65,6 +66,7 @@ fn config_with_tls_bundle() -> HookConfig {
             "/tmp/hook.dylib".to_string(),
         ),
         ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs".to_string()),
+        ("AGORA_SANDBOX_FILESYSTEM_MODE", "plain".to_string()),
         ("AGORA_SANDBOX_TRACE_ID", "trace-root".to_string()),
         (
             "AGORA_SANDBOX_TLS_TRUST_BUNDLE",
@@ -179,7 +181,7 @@ fn child_environment_accepts_a_null_source_environment() {
         unsafe { ChildEnvironment::new(std::ptr::null(), &config(), &child_trace()) }.unwrap();
 
     assert!(!environment.as_exec_ptr().is_null());
-    assert_eq!(environment.values.len(), 11);
+    assert_eq!(environment.values.len(), 12);
 }
 
 #[test]

@@ -3,6 +3,8 @@ use crate::filesystem::{EntryState, Materializer};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 struct Fixture {
     directory: PathBuf,
@@ -40,20 +42,56 @@ fn errno(error: &anyhow::Error) -> Option<i32> {
 }
 
 #[test]
-fn read_materializes_and_refreshes_host_files() {
+fn overlay_lock_serializes_threads() {
+    let directory =
+        std::env::temp_dir().join(format!("agora-overlay-lock-{}", uuid::Uuid::new_v4()));
+    let store = Arc::new(OverlayStore::new(directory.join("fs")).unwrap());
+    let (first_entered_tx, first_entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let first_store = Arc::clone(&store);
+    let first = std::thread::spawn(move || {
+        first_store
+            .with_lock(|| {
+                first_entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+    });
+    first_entered_rx.recv().unwrap();
+
+    let (second_entered_tx, second_entered_rx) = mpsc::channel();
+    let second_store = Arc::clone(&store);
+    let second = std::thread::spawn(move || {
+        second_store
+            .with_lock(|| {
+                second_entered_tx.send(()).unwrap();
+                Ok(())
+            })
+            .unwrap();
+    });
+    let entered_while_locked = second_entered_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_ok();
+    release_tx.send(()).unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    assert!(!entered_while_locked);
+
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn read_uses_lower_without_materializing_host_files() {
     let fixture = Fixture::new();
     let source = fixture.lower.join("file");
     std::fs::write(&source, b"first").unwrap();
 
     let mapped = fixture.store.prepare_read(&source).unwrap();
+    assert_eq!(mapped, source);
     assert_eq!(std::fs::read(&mapped).unwrap(), b"first");
-    assert!(matches!(
-        fixture.store.metadata.state(&source).unwrap(),
-        Some(EntryState::Cached {
-            materializer: Materializer::Copy,
-            ..
-        })
-    ));
+    assert_eq!(fixture.store.metadata.state(&source).unwrap(), None);
     assert_eq!(fixture.store.prepare_read(&source).unwrap(), mapped);
 
     std::fs::write(&source, b"second").unwrap();
@@ -137,6 +175,7 @@ fn directory_view_keeps_lower_entries_lazy_and_tracks_whiteouts() {
     let upper_names = std::fs::read_dir(view.upper())
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
+        .filter(|name| !view.hidden().contains(name))
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(upper_names.len(), 1);
     assert!(upper_names.contains(std::ffi::OsStr::new("cow")));
@@ -150,6 +189,21 @@ fn directory_view_keeps_lower_entries_lazy_and_tracks_whiteouts() {
     assert!(lower_names.contains(std::ffi::OsStr::new("lower")));
     assert!(lower_names.contains(std::ffi::OsStr::new("cow")));
     assert!(lower_names.contains(std::ffi::OsStr::new("removed")));
+}
+
+#[test]
+fn physical_upper_directories_remain_owner_manageable() {
+    let fixture = Fixture::new();
+    let directory = fixture.lower.join("read-only");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let upper = fixture.store.prepare_directory(&directory).unwrap();
+
+    assert_eq!(
+        upper.metadata().unwrap().permissions().mode() & 0o700,
+        0o700
+    );
 }
 
 #[test]
@@ -185,6 +239,11 @@ fn rename_and_mkdir_never_change_lower_paths() {
     fixture.store.rename(&source, &target).unwrap();
     assert!(fixture.store.prepare_read(&source).is_err());
     assert_eq!(
+        fixture.store.state(&source).unwrap(),
+        Some(EntryState::Whiteout)
+    );
+    assert_eq!(fixture.store.state(&target).unwrap(), Some(EntryState::Cow));
+    assert_eq!(
         std::fs::read(fixture.store.prepare_read(&target).unwrap()).unwrap(),
         b"host"
     );
@@ -215,16 +274,21 @@ fn rename_preserves_sources_and_destinations_when_posix_checks_fail() {
 
     fixture.store.rename(&file, &file).unwrap();
     assert_eq!(std::fs::read(&file).unwrap(), b"file");
+    assert_eq!(fixture.store.state(&file).unwrap(), None);
 
     let error = fixture.store.rename(&file, &directory).unwrap_err();
     assert_eq!(errno(&error), Some(libc::EISDIR));
     assert_eq!(std::fs::read(&file).unwrap(), b"file");
     assert_eq!(std::fs::read(&child).unwrap(), b"child");
+    assert_eq!(fixture.store.state(&file).unwrap(), None);
+    assert!(!fixture.store.destination(&file).unwrap().exists());
 
     let error = fixture.store.rename(&directory, &file).unwrap_err();
     assert_eq!(errno(&error), Some(libc::ENOTDIR));
     assert_eq!(std::fs::read(&file).unwrap(), b"file");
     assert_eq!(std::fs::read(&child).unwrap(), b"child");
+    assert_eq!(fixture.store.state(&directory).unwrap(), None);
+    assert!(!fixture.store.destination(&directory).unwrap().exists());
 
     let error = fixture
         .store
@@ -232,6 +296,14 @@ fn rename_preserves_sources_and_destinations_when_posix_checks_fail() {
         .unwrap_err();
     assert_eq!(errno(&error), Some(libc::ENOTEMPTY));
     assert_eq!(std::fs::read(&child).unwrap(), b"child");
+    assert_eq!(fixture.store.state(&other_directory).unwrap(), None);
+    assert!(
+        !fixture
+            .store
+            .destination(&other_directory)
+            .unwrap()
+            .exists()
+    );
 
     let error = fixture
         .store
@@ -239,24 +311,92 @@ fn rename_preserves_sources_and_destinations_when_posix_checks_fail() {
         .unwrap_err();
     assert_eq!(errno(&error), Some(libc::EINVAL));
     assert_eq!(std::fs::read(&child).unwrap(), b"child");
+    assert_eq!(fixture.store.state(&directory).unwrap(), None);
+    assert!(!fixture.store.destination(&directory).unwrap().exists());
 }
 
 #[test]
-fn paths_are_normalized_and_control_namespace_is_reserved() {
+fn cached_copy_up_refreshes_from_lower_before_a_later_write() {
+    let fixture = Fixture::new();
+    let source = fixture.lower.join("source");
+    std::fs::write(&source, b"first").unwrap();
+    let staged = fixture.store.stage_write(&source, false).unwrap();
+    assert!(matches!(
+        fixture.store.state(&source).unwrap(),
+        Some(EntryState::Cached { .. })
+    ));
+    drop(staged);
+
+    std::fs::write(&source, b"second").unwrap();
+    let staged = fixture.store.stage_write(&source, false).unwrap();
+    assert_eq!(std::fs::read(staged.destination()).unwrap(), b"second");
+    assert_eq!(
+        fixture.store.visible_path(&source).unwrap(),
+        source.canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn directory_rename_preserves_lower_symlinks() {
+    let fixture = Fixture::new();
+    let source = fixture.lower.join("source");
+    let target = fixture.lower.join("target");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("file"), b"contents").unwrap();
+    symlink("file", source.join("link")).unwrap();
+
+    fixture.store.rename(&source, &target).unwrap();
+
+    let mapped = fixture.store.prepare_directory(&target).unwrap();
+    assert_eq!(
+        std::fs::read_link(mapped.join("link")).unwrap(),
+        Path::new("file")
+    );
+    assert_eq!(std::fs::read(mapped.join("link")).unwrap(), b"contents");
+}
+
+#[test]
+fn paths_are_normalized_and_logical_control_names_are_isolated() {
     let fixture = Fixture::new();
     assert!(fixture.store.prepare_read(Path::new("relative")).is_err());
-    assert!(
-        fixture
-            .store
-            .prepare_read(Path::new("/.agora/volume.json"))
-            .is_err()
-    );
     assert_eq!(
         fixture.store.normalize(Path::new("/tmp/a/../b")).unwrap(),
         Path::new("/tmp/b")
     );
-    let internal = fixture.store.root().join(".agora/volume.json");
-    assert_eq!(fixture.store.prepare_read(&internal).unwrap(), internal);
+    let logical = Path::new("/.metadata");
+    let mapped = fixture.store.prepare_write(logical, true).unwrap();
+    assert_ne!(mapped, fixture.store.root().join(".metadata"));
+    assert_eq!(fixture.store.logical_path(&mapped).unwrap(), logical);
+}
+
+#[test]
+fn internal_paths_bypass_overlay_state_and_control_aliases_round_trip() {
+    let fixture = Fixture::new();
+    let internal_file = fixture.store.root().join("internal");
+    std::fs::write(&internal_file, b"internal").unwrap();
+    assert_eq!(
+        fixture.store.prepare_read(&internal_file).unwrap(),
+        internal_file
+    );
+    let staged = fixture.store.stage_write(&internal_file, false).unwrap();
+    assert_eq!(staged.destination(), internal_file);
+    fixture.store.commit_write(staged).unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .prepare_directory(fixture.store.root())
+            .unwrap(),
+        fixture.store.root()
+    );
+
+    let logical_control = Path::new("/.metadata");
+    let encoded = fixture.store.prepare_write(logical_control, true).unwrap();
+    std::fs::write(&encoded, b"logical metadata").unwrap();
+    let view = fixture.store.directory_view(Path::new("/")).unwrap();
+    assert_eq!(
+        view.aliases().get(encoded.file_name().unwrap()),
+        Some(&std::ffi::OsString::from(".metadata"))
+    );
 }
 
 #[test]
@@ -328,7 +468,14 @@ fn overlay_handles_missing_cached_entries_cow_ancestors_and_type_errors() {
     let fixture = Fixture::new();
     let cached = fixture.lower.join("cached");
     std::fs::write(&cached, b"host").unwrap();
-    let mapped = fixture.store.prepare_read(&cached).unwrap();
+    let mapped = fixture
+        .store
+        .prepare_executable(&cached, |temporary| {
+            std::fs::write(temporary, b"prepared")?;
+            std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        })
+        .unwrap();
     std::fs::remove_file(&mapped).unwrap();
     assert_eq!(
         fixture.store.visible_path(&cached).unwrap(),
@@ -381,14 +528,10 @@ fn overlay_handles_missing_cached_entries_cow_ancestors_and_type_errors() {
     );
     assert!(fixture.store.prepare_directory(&host_file).is_err());
 
-    let internal = fixture.store.root().join(".agora/overlay.lock");
+    let internal = fixture.store.root().join(".vfs.lock");
     assert_eq!(
-        fixture.store.prepare_write(&internal, true).unwrap(),
-        internal
-    );
-    assert_eq!(
-        fixture.store.prepare_directory(&internal).unwrap(),
-        internal
+        fixture.store.logical_path(&internal).unwrap(),
+        Path::new("/.vfs.lock")
     );
     assert!(
         fixture
@@ -396,7 +539,7 @@ fn overlay_handles_missing_cached_entries_cow_ancestors_and_type_errors() {
             .directory_view(Path::new("/"))
             .unwrap()
             .hidden()
-            .contains(std::ffi::OsStr::new(".agora"))
+            .contains(std::ffi::OsStr::new(".vfs.lock"))
     );
 }
 
@@ -405,7 +548,14 @@ fn executable_metadata_and_failed_publication_are_consistent() {
     let fixture = Fixture::new();
     let source = fixture.lower.join("tool");
     std::fs::write(&source, b"tool").unwrap();
-    fixture.store.prepare_read(&source).unwrap();
+    fixture
+        .store
+        .prepare_executable(&source, |temporary| {
+            std::fs::write(temporary, b"prepared")?;
+            std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        })
+        .unwrap();
 
     fixture.store.mark_executable(&source).unwrap();
     assert!(matches!(
@@ -420,6 +570,7 @@ fn executable_metadata_and_failed_publication_are_consistent() {
         .mark_executable(&fixture.lower.join("missing"))
         .unwrap();
 
+    std::fs::write(&source, b"changed tool").unwrap();
     let failed = fixture.store.prepare_executable(&source, |temporary| {
         std::fs::write(temporary, b"partial")?;
         anyhow::bail!("preparation failed")
@@ -455,13 +606,9 @@ fn visible_symlinks_follow_overlay_state_of_their_canonical_target() {
     symlink(&target, &link).unwrap();
     let target = target.canonicalize().unwrap();
 
-    let cached = fixture.store.prepare_read(&target).unwrap();
-    assert_eq!(fixture.store.visible_path(&link).unwrap(), cached);
-    std::fs::remove_file(&cached).unwrap();
-    assert_eq!(
-        fixture.store.visible_path(&link).unwrap(),
-        target.canonicalize().unwrap()
-    );
+    assert_eq!(fixture.store.prepare_read(&target).unwrap(), target);
+    assert_eq!(fixture.store.prepare_read(&link).unwrap(), link);
+    assert_eq!(fixture.store.visible_path(&link).unwrap(), target);
 
     let cow = fixture.store.prepare_write(&target, false).unwrap();
     std::fs::write(&cow, b"sandbox").unwrap();

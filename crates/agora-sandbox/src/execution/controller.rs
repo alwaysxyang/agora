@@ -3,6 +3,7 @@ use super::protocol::{
 };
 use super::store::ExecutableStore;
 use anyhow::{Context, Result};
+use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -38,15 +39,21 @@ pub(crate) struct ExecutionController {
     store: Arc<Mutex<ExecutableStore>>,
     shutdown: watch::Sender<bool>,
     tasks: JoinSet<Result<()>>,
+    cleanup_directory: Option<PathBuf>,
 }
 
 impl ExecutionController {
     #[cfg(test)]
     pub(crate) async fn start(directory: PathBuf) -> Result<Self> {
-        Self::start_for_run(directory).await
+        Self::start_with_cleanup(directory, false).await
     }
 
     pub(crate) async fn start_for_run(directory: PathBuf) -> Result<Self> {
+        Self::start_with_cleanup(directory, true).await
+    }
+
+    async fn start_with_cleanup(directory: PathBuf, cleanup: bool) -> Result<Self> {
+        let cleanup_directory = cleanup.then(|| directory.clone());
         let store = Arc::new(Mutex::new(ExecutableStore::new(directory)?));
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -65,6 +72,7 @@ impl ExecutionController {
             store,
             shutdown,
             tasks,
+            cleanup_directory,
         })
     }
 
@@ -101,8 +109,25 @@ impl ExecutionController {
                 _ => {}
             }
         }
-        if let Some(error) = first_error {
-            return Err(error);
+        let cleanup = self.cleanup();
+        match (first_error, cleanup) {
+            (Some(error), _) => Err(error),
+            (None, cleanup) => cleanup,
+        }
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        if let Some(directory) = self.cleanup_directory.take() {
+            match fs::remove_dir_all(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).context(format!(
+                        "failed to remove sandbox execution directory {}",
+                        directory.display()
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -129,6 +154,7 @@ impl Drop for ExecutionController {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
         self.tasks.abort_all();
+        let _ = self.cleanup();
     }
 }
 

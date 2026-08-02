@@ -48,6 +48,12 @@ const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
 #[cfg(target_os = "macos")]
 const FILESYSTEM_ROOT: &str = "AGORA_SANDBOX_FILESYSTEM_ROOT";
 #[cfg(target_os = "macos")]
+const FILESYSTEM_MODE: &str = "AGORA_SANDBOX_FILESYSTEM_MODE";
+#[cfg(target_os = "macos")]
+const FILESYSTEM_KEY: &str = "AGORA_SANDBOX_FILESYSTEM_KEY";
+#[cfg(target_os = "macos")]
+const FILESYSTEM_SALT: &str = "AGORA_SANDBOX_FILESYSTEM_SALT";
+#[cfg(target_os = "macos")]
 const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
 #[cfg(target_os = "macos")]
 const TLS_TRUST_BUNDLE: &str = "AGORA_SANDBOX_TLS_TRUST_BUNDLE";
@@ -251,7 +257,11 @@ impl SandboxConfig {
     }
 
     #[cfg(target_os = "macos")]
-    fn write_tls_trust_bundle(&self, ca_certificate: &[u8]) -> Result<PathBuf> {
+    fn write_tls_trust_bundle(
+        &self,
+        runtime_directory: &Path,
+        ca_certificate: &[u8],
+    ) -> Result<PathBuf> {
         let native = crate::network::native_root_certificates()
             .context("failed to load native TLS roots for client trust bundle")?;
         let mut bundle = ca_certificate.to_vec();
@@ -273,8 +283,7 @@ impl SandboxConfig {
             fingerprint ^= u128::from(*byte);
             fingerprint = fingerprint.wrapping_mul(309_485_009_821_345_068_724_781_371);
         }
-        let path = self
-            .workdir
+        let path = runtime_directory
             .join(TLS_TRUST_BUNDLE_DIRECTORY)
             .join(format!("trust-bundle-{fingerprint:032x}.crt"));
         let parent = path
@@ -440,6 +449,10 @@ where
             self.config.encrypted_workspace_key(),
         )
         .await?;
+        let runtime_directory = tempfile::Builder::new()
+            .prefix("agora-sandbox-run-")
+            .tempdir()
+            .context("failed to create sandbox runtime directory")?;
         let tls_ca_files = self.config.tls_ca_for_workdir()?;
         let hook_library = self.config.hook_library.canonicalize().with_context(|| {
             format!(
@@ -478,7 +491,9 @@ where
                         ca.private_key.display()
                     )
                 })?;
-                let trust_bundle = self.config.write_tls_trust_bundle(&certificate)?;
+                let trust_bundle = self
+                    .config
+                    .write_tls_trust_bundle(runtime_directory.path(), &certificate)?;
                 Ok::<_, anyhow::Error>((certificate, private_key, certificate_path, trust_bundle))
             })
             .transpose()?;
@@ -501,7 +516,9 @@ where
         .await?;
         let mut execution = {
             let controller =
-                match ExecutionController::start_for_run(filesystem.root().to_path_buf()).await {
+                match ExecutionController::start_for_run(runtime_directory.path().join("root"))
+                    .await
+                {
                     Ok(controller) => controller,
                     Err(error) => {
                         let _ = audit.shutdown().await;
@@ -601,8 +618,26 @@ where
             .env(AUDIT_TOKEN, audit_runtime.token())
             .env(HOOK_LIBRARIES, &injected_libraries)
             .env(FILESYSTEM_ROOT, filesystem.root())
+            .env(
+                FILESYSTEM_MODE,
+                match self.config.filesystem_mode {
+                    FilesystemMode::Encrypted => "encrypted",
+                    FilesystemMode::Plain => "plain",
+                },
+            )
             .env(TRACE_ID_ENVIRONMENT, trace.encode())
             .env("DYLD_INSERT_LIBRARIES", injected_libraries);
+        if let (Some(key), Some(salt)) = (filesystem.encrypted_key(), filesystem.encrypted_salt()) {
+            child
+                .env(
+                    FILESYSTEM_KEY,
+                    base64::engine::general_purpose::STANDARD.encode(key),
+                )
+                .env(
+                    FILESYSTEM_SALT,
+                    base64::engine::general_purpose::STANDARD.encode(salt),
+                );
+        }
         let tls_trust_anchors = tls_trust_anchor_der
             .into_iter()
             .chain(
@@ -707,7 +742,7 @@ pub async fn migrate_filesystem_key(
 pub enum FilesystemKeyMigrationProgress {
     Validating,
     AcquiringLock,
-    ChangingPassphrase,
+    ReencryptingFiles,
     VerifyingNewKey,
     UpdatingMetadata,
     Completed,
@@ -719,7 +754,7 @@ impl FilesystemKeyMigrationProgress {
         match self {
             Self::Validating => 5,
             Self::AcquiringLock => 15,
-            Self::ChangingPassphrase => 40,
+            Self::ReencryptingFiles => 40,
             Self::VerifyingNewKey => 75,
             Self::UpdatingMetadata => 90,
             Self::Completed => 100,
@@ -730,7 +765,7 @@ impl FilesystemKeyMigrationProgress {
         match self {
             Self::Validating => "Validating keys",
             Self::AcquiringLock => "Acquiring filesystem lock",
-            Self::ChangingPassphrase => "Changing filesystem key",
+            Self::ReencryptingFiles => "Re-encrypting filesystem files",
             Self::VerifyingNewKey => "Verifying encrypted filesystem",
             Self::UpdatingMetadata => "Updating key metadata",
             Self::Completed => "Migration complete",
@@ -744,7 +779,7 @@ impl From<KeyMigrationStage> for FilesystemKeyMigrationProgress {
         match stage {
             KeyMigrationStage::Validating => Self::Validating,
             KeyMigrationStage::AcquiringLock => Self::AcquiringLock,
-            KeyMigrationStage::ChangingPassphrase => Self::ChangingPassphrase,
+            KeyMigrationStage::ReencryptingFiles => Self::ReencryptingFiles,
             KeyMigrationStage::VerifyingNewKey => Self::VerifyingNewKey,
             KeyMigrationStage::UpdatingMetadata => Self::UpdatingMetadata,
             KeyMigrationStage::Completed => Self::Completed,

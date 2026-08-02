@@ -1,4 +1,5 @@
 use crate::trace::{TRACE_ID_ENVIRONMENT, TraceContext};
+use base64::Engine;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::OnceLock;
 
@@ -11,6 +12,9 @@ const AUDIT_CONTROL: &str = "AGORA_SANDBOX_AUDIT_CONTROL";
 const AUDIT_TOKEN: &str = "AGORA_SANDBOX_AUDIT_TOKEN";
 const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
 const FILESYSTEM_ROOT: &str = "AGORA_SANDBOX_FILESYSTEM_ROOT";
+const FILESYSTEM_MODE: &str = "AGORA_SANDBOX_FILESYSTEM_MODE";
+const FILESYSTEM_KEY: &str = "AGORA_SANDBOX_FILESYSTEM_KEY";
+const FILESYSTEM_SALT: &str = "AGORA_SANDBOX_FILESYSTEM_SALT";
 const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
 const TLS_TRUST_BUNDLE: &str = "AGORA_SANDBOX_TLS_TRUST_BUNDLE";
 
@@ -22,7 +26,7 @@ const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
     "GIT_SSL_CAINFO",
 ];
 
-pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 17] = [
+pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 20] = [
     TOKEN,
     PROXY_IPV4,
     PROXY_IPV6,
@@ -32,6 +36,9 @@ pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 17] = [
     AUDIT_TOKEN,
     HOOK_LIBRARIES,
     FILESYSTEM_ROOT,
+    FILESYSTEM_MODE,
+    FILESYSTEM_KEY,
+    FILESYSTEM_SALT,
     TLS_TRUST_ANCHOR_DER,
     TLS_TRUST_BUNDLE,
     TRACE_ID_ENVIRONMENT,
@@ -53,6 +60,10 @@ pub(super) struct HookConfig {
     audit_token: String,
     hook_libraries: String,
     filesystem_root: String,
+    filesystem_mode: String,
+    filesystem_key: Option<String>,
+    filesystem_salt: Option<String>,
+    filesystem_cipher: Option<crate::filesystem::FileCipher>,
     tls_trust_anchor_der: Option<String>,
     tls_trust_bundle: Option<String>,
     trace: TraceContext,
@@ -81,6 +92,23 @@ impl HookConfig {
         let audit_token = Self::required(&mut get, AUDIT_TOKEN)?;
         let hook_libraries = Self::required(&mut get, HOOK_LIBRARIES)?;
         let filesystem_root = Self::required(&mut get, FILESYSTEM_ROOT)?;
+        let filesystem_mode = Self::required(&mut get, FILESYSTEM_MODE)?;
+        let filesystem_key = get(FILESYSTEM_KEY).filter(|value| !value.is_empty());
+        let filesystem_salt = get(FILESYSTEM_SALT).filter(|value| !value.is_empty());
+        match filesystem_mode.as_str() {
+            "plain" if filesystem_key.is_none() && filesystem_salt.is_none() => {}
+            "encrypted" if filesystem_key.is_some() && filesystem_salt.is_some() => {}
+            "plain" => return Err("plain filesystem mode cannot include a key or salt".into()),
+            "encrypted" => {
+                return Err("encrypted filesystem mode requires a key and salt".into());
+            }
+            _ => return Err(format!("invalid {FILESYSTEM_MODE}: {filesystem_mode}")),
+        }
+        let filesystem_cipher = Self::decode_filesystem_cipher(
+            &filesystem_mode,
+            filesystem_key.as_deref(),
+            filesystem_salt.as_deref(),
+        )?;
         let tls_trust_anchor_der = get(TLS_TRUST_ANCHOR_DER).filter(|value| !value.is_empty());
         let tls_trust_bundle = get(TLS_TRUST_BUNDLE).filter(|value| !value.is_empty());
         let trace = TraceContext::parse(&Self::required(&mut get, TRACE_ID_ENVIRONMENT)?)
@@ -110,6 +138,10 @@ impl HookConfig {
             audit_token,
             hook_libraries,
             filesystem_root,
+            filesystem_mode,
+            filesystem_key,
+            filesystem_salt,
+            filesystem_cipher,
             tls_trust_anchor_der,
             tls_trust_bundle,
             trace,
@@ -151,6 +183,29 @@ impl HookConfig {
         &self.filesystem_root
     }
 
+    pub(super) fn filesystem_cipher(&self) -> Option<crate::filesystem::FileCipher> {
+        self.filesystem_cipher.clone()
+    }
+
+    fn decode_filesystem_cipher(
+        mode: &str,
+        key: Option<&str>,
+        salt: Option<&str>,
+    ) -> Result<Option<crate::filesystem::FileCipher>, String> {
+        if mode == "plain" {
+            return Ok(None);
+        }
+        let key = base64::engine::general_purpose::STANDARD
+            .decode(key.unwrap_or_default())
+            .map_err(|error| format!("invalid {FILESYSTEM_KEY}: {error}"))?;
+        let salt = base64::engine::general_purpose::STANDARD
+            .decode(salt.unwrap_or_default())
+            .map_err(|error| format!("invalid {FILESYSTEM_SALT}: {error}"))?;
+        crate::filesystem::FileCipher::derive(&key, &salt)
+            .map(Some)
+            .map_err(|error| format!("invalid encrypted filesystem configuration: {error:#}"))
+    }
+
     pub(super) fn tls_trust_anchor_der(&self) -> Option<&str> {
         self.tls_trust_anchor_der.as_deref()
     }
@@ -183,8 +238,15 @@ impl HookConfig {
             (AUDIT_TOKEN, self.audit_token.clone()),
             (HOOK_LIBRARIES, self.hook_libraries.clone()),
             (FILESYSTEM_ROOT, self.filesystem_root.clone()),
+            (FILESYSTEM_MODE, self.filesystem_mode.clone()),
             (TRACE_ID_ENVIRONMENT, trace.encode()),
         ];
+        if let Some(key) = &self.filesystem_key {
+            environment.push((FILESYSTEM_KEY, key.clone()));
+        }
+        if let Some(salt) = &self.filesystem_salt {
+            environment.push((FILESYSTEM_SALT, salt.clone()));
+        }
         if let Some(anchor) = &self.tls_trust_anchor_der {
             environment.push((TLS_TRUST_ANCHOR_DER, anchor.clone()));
         }
@@ -214,7 +276,16 @@ impl HookConfig {
 }
 
 pub(super) fn initialize() {
-    let _ = global();
+    if global().is_some() {
+        for key in [
+            FILESYSTEM_ROOT,
+            FILESYSTEM_MODE,
+            FILESYSTEM_KEY,
+            FILESYSTEM_SALT,
+        ] {
+            unsafe { std::env::remove_var(key) };
+        }
+    }
 }
 
 pub(super) fn global() -> Option<&'static HookConfig> {

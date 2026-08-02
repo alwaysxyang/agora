@@ -1,6 +1,6 @@
 use crate::filesystem::{EntryState, Materializer, OverlayStore};
 use anyhow::{Context, Result, bail};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -9,7 +9,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 const MACH_64_MAGIC: u32 = 0xfeed_facf;
@@ -22,6 +22,30 @@ const CS_REQUIRE_LV: u32 = 0x0000_2000;
 const CS_RUNTIME: u32 = 0x0001_0000;
 const CS_DYLD_RESTRICTED: u32 = CS_RESTRICT | CS_REQUIRE_LV | CS_RUNTIME;
 const MAX_SHEBANG_LINE_SIZE: usize = 1024;
+const SIGNATURE_CACHE_CAPACITY: usize = 1024;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct ExecutableIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    flags: u32,
+}
+
+impl ExecutableIdentity {
+    fn new(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            flags: metadata.st_flags(),
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct ArchitectureSelection {
@@ -101,7 +125,32 @@ impl ExecutableStore {
     fn requires_copy(source: &Path, metadata: &Metadata) -> Result<bool> {
         let sip_restricted =
             metadata.st_flags() & SF_RESTRICTED != 0 && sip_restricts_protected_files();
-        Ok(sip_restricted || Self::code_signing_flags(source)? & CS_DYLD_RESTRICTED != 0)
+        Ok(sip_restricted
+            || Self::cached_code_signing_flags(metadata, || Self::code_signing_flags(source))?
+                & CS_DYLD_RESTRICTED
+                != 0)
+    }
+
+    fn cached_code_signing_flags(
+        metadata: &Metadata,
+        inspect: impl FnOnce() -> Result<u32>,
+    ) -> Result<u32> {
+        static CACHE: OnceLock<Mutex<HashMap<ExecutableIdentity, u32>>> = OnceLock::new();
+
+        let identity = ExecutableIdentity::new(metadata);
+        let mut cache = CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(flags) = cache.get(&identity) {
+            return Ok(*flags);
+        }
+        let flags = inspect()?;
+        if cache.len() >= SIGNATURE_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(identity, flags);
+        Ok(flags)
     }
 
     fn code_signing_flags(source: &Path) -> Result<u32> {
