@@ -32,6 +32,8 @@ fn hook_configuration_requires_all_runtime_values() {
         ("AGORA_SANDBOX_PROXY_IPV6", "[::1]:41001"),
         ("AGORA_SANDBOX_EXECUTION_CONTROL", "127.0.0.1:41002"),
         ("AGORA_SANDBOX_EXECUTION_TOKEN", "execution-token"),
+        ("AGORA_SANDBOX_AUDIT_CONTROL", "127.0.0.1:41003"),
+        ("AGORA_SANDBOX_AUDIT_TOKEN", "audit-token"),
         ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
         ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs"),
         ("AGORA_SANDBOX_TRACE_ID", "trace-root"),
@@ -39,6 +41,8 @@ fn hook_configuration_requires_all_runtime_values() {
     let config = HookConfig::from_getter(|key| values.get(key).map(ToString::to_string)).unwrap();
 
     assert_eq!(config.tls_trust_anchor_der(), None);
+    assert_eq!(config.audit_control(), "127.0.0.1:41003".parse().unwrap());
+    assert_eq!(config.audit_token(), "audit-token");
 
     assert_eq!(
         config.proxy_for(SocketAddr::from(([203, 0, 113, 10], 443))),
@@ -51,6 +55,7 @@ fn hook_configuration_requires_all_runtime_values() {
     assert!(config.is_internal("127.0.0.1:41000".parse().unwrap()));
     assert!(config.is_internal("[::1]:41001".parse().unwrap()));
     assert!(config.is_internal("127.0.0.1:41002".parse().unwrap()));
+    assert!(config.is_internal("127.0.0.1:41003".parse().unwrap()));
 
     let error = HookConfig::from_getter(|key| {
         (key != "AGORA_SANDBOX_TOKEN")
@@ -69,6 +74,8 @@ fn hook_configuration_propagates_an_optional_tls_trust_anchor() {
         ("AGORA_SANDBOX_PROXY_IPV6", "[::1]:41001"),
         ("AGORA_SANDBOX_EXECUTION_CONTROL", "127.0.0.1:41002"),
         ("AGORA_SANDBOX_EXECUTION_TOKEN", "execution-token"),
+        ("AGORA_SANDBOX_AUDIT_CONTROL", "127.0.0.1:41003"),
+        ("AGORA_SANDBOX_AUDIT_TOKEN", "audit-token"),
         ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
         ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs"),
         ("AGORA_SANDBOX_TRACE_ID", "trace-root"),
@@ -123,6 +130,8 @@ fn hook_configuration_rejects_invalid_or_non_loopback_proxy_addresses() {
         ("AGORA_SANDBOX_PROXY_IPV6", "[::1]:41001"),
         ("AGORA_SANDBOX_EXECUTION_CONTROL", "127.0.0.1:41002"),
         ("AGORA_SANDBOX_EXECUTION_TOKEN", "execution-token"),
+        ("AGORA_SANDBOX_AUDIT_CONTROL", "127.0.0.1:41003"),
+        ("AGORA_SANDBOX_AUDIT_TOKEN", "audit-token"),
         ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
         ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs"),
         ("AGORA_SANDBOX_TRACE_ID", "trace-root"),
@@ -173,6 +182,11 @@ fn hook_configuration_rejects_invalid_or_non_loopback_proxy_addresses() {
     );
     assert!(
         parse(&[("AGORA_SANDBOX_EXECUTION_CONTROL", "[::1]:80")])
+            .unwrap_err()
+            .contains("IPv4 loopback")
+    );
+    assert!(
+        parse(&[("AGORA_SANDBOX_AUDIT_CONTROL", "[::1]:80")])
             .unwrap_err()
             .contains("IPv4 loopback")
     );

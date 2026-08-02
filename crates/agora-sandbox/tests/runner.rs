@@ -1,4 +1,6 @@
-use agora_sandbox::callback::{Decision, Event, EventType, NetworkEvent, NoopCallback};
+use agora_sandbox::callback::{
+    Decision, Event, EventType, FileAccessMode, FileEvent, NetworkEvent, NoopCallback,
+};
 use agora_sandbox::network::{NetworkEnforcement, TlsMode};
 use agora_sandbox::runner::{Sandbox, SandboxCommand, SandboxConfig};
 #[cfg(target_os = "macos")]
@@ -271,6 +273,104 @@ async fn runner_persists_an_encrypted_workspace_without_modifying_the_source() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn runner_persists_a_plain_workspace_without_modifying_the_source() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-plain-workspace-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("input.txt"), b"original\n").unwrap();
+    let config = SandboxConfig::new(hook_library())
+        .with_workdir(&workdir)
+        .with_plain_workspace();
+    let create = SandboxCommand::new("/bin/sh")
+        .args([
+            "-c",
+            "test \"$(cat input.txt)\" = original && printf 'plain workspace marker\\n' > output.txt",
+        ])
+        .current_dir(&source);
+    let created = Sandbox::new(config.clone(), NoopCallback)
+        .run(create)
+        .await
+        .unwrap();
+
+    assert!(created.status().success());
+    assert_eq!(
+        std::fs::read(source.join("input.txt")).unwrap(),
+        b"original\n"
+    );
+    assert!(!source.join("output.txt").exists());
+    let persisted = workdir
+        .join("fs")
+        .join(source.canonicalize().unwrap().strip_prefix("/").unwrap())
+        .join("output.txt");
+    assert_eq!(
+        std::fs::read(&persisted).unwrap(),
+        b"plain workspace marker\n"
+    );
+    assert!(!workdir.join("filesystem/fs.sparsebundle").exists());
+
+    let verify = SandboxCommand::new("/bin/sh")
+        .args([
+            "-c",
+            "test \"$(cat input.txt)\" = original && test \"$(cat output.txt)\" = 'plain workspace marker'",
+        ])
+        .current_dir(&source);
+    let verified = Sandbox::new(config, NoopCallback)
+        .run(verify)
+        .await
+        .unwrap();
+
+    assert!(verified.status().success());
+    assert!(!source.join("output.txt").exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_rejects_concurrent_plain_sandboxes_in_the_same_workdir() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-plain-lock-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    let config = SandboxConfig::new(hook_library())
+        .with_workdir(&workdir)
+        .with_plain_workspace();
+    let first = tokio::spawn(
+        Sandbox::new(config.clone(), NoopCallback).run(
+            SandboxCommand::new("/bin/sleep")
+                .arg("1")
+                .current_dir(&source),
+        ),
+    );
+    let lock = workdir.join("filesystem/fs.lock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !lock.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "plain filesystem lock was not created"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let error = Sandbox::new(config, NoopCallback)
+        .run(SandboxCommand::new("/usr/bin/true").current_dir(&source))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("filesystem is already in use"));
+    assert!(first.await.unwrap().unwrap().status().success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn runner_interposes_the_complete_filesystem_operation_set() {
     let directory = std::env::temp_dir().join(format!(
         "agora-sandbox-filesystem-hook-test-{}",
@@ -287,12 +387,40 @@ async fn runner_interposes_the_complete_filesystem_operation_set() {
         .current_dir(&source)
         .env("AGORA_SANDBOX_TEST_FILESYSTEM_CHILD", &source);
 
-    let outcome = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+    let events = Arc::new(Mutex::new(Vec::<FileEvent>::new()));
+    let callback = {
+        let events = Arc::clone(&events);
+        move |event: Event| {
+            if let Event::File(event) = event {
+                events.lock().unwrap().push(event);
+            }
+            std::future::ready(Decision::Allow)
+        }
+    };
+    let outcome = Sandbox::new(sandbox_config_in(&workdir), callback)
         .run(command)
         .await
         .unwrap();
 
     assert!(outcome.status().success());
+    let source_path = source.join("source.txt").to_string_lossy().into_owned();
+    let source_events = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.file.path == source_path)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(source_events.iter().any(|event| {
+        event.event_type == EventType::FilesystemOpen
+            && event.file.mode.access == FileAccessMode::Read
+            && !event.trace_id.is_empty()
+    }));
+    assert!(source_events.iter().any(|event| {
+        event.event_type == EventType::FilesystemClose
+            && event.file.mode.access == FileAccessMode::Read
+            && !event.trace_id.is_empty()
+    }));
     assert_eq!(std::fs::read(source.join("source.txt")).unwrap(), b"host");
     assert!(!source.join("created.txt").exists());
     assert!(!source.join("created").exists());

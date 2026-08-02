@@ -1,8 +1,8 @@
 use agora_sandbox::callback::{
     BasicAuth, Callback, CommandContext, Decision, DomainSource, EVENT_SCHEMA_VERSION, Event,
-    EventMetrics, EventResult, EventStatus, EventType, HttpProxy, NetworkContext, NetworkEvent,
-    NetworkProtocol, NoopCallback, ProcessContext, ProcessEvent, ProcessOperation, Proxy, Redact,
-    Subsystem,
+    EventMetrics, EventResult, EventStatus, EventType, FileAccessMode, FileContext, FileEvent,
+    FileOpenMode, HttpProxy, NetworkContext, NetworkEvent, NetworkProtocol, NoopCallback,
+    ProcessContext, ProcessEvent, ProcessOperation, Proxy, Redact, Subsystem,
 };
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
@@ -77,6 +77,39 @@ fn process_event() -> ProcessEvent {
     }
 }
 
+fn file_event() -> FileEvent {
+    FileEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "event-3".to_string(),
+        occurred_at: "2026-07-23T12:34:56.789Z".to_string(),
+        subsystem: Subsystem::Filesystem,
+        event_type: EventType::FilesystemOpen,
+        sandbox_id: "sandbox-1".to_string(),
+        run_id: "run-1".to_string(),
+        trace_id: "trace-root, trace-child".to_string(),
+        process: ProcessContext {
+            pid: 101,
+            ppid: 100,
+            executable: "/usr/bin/curl".to_string(),
+        },
+        file: FileContext {
+            path: "/tmp/output.json".to_string(),
+            mode: FileOpenMode {
+                access: FileAccessMode::ReadWrite,
+                create: true,
+                truncate: true,
+                append: false,
+                exclusive: false,
+            },
+        },
+        result: EventResult {
+            status: EventStatus::Started,
+            error_code: None,
+            error_message: None,
+        },
+    }
+}
+
 #[test]
 fn callback_event_uses_stable_versioned_json_fields() {
     let event = Event::Network(network_event());
@@ -109,6 +142,20 @@ fn process_event_preserves_arguments_at_the_redacted_event_boundary() {
     assert_eq!(value["command"]["operation"], "execve");
     assert_eq!(value["command"]["arguments"][0], "curl");
     assert_eq!(value["command"]["arguments"][1], "https://example.com");
+}
+
+#[test]
+fn file_event_preserves_logical_path_mode_and_trace_context() {
+    let value = serde_json::to_value(Event::File(file_event()).redacted()).unwrap();
+
+    assert_eq!(value["schema_version"], EVENT_SCHEMA_VERSION);
+    assert_eq!(value["subsystem"], "filesystem");
+    assert_eq!(value["event_type"], "filesystem.open");
+    assert_eq!(value["trace_id"], "trace-root, trace-child");
+    assert_eq!(value["file"]["path"], "/tmp/output.json");
+    assert_eq!(value["file"]["mode"]["access"], "read_write");
+    assert_eq!(value["file"]["mode"]["create"], true);
+    assert_eq!(value["file"]["mode"]["truncate"], true);
 }
 
 #[test]

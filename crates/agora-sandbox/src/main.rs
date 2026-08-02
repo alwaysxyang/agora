@@ -3,9 +3,9 @@ use agora_core::lifecycle::{
     signal::{Signal, SignalHandlers},
 };
 use agora_sandbox::{
-    callback::{Callback, Decision, Event, EventType, ProcessOperation},
+    callback::{Callback, Decision, Event, EventType, FileOpenMode, ProcessOperation},
     network::TlsMode,
-    runner::{Sandbox, SandboxCommand, SandboxConfig, migrate_filesystem_key},
+    runner::{FilesystemMode, Sandbox, SandboxCommand, SandboxConfig},
 };
 use anyhow::{Context, Result};
 use clap::{ColorChoice, Parser, Subcommand, ValueEnum};
@@ -15,6 +15,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+mod key_migration;
 
 #[derive(Parser)]
 #[command(
@@ -48,6 +50,10 @@ struct Arguments {
     #[arg(long)]
     filesystem_key: Option<String>,
 
+    /// Filesystem storage mode
+    #[arg(long, value_enum, default_value_t = FilesystemArgument::Encrypted)]
+    filesystem: FilesystemArgument,
+
     /// Path to a DER CA certificate trusted by sandboxed SecTrust TLS clients
     #[arg(long)]
     tls_trust_anchor: Option<PathBuf>,
@@ -67,19 +73,11 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum CliCommand {
-    /// Change the passphrase of an existing encrypted filesystem
+    /// Interactively change the passphrase of an existing encrypted filesystem
     MigrateKey {
         /// Sandbox work directory; defaults to ~/.agora-sandbox
         #[arg(long)]
         workdir: Option<PathBuf>,
-
-        /// Current encrypted filesystem passphrase
-        #[arg(long)]
-        filesystem_key: String,
-
-        /// Replacement encrypted filesystem passphrase
-        #[arg(long)]
-        new_filesystem_key: String,
     },
 }
 
@@ -95,6 +93,22 @@ impl From<TlsArgument> for TlsMode {
         match value {
             TlsArgument::Off => Self::Off,
             TlsArgument::Auto => Self::Auto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum FilesystemArgument {
+    #[default]
+    Encrypted,
+    Plain,
+}
+
+impl From<FilesystemArgument> for FilesystemMode {
+    fn from(value: FilesystemArgument) -> Self {
+        match value {
+            FilesystemArgument::Encrypted => Self::Encrypted,
+            FilesystemArgument::Plain => Self::Plain,
         }
     }
 }
@@ -154,6 +168,25 @@ impl AuditState {
                     arguments: event.command.arguments.clone(),
                     current_dir: event.command.current_dir.clone(),
                     operation: event.command.operation,
+                })
+            }
+            Event::File(event)
+                if matches!(
+                    event.event_type,
+                    EventType::FilesystemOpen | EventType::FilesystemClose
+                ) =>
+            {
+                Some(AuditRecord::Filesystem {
+                    access_time: event.occurred_at.clone(),
+                    trace_id: event.trace_id.clone(),
+                    pid: event.process.pid,
+                    operation: match event.event_type {
+                        EventType::FilesystemOpen => FileOperation::Open,
+                        EventType::FilesystemClose => FileOperation::Close,
+                        _ => unreachable!(),
+                    },
+                    path: event.file.path.clone(),
+                    mode: event.file.mode,
                 })
             }
             _ => None,
@@ -229,17 +262,27 @@ enum AuditRecord {
         current_dir: String,
         operation: ProcessOperation,
     },
+    Filesystem {
+        access_time: String,
+        trace_id: String,
+        pid: u32,
+        operation: FileOperation,
+        path: String,
+        mode: FileOpenMode,
+    },
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FileOperation {
+    Open,
+    Close,
 }
 
 async fn async_main(arguments: Arguments) -> Result<u8> {
     match arguments.subcommand {
-        Some(CliCommand::MigrateKey {
-            workdir,
-            filesystem_key,
-            new_filesystem_key,
-        }) => {
-            let workdir = workdir.unwrap_or_else(SandboxConfig::default_workdir);
-            migrate_filesystem_key(workdir, filesystem_key, new_filesystem_key).await?;
+        Some(CliCommand::MigrateKey { workdir }) => {
+            key_migration::run(workdir).await?;
             return Ok(0);
         }
         None => {}
@@ -252,8 +295,17 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
     if let Some(workdir) = arguments.workdir {
         config = config.with_workdir(workdir);
     }
-    if let Some(key) = arguments.filesystem_key {
-        config = config.with_encrypted_workspace(key);
+    match (arguments.filesystem, arguments.filesystem_key) {
+        (FilesystemArgument::Encrypted, Some(key)) => {
+            config = config.with_encrypted_workspace(key);
+        }
+        (FilesystemArgument::Encrypted, None) => {}
+        (FilesystemArgument::Plain, None) => {
+            config = config.with_plain_workspace();
+        }
+        (FilesystemArgument::Plain, Some(_)) => {
+            anyhow::bail!("--filesystem-key cannot be used with plain filesystem mode");
+        }
     }
     config.network.tls = arguments.tls.into();
     if let Some(anchor) = arguments.tls_trust_anchor {

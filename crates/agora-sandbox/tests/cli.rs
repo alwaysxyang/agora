@@ -67,6 +67,8 @@ fn sandbox_cli_documents_only_available_options() {
     assert!(stdout.contains("--hook-library <HOOK_LIBRARY>"));
     assert!(stdout.contains("--audit-file <AUDIT_FILE>"));
     assert!(stdout.contains("--workdir <WORKDIR>"));
+    assert!(stdout.contains("--filesystem <FILESYSTEM>"));
+    assert!(stdout.contains("[possible values: encrypted, plain]"));
     assert!(stdout.contains("--filesystem-key <FILESYSTEM_KEY>"));
     assert!(!stdout.contains("--filesystem-key-file"));
     assert!(stdout.contains("--tls-trust-anchor <TLS_TRUST_ANCHOR>"));
@@ -104,6 +106,62 @@ fn sandbox_cli_rejects_the_removed_clean_command() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand 'clean'"));
 }
 
+#[test]
+fn sandbox_cli_documents_interactive_key_migration() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .args(["migrate-key", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--workdir <WORKDIR>"));
+    assert!(stdout.contains("Interactively"));
+    assert!(!stdout.contains("--filesystem-key"));
+    assert!(!stdout.contains("--new-filesystem-key"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_cli_runs_with_an_explicit_plain_filesystem_and_no_key() {
+    let workdir = cli_workdir();
+    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .arg("--hook-library")
+        .arg(hook_library())
+        .arg("--workdir")
+        .arg(&workdir)
+        .args(["--filesystem", "plain"])
+        .args(["-c", "/usr/bin/true"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(workdir.join("fs").is_dir());
+    assert!(!workdir.join("filesystem/fs.sparsebundle").exists());
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
+fn sandbox_cli_rejects_a_key_in_plain_filesystem_mode() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .args(["--filesystem", "plain"])
+        .args(["--filesystem-key", "unused"])
+        .args(["-c", "/usr/bin/true"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--filesystem-key cannot be used with plain filesystem mode")
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn sandbox_cli_migrates_the_encrypted_filesystem_key_in_place() {
@@ -128,20 +186,32 @@ fn sandbox_cli_migrates_the_encrypted_filesystem_key_in_place() {
         String::from_utf8_lossy(&initialized.stderr)
     );
 
-    let migrated = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+    let mut migrated = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"));
+    migrated
         .arg("migrate-key")
         .arg("--workdir")
         .arg(&workdir)
-        .args(["--filesystem-key", "old-filesystem-key"])
-        .args(["--new-filesystem-key", "new-filesystem-key"])
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut migrated = migrated.spawn().unwrap();
+    migrated
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"old-filesystem-key\nnew-filesystem-key\n")
         .unwrap();
+    let migrated = migrated.wait_with_output().unwrap();
     assert!(
         migrated.status.success(),
         "stdout={}\nstderr={}",
         String::from_utf8_lossy(&migrated.stdout),
         String::from_utf8_lossy(&migrated.stderr)
     );
+    let stdout = String::from_utf8_lossy(&migrated.stdout);
+    assert!(stdout.contains("Current filesystem key"), "{stdout}");
+    assert!(stdout.contains("New filesystem key"), "{stdout}");
+    assert!(stdout.contains("100%"), "{stdout}");
 
     let old_key = run("old-filesystem-key");
     assert!(!old_key.status.success());
@@ -155,6 +225,50 @@ fn sandbox_cli_migrates_the_encrypted_filesystem_key_in_place() {
         String::from_utf8_lossy(&new_key.stderr)
     );
     std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_cli_prompts_for_migration_keys_in_a_terminal() {
+    let workdir = cli_workdir();
+    let mut process = Command::new("/usr/bin/script");
+    process
+        .arg("-q")
+        .arg("/dev/null")
+        .arg(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .arg("migrate-key")
+        .arg("--workdir")
+        .arg(&workdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = process.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"old-filesystem-key\nnew-filesystem-key\n")
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("interactive key migration did not exit before the deadline");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let output = child.wait_with_output().unwrap();
+
+    assert!(!status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Current filesystem key"), "{stdout}");
+    assert!(stdout.contains("New filesystem key"), "{stdout}");
+    assert!(stdout.contains("Migration progress"), "{stdout}");
+    assert!(stdout.contains("5%"), "{stdout}");
 }
 
 #[cfg(target_os = "macos")]
@@ -398,13 +512,17 @@ fn sandbox_cli_writes_compact_audit_to_stdout_by_default() {
         String::from_utf8_lossy(&output.stderr)
     );
     let records = audit_records(&output.stdout);
+    let network_records = records
+        .iter()
+        .filter(|record| record["type"] == "network")
+        .collect::<Vec<_>>();
     assert_eq!(
-        records.len(),
+        network_records.len(),
         1,
         "stdout={}",
         String::from_utf8_lossy(&output.stdout)
     );
-    assert_audit_record(&records[0], destination);
+    assert_audit_record(network_records[0], destination);
     assert!(!String::from_utf8_lossy(&output.stderr).contains("network.connect.attempt"));
 }
 
@@ -429,9 +547,13 @@ fn sandbox_cli_appends_compact_audit_to_the_configured_file() {
     assert!(audit_records(&first.stdout).is_empty());
     assert!(audit_records(&second.stdout).is_empty());
     let records = audit_records(&std::fs::read(&audit_file).unwrap());
-    assert_eq!(records.len(), 2);
-    assert_audit_record(&records[0], first_destination);
-    assert_audit_record(&records[1], second_destination);
+    let network_records = records
+        .iter()
+        .filter(|record| record["type"] == "network")
+        .collect::<Vec<_>>();
+    assert_eq!(network_records.len(), 2);
+    assert_audit_record(network_records[0], first_destination);
+    assert_audit_record(network_records[1], second_destination);
     std::fs::remove_dir_all(temp).unwrap();
 }
 

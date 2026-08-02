@@ -7,6 +7,8 @@ const PROXY_IPV4: &str = "AGORA_SANDBOX_PROXY_IPV4";
 const PROXY_IPV6: &str = "AGORA_SANDBOX_PROXY_IPV6";
 const EXECUTION_CONTROL: &str = "AGORA_SANDBOX_EXECUTION_CONTROL";
 const EXECUTION_TOKEN: &str = "AGORA_SANDBOX_EXECUTION_TOKEN";
+const AUDIT_CONTROL: &str = "AGORA_SANDBOX_AUDIT_CONTROL";
+const AUDIT_TOKEN: &str = "AGORA_SANDBOX_AUDIT_TOKEN";
 const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
 const FILESYSTEM_ROOT: &str = "AGORA_SANDBOX_FILESYSTEM_ROOT";
 const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
@@ -20,12 +22,14 @@ const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
     "GIT_SSL_CAINFO",
 ];
 
-pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 15] = [
+pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 17] = [
     TOKEN,
     PROXY_IPV4,
     PROXY_IPV6,
     EXECUTION_CONTROL,
     EXECUTION_TOKEN,
+    AUDIT_CONTROL,
+    AUDIT_TOKEN,
     HOOK_LIBRARIES,
     FILESYSTEM_ROOT,
     TLS_TRUST_ANCHOR_DER,
@@ -45,6 +49,8 @@ pub(super) struct HookConfig {
     proxy_ipv6: SocketAddr,
     execution_control: SocketAddr,
     execution_token: String,
+    audit_control: SocketAddr,
+    audit_token: String,
     hook_libraries: String,
     filesystem_root: String,
     tls_trust_anchor_der: Option<String>,
@@ -69,6 +75,10 @@ impl HookConfig {
             .parse::<SocketAddr>()
             .map_err(|error| format!("invalid {EXECUTION_CONTROL}: {error}"))?;
         let execution_token = Self::required(&mut get, EXECUTION_TOKEN)?;
+        let audit_control = Self::required(&mut get, AUDIT_CONTROL)?
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("invalid {AUDIT_CONTROL}: {error}"))?;
+        let audit_token = Self::required(&mut get, AUDIT_TOKEN)?;
         let hook_libraries = Self::required(&mut get, HOOK_LIBRARIES)?;
         let filesystem_root = Self::required(&mut get, FILESYSTEM_ROOT)?;
         let tls_trust_anchor_der = get(TLS_TRUST_ANCHOR_DER).filter(|value| !value.is_empty());
@@ -87,12 +97,17 @@ impl HookConfig {
                 "{EXECUTION_CONTROL} must be an IPv4 loopback address"
             ));
         }
+        if !audit_control.ip().is_loopback() || !matches!(audit_control.ip(), IpAddr::V4(_)) {
+            return Err(format!("{AUDIT_CONTROL} must be an IPv4 loopback address"));
+        }
         Ok(Self {
             token,
             proxy_ipv4,
             proxy_ipv6,
             execution_control,
             execution_token,
+            audit_control,
+            audit_token,
             hook_libraries,
             filesystem_root,
             tls_trust_anchor_der,
@@ -118,6 +133,14 @@ impl HookConfig {
 
     pub(super) fn execution_token(&self) -> &str {
         &self.execution_token
+    }
+
+    pub(super) fn audit_control(&self) -> SocketAddr {
+        self.audit_control
+    }
+
+    pub(super) fn audit_token(&self) -> &str {
+        &self.audit_token
     }
 
     pub(super) fn hook_libraries(&self) -> &str {
@@ -156,6 +179,8 @@ impl HookConfig {
             (PROXY_IPV6, self.proxy_ipv6.to_string()),
             (EXECUTION_CONTROL, self.execution_control.to_string()),
             (EXECUTION_TOKEN, self.execution_token.clone()),
+            (AUDIT_CONTROL, self.audit_control.to_string()),
+            (AUDIT_TOKEN, self.audit_token.clone()),
             (HOOK_LIBRARIES, self.hook_libraries.clone()),
             (FILESYSTEM_ROOT, self.filesystem_root.clone()),
             (TRACE_ID_ENVIRONMENT, trace.encode()),
@@ -178,6 +203,7 @@ impl HookConfig {
         destination == self.proxy_ipv4
             || destination == self.proxy_ipv6
             || destination == self.execution_control
+            || destination == self.audit_control
     }
 
     fn required(get: &mut impl FnMut(&str) -> Option<String>, key: &str) -> Result<String, String> {

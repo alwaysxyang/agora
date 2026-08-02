@@ -1,16 +1,8 @@
 use super::protocol::{
-    CommandRequest, PrepareResponse, decode_prepare_request, encode_prepare_response, frame_length,
+    PrepareResponse, decode_prepare_request, encode_prepare_response, frame_length,
 };
 use super::store::ExecutableStore;
-#[cfg(test)]
-use crate::callback::NoopCallback;
-use crate::callback::{
-    Callback, CommandContext, EVENT_SCHEMA_VERSION, Event, EventResult, EventStatus, EventType,
-    ProcessContext, ProcessEvent, Subsystem,
-};
-use crate::trace::TraceContext;
 use anyhow::{Context, Result};
-use chrono::{SecondsFormat, Utc};
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -51,26 +43,10 @@ pub(crate) struct ExecutionController {
 impl ExecutionController {
     #[cfg(test)]
     pub(crate) async fn start(directory: PathBuf) -> Result<Self> {
-        Self::start_with_callback(
-            directory,
-            "test-sandbox".to_string(),
-            "test-run".to_string(),
-            NoopCallback,
-            Duration::from_secs(1),
-        )
-        .await
+        Self::start_for_run(directory).await
     }
 
-    pub(crate) async fn start_with_callback<C>(
-        directory: PathBuf,
-        sandbox_id: String,
-        run_id: String,
-        callback: C,
-        callback_timeout: Duration,
-    ) -> Result<Self>
-    where
-        C: Callback,
-    {
+    pub(crate) async fn start_for_run(directory: PathBuf) -> Result<Self> {
         let store = Arc::new(Mutex::new(ExecutableStore::new(directory)?));
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -81,10 +57,6 @@ impl ExecutionController {
         let state = Arc::new(ExecutionState {
             token: token.clone(),
             store: Arc::clone(&store),
-            sandbox_id,
-            run_id,
-            callback,
-            callback_timeout,
         });
         let mut tasks = JoinSet::new();
         tasks.spawn(ExecutionServer::new(listener, state).run(receiver));
@@ -160,70 +132,19 @@ impl Drop for ExecutionController {
     }
 }
 
-struct ExecutionState<C>
-where
-    C: Callback,
-{
+struct ExecutionState {
     token: String,
     store: Arc<Mutex<ExecutableStore>>,
-    sandbox_id: String,
-    run_id: String,
-    callback: C,
-    callback_timeout: Duration,
 }
 
-impl<C> ExecutionState<C>
-where
-    C: Callback,
-{
-    async fn publish_command(&self, command: &CommandRequest) -> Result<()> {
-        let trace = TraceContext::parse(&command.trace_id)
-            .map_err(|error| anyhow::anyhow!("invalid command trace id: {error}"))?;
-        let event = Event::Process(ProcessEvent {
-            schema_version: EVENT_SCHEMA_VERSION,
-            event_id: Uuid::new_v4().to_string(),
-            occurred_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            subsystem: Subsystem::Process,
-            event_type: EventType::ProcessExecAttempt,
-            sandbox_id: self.sandbox_id.clone(),
-            run_id: self.run_id.clone(),
-            trace_id: trace.encode(),
-            process: ProcessContext {
-                pid: command.pid,
-                ppid: command.ppid,
-                executable: command.process_executable.clone(),
-            },
-            command: CommandContext {
-                executable: command.executable.clone(),
-                arguments: command.arguments.clone(),
-                current_dir: command.current_dir.clone(),
-                operation: command.operation,
-            },
-            result: EventResult {
-                status: EventStatus::Started,
-                error_code: None,
-                error_message: None,
-            },
-        });
-        let _ = tokio::time::timeout(self.callback_timeout, self.callback.on_event(event)).await;
-        Ok(())
-    }
-}
-
-struct ExecutionServer<C>
-where
-    C: Callback,
-{
+struct ExecutionServer {
     listener: TcpListener,
-    state: Arc<ExecutionState<C>>,
+    state: Arc<ExecutionState>,
     connections: Arc<Semaphore>,
 }
 
-impl<C> ExecutionServer<C>
-where
-    C: Callback,
-{
-    fn new(listener: TcpListener, state: Arc<ExecutionState<C>>) -> Self {
+impl ExecutionServer {
+    fn new(listener: TcpListener, state: Arc<ExecutionState>) -> Self {
         Self {
             listener,
             state,
@@ -261,7 +182,7 @@ where
         Ok(())
     }
 
-    async fn handle(mut stream: TcpStream, state: Arc<ExecutionState<C>>) -> Result<()> {
+    async fn handle(mut stream: TcpStream, state: Arc<ExecutionState>) -> Result<()> {
         let frame =
             tokio::time::timeout(EXECUTION_HANDSHAKE_TIMEOUT, Self::read_frame(&mut stream))
                 .await
@@ -273,19 +194,6 @@ where
                 message: "invalid execution token".to_string(),
             }
         } else {
-            if let Some(command) = request.command.as_ref()
-                && let Err(error) = state.publish_command(command).await
-            {
-                let response = PrepareResponse::Error {
-                    errno: libc::EINVAL,
-                    message: format!("{error:#}"),
-                };
-                stream
-                    .write_all(&encode_prepare_response(&response)?)
-                    .await?;
-                stream.shutdown().await?;
-                return Ok(());
-            }
             let store = Arc::clone(&state.store);
             let executable = request.executable;
             match tokio::task::spawn_blocking(move || lock(&store).prepare(&executable)).await {

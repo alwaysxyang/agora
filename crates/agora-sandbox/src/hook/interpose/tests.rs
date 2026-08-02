@@ -50,6 +50,8 @@ fn runtime() -> HookRuntime {
                 "AGORA_SANDBOX_PROXY_IPV6" => "[::1]:41001",
                 "AGORA_SANDBOX_EXECUTION_CONTROL" => "127.0.0.1:41002",
                 "AGORA_SANDBOX_EXECUTION_TOKEN" => "execution-token",
+                "AGORA_SANDBOX_AUDIT_CONTROL" => "127.0.0.1:41003",
+                "AGORA_SANDBOX_AUDIT_TOKEN" => "audit-token",
                 "AGORA_SANDBOX_HOOK_LIBRARIES" => "/tmp/hook.dylib",
                 "AGORA_SANDBOX_FILESYSTEM_ROOT" => "/tmp/agora-fs",
                 "AGORA_SANDBOX_TRACE_ID" => "trace-root",

@@ -1,7 +1,8 @@
 use super::{
-    Sandbox, SandboxCommand, SandboxConfig, SandboxOutcome, process_group_exists,
+    FilesystemMode, Sandbox, SandboxCommand, SandboxConfig, SandboxOutcome, process_group_exists,
     signal_process_group, wait_for_child_or_service,
 };
+use crate::audit::AuditController;
 use crate::callback::{Decision, Event, EventType, NoopCallback, TlsOutcome};
 use crate::execution::ExecutionController;
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
@@ -165,7 +166,7 @@ async fn system_curl_completes_the_transparent_tls_chain() {
         .iter()
         .find_map(|event| match event {
             Event::Process(event) if event.command.executable == "/usr/bin/curl" => Some(event),
-            Event::Network(_) | Event::Process(_) => None,
+            Event::Network(_) | Event::Process(_) | Event::File(_) => None,
         })
         .expect("curl process event");
     let established = events
@@ -180,7 +181,7 @@ async fn system_curl_completes_the_transparent_tls_chain() {
             {
                 Some(event)
             }
-            Event::Network(_) | Event::Process(_) => None,
+            Event::Network(_) | Event::Process(_) | Event::File(_) => None,
         })
         .expect("curl TLS connection event");
     assert_eq!(process.trace_id, established.trace_id);
@@ -218,10 +219,18 @@ async fn encrypted_overlay_preserves_the_host_while_the_child_uses_cow_and_white
         removed = removed.display(),
         directory = directory.display(),
     );
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let callback = {
+        let events = Arc::clone(&events);
+        move |event| {
+            events.lock().unwrap().push(event);
+            std::future::ready(Decision::Allow)
+        }
+    };
     let config = SandboxConfig::new(built_hook_library())
         .with_workdir(&root)
         .with_encrypted_workspace("test-filesystem-key");
-    let outcome = Sandbox::new(config, NoopCallback)
+    let outcome = Sandbox::new(config, callback)
         .run(SandboxCommand::new("/bin/bash").args(["-c", script.as_str()]))
         .await
         .unwrap();
@@ -235,6 +244,25 @@ async fn encrypted_overlay_preserves_the_host_while_the_child_uses_cow_and_white
     assert_eq!(std::fs::read(&removed).unwrap(), b"host removed");
     assert!(!created.exists());
     assert!(!directory.exists());
+    let events = events.lock().unwrap();
+    let file_events = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::File(event) if event.file.path == existing.to_string_lossy() => Some(event),
+            Event::Network(_) | Event::Process(_) | Event::File(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        file_events
+            .iter()
+            .any(|event| event.event_type == EventType::FilesystemOpen)
+    );
+    assert!(
+        file_events
+            .iter()
+            .any(|event| event.event_type == EventType::FilesystemClose)
+    );
+    drop(events);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -314,12 +342,16 @@ fn sandbox_config_and_command_builders_preserve_runtime_inputs() {
     );
     assert_eq!(config.tls_trust_anchor(), None);
     assert_eq!(config.tls_ca(), None);
+    assert_eq!(config.filesystem_mode(), FilesystemMode::Encrypted);
     let encrypted = config.clone().with_encrypted_workspace("top secret");
     assert_eq!(
         encrypted.encrypted_workspace_key(),
         Some(b"top secret".as_slice())
     );
     assert!(!format!("{encrypted:?}").contains("top secret"));
+    let plain = encrypted.with_plain_workspace();
+    assert_eq!(plain.filesystem_mode(), FilesystemMode::Plain);
+    assert_eq!(plain.encrypted_workspace_key(), None);
     assert!(
         config
             .validate()
@@ -361,6 +393,25 @@ fn sandbox_config_requires_a_filesystem_key() {
     let error = SandboxConfig::new(&hook).validate().unwrap_err();
 
     assert!(error.to_string().contains("filesystem key is required"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_config_allows_an_explicit_plain_workspace_without_a_key() {
+    let root = std::env::temp_dir().join(format!(
+        "agora-plain-filesystem-config-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let hook = root.join("hook.dylib");
+    std::fs::write(&hook, b"hook").unwrap();
+
+    let config = SandboxConfig::new(&hook).with_plain_workspace();
+
+    assert!(config.validate().is_ok());
+    assert_eq!(config.filesystem_mode(), FilesystemMode::Plain);
+    assert_eq!(config.encrypted_workspace_key(), None);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -660,12 +711,26 @@ async fn proxy_failure_terminates_the_child_process() {
     .unwrap();
     let mut child = sleeping_child();
     let mut execution = ExecutionController::start(workdir.clone()).await.unwrap();
+    let mut audit = AuditController::start(
+        "sandbox".to_string(),
+        "run".to_string(),
+        NoopCallback,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
     controller.abort_listener_for_test();
     let process_group = child.id().unwrap() as libc::pid_t;
 
     let result = tokio::time::timeout(
         Duration::from_secs(1),
-        wait_for_child_or_service(&mut child, process_group, &mut controller, &mut execution),
+        wait_for_child_or_service(
+            &mut child,
+            process_group,
+            &mut controller,
+            &mut execution,
+            &mut audit,
+        ),
     )
     .await
     .unwrap();
@@ -679,6 +744,7 @@ async fn proxy_failure_terminates_the_child_process() {
     assert!(child.try_wait().unwrap().is_some());
     controller.shutdown().await.unwrap();
     execution.shutdown().await.unwrap();
+    audit.shutdown().await.unwrap();
     std::fs::remove_dir_all(workdir).unwrap();
 }
 
@@ -697,12 +763,26 @@ async fn execution_controller_failure_terminates_the_child_process() {
     .unwrap();
     let mut child = sleeping_child();
     let mut execution = ExecutionController::start(workdir.clone()).await.unwrap();
+    let mut audit = AuditController::start(
+        "sandbox".to_string(),
+        "run".to_string(),
+        NoopCallback,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
     execution.abort_server_for_test();
     let process_group = child.id().unwrap() as libc::pid_t;
 
     let result = tokio::time::timeout(
         Duration::from_secs(1),
-        wait_for_child_or_service(&mut child, process_group, &mut controller, &mut execution),
+        wait_for_child_or_service(
+            &mut child,
+            process_group,
+            &mut controller,
+            &mut execution,
+            &mut audit,
+        ),
     )
     .await
     .unwrap();
@@ -716,5 +796,6 @@ async fn execution_controller_failure_terminates_the_child_process() {
     assert!(child.try_wait().unwrap().is_some());
     controller.shutdown().await.unwrap();
     assert!(execution.shutdown().await.is_ok());
+    audit.shutdown().await.unwrap();
     std::fs::remove_dir_all(workdir).unwrap();
 }

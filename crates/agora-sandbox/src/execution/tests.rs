@@ -1,15 +1,12 @@
 use super::ExecutionController;
 use super::protocol::{
-    CommandRequest, EXECUTION_PROTOCOL_VERSION, PrepareRequest, PrepareResponse, ProcessOperation,
-    TRUNCATED_ARGUMENTS, decode_prepare_request, decode_prepare_response, encode_prepare_request,
-    encode_prepare_request_with_command, encode_prepare_response, frame_length,
+    EXECUTION_PROTOCOL_VERSION, PrepareRequest, PrepareResponse, decode_prepare_request,
+    decode_prepare_response, encode_prepare_request, encode_prepare_response, frame_length,
 };
-use crate::callback::{Decision, Event, EventType};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -43,24 +40,12 @@ fn body(frame: &[u8]) -> &[u8] {
 
 #[test]
 fn execution_prepare_protocol_preserves_paths() {
-    let command = CommandRequest {
-        trace_id: "trace-root, trace-child".to_string(),
-        pid: 101,
-        ppid: 100,
-        process_executable: "/bin/bash".to_string(),
-        executable: "/usr/bin/curl".to_string(),
-        arguments: vec!["curl".to_string(), "https://example.com".to_string()],
-        current_dir: "/tmp".to_string(),
-        operation: ProcessOperation::Execve,
-    };
-    let request =
-        encode_prepare_request_with_command("token", Path::new("/tmp/客户端"), &command).unwrap();
+    let request = encode_prepare_request("token", Path::new("/tmp/客户端")).unwrap();
     assert_eq!(
         decode_prepare_request(body(&request)).unwrap(),
         PrepareRequest {
             token: "token".to_string(),
             executable: PathBuf::from("/tmp/客户端"),
-            command: Some(command),
         }
     );
 
@@ -69,33 +54,6 @@ fn execution_prepare_protocol_preserves_paths() {
     assert_eq!(
         decode_prepare_response(body(&response)).unwrap(),
         PrepareResponse::Ready(PathBuf::from("/tmp/agora/curl"))
-    );
-}
-
-#[test]
-fn execution_prepare_protocol_bounds_oversized_argument_metadata() {
-    let command = CommandRequest {
-        trace_id: "trace-root".to_string(),
-        pid: 101,
-        ppid: 100,
-        process_executable: "/bin/bash".to_string(),
-        executable: "/usr/bin/true".to_string(),
-        arguments: vec![
-            "visible".to_string(),
-            "x".repeat(70 * 1024),
-            "omitted".to_string(),
-        ],
-        current_dir: "/tmp".to_string(),
-        operation: ProcessOperation::Execve,
-    };
-
-    let request =
-        encode_prepare_request_with_command("token", Path::new("/usr/bin/true"), &command).unwrap();
-    let decoded = decode_prepare_request(body(&request)).unwrap();
-
-    assert_eq!(
-        decoded.command.unwrap().arguments,
-        ["visible", TRUNCATED_ARGUMENTS]
     );
 }
 
@@ -210,73 +168,6 @@ async fn execution_controller_rejects_an_invalid_token() {
     assert!(prepared.is_file());
     controller.shutdown().await.unwrap();
     assert!(directory.join(".agora/overlay.lock").is_file());
-}
-
-#[tokio::test]
-async fn execution_controller_publishes_commands_without_applying_network_decisions() {
-    let root = TestDirectory::new();
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let callback = {
-        let events = Arc::clone(&events);
-        move |event: Event| {
-            events.lock().unwrap().push(event);
-            std::future::ready(Decision::Deny {
-                reason: Some("process events are audit-only".to_string()),
-            })
-        }
-    };
-    let controller = ExecutionController::start_with_callback(
-        root.cache(),
-        "sandbox-1".to_string(),
-        "run-1".to_string(),
-        callback,
-        Duration::from_secs(1),
-    )
-    .await
-    .unwrap();
-    let command = CommandRequest {
-        trace_id: "trace-root, trace-child".to_string(),
-        pid: 101,
-        ppid: 100,
-        process_executable: "/bin/bash".to_string(),
-        executable: "/bin/sh".to_string(),
-        arguments: vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
-        current_dir: "/tmp".to_string(),
-        operation: ProcessOperation::PosixSpawn,
-    };
-    let mut stream = TcpStream::connect(controller.runtime().control())
-        .await
-        .unwrap();
-    stream
-        .write_all(
-            &encode_prepare_request_with_command(
-                controller.runtime().token(),
-                Path::new("/bin/sh"),
-                &command,
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    let mut prefix = [0_u8; 4];
-    stream.read_exact(&mut prefix).await.unwrap();
-    let mut response = vec![0_u8; frame_length(prefix).unwrap()];
-    stream.read_exact(&mut response).await.unwrap();
-
-    assert!(matches!(
-        decode_prepare_response(&response).unwrap(),
-        PrepareResponse::Ready(_)
-    ));
-    {
-        let events = events.lock().unwrap();
-        let Event::Process(event) = &events[0] else {
-            panic!("expected a process event");
-        };
-        assert_eq!(event.event_type, EventType::ProcessExecAttempt);
-        assert_eq!(event.trace_id, command.trace_id);
-        assert_eq!(event.command.arguments, command.arguments);
-    }
-    controller.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -406,51 +297,6 @@ async fn execution_controller_bounds_concurrent_handshakes() {
     ));
 
     drop(idle);
-    controller.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn execution_controller_isolates_an_invalid_command_trace() {
-    let root = TestDirectory::new();
-    let controller = ExecutionController::start(root.cache()).await.unwrap();
-    let command = CommandRequest {
-        trace_id: "invalid\ntrace".to_string(),
-        pid: 101,
-        ppid: 100,
-        process_executable: "/bin/bash".to_string(),
-        executable: "/bin/sh".to_string(),
-        arguments: vec!["/bin/sh".to_string()],
-        current_dir: "/tmp".to_string(),
-        operation: ProcessOperation::Execve,
-    };
-    let mut stream = TcpStream::connect(controller.runtime().control())
-        .await
-        .unwrap();
-    stream
-        .write_all(
-            &encode_prepare_request_with_command(
-                controller.runtime().token(),
-                Path::new("/bin/sh"),
-                &command,
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    let mut prefix = [0_u8; 4];
-    stream.read_exact(&mut prefix).await.unwrap();
-    let mut response = vec![0_u8; frame_length(prefix).unwrap()];
-    stream.read_exact(&mut response).await.unwrap();
-
-    let PrepareResponse::Error { errno, message } = decode_prepare_response(&response).unwrap()
-    else {
-        panic!("an invalid trace must be rejected");
-    };
-    assert_eq!(errno, libc::EINVAL);
-    assert!(message.contains("invalid command trace id"));
-
-    let prepared = controller.prepare(PathBuf::from("/bin/sh")).await.unwrap();
-    assert!(prepared.is_file());
     controller.shutdown().await.unwrap();
 }
 

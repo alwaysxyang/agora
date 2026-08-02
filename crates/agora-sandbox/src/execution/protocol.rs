@@ -1,5 +1,3 @@
-pub(crate) use crate::callback::ProcessOperation;
-use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -8,27 +6,13 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 mod tests;
 
-pub(crate) const EXECUTION_PROTOCOL_VERSION: u16 = 4;
+pub(crate) const EXECUTION_PROTOCOL_VERSION: u16 = 5;
 pub(super) const MAX_EXECUTION_FRAME_SIZE: usize = 64 * 1024;
-pub(crate) const TRUNCATED_ARGUMENTS: &str = "[truncated]";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PrepareRequest {
     pub(crate) token: String,
     pub(crate) executable: PathBuf,
-    pub(crate) command: Option<CommandRequest>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CommandRequest {
-    pub(crate) trace_id: String,
-    pub(crate) pid: u32,
-    pub(crate) ppid: u32,
-    pub(crate) process_executable: String,
-    pub(crate) executable: String,
-    pub(crate) arguments: Vec<String>,
-    pub(crate) current_dir: String,
-    pub(crate) operation: ProcessOperation,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -38,22 +22,6 @@ pub(crate) enum PrepareResponse {
 }
 
 pub(crate) fn encode_prepare_request(token: &str, executable: &Path) -> io::Result<Vec<u8>> {
-    encode_request(token, executable, None)
-}
-
-pub(crate) fn encode_prepare_request_with_command(
-    token: &str,
-    executable: &Path,
-    command: &CommandRequest,
-) -> io::Result<Vec<u8>> {
-    encode_request(token, executable, Some(command))
-}
-
-fn encode_request(
-    token: &str,
-    executable: &Path,
-    command: Option<&CommandRequest>,
-) -> io::Result<Vec<u8>> {
     if token.is_empty() || token.len() > u16::MAX as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -61,68 +29,25 @@ fn encode_request(
         ));
     }
     let executable = executable.as_os_str().as_bytes();
+    if executable.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "executable path is empty",
+        ));
+    }
     let executable_length = u32::try_from(executable.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "executable path is too long"))?;
-    let fixed_length = 12_usize
-        .checked_add(token.len())
-        .and_then(|length| length.checked_add(executable.len()))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "request is too large"))?;
-    let command_budget = MAX_EXECUTION_FRAME_SIZE
-        .checked_sub(fixed_length)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "request is too large"))?;
-    let command = command
-        .map(|command| encode_bounded_command(command, command_budget))
-        .transpose()?
-        .unwrap_or_default();
-    let command_length = u32::try_from(command.len()).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "command metadata is too large")
-    })?;
-    let mut body = Vec::with_capacity(12 + token.len() + executable.len() + command.len());
+    let mut body = Vec::with_capacity(8 + token.len() + executable.len());
     body.extend_from_slice(&EXECUTION_PROTOCOL_VERSION.to_be_bytes());
     body.extend_from_slice(&(token.len() as u16).to_be_bytes());
     body.extend_from_slice(&executable_length.to_be_bytes());
-    body.extend_from_slice(&command_length.to_be_bytes());
     body.extend_from_slice(token.as_bytes());
     body.extend_from_slice(executable);
-    body.extend_from_slice(&command);
     encode_frame(body)
 }
 
-fn encode_bounded_command(command: &CommandRequest, budget: usize) -> io::Result<Vec<u8>> {
-    let serialize = |command: &CommandRequest| {
-        serde_json::to_vec(command)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
-    };
-    let encoded = serialize(command)?;
-    if encoded.len() <= budget {
-        return Ok(encoded);
-    }
-
-    let mut bounded = command.clone();
-    bounded.arguments.clear();
-    for argument in &command.arguments {
-        bounded.arguments.push(argument.clone());
-        bounded.arguments.push(TRUNCATED_ARGUMENTS.to_string());
-        let fits = serialize(&bounded)?.len() <= budget;
-        bounded.arguments.pop();
-        if !fits {
-            bounded.arguments.pop();
-            break;
-        }
-    }
-    bounded.arguments.push(TRUNCATED_ARGUMENTS.to_string());
-    let encoded = serialize(&bounded)?;
-    if encoded.len() > budget {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "command metadata is too large",
-        ));
-    }
-    Ok(encoded)
-}
-
 pub(crate) fn decode_prepare_request(frame: &[u8]) -> io::Result<PrepareRequest> {
-    if frame.len() < 12 {
+    if frame.len() < 8 {
         return Err(invalid_data("execution request is truncated"));
     }
     let version = u16::from_be_bytes([frame[0], frame[1]]);
@@ -131,34 +56,20 @@ pub(crate) fn decode_prepare_request(frame: &[u8]) -> io::Result<PrepareRequest>
     }
     let token_length = u16::from_be_bytes([frame[2], frame[3]]) as usize;
     let path_length = u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize;
-    let command_length = u32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]) as usize;
-    let expected = 12_usize
+    let expected = 8_usize
         .checked_add(token_length)
         .and_then(|length| length.checked_add(path_length))
-        .and_then(|length| length.checked_add(command_length))
         .ok_or_else(|| invalid_data("execution request length overflow"))?;
     if expected != frame.len() || token_length == 0 || path_length == 0 {
         return Err(invalid_data("invalid execution request lengths"));
     }
-    let token_end = 12 + token_length;
+    let token_end = 8 + token_length;
     let path_end = token_end + path_length;
-    let token = std::str::from_utf8(&frame[12..token_end])
+    let token = std::str::from_utf8(&frame[8..token_end])
         .map_err(|_| invalid_data("execution token is not UTF-8"))?
         .to_string();
     let executable = PathBuf::from(OsString::from_vec(frame[token_end..path_end].to_vec()));
-    let command = if command_length == 0 {
-        None
-    } else {
-        Some(
-            serde_json::from_slice(&frame[path_end..])
-                .map_err(|_| invalid_data("invalid command metadata"))?,
-        )
-    };
-    Ok(PrepareRequest {
-        token,
-        executable,
-        command,
-    })
+    Ok(PrepareRequest { token, executable })
 }
 
 pub(super) fn encode_prepare_response(response: &PrepareResponse) -> io::Result<Vec<u8>> {

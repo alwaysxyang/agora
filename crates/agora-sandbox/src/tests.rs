@@ -1,14 +1,15 @@
 use super::{
-    Arguments, AuditOutput, AuditState, JsonCallback, TlsArgument, async_main,
+    Arguments, AuditOutput, AuditState, FilesystemArgument, JsonCallback, TlsArgument, async_main,
     default_hook_library, exit_status_code, parse_command, shutdown_signals, signal_exit_code,
 };
 use agora_core::lifecycle::shutdown::ShutdownGuard;
 use agora_sandbox::callback::{
     Callback, CommandContext, Decision, EVENT_SCHEMA_VERSION, Event, EventResult, EventStatus,
-    EventType, NetworkContext, NetworkEvent, NetworkProtocol, ProcessContext, ProcessEvent,
-    ProcessOperation, Subsystem,
+    EventType, FileAccessMode, FileContext, FileEvent, FileOpenMode, NetworkContext, NetworkEvent,
+    NetworkProtocol, ProcessContext, ProcessEvent, ProcessOperation, Subsystem,
 };
 use agora_sandbox::network::TlsMode;
+use agora_sandbox::runner::FilesystemMode;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Command;
 use uuid::Uuid;
@@ -50,6 +51,18 @@ fn event(event_type: EventType, connection_id: Option<&str>, network: bool) -> N
     }
 }
 
+#[test]
+fn filesystem_arguments_map_to_their_runtime_modes() {
+    assert_eq!(
+        FilesystemMode::from(FilesystemArgument::Encrypted),
+        FilesystemMode::Encrypted
+    );
+    assert_eq!(
+        FilesystemMode::from(FilesystemArgument::Plain),
+        FilesystemMode::Plain
+    );
+}
+
 fn process_event() -> ProcessEvent {
     ProcessEvent {
         schema_version: EVENT_SCHEMA_VERSION,
@@ -70,6 +83,39 @@ fn process_event() -> ProcessEvent {
             arguments: vec!["curl".to_string(), "https://example.com".to_string()],
             current_dir: "/tmp".to_string(),
             operation: ProcessOperation::PosixSpawn,
+        },
+        result: EventResult {
+            status: EventStatus::Started,
+            error_code: None,
+            error_message: None,
+        },
+    }
+}
+
+fn file_event(event_type: EventType) -> FileEvent {
+    FileEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "file-event".to_string(),
+        occurred_at: "2026-07-29T12:00:02Z".to_string(),
+        subsystem: Subsystem::Filesystem,
+        event_type,
+        sandbox_id: "sandbox".to_string(),
+        run_id: "run".to_string(),
+        trace_id: "trace-root, trace-child".to_string(),
+        process: ProcessContext {
+            pid: 43,
+            ppid: 42,
+            executable: "/bin/bash".to_string(),
+        },
+        file: FileContext {
+            path: "/Users/example/project/input.txt".to_string(),
+            mode: FileOpenMode {
+                access: FileAccessMode::ReadWrite,
+                create: true,
+                truncate: false,
+                append: true,
+                exclusive: false,
+            },
         },
         result: EventResult {
             status: EventStatus::Started,
@@ -136,12 +182,18 @@ fn audit_state_writes_attempts_immediately_without_terminal_duplicates() {
 }
 
 #[test]
-fn audit_state_writes_process_and_network_records_to_the_same_stream() {
+fn audit_state_writes_process_network_and_filesystem_records_to_the_same_stream() {
     let root = std::env::temp_dir().join(format!("agora-audit-events-{}", Uuid::new_v4()));
     let path = root.join("audit.jsonl");
     let mut state = AuditState::new(Some(&path)).unwrap();
 
     state.on_event(&Event::Process(process_event())).unwrap();
+    state
+        .on_event(&Event::File(file_event(EventType::FilesystemOpen)))
+        .unwrap();
+    state
+        .on_event(&Event::File(file_event(EventType::FilesystemClose)))
+        .unwrap();
     state
         .on_event(&Event::Network(event(
             EventType::NetworkConnectAttempt,
@@ -160,8 +212,17 @@ fn audit_state_writes_process_and_network_records_to_the_same_stream() {
     assert_eq!(records[0]["arguments"][0], "curl");
     assert_eq!(records[0]["arguments"][1], "https://example.com");
     assert_eq!(records[0]["trace_id"], "trace-root, trace-child");
-    assert_eq!(records[1]["type"], "network");
-    assert_eq!(records[1]["trace_id"], "trace-root");
+    assert_eq!(records[1]["type"], "filesystem");
+    assert_eq!(records[1]["operation"], "open");
+    assert_eq!(records[1]["path"], "/Users/example/project/input.txt");
+    assert_eq!(records[1]["mode"]["access"], "read_write");
+    assert_eq!(records[1]["mode"]["create"], true);
+    assert_eq!(records[1]["mode"]["append"], true);
+    assert_eq!(records[1]["trace_id"], "trace-root, trace-child");
+    assert_eq!(records[2]["type"], "filesystem");
+    assert_eq!(records[2]["operation"], "close");
+    assert_eq!(records[3]["type"], "network");
+    assert_eq!(records[3]["trace_id"], "trace-root");
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -250,6 +311,7 @@ async fn async_main_rejects_an_empty_encrypted_workspace_key() {
         audit_file: None,
         workdir: Some(root.clone()),
         filesystem_key: Some(String::new()),
+        filesystem: FilesystemArgument::Encrypted,
         tls_trust_anchor: None,
         tls: super::TlsArgument::Off,
         tls_ca_cert: None,

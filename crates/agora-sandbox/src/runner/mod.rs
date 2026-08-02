@@ -1,8 +1,11 @@
+#[cfg(target_os = "macos")]
+use crate::audit::AuditController;
 use crate::callback::Callback;
 #[cfg(target_os = "macos")]
 use crate::execution::{ExecutionController, resolve_executable, resolve_shebang};
+pub use crate::filesystem::FilesystemMode;
 #[cfg(target_os = "macos")]
-use crate::filesystem::EncryptedWorkspace;
+use crate::filesystem::{EncryptedWorkspace, FilesystemWorkspace, KeyMigrationStage};
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
 use crate::trace::{TRACE_ID_ENVIRONMENT, TraceContext};
 use anyhow::{Context, Result, bail};
@@ -37,6 +40,10 @@ const EXECUTION_CONTROL: &str = "AGORA_SANDBOX_EXECUTION_CONTROL";
 #[cfg(target_os = "macos")]
 const EXECUTION_TOKEN: &str = "AGORA_SANDBOX_EXECUTION_TOKEN";
 #[cfg(target_os = "macos")]
+const AUDIT_CONTROL: &str = "AGORA_SANDBOX_AUDIT_CONTROL";
+#[cfg(target_os = "macos")]
+const AUDIT_TOKEN: &str = "AGORA_SANDBOX_AUDIT_TOKEN";
+#[cfg(target_os = "macos")]
 const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
 #[cfg(target_os = "macos")]
 const FILESYSTEM_ROOT: &str = "AGORA_SANDBOX_FILESYSTEM_ROOT";
@@ -62,6 +69,7 @@ pub struct SandboxConfig {
     pub network: NetworkConfig,
     hook_library: PathBuf,
     workdir: PathBuf,
+    filesystem_mode: FilesystemMode,
     encrypted_workspace_key: Option<SecretBytes>,
     tls_trust_anchor: Option<PathBuf>,
     tls_ca: Option<TlsCaFiles>,
@@ -100,6 +108,7 @@ impl SandboxConfig {
             network: NetworkConfig::default(),
             hook_library: hook_library.into(),
             workdir: Self::default_workdir(),
+            filesystem_mode: FilesystemMode::default(),
             encrypted_workspace_key: None,
             tls_trust_anchor: None,
             tls_ca: None,
@@ -129,8 +138,19 @@ impl SandboxConfig {
     }
 
     pub fn with_encrypted_workspace(mut self, key: impl AsRef<[u8]>) -> Self {
+        self.filesystem_mode = FilesystemMode::Encrypted;
         self.encrypted_workspace_key = Some(SecretBytes::new(key));
         self
+    }
+
+    pub fn with_plain_workspace(mut self) -> Self {
+        self.filesystem_mode = FilesystemMode::Plain;
+        self.encrypted_workspace_key = None;
+        self
+    }
+
+    pub fn filesystem_mode(&self) -> FilesystemMode {
+        self.filesystem_mode
     }
 
     pub fn encrypted_workspace_key(&self) -> Option<&[u8]> {
@@ -186,9 +206,15 @@ impl SandboxConfig {
             );
         }
         #[cfg(target_os = "macos")]
-        match &self.encrypted_workspace_key {
-            Some(key) => EncryptedWorkspace::validate_passphrase(key.as_bytes())?,
-            None => bail!("sandbox filesystem key is required"),
+        match (self.filesystem_mode, &self.encrypted_workspace_key) {
+            (FilesystemMode::Encrypted, Some(key)) => {
+                EncryptedWorkspace::validate_passphrase(key.as_bytes())?
+            }
+            (FilesystemMode::Encrypted, None) => bail!("sandbox filesystem key is required"),
+            (FilesystemMode::Plain, None) => {}
+            (FilesystemMode::Plain, Some(_)) => {
+                bail!("encrypted filesystem key cannot be used with plain filesystem mode")
+            }
         }
         if let Some(anchor) = &self.tls_trust_anchor
             && !anchor.is_file()
@@ -408,11 +434,12 @@ where
     pub async fn run(self, mut command: SandboxCommand) -> Result<SandboxOutcome> {
         self.config.validate()?;
         let callback = std::sync::Arc::new(self.callback);
-        let key = self
-            .config
-            .encrypted_workspace_key()
-            .context("sandbox filesystem key is required")?;
-        let mut encrypted_workspace = EncryptedWorkspace::start(&self.config.workdir, key).await?;
+        let mut filesystem = FilesystemWorkspace::start(
+            &self.config.workdir,
+            self.config.filesystem_mode,
+            self.config.encrypted_workspace_key(),
+        )
+        .await?;
         let tls_ca_files = self.config.tls_ca_for_workdir()?;
         let hook_library = self.config.hook_library.canonicalize().with_context(|| {
             format!(
@@ -458,22 +485,29 @@ where
         let sandbox_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
         let trace = TraceContext::root();
-        let mut execution = {
-            let execution_callback = {
+        let audit_callback = {
+            let callback = std::sync::Arc::clone(&callback);
+            move |event| {
                 let callback = std::sync::Arc::clone(&callback);
-                move |event| {
-                    let callback = std::sync::Arc::clone(&callback);
-                    async move { callback.on_event(event).await }
-                }
-            };
-            let controller = ExecutionController::start_with_callback(
-                encrypted_workspace.root().to_path_buf(),
-                sandbox_id.clone(),
-                run_id.clone(),
-                execution_callback,
-                self.config.network.callback_timeout,
-            )
-            .await?;
+                async move { callback.on_event(event).await }
+            }
+        };
+        let mut audit = AuditController::start(
+            sandbox_id.clone(),
+            run_id.clone(),
+            audit_callback,
+            self.config.network.callback_timeout,
+        )
+        .await?;
+        let mut execution = {
+            let controller =
+                match ExecutionController::start_for_run(filesystem.root().to_path_buf()).await {
+                    Ok(controller) => controller,
+                    Err(error) => {
+                        let _ = audit.shutdown().await;
+                        return Err(error);
+                    }
+                };
             let executable = command.resolved_program()?;
             let prepared = controller.prepare(executable).await?;
             if let Some(shebang) = resolve_shebang(&prepared)? {
@@ -544,11 +578,13 @@ where
             Ok(controller) => controller,
             Err(error) => {
                 let _ = execution.shutdown().await;
+                let _ = audit.shutdown().await;
                 return Err(error);
             }
         };
         let runtime = controller.runtime();
         let execution_runtime = execution.runtime();
+        let audit_runtime = audit.runtime();
         let injected_libraries = Self::injected_libraries(&hook_library)?;
         let mut child = command.into_command();
         child
@@ -561,8 +597,10 @@ where
             .env(PROXY_IPV6, runtime.proxy_ipv6().to_string())
             .env(EXECUTION_CONTROL, execution_runtime.control().to_string())
             .env(EXECUTION_TOKEN, execution_runtime.token())
+            .env(AUDIT_CONTROL, audit_runtime.control().to_string())
+            .env(AUDIT_TOKEN, audit_runtime.token())
             .env(HOOK_LIBRARIES, &injected_libraries)
-            .env(FILESYSTEM_ROOT, encrypted_workspace.root())
+            .env(FILESYSTEM_ROOT, filesystem.root())
             .env(TRACE_ID_ENVIRONMENT, trace.encode())
             .env("DYLD_INSERT_LIBRARIES", injected_libraries);
         let tls_trust_anchors = tls_trust_anchor_der
@@ -590,6 +628,7 @@ where
             Err(error) => {
                 let _ = controller.shutdown().await;
                 let _ = execution.shutdown().await;
+                let _ = audit.shutdown().await;
                 return Err(error).context("failed to start sandbox child");
             }
         };
@@ -603,22 +642,30 @@ where
             let _ = terminate_process_group(&mut child, process_group).await;
             let _ = controller.shutdown().await;
             let _ = execution.shutdown().await;
+            let _ = audit.shutdown().await;
             return Err(error);
         }
-        let status =
-            wait_for_child_or_service(&mut child, process_group, &mut controller, &mut execution)
-                .await;
+        let status = wait_for_child_or_service(
+            &mut child,
+            process_group,
+            &mut controller,
+            &mut execution,
+            &mut audit,
+        )
+        .await;
         let terminal_restore = terminal
             .as_mut()
             .map(ForegroundTerminal::restore)
             .transpose();
         let shutdown = controller.shutdown().await;
         let execution_shutdown = execution.shutdown().await;
-        let filesystem_shutdown = encrypted_workspace.shutdown().await;
+        let audit_shutdown = audit.shutdown().await;
+        let filesystem_shutdown = filesystem.shutdown().await;
         let status = status?;
         terminal_restore?;
         shutdown?;
         execution_shutdown?;
+        audit_shutdown?;
         filesystem_shutdown.with_context(|| {
             format!("sandbox child exited with status {status} before filesystem shutdown")
         })?;
@@ -653,6 +700,72 @@ pub async fn migrate_filesystem_key(
     new_key: impl AsRef<[u8]>,
 ) -> Result<()> {
     EncryptedWorkspace::migrate_key(workdir.as_ref(), old_key.as_ref(), new_key.as_ref()).await
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilesystemKeyMigrationProgress {
+    Validating,
+    AcquiringLock,
+    ChangingPassphrase,
+    VerifyingNewKey,
+    UpdatingMetadata,
+    Completed,
+}
+
+#[cfg(target_os = "macos")]
+impl FilesystemKeyMigrationProgress {
+    pub const fn percent(self) -> u8 {
+        match self {
+            Self::Validating => 5,
+            Self::AcquiringLock => 15,
+            Self::ChangingPassphrase => 40,
+            Self::VerifyingNewKey => 75,
+            Self::UpdatingMetadata => 90,
+            Self::Completed => 100,
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Validating => "Validating keys",
+            Self::AcquiringLock => "Acquiring filesystem lock",
+            Self::ChangingPassphrase => "Changing filesystem key",
+            Self::VerifyingNewKey => "Verifying encrypted filesystem",
+            Self::UpdatingMetadata => "Updating key metadata",
+            Self::Completed => "Migration complete",
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<KeyMigrationStage> for FilesystemKeyMigrationProgress {
+    fn from(stage: KeyMigrationStage) -> Self {
+        match stage {
+            KeyMigrationStage::Validating => Self::Validating,
+            KeyMigrationStage::AcquiringLock => Self::AcquiringLock,
+            KeyMigrationStage::ChangingPassphrase => Self::ChangingPassphrase,
+            KeyMigrationStage::VerifyingNewKey => Self::VerifyingNewKey,
+            KeyMigrationStage::UpdatingMetadata => Self::UpdatingMetadata,
+            KeyMigrationStage::Completed => Self::Completed,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub async fn migrate_filesystem_key_with_progress(
+    workdir: impl AsRef<Path>,
+    old_key: impl AsRef<[u8]>,
+    new_key: impl AsRef<[u8]>,
+    mut on_progress: impl FnMut(FilesystemKeyMigrationProgress),
+) -> Result<()> {
+    EncryptedWorkspace::migrate_key_with_progress(
+        workdir.as_ref(),
+        old_key.as_ref(),
+        new_key.as_ref(),
+        |stage| on_progress(stage.into()),
+    )
+    .await
 }
 
 #[cfg(target_os = "macos")]
@@ -751,22 +864,26 @@ async fn wait_for_child_or_service(
     process_group: libc::pid_t,
     controller: &mut NetworkController,
     execution: &mut ExecutionController,
+    audit: &mut AuditController,
 ) -> Result<ExitStatus> {
     enum Completion {
         Child(std::io::Result<ExitStatus>),
         Proxy(anyhow::Error),
         Execution(anyhow::Error),
+        Audit(anyhow::Error),
     }
 
     let completion = tokio::select! {
         status = child.wait() => Completion::Child(status),
         error = controller.wait_failure() => Completion::Proxy(error),
         error = execution.wait_failure() => Completion::Execution(error),
+        error = audit.wait_failure() => Completion::Audit(error),
     };
     let result = match completion {
         Completion::Child(status) => status.context("sandbox child wait failed"),
         Completion::Proxy(error) => Err(error).context("sandbox network proxy failed"),
         Completion::Execution(error) => Err(error).context("sandbox execution controller failed"),
+        Completion::Audit(error) => Err(error).context("sandbox audit controller failed"),
     };
     let termination = terminate_process_group(child, process_group).await;
     match result {

@@ -47,6 +47,10 @@ thread_local! {
 
 static HOOK_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+pub(super) fn initialized() -> bool {
+    HOOK_INITIALIZED.load(Ordering::Acquire)
+}
+
 extern "C" fn initialize_hook() {
     config::initialize();
     HOOK_INITIALIZED.store(true, Ordering::Release);
@@ -230,7 +234,7 @@ pub unsafe extern "C" fn agora_sandbox_connect(
         Ok(None) => return unsafe { original(socket, address, length) },
         Err(()) => return -1,
     };
-    if !HOOK_INITIALIZED.load(Ordering::Acquire) {
+    if !initialized() {
         return unsafe { HookRuntime::deny() };
     }
     let Some(runtime) = HookRuntime::global() else {
@@ -298,7 +302,7 @@ pub unsafe extern "C" fn agora_sandbox_connectx(
         }
         Err(()) => return -1,
     };
-    if !HOOK_INITIALIZED.load(Ordering::Acquire) {
+    if !initialized() {
         return unsafe { HookRuntime::deny() };
     }
     let Some(runtime) = HookRuntime::global() else {

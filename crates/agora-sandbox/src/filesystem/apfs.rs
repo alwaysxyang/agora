@@ -25,6 +25,16 @@ const MAX_KEY_SIZE: usize = 64 * 1024;
 const DETACH_ATTEMPTS: usize = 200;
 const DETACH_RETRY_DELAY: Duration = Duration::from_millis(50);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyMigrationStage {
+    Validating,
+    AcquiringLock,
+    ChangingPassphrase,
+    VerifyingNewKey,
+    UpdatingMetadata,
+    Completed,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct VolumeMetadata {
     version: u32,
@@ -96,11 +106,22 @@ impl EncryptedWorkspace {
         old_passphrase: &[u8],
         new_passphrase: &[u8],
     ) -> Result<()> {
+        Self::migrate_key_with_progress(workdir, old_passphrase, new_passphrase, |_| {}).await
+    }
+
+    pub(crate) async fn migrate_key_with_progress(
+        workdir: &Path,
+        old_passphrase: &[u8],
+        new_passphrase: &[u8],
+        mut on_progress: impl FnMut(KeyMigrationStage),
+    ) -> Result<()> {
+        on_progress(KeyMigrationStage::Validating);
         Self::validate_passphrase(old_passphrase)?;
         Self::validate_passphrase(new_passphrase)?;
         if old_passphrase == new_passphrase {
             bail!("new filesystem key must differ from the current key");
         }
+        on_progress(KeyMigrationStage::AcquiringLock);
         let workdir = Self::resolved_destination(workdir)?;
         let directory = workdir.join(FILESYSTEM_DIRECTORY);
         Self::prepare_directory(&directory)?;
@@ -125,6 +146,7 @@ impl EncryptedWorkspace {
         input.push(0);
         input.extend_from_slice(new_passphrase);
         input.push(0);
+        on_progress(KeyMigrationStage::ChangingPassphrase);
         Self::run_hdiutil(&arguments, &input, "change encrypted filesystem key").await?;
 
         let mut workspace = Self {
@@ -132,14 +154,18 @@ impl EncryptedWorkspace {
             _lock: lock,
             mounted: false,
         };
+        on_progress(KeyMigrationStage::VerifyingNewKey);
         workspace
             .attach(&image, new_passphrase)
             .await
             .context("filesystem key changed but new key verification failed")?;
+        on_progress(KeyMigrationStage::UpdatingMetadata);
         let migrated = workspace.update_key_id();
         let shutdown = workspace.shutdown().await;
         migrated?;
-        shutdown
+        shutdown?;
+        on_progress(KeyMigrationStage::Completed);
+        Ok(())
     }
 
     pub(crate) async fn shutdown(&mut self) -> Result<()> {
@@ -250,7 +276,7 @@ impl EncryptedWorkspace {
         Ok(mounted_at.to_bytes() == path_bytes)
     }
 
-    fn resolved_destination(path: &Path) -> Result<PathBuf> {
+    pub(super) fn resolved_destination(path: &Path) -> Result<PathBuf> {
         let absolute = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -260,24 +286,15 @@ impl EncryptedWorkspace {
         let mut ancestor = absolute.as_path();
         while !ancestor.exists() {
             let name = ancestor.file_name().with_context(|| {
-                format!(
-                    "encrypted filesystem path cannot be resolved: {}",
-                    path.display()
-                )
+                format!("filesystem path cannot be resolved: {}", path.display())
             })?;
             missing.push(name.to_os_string());
             ancestor = ancestor.parent().with_context(|| {
-                format!(
-                    "encrypted filesystem path cannot be resolved: {}",
-                    path.display()
-                )
+                format!("filesystem path cannot be resolved: {}", path.display())
             })?;
         }
         let mut resolved = ancestor.canonicalize().with_context(|| {
-            format!(
-                "failed to resolve encrypted filesystem parent {}",
-                ancestor.display()
-            )
+            format!("failed to resolve filesystem parent {}", ancestor.display())
         })?;
         for component in missing.into_iter().rev() {
             resolved.push(component);

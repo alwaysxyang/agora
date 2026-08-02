@@ -3,10 +3,10 @@
 use super::config::{self, CHILD_RUNTIME_ENVIRONMENT, HookConfig};
 use super::dyld::{dyld_interpose, function_from_interpose};
 use super::socket::set_errno;
+use crate::audit::{AuditClient, AuditEventRequest};
+use crate::callback::{CommandContext, ProcessContext, ProcessOperation};
 use crate::execution::{
-    CommandRequest, PrepareResponse, ProcessOperation, TRUNCATED_ARGUMENTS,
-    decode_prepare_response, encode_prepare_request, encode_prepare_request_with_command,
-    frame_length, resolve_shebang,
+    PrepareResponse, decode_prepare_response, encode_prepare_request, frame_length, resolve_shebang,
 };
 use crate::trace::TraceContext;
 use std::cell::Cell;
@@ -19,6 +19,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 const MAX_RECORDED_ARGUMENTS: usize = 256;
+const MAX_RECORDED_ARGUMENT_BYTES: usize = 32 * 1024;
+const TRUNCATED_ARGUMENTS: &str = "[truncated]";
 
 type PosixSpawnFn = unsafe extern "C" fn(
     *mut libc::pid_t,
@@ -57,6 +59,7 @@ impl Drop for ProcessHookGuard {
 
 struct ProcessHookRuntime {
     config: HookConfig,
+    audit: Option<AuditClient>,
 }
 
 #[derive(Debug)]
@@ -228,27 +231,24 @@ impl ProcessHookRuntime {
         }
         static RUNTIME: OnceLock<Option<ProcessHookRuntime>> = OnceLock::new();
         RUNTIME
-            .get_or_init(|| config::global().cloned().map(|config| Self { config }))
+            .get_or_init(|| {
+                config::global().cloned().map(|config| Self {
+                    audit: Some(AuditClient::new(
+                        config.audit_control(),
+                        config.audit_token(),
+                    )),
+                    config,
+                })
+            })
             .as_ref()
     }
 
-    fn prepare(
-        &self,
-        executable: &Path,
-        command: Option<&CommandRequest>,
-    ) -> Result<CString, PrepareError> {
+    fn prepare(&self, executable: &Path) -> Result<CString, PrepareError> {
         let mut stream = TcpStream::connect(self.config.execution_control())?;
         let timeout = Some(Duration::from_secs(30));
         stream.set_read_timeout(timeout)?;
         stream.set_write_timeout(timeout)?;
-        let request = match command {
-            Some(command) => encode_prepare_request_with_command(
-                self.config.execution_token(),
-                executable,
-                command,
-            )?,
-            None => encode_prepare_request(self.config.execution_token(), executable)?,
-        };
+        let request = encode_prepare_request(self.config.execution_token(), executable)?;
         stream.write_all(&request)?;
         let mut prefix = [0_u8; 4];
         stream.read_exact(&mut prefix)?;
@@ -265,12 +265,8 @@ impl ProcessHookRuntime {
         }
     }
 
-    fn prepare_executable(
-        &self,
-        executable: &Path,
-        command: &CommandRequest,
-    ) -> Result<PreparedExecutable, PrepareError> {
-        let program = self.prepare(executable, Some(command))?;
+    fn prepare_executable(&self, executable: &Path) -> Result<PreparedExecutable, PrepareError> {
+        let program = self.prepare(executable)?;
         let script = Path::new(OsStr::from_bytes(program.to_bytes()));
         let Some(shebang) = resolve_shebang(script)
             .map_err(|error| PrepareError::from_anyhow(error, libc::ENOEXEC))?
@@ -280,7 +276,7 @@ impl ProcessHookRuntime {
                 arguments: Vec::new(),
             });
         };
-        let interpreter = self.prepare(&shebang.interpreter, None)?;
+        let interpreter = self.prepare(&shebang.interpreter)?;
         let mut arguments = Vec::with_capacity(2);
         if let Some(argument) = shebang.argument {
             arguments.push(
@@ -297,6 +293,15 @@ impl ProcessHookRuntime {
             program: interpreter,
             arguments,
         })
+    }
+
+    fn publish(&self, event: AuditEventRequest) -> Result<(), PrepareError> {
+        let Some(audit) = &self.audit else {
+            return Ok(());
+        };
+        audit
+            .publish(event)
+            .map_err(|error| PrepareError::new(error.errno(), error.to_string()))
     }
 }
 
@@ -369,29 +374,33 @@ unsafe fn prepared_executable(
         )
     })?;
     let trace = runtime.config.trace().child();
-    let command = unsafe { command_request(&executable, arguments, operation, &trace) }?;
-    let prepared = runtime.prepare_executable(&executable, &command)?;
+    let event = unsafe { process_event_request(&executable, arguments, operation, &trace) }?;
+    runtime.publish(event)?;
+    let prepared = runtime.prepare_executable(&executable)?;
     Ok((prepared, trace))
 }
 
-unsafe fn command_request(
+unsafe fn process_event_request(
     executable: &Path,
     arguments: *const *const libc::c_char,
     operation: ProcessOperation,
     trace: &TraceContext,
-) -> Result<CommandRequest, PrepareError> {
+) -> Result<AuditEventRequest, PrepareError> {
     let mut values = Vec::new();
+    let mut recorded_bytes = 0_usize;
     if !arguments.is_null() {
         let mut current = arguments;
         while values.len() < MAX_RECORDED_ARGUMENTS && !(unsafe { *current }).is_null() {
-            values.push(
-                unsafe { CStr::from_ptr(*current) }
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            let value = unsafe { CStr::from_ptr(*current) }.to_string_lossy();
+            if recorded_bytes.saturating_add(value.len()) > MAX_RECORDED_ARGUMENT_BYTES {
+                values.push(TRUNCATED_ARGUMENTS.to_string());
+                break;
+            }
+            recorded_bytes += value.len();
+            values.push(value.into_owned());
             current = unsafe { current.add(1) };
         }
-        if !(unsafe { *current }).is_null() {
+        if values.len() == MAX_RECORDED_ARGUMENTS && !(unsafe { *current }).is_null() {
             values.push(TRUNCATED_ARGUMENTS.to_string());
         }
     }
@@ -409,15 +418,19 @@ unsafe fn command_request(
             format!("failed to resolve current directory: {error}"),
         )
     })?;
-    Ok(CommandRequest {
+    Ok(AuditEventRequest::Process {
         trace_id: trace.encode(),
-        pid: std::process::id(),
-        ppid: unsafe { libc::getppid() as u32 },
-        process_executable: process_executable.to_string_lossy().into_owned(),
-        executable: executable.to_string_lossy().into_owned(),
-        arguments: values,
-        current_dir: current_dir.to_string_lossy().into_owned(),
-        operation,
+        process: ProcessContext {
+            pid: std::process::id(),
+            ppid: unsafe { libc::getppid() as u32 },
+            executable: process_executable.to_string_lossy().into_owned(),
+        },
+        command: CommandContext {
+            executable: executable.to_string_lossy().into_owned(),
+            arguments: values,
+            current_dir: current_dir.to_string_lossy().into_owned(),
+            operation,
+        },
     })
 }
 

@@ -4,7 +4,7 @@ use std::fmt;
 use std::future::Future;
 use std::net::IpAddr;
 
-pub const EVENT_SCHEMA_VERSION: u16 = 7;
+pub const EVENT_SCHEMA_VERSION: u16 = 8;
 
 pub trait Callback: Send + Sync + 'static {
     fn on_event(&self, event: Event) -> impl Future<Output = Decision> + Send;
@@ -33,20 +33,21 @@ impl Callback for NoopCallback {
 pub enum Event {
     Network(NetworkEvent),
     Process(ProcessEvent),
+    File(FileEvent),
 }
 
 impl Event {
     pub fn as_network(&self) -> Option<&NetworkEvent> {
         match self {
             Self::Network(event) => Some(event),
-            Self::Process(_) => None,
+            Self::Process(_) | Self::File(_) => None,
         }
     }
 
     pub fn into_network(self) -> Option<NetworkEvent> {
         match self {
             Self::Network(event) => Some(event),
-            Self::Process(_) => None,
+            Self::Process(_) | Self::File(_) => None,
         }
     }
 }
@@ -61,6 +62,7 @@ impl Serialize for Redacted<'_, Event> {
         match self.0 {
             Event::Network(event) => event.redacted().serialize(serializer),
             Event::Process(event) => event.serialize(serializer),
+            Event::File(event) => event.serialize(serializer),
         }
     }
 }
@@ -244,10 +246,10 @@ pub enum EventType {
     NetworkConnectFailed,
     #[serde(rename = "network.connection.closed")]
     NetworkConnectionClosed,
-    #[serde(rename = "filesystem.read")]
-    FilesystemRead,
-    #[serde(rename = "filesystem.write")]
-    FilesystemWrite,
+    #[serde(rename = "filesystem.open")]
+    FilesystemOpen,
+    #[serde(rename = "filesystem.close")]
+    FilesystemClose,
     #[serde(rename = "process.started")]
     ProcessStarted,
     #[serde(rename = "process.exec.attempt")]
@@ -276,6 +278,44 @@ pub struct ProcessEvent {
     pub process: ProcessContext,
     pub command: CommandContext,
     pub result: EventResult,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEvent {
+    pub schema_version: u16,
+    pub event_id: String,
+    pub occurred_at: String,
+    pub subsystem: Subsystem,
+    pub event_type: EventType,
+    pub sandbox_id: String,
+    pub run_id: String,
+    pub trace_id: String,
+    pub process: ProcessContext,
+    pub file: FileContext,
+    pub result: EventResult,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileContext {
+    pub path: String,
+    pub mode: FileOpenMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileOpenMode {
+    pub access: FileAccessMode,
+    pub create: bool,
+    pub truncate: bool,
+    pub append: bool,
+    pub exclusive: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileAccessMode {
+    Read,
+    Write,
+    ReadWrite,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

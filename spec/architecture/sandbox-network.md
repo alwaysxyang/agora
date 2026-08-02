@@ -52,7 +52,7 @@ traffic.
   upstream connect timeout, and the per-run maximum number of active proxied connections. Domain
   inspection defaults to 500 ms, callback execution defaults to five seconds, the connection limit
   defaults to 256, and zero values are rejected.
-- Versioned network and process callback events, `Decision`, proxy route types, and explicit
+- Versioned network, process, and file callback events, `Decision`, proxy route types, and explicit
   `Redact` views under `callback`.
 
 The CLI is a thin adapter:
@@ -85,20 +85,20 @@ its environment. The child inherits stdin, stdout, and stderr. The
 `-c` value is tokenized into a program and arguments but is not
 implicitly run through a system shell; pipes, redirections, substitutions, and other shell
 operators require an explicit shell command. The CLI audit adapter writes one compact JSON record
-for each validated network connection attempt and each intercepted descendant process execution
-attempt. It writes JSON Lines to stdout by default; `--audit-file <path>` instead appends to that
+for each validated network connection attempt, intercepted descendant process execution attempt,
+and intercepted file open or close attempt. It writes JSON Lines to stdout by default;
+`--audit-file <path>` instead appends to that
 file and creates missing parent directories. Network records contain `access_time`, `trace_id`,
 `pid`, destination IP and port, and the observed domain. Process records contain `access_time`,
 `trace_id`, PID, PPID, current and requested executables, arguments, current directory, and launch
 operation. The root command is started directly by the runner and therefore does not emit a
-`process.exec.attempt` record. The child still inherits stdout and stderr, so callers that require a
+`process.exec.attempt` record. File records contain `access_time`, `trace_id`, PID, operation,
+logical path, and structured open mode. The child still inherits stdout and stderr, so callers that require a
 pure audit stream should use `--audit-file`. CLI startup and audit-write errors are written directly
 to stderr without the project logger. The CLI returns the child's exit code. SIGINT and SIGTERM
 terminate the active run through the shared process lifecycle. Strict network enforcement remains
-unavailable and is not exposed as a CLI option.
-`agora-sandbox clean [--workdir <WORKDIR>]` removes only `<workdir>/fs`; persistent cache layout,
-checksum validation, and cleanup behavior are specified in
-[Sandbox Executable Cache](sandbox.md).
+unavailable and is not exposed as a CLI option. Filesystem persistence and destructive-reset
+behavior are specified in [Sandbox Filesystem And Executable Preparation](sandbox.md).
 
 ## Runtime Flow
 
@@ -109,6 +109,7 @@ Sandbox::run
   -> validate intercept and TLS policy
   -> validate the optional DER trust anchor and explicit fixed PEM interception CA paths
   -> use the configured persistent workdir and load or generate its default CA when explicit paths are absent
+  -> create an authenticated loopback audit controller for process and file events
   -> create an authenticated loopback execution controller backed by <workdir>/fs
      whose incomplete handshakes expire after one second and whose active connections are capped at 64
   -> resolve the root executable and prepare a persistent native copy only when injection
@@ -121,12 +122,19 @@ Sandbox::run
 
 intercepted child posix_spawn/exec
   -> resolve the requested executable
-  -> append one trace id and request preparation from the authenticated execution controller
-  -> publish process.exec.attempt through the shared callback; its returned Decision is ignored
+  -> append one trace id and publish process.exec.attempt through the authenticated audit controller
+  -> request preparation from the authenticated execution controller
   -> reuse a valid persistent copy or mirror and ad-hoc sign a native-architecture copy beneath
      <workdir>/fs while preserving the executable's canonical absolute path
   -> rebuild the protected control environment and DYLD_INSERT_LIBRARIES from the loaded snapshot
   -> invoke the original launch operation with the original or prepared executable
+
+intercepted child open/openat/fopen and close/fclose
+  -> resolve and retain the logical path before overlay mapping
+  -> derive structured access, create, truncate, append, and exclusive mode fields
+  -> publish filesystem.open through the authenticated audit controller before native open
+  -> associate successful descriptors with their logical file context
+  -> publish filesystem.close before native close and remove the association after success
 
 intercepted child SecTrust TLS evaluation
   -> detect whether the trust object uses an SSL policy
@@ -171,9 +179,9 @@ observed by the application through subsequent I/O. Audit events still report th
 attempt and result.
 
 Normal shutdown terminates residual processes in the run's process group, drains active relays for
-up to one second, and stops both proxy listeners and the execution controller. Prepared executables,
-directory-local checksum manifests, CA material, and CA-keyed trust bundles remain under the
-configured work directory for reuse. The runner monitors the network listeners and execution
+up to one second, and stops the proxy listeners, execution controller, and audit controller. Prepared
+executables, directory metadata, CA material, and CA-keyed trust bundles remain under the configured
+work directory for reuse. The runner monitors the network listeners, execution controller, and audit
 controller while the child is active. An unexpected service exit terminates the process group
 instead of allowing descendants to continue after their interception path has failed. A descendant
 that deliberately creates a new session or process group can leave this lifecycle boundary;
@@ -188,7 +196,8 @@ The private execution-preparation controller applies an independent limit of 64 
 connections. Connections above that limit are closed immediately, and a client that does not finish
 its length-prefixed request frame within one second is disconnected. These bounds prevent an
 injected or malfunctioning descendant from retaining unbounded controller tasks or file descriptors;
-the per-run token remains the authentication boundary for requests that complete the handshake.
+the audit controller applies the same connection limit and one-second request timeout independently.
+The per-run token remains the authentication boundary for requests that complete the handshake.
 
 ## Hook Coverage
 
@@ -199,13 +208,17 @@ currently covers:
 - The simple `connectx` form without source binding, flags, or caller-provided initial data.
 - `posix_spawn`, `posix_spawnp`, `execve`, `execv`, and `execvp` for recursive executable
   preparation and hook injection.
+- `open`, `openat`, `fopen`, `close`, and `fclose` for overlay mapping and file lifecycle audit,
+  together with the path metadata, mutation, current-directory, and directory-enumeration APIs
+  described in [Sandbox Filesystem And Executable Preparation](sandbox.md).
 - `SecTrustCreateWithCertificates`, `SecTrustEvaluateWithError`,
   `SecTrustEvaluateAsyncWithError`, and the deprecated `SecTrustEvaluate` and
   `SecTrustEvaluateAsync` entry points for optional process-local SSL trust-anchor injection.
 
-Descriptor inspection and lifecycle APIs such as `getpeername`, `close`, `dup`, and `dup2` are not
+Network descriptor inspection and duplication APIs such as `getpeername`, `dup`, and `dup2` are not
 interposed. Consequently, `getpeername` on an intercepted socket reports the loopback proxy rather
-than the original destination.
+than the original destination, and duplicated file descriptors do not acquire a separate lifecycle
+audit association.
 
 The hook snapshots immutable control configuration when the dylib loads and reads PID and PPID for
 each intercepted connection. The runner reads configured trust certificates once and transports
@@ -241,9 +254,11 @@ Covered interception is fail-closed. Missing or invalid run configuration, unava
 calls with source binding, flags, or caller-provided initial data return an error without connecting
 to the original destination. Unsupported complex `connectx` forms currently return `EACCES`.
 
-The hook has no best-effort network fallback path. A failure that occurs before the proxy accepts a
-valid CONNECT preface therefore produces no callback event. The separate execution controller uses
-an authenticated loopback connection only to prepare descendants before a covered process launch.
+The hook has no best-effort network or audit fallback path. A failure that occurs before the proxy
+accepts a valid CONNECT preface therefore produces no callback event. The execution controller uses
+an authenticated loopback connection only to prepare descendants, while the independent audit
+controller receives process and file events. Audit-controller unavailability fails the covered
+launch or file operation closed.
 
 The executable preparation path follows the architecture used to compile `agora-sandbox`. A copied
 executable mirrors its canonical source path beneath `<workdir>/fs`; for example, `/usr/bin/curl`
@@ -255,7 +270,7 @@ binaries are thinned to that selected architecture before the original signature
 an ad-hoc signature. Executables without dyld restrictions and scripts remain at their canonical
 original paths. Shebang scripts are launched through their declared interpreter, and that interpreter
 is independently prepared when required. Prepared copies are reused across runs only when the
-executable exists and its directory-local `checksums.json` entry matches the source MD5. The original
+executable exists and its directory metadata entry matches the source MD5. The original
 executable is never modified.
 
 Remaining coverage gaps exist outside code that successfully enters the hook:
@@ -298,12 +313,13 @@ require a future host-native boundary that derives identity independently of chi
 ## Callback Contract
 
 `Callback::on_event` receives an owned, versioned `Event` and asynchronously returns `Decision`.
-Event schema version 7 contains `Event::Network(NetworkEvent)` and `Event::Process(ProcessEvent)`.
+Event schema version 8 contains `Event::Network(NetworkEvent)`, `Event::Process(ProcessEvent)`, and
+`Event::File(FileEvent)`.
 For `network.connect.attempt`, `Decision::Allow` routes directly, `Decision::Deny` blocks the
 connection, and `Decision::Proxy` selects a typed proxy route. The only implemented route is
 `Proxy::Http`, containing an address and optional Basic Auth username and password. The address is
 an authority in `<host>:<port>` form; DNS names and bracketed IPv6 addresses are accepted. Decisions
-returned for process or network notification events are ignored.
+returned for process, file, or network notification events are ignored.
 
 The network path publishes:
 
@@ -327,10 +343,16 @@ when known.
 The process path currently publishes `process.exec.attempt` for intercepted descendant `posix_spawn`,
 `posix_spawnp`, `execve`, `execv`, and `execvp` operations. A process event contains sandbox and run
 ids, the trace chain, current PID/PPID/executable, requested executable, arguments, current directory,
-operation, and result. The hook records at most 256 arguments. Execution protocol version 4 bounds
-the complete request to 64 KiB and replaces the omitted argument tail with `[truncated]` instead of
-rejecting an otherwise valid command. The root command is outside this process-event path because
-the runner launches it before any hooked descendant launch occurs.
+operation, and result. The hook records at most 256 arguments and replaces the omitted argument tail
+with `[truncated]`. Process event delivery is independent of execution preparation protocol version 5,
+which now carries only authentication and an executable path. The root command is outside this
+process-event path because the runner launches it before any hooked descendant launch occurs.
+
+The filesystem path publishes `filesystem.open` and `filesystem.close` through local audit protocol
+version 1. Events include the logical path before overlay mapping, structured open mode, process
+identity, and the same trace chain used by process and network events. Successful opens register their
+native descriptor so close events retain the original path and mode. Audit delivery failure fails the
+intercepted operation closed; callback decisions for these audit-only events are ignored.
 
 Domain observation is deliberately narrow:
 
@@ -349,9 +371,9 @@ upstream connection. Server-first and otherwise silent protocols wait for the bo
 timeout and are then evaluated with no domain.
 
 Delivery is asynchronous and deliberately has no built-in persistence, queue, retry, batching, or
-remote transport. The callback is invoked from network connection tasks and the execution
-controller. Decisions are enforced only for `network.connect.attempt`; decisions returned for
-process events and network notification events are ignored. An attempt
+remote transport. The callback is invoked from network connection tasks and the audit controller.
+Decisions are enforced only for `network.connect.attempt`; decisions returned for process, file,
+and network notification events are ignored. An attempt
 callback that exceeds `callback_timeout` is denied fail-closed. The embedding application owns
 policy lookup, serialization, and storage. The SDK also provides `NoopCallback`, which always returns
 `Decision::Allow`.
@@ -370,10 +392,10 @@ response head are preserved as the first server-to-client tunnel bytes. SOCKS pr
 implemented.
 
 The binary's callback adapter is intentionally narrower than the SDK event contract. It emits one
-compact record immediately for each `network.connect.attempt` and `process.exec.attempt`, and always
-returns `Decision::Allow`. A domain that cannot be derived from HTTP Host or TLS SNI is serialized
-as `null`. Both record types include the same `trace_id`, allowing a process launch and its network
-attempts to be correlated.
+compact record immediately for each `network.connect.attempt`, `process.exec.attempt`,
+`filesystem.open`, and `filesystem.close`, and always returns `Decision::Allow`. A domain that cannot
+be derived from HTTP Host or TLS SNI is serialized as `null`. All record types include the same
+`trace_id`, allowing process launches, file activity, and network attempts to be correlated.
 
 ## Root Privileges
 
