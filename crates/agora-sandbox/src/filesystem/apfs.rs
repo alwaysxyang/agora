@@ -24,6 +24,18 @@ const IMAGE_CAPACITY: &str = "100g";
 const MAX_KEY_SIZE: usize = 64 * 1024;
 const DETACH_ATTEMPTS: usize = 200;
 const DETACH_RETRY_DELAY: Duration = Duration::from_millis(50);
+const WATCHDOG_SCRIPT: &str = r#"
+if IFS= read -r status && [ "$status" = done ]; then
+    exit 0
+fi
+attempt=0
+while [ "$attempt" -lt 200 ]; do
+    /usr/bin/hdiutil detach "$1" >/dev/null 2>&1 && exit 0
+    attempt=$((attempt + 1))
+    /bin/sleep 0.05
+done
+exit 1
+"#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyMigrationStage {
@@ -43,10 +55,61 @@ struct VolumeMetadata {
 }
 
 #[derive(Debug)]
+struct MountWatchdog {
+    child: std::process::Child,
+    input: Option<std::process::ChildStdin>,
+}
+
+impl MountWatchdog {
+    fn start(mount_point: &Path, lock: &File) -> Result<Self> {
+        let lock = lock
+            .try_clone()
+            .context("failed to duplicate encrypted filesystem lock for watchdog")?;
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(WATCHDOG_SCRIPT)
+            .arg("agora-sandbox-mount-watchdog")
+            .arg(mount_point)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(lock))
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to start encrypted filesystem mount watchdog")?;
+        let input = child
+            .stdin
+            .take()
+            .context("encrypted filesystem mount watchdog input is unavailable")?;
+        Ok(Self {
+            child,
+            input: Some(input),
+        })
+    }
+
+    fn stop(mut self) -> Result<()> {
+        let notified = if let Some(mut input) = self.input.take() {
+            std::io::Write::write_all(&mut input, b"done\n")
+                .context("failed to stop encrypted filesystem mount watchdog")
+        } else {
+            Ok(())
+        };
+        let status = self
+            .child
+            .wait()
+            .context("failed to wait for encrypted filesystem mount watchdog")?;
+        notified?;
+        if !status.success() {
+            bail!("encrypted filesystem mount watchdog exited with {status}");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct EncryptedWorkspace {
     mount_point: PathBuf,
     _lock: File,
     mounted: bool,
+    watchdog: Option<MountWatchdog>,
 }
 
 impl EncryptedWorkspace {
@@ -69,6 +132,7 @@ impl EncryptedWorkspace {
             mount_point,
             _lock: lock,
             mounted: false,
+            watchdog: None,
         };
         if let Err(error) = workspace.attach(&image, passphrase).await {
             if !image_exists {
@@ -153,6 +217,7 @@ impl EncryptedWorkspace {
             mount_point,
             _lock: lock,
             mounted: false,
+            watchdog: None,
         };
         on_progress(KeyMigrationStage::VerifyingNewKey);
         workspace
@@ -169,11 +234,11 @@ impl EncryptedWorkspace {
     }
 
     pub(crate) async fn shutdown(&mut self) -> Result<()> {
-        if !self.mounted {
-            return Ok(());
+        if self.mounted {
+            Self::detach(&self.mount_point).await?;
+            self.mounted = false;
         }
-        Self::detach(&self.mount_point).await?;
-        self.mounted = false;
+        self.stop_watchdog()?;
         Ok(())
     }
 
@@ -388,6 +453,14 @@ impl EncryptedWorkspace {
                 )
             })?;
         self.mounted = true;
+        match MountWatchdog::start(&self.mount_point, &self._lock) {
+            Ok(watchdog) => self.watchdog = Some(watchdog),
+            Err(error) => {
+                let _ = Self::detach(&self.mount_point).await;
+                self.mounted = false;
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
@@ -498,6 +571,7 @@ impl EncryptedWorkspace {
 
     fn detach_blocking(&mut self) {
         if !self.mounted {
+            let _ = self.stop_watchdog();
             return;
         }
         for attempt in 0..DETACH_ATTEMPTS {
@@ -509,12 +583,21 @@ impl EncryptedWorkspace {
                 .status();
             if status.is_ok_and(|status| status.success()) {
                 self.mounted = false;
+                let _ = self.stop_watchdog();
                 return;
             }
             if attempt + 1 < DETACH_ATTEMPTS {
                 std::thread::sleep(DETACH_RETRY_DELAY);
             }
         }
+    }
+
+    fn stop_watchdog(&mut self) -> Result<()> {
+        self.watchdog
+            .take()
+            .map(MountWatchdog::stop)
+            .transpose()
+            .map(|_| ())
     }
 }
 

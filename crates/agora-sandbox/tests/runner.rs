@@ -422,8 +422,16 @@ async fn runner_interposes_the_complete_filesystem_operation_set() {
             && !event.trace_id.is_empty()
     }));
     assert_eq!(std::fs::read(source.join("source.txt")).unwrap(), b"host");
-    assert!(!source.join("created.txt").exists());
-    assert!(!source.join("created").exists());
+    for path in [
+        "created.txt",
+        "creat.txt",
+        "spawn.txt",
+        "renamed-at.txt",
+        "created-at",
+        "created",
+    ] {
+        assert!(!source.join(path).exists());
+    }
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -617,6 +625,10 @@ fn filesystem_interposed_child_process() {
             .as_encoded_bytes(),
     )
     .unwrap();
+    let creat =
+        std::ffi::CString::new(root.join("creat.txt").as_os_str().as_encoded_bytes()).unwrap();
+    let spawn =
+        std::ffi::CString::new(root.join("spawn.txt").as_os_str().as_encoded_bytes()).unwrap();
 
     unsafe {
         assert_eq!(libc::access(source.as_ptr(), libc::R_OK), 0);
@@ -643,7 +655,126 @@ fn filesystem_interposed_child_process() {
         );
         assert!(created_file >= 0);
         assert_eq!(libc::write(created_file, b"created".as_ptr().cast(), 7), 7);
+        assert_eq!(libc::ftruncate(created_file, 4), 0);
+        assert_eq!(libc::fchmod(created_file, 0o640), 0);
+        assert_eq!(libc::fchown(created_file, !0, !0), 0);
         assert_eq!(libc::close(created_file), 0);
+
+        let creat_file = libc::creat(creat.as_ptr(), 0o600);
+        assert!(creat_file >= 0);
+        assert_eq!(libc::write(creat_file, b"creat".as_ptr().cast(), 5), 5);
+        assert_eq!(libc::close(creat_file), 0);
+        assert_eq!(libc::truncate(creat.as_ptr(), 2), 0);
+
+        assert_eq!(libc::chmod(source.as_ptr(), 0o600), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(libc::chown(source.as_ptr(), !0, !0), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(libc::lchown(source.as_ptr(), !0, !0), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(
+            libc::fchmodat(directory, c"source.txt".as_ptr(), 0o600, 0),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(
+            libc::fchownat(directory, c"source.txt".as_ptr(), !0, !0, 0),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+
+        assert_eq!(libc::mkdirat(directory, c"created-at".as_ptr(), 0o700), 0);
+        assert_eq!(
+            libc::renameat(
+                directory,
+                c"created.txt".as_ptr(),
+                directory,
+                c"renamed-at.txt".as_ptr(),
+            ),
+            0
+        );
+        assert_eq!(libc::unlinkat(directory, c"renamed-at.txt".as_ptr(), 0), 0);
+        assert_eq!(
+            libc::unlinkat(directory, c"created-at".as_ptr(), libc::AT_REMOVEDIR),
+            0
+        );
+
+        assert_eq!(libc::link(source.as_ptr(), c"hard-link".as_ptr()), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(
+            libc::linkat(
+                directory,
+                c"source.txt".as_ptr(),
+                directory,
+                c"hard-link-at".as_ptr(),
+                0,
+            ),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(
+            libc::symlink(c"source.txt".as_ptr(), c"symlink".as_ptr()),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(
+            libc::symlinkat(c"source.txt".as_ptr(), directory, c"symlink-at".as_ptr()),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(libc::clonefile(source.as_ptr(), c"clone".as_ptr(), 0), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(
+            libc::clonefileat(
+                directory,
+                c"source.txt".as_ptr(),
+                directory,
+                c"clone-at".as_ptr(),
+                0,
+            ),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(
+            libc::copyfile(
+                source.as_ptr(),
+                c"copy".as_ptr(),
+                std::ptr::null_mut(),
+                libc::COPYFILE_DATA,
+            ),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+
+        let mut actions: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
+        assert_eq!(libc::posix_spawn_file_actions_init(&mut actions), 0);
+        assert_eq!(
+            libc::posix_spawn_file_actions_addopen(
+                &mut actions,
+                9,
+                spawn.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                0o600,
+            ),
+            0
+        );
+        let mut child = 0;
+        let arguments = [c"/usr/bin/true".as_ptr().cast_mut(), std::ptr::null_mut()];
+        assert_eq!(
+            libc::posix_spawn(
+                &mut child,
+                c"/usr/bin/true".as_ptr(),
+                &actions,
+                std::ptr::null(),
+                arguments.as_ptr(),
+                std::ptr::null(),
+            ),
+            0
+        );
+        let mut child_status = 0;
+        assert_eq!(libc::waitpid(child, &mut child_status, 0), child);
+        assert_eq!(child_status, 0);
+        assert_eq!(libc::posix_spawn_file_actions_destroy(&mut actions), 0);
         assert_eq!(libc::close(directory), 0);
 
         let stream = libc::fopen(source.as_ptr(), c"r".as_ptr());
@@ -651,10 +782,7 @@ fn filesystem_interposed_child_process() {
         assert_eq!(libc::fclose(stream), 0);
 
         assert_eq!(libc::mkdir(created.as_ptr(), 0o700), 0);
-        let created_file =
-            std::ffi::CString::new(root.join("created.txt").as_os_str().as_encoded_bytes())
-                .unwrap();
-        assert_eq!(libc::rename(created_file.as_ptr(), renamed.as_ptr()), 0);
+        assert_eq!(libc::rename(creat.as_ptr(), renamed.as_ptr()), 0);
         assert_eq!(libc::unlink(renamed.as_ptr()), 0);
 
         let directory = libc::opendir(root_path.as_ptr());

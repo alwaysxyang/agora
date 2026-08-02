@@ -51,7 +51,7 @@ struct Arguments {
     filesystem_key: Option<String>,
 
     /// Filesystem storage mode
-    #[arg(long, value_enum, default_value_t = FilesystemArgument::Encrypted)]
+    #[arg(long, value_enum, default_value_t = FilesystemArgument::Plain)]
     filesystem: FilesystemArgument,
 
     /// Path to a DER CA certificate trusted by sandboxed SecTrust TLS clients
@@ -99,8 +99,8 @@ impl From<TlsArgument> for TlsMode {
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 enum FilesystemArgument {
-    #[default]
     Encrypted,
+    #[default]
     Plain,
 }
 
@@ -299,7 +299,9 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
         (FilesystemArgument::Encrypted, Some(key)) => {
             config = config.with_encrypted_workspace(key);
         }
-        (FilesystemArgument::Encrypted, None) => {}
+        (FilesystemArgument::Encrypted, None) => {
+            anyhow::bail!("--filesystem-key is required with encrypted filesystem mode");
+        }
         (FilesystemArgument::Plain, None) => {
             config = config.with_plain_workspace();
         }

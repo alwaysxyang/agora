@@ -2,7 +2,7 @@
 
 ## Goal
 
-`agora-sandbox` provides one rootless filesystem view for every injectable process in a sandbox run. The view mirrors absolute host paths beneath `<workdir>/fs`, reads through to the host filesystem on cache misses, preserves sandbox writes through copy-on-write, and never modifies the host filesystem. Encrypted APFS storage is the default; plaintext storage is available only through an explicit mode selection.
+`agora-sandbox` provides one rootless filesystem view for every injectable process in a sandbox run. The view mirrors absolute host paths beneath `<workdir>/fs`, reads through to the host filesystem on cache misses, preserves sandbox writes through copy-on-write, and never modifies the host filesystem. Plaintext storage is the default; encrypted APFS storage is available through an explicit mode selection.
 
 The implementation is process-tree scoped. It applies only to processes that successfully load the Agora hook library. A process that cannot be prepared for injection is rejected instead of running outside the filesystem view.
 
@@ -31,9 +31,9 @@ An absolute host path `/tmp/example` maps to `<workdir>/fs/tmp/example`. Relativ
 
 ## Storage Modes
 
-Encrypted mode is the default and requires a filesystem key. The CLI uses `--filesystem encrypted --filesystem-key <KEY>`, and the SDK uses `SandboxConfig::with_encrypted_workspace`. An absent, empty, invalid, or incorrect key fails closed before the target process starts.
+Plaintext mode is the default and uses an ordinary persistent `<workdir>/fs` directory without a filesystem key.
 
-Plaintext mode is selected explicitly with `--filesystem plain` or `SandboxConfig::with_plain_workspace`. It rejects a filesystem key and uses an ordinary persistent `<workdir>/fs` directory. It is not a fallback for an encrypted startup failure. The overlay behavior is identical, but plaintext mode does not encrypt data at rest.
+Encrypted mode is selected explicitly with `--filesystem encrypted --filesystem-key <KEY>` or `SandboxConfig::with_encrypted_workspace`. An absent, empty, invalid, or incorrect key fails closed before the target process starts. Plaintext mode rejects a filesystem key and is not a fallback for an encrypted startup failure. The overlay behavior is identical, but plaintext mode does not encrypt data at rest.
 
 Both modes acquire `<workdir>/filesystem/fs.lock`. Runs using the same work directory are mutually exclusive, while runs using different work directories can proceed concurrently.
 
@@ -81,7 +81,7 @@ Metadata and file publication are serialized by the filesystem root's overlay lo
 
 ## Path Resolution And Copy-On-Write
 
-The hook intercepts path-based filesystem entry points rather than `read` and `write`. File descriptors returned by an intercepted open point at files in the selected sandbox tree, so normal descriptor reads, writes, seeks, locks, `mmap`, and `fsync` retain native kernel behavior.
+The hook intercepts path-based filesystem entry points rather than `read` and `write`. This includes open and create, metadata and access checks, truncate, deletion, rename, directory creation, current-directory operations, and directory enumeration, including their supported `*at` forms. Tracked directory descriptors resolve through their logical path. File descriptors returned by an intercepted open point at files in the selected sandbox tree, so normal descriptor reads, writes, seeks, locks, `mmap`, and `fsync` retain native kernel behavior. Descriptor-based truncate, permission, and ownership changes require a regular file in the selected root. Path permission/ownership changes, hard-link and symlink creation, and `clonefile`/`copyfile` are interposed but fail with `ENOTSUP` while the runtime is active.
 
 Intercepted `open`, `openat`, and `fopen` attempts publish the logical path and structured open mode through the sandbox audit callback. Successful opens associate that context with the native descriptor; intercepted `close` and `fclose` publish the matching close event and release the association after native close succeeds. File events carry the inherited trace chain used by process and network events.
 
@@ -97,12 +97,14 @@ For a read:
 For a write-intent open (`O_WRONLY`, `O_RDWR`, `O_APPEND`, `O_TRUNC`, or creation):
 
 1. Materialize the host file first when no sandbox copy exists.
-2. Change its state to `cow` before returning a writable descriptor.
-3. Create a new sandbox file and mark it `cow` when neither view contains the path.
+2. Invoke the native open on the mirrored path and change its state to `cow` only after that open succeeds.
+3. Create a new sandbox file and mark it `cow` only after its native open succeeds when neither view contains the path.
+
+`posix_spawn_file_actions_addopen` records the mirrored path without executing the action. Pending write state is committed immediately before `posix_spawn` or `posix_spawnp` uses the actions, and destroying unused actions discards the pending state.
 
 This is file-level copy-on-write. The first write-intent open copies the complete host file; it does not copy individual blocks lazily.
 
-Deleting a path removes its sandbox copy and records a whiteout. Renaming moves the sandbox entry and its state without modifying either host path. Directory reads merge host and sandbox names, remove whiteouts, prefer sandbox entries, and hide `.agora`.
+Deleting a path removes its sandbox copy and records a whiteout. Renaming moves the sandbox entry and its state without modifying either host path, after enforcing same-path, type, descendant, and non-empty-directory rules. Directory reads merge host and sandbox names, remove whiteouts, prefer sandbox entries, and hide `.agora`.
 
 ## Process Integration
 
@@ -129,7 +131,7 @@ The previous `clean` command is removed. The encrypted filesystem is persistent;
 
 All filesystem setup and path-virtualization failures are fail-closed. The target process is not started when its selected filesystem root cannot be created, mounted when required, validated, or locked. An intercepted operation returns an appropriate POSIX error instead of falling back to a host write.
 
-The sparse bundle is detached on normal completion, startup rollback, service failure, and best-effort synchronous drop. The mounted plaintext view remains accessible to the same host user while the sandbox is running; encryption protects data at rest.
+The sparse bundle is detached on normal completion, startup rollback, service failure, and best-effort synchronous drop. A watchdog inherits the filesystem lock while the image is mounted and retries a normal detach when controller death closes its liveness pipe. The mounted plaintext view remains accessible to the same host user while the sandbox is running; encryption protects data at rest.
 
 ## Verification
 

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** Execute this plan sequentially in the current task. Do not dispatch subagents. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the optional encrypted snapshot and plaintext executable cache with one rootless, read-through COW filesystem, encrypted by default, with explicit plaintext storage and in-place encrypted-key migration.
+**Goal:** Replace the optional encrypted snapshot and plaintext executable cache with one rootless, read-through COW filesystem, plaintext by default, with explicit encrypted storage and in-place encrypted-key migration.
 
-**Architecture:** Prepare one persistent filesystem root at `<workdir>/fs`, backed by an encrypted APFS sparse bundle by default or an explicitly selected plaintext directory. A filesystem store owns directory metadata, materialization, COW transitions, and whiteouts; the executable store publishes prepared binaries through that store. The injected dylib redirects supported path APIs into the selected tree while preserving native descriptor I/O.
+**Architecture:** Prepare one persistent filesystem root at `<workdir>/fs`, backed by a plaintext directory by default or an explicitly selected encrypted APFS sparse bundle. A filesystem store owns directory metadata, materialization, COW transitions, and whiteouts; the executable store publishes prepared binaries through that store. The injected dylib redirects supported path APIs into the selected tree while preserving native descriptor I/O.
 
 **Tech Stack:** Rust, Tokio, macOS dyld interposition, APFS sparse bundles through `hdiutil`, serde JSON metadata, MD5 source checksums.
 
@@ -79,7 +79,8 @@
 
 - [x] Add tests for filesystem-root environment parsing, relative and absolute path resolution, bypass paths, read opens, write opens, creation, deletion, and rename.
 - [x] Inject the selected filesystem root into every prepared process environment.
-- [x] Interpose the supported open/stat/access/mutation entry points and route them through the overlay store.
+- [x] Interpose open/create, stat/access, truncate, metadata mutation, link/copy, deletion/rename, directory, and supported `*at` entry points; route supported operations through the overlay and return `ENOTSUP` for path mutation families that cannot yet be represented safely.
+- [x] Rewrite deferred `posix_spawn_file_actions_addopen` paths and commit pending COW state when spawn consumes the actions.
 - [x] Preserve errno, catch hook panics, bypass recursive/internal operations, and deny unavailable virtualization.
 - [x] Add merged directory enumeration with encrypted precedence, whiteout filtering, and control namespace hiding.
 - [x] Run hook tests and confirm they pass.
@@ -124,7 +125,7 @@
 - Modify: `crates/agora-sandbox/tests/cli.rs`
 - Modify: `crates/agora-sandbox/tests/runner.rs`
 
-- [x] Keep encrypted storage as the default and continue requiring a valid key.
+- [x] Keep plaintext storage as the default and require a valid key when encrypted storage is selected.
 - [x] Add explicit `--filesystem plain` and `SandboxConfig::with_plain_workspace` selection without an encryption key.
 - [x] Reuse the same overlay, execution preparation, and hook integration for both storage modes.
 - [x] Make both modes use the same per-workdir non-blocking filesystem lock.

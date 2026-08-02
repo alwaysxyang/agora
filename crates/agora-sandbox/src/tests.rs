@@ -53,6 +53,10 @@ fn event(event_type: EventType, connection_id: Option<&str>, network: bool) -> N
 
 #[test]
 fn filesystem_arguments_map_to_their_runtime_modes() {
+    assert!(matches!(
+        FilesystemArgument::default(),
+        FilesystemArgument::Plain
+    ));
     assert_eq!(
         FilesystemMode::from(FilesystemArgument::Encrypted),
         FilesystemMode::Encrypted
@@ -322,4 +326,28 @@ async fn async_main_rejects_an_empty_encrypted_workspace_key() {
     assert!(error.to_string().contains("key is empty"));
 
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn async_main_requires_a_key_for_explicit_encrypted_mode() {
+    let arguments = Arguments {
+        command: Some("/bin/true".to_string()),
+        subcommand: None,
+        hook_library: Some("/missing/hook-library.dylib".into()),
+        audit_file: None,
+        workdir: None,
+        filesystem_key: None,
+        filesystem: FilesystemArgument::Encrypted,
+        tls_trust_anchor: None,
+        tls: super::TlsArgument::Off,
+        tls_ca_cert: None,
+        tls_ca_key: None,
+    };
+
+    let error = async_main(arguments).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("--filesystem-key is required with encrypted filesystem mode")
+    );
 }

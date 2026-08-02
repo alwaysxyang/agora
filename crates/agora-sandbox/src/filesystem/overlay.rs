@@ -25,6 +25,17 @@ pub(crate) struct DirectoryView {
     hidden: BTreeSet<OsString>,
 }
 
+pub(crate) struct StagedWrite {
+    logical: PathBuf,
+    destination: PathBuf,
+}
+
+impl StagedWrite {
+    pub(crate) fn destination(&self) -> &Path {
+        &self.destination
+    }
+}
+
 impl DirectoryView {
     pub(crate) fn upper(&self) -> &Path {
         &self.upper
@@ -130,11 +141,32 @@ impl OverlayStore {
     }
 
     pub(crate) fn prepare_write(&self, path: &Path, create: bool) -> Result<PathBuf> {
+        let staged = self.stage_write(path, create)?;
+        let destination = staged.destination.clone();
+        self.commit_write(staged)?;
+        Ok(destination)
+    }
+
+    pub(crate) fn stage_write(&self, path: &Path, create: bool) -> Result<StagedWrite> {
         let path = self.normalize(path)?;
         if self.is_internal(&path) {
-            return Ok(path);
+            return Ok(StagedWrite {
+                destination: path.clone(),
+                logical: path,
+            });
         }
-        self.with_lock(|| self.prepare_write_locked(&path, create))
+        let destination = self.with_lock(|| self.stage_write_locked(&path, create))?;
+        Ok(StagedWrite {
+            logical: path,
+            destination,
+        })
+    }
+
+    pub(crate) fn commit_write(&self, staged: StagedWrite) -> Result<()> {
+        if self.is_internal(&staged.logical) {
+            return Ok(());
+        }
+        self.with_lock(|| self.metadata.set(&staged.logical, EntryState::Cow))
     }
 
     pub(crate) fn prepare_directory(&self, path: &Path) -> Result<PathBuf> {
@@ -330,14 +362,13 @@ impl OverlayStore {
         }
     }
 
-    fn prepare_write_locked(&self, path: &Path, create: bool) -> Result<PathBuf> {
+    fn stage_write_locked(&self, path: &Path, create: bool) -> Result<PathBuf> {
         let destination = self.destination(path)?;
         if self.cow_ancestor_locked(path)? {
             if !destination.exists() && !create {
                 return Self::not_found(path);
             }
             self.ensure_parent_locked(path)?;
-            self.metadata.set(path, EntryState::Cow)?;
             return Ok(destination);
         }
         match self.metadata.state(path)? {
@@ -359,7 +390,6 @@ impl OverlayStore {
             None if create => self.ensure_parent_locked(path)?,
             None => return Self::not_found(path),
         }
-        self.metadata.set(path, EntryState::Cow)?;
         Ok(destination)
     }
 
@@ -512,7 +542,27 @@ impl OverlayStore {
 
     fn rename_locked(&self, from: &Path, to: &Path) -> Result<()> {
         let from_destination = self.prepare_read_locked(from)?;
-        if from_destination.is_dir() && !self.cow_ancestor_locked(from)? {
+        if from == to {
+            return Ok(());
+        }
+        let from_metadata = from_destination.symlink_metadata()?;
+        if from_metadata.is_dir() && to.starts_with(from) {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL).into());
+        }
+        if self.visible_exists_locked(to)? {
+            let to_visible = self.prepare_read_locked(to)?;
+            let to_metadata = to_visible.symlink_metadata()?;
+            if from_metadata.is_dir() && !to_metadata.is_dir() {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR).into());
+            }
+            if !from_metadata.is_dir() && to_metadata.is_dir() {
+                return Err(std::io::Error::from_raw_os_error(libc::EISDIR).into());
+            }
+            if to_metadata.is_dir() && !self.directory_is_empty_locked(to)? {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY).into());
+            }
+        }
+        if from_metadata.is_dir() && !self.cow_ancestor_locked(from)? {
             self.materialize_tree_locked(from)?;
         }
         self.ensure_parent_locked(to)?;

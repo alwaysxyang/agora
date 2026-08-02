@@ -9,8 +9,6 @@ use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-const FILESYSTEM_KEY: &str = "test-filesystem-key";
-
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -69,6 +67,7 @@ fn sandbox_cli_documents_only_available_options() {
     assert!(stdout.contains("--workdir <WORKDIR>"));
     assert!(stdout.contains("--filesystem <FILESYSTEM>"));
     assert!(stdout.contains("[possible values: encrypted, plain]"));
+    assert!(stdout.contains("[default: plain]"));
     assert!(stdout.contains("--filesystem-key <FILESYSTEM_KEY>"));
     assert!(!stdout.contains("--filesystem-key-file"));
     assert!(stdout.contains("--tls-trust-anchor <TLS_TRUST_ANCHOR>"));
@@ -123,14 +122,13 @@ fn sandbox_cli_documents_interactive_key_migration() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn sandbox_cli_runs_with_an_explicit_plain_filesystem_and_no_key() {
+fn sandbox_cli_runs_with_the_default_plain_filesystem_and_no_key() {
     let workdir = cli_workdir();
     let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
         .arg("--hook-library")
         .arg(hook_library())
         .arg("--workdir")
         .arg(&workdir)
-        .args(["--filesystem", "plain"])
         .args(["-c", "/usr/bin/true"])
         .output()
         .unwrap();
@@ -172,6 +170,7 @@ fn sandbox_cli_migrates_the_encrypted_filesystem_key_in_place() {
             .arg(hook_library())
             .arg("--workdir")
             .arg(&workdir)
+            .args(["--filesystem", "encrypted"])
             .args(["--filesystem-key", key])
             .args(["-c", "/usr/bin/true"])
             .output()
@@ -288,7 +287,6 @@ fn sandbox_cli_auto_generates_reuses_and_replaces_a_configured_tls_ca() {
             .arg(hook_library())
             .arg("--workdir")
             .arg(&workdir)
-            .args(["--filesystem-key", FILESYSTEM_KEY])
             .args(["--tls", "auto", "--tls-ca-cert"])
             .arg(&certificate)
             .arg("--tls-ca-key")
@@ -366,7 +364,6 @@ fn sandbox_cli_runs_an_interactive_bash_in_a_terminal() {
         .arg(hook_library())
         .arg("--workdir")
         .arg(&workdir)
-        .args(["--filesystem-key", FILESYSTEM_KEY])
         .arg("-c")
         .arg("/bin/bash")
         .stdin(Stdio::piped())
@@ -468,7 +465,6 @@ fn sandbox_cli_injects_the_configured_tls_trust_anchor() {
         .arg(hook_library())
         .arg("--workdir")
         .arg(&directory)
-        .args(["--filesystem-key", FILESYSTEM_KEY])
         .arg("--tls-trust-anchor")
         .arg(&anchor)
         .arg("-c")
@@ -578,7 +574,6 @@ fn run_audited_cli(audit_file: Option<&Path>) -> (Output, SocketAddr) {
         .arg(hook_library())
         .arg("--workdir")
         .arg(&workdir)
-        .args(["--filesystem-key", FILESYSTEM_KEY])
         .arg("-c")
         .arg(command)
         .env("AGORA_SANDBOX_TEST_CLI_CHILD", "1")

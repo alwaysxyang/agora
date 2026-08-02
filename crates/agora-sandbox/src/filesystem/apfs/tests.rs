@@ -1,4 +1,4 @@
-use super::{EncryptedWorkspace, MAX_KEY_SIZE, METADATA_VERSION, VolumeMetadata};
+use super::{EncryptedWorkspace, MAX_KEY_SIZE, METADATA_VERSION, MountWatchdog, VolumeMetadata};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +13,7 @@ fn workspace(root: &Path) -> EncryptedWorkspace {
         mount_point,
         _lock: std::fs::File::create(root.join("lock")).unwrap(),
         mounted: false,
+        watchdog: None,
     }
 }
 
@@ -93,6 +94,21 @@ fn filesystem_lock_is_exclusive() {
         }
     }
     assert!(reacquired.is_some());
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn mount_watchdog_inherits_the_lock_and_stops_cleanly() {
+    let directory = temporary_directory("watchdog");
+    std::fs::create_dir_all(&directory).unwrap();
+    let lock = EncryptedWorkspace::lock(&directory).unwrap();
+    let watchdog = MountWatchdog::start(&directory.join("fs"), &lock).unwrap();
+    drop(lock);
+
+    assert!(EncryptedWorkspace::lock(&directory).is_err());
+    watchdog.stop().unwrap();
+    assert!(EncryptedWorkspace::lock(&directory).is_ok());
 
     std::fs::remove_dir_all(directory).unwrap();
 }

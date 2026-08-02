@@ -9,8 +9,8 @@ mod workspace;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FilesystemMode {
-    #[default]
     Encrypted,
+    #[default]
     Plain,
 }
 
@@ -19,6 +19,6 @@ pub(crate) use apfs::{EncryptedWorkspace, KeyMigrationStage};
 #[cfg(target_os = "macos")]
 pub(crate) use metadata::{EntryState, Materializer};
 #[cfg(target_os = "macos")]
-pub(crate) use overlay::{DirectoryView, OverlayStore};
+pub(crate) use overlay::{DirectoryView, OverlayStore, StagedWrite};
 #[cfg(target_os = "macos")]
 pub(crate) use workspace::FilesystemWorkspace;

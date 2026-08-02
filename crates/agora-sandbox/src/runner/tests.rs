@@ -342,7 +342,7 @@ fn sandbox_config_and_command_builders_preserve_runtime_inputs() {
     );
     assert_eq!(config.tls_trust_anchor(), None);
     assert_eq!(config.tls_ca(), None);
-    assert_eq!(config.filesystem_mode(), FilesystemMode::Encrypted);
+    assert_eq!(config.filesystem_mode(), FilesystemMode::Plain);
     let encrypted = config.clone().with_encrypted_workspace("top secret");
     assert_eq!(
         encrypted.encrypted_workspace_key(),
@@ -381,7 +381,7 @@ fn sandbox_config_and_command_builders_preserve_runtime_inputs() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn sandbox_config_requires_a_filesystem_key() {
+fn sandbox_config_defaults_to_plain_without_a_filesystem_key() {
     let root = std::env::temp_dir().join(format!(
         "agora-required-filesystem-key-{}",
         uuid::Uuid::new_v4()
@@ -390,9 +390,11 @@ fn sandbox_config_requires_a_filesystem_key() {
     let hook = root.join("hook.dylib");
     std::fs::write(&hook, b"hook").unwrap();
 
-    let error = SandboxConfig::new(&hook).validate().unwrap_err();
+    let config = SandboxConfig::new(&hook);
 
-    assert!(error.to_string().contains("filesystem key is required"));
+    assert!(config.validate().is_ok());
+    assert_eq!(config.filesystem_mode(), FilesystemMode::Plain);
+    assert_eq!(config.encrypted_workspace_key(), None);
     std::fs::remove_dir_all(root).unwrap();
 }
 

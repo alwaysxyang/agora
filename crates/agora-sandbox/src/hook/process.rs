@@ -47,7 +47,13 @@ struct ProcessHookGuard;
 
 impl ProcessHookGuard {
     fn enter() -> Option<Self> {
-        INSIDE_PROCESS_HOOK.with(|inside| (!inside.replace(true)).then_some(Self))
+        INSIDE_PROCESS_HOOK.with(|inside| {
+            if inside.replace(true) {
+                None
+            } else {
+                Some(Self)
+            }
+        })
     }
 }
 
@@ -477,6 +483,9 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
     else {
         return libc::EACCES;
     };
+    if let Err(error) = unsafe { super::filesystem::commit_spawn_file_actions(file_actions) } {
+        return PrepareError::from_anyhow(error, libc::EIO).errno;
+    }
     unsafe {
         original(
             pid,
@@ -532,6 +541,9 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
     else {
         return libc::EACCES;
     };
+    if let Err(error) = unsafe { super::filesystem::commit_spawn_file_actions(file_actions) } {
+        return PrepareError::from_anyhow(error, libc::EIO).errno;
+    }
     unsafe {
         original(
             pid,

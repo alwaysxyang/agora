@@ -32,6 +32,13 @@ impl Drop for Fixture {
     }
 }
 
+fn errno(error: &anyhow::Error) -> Option<i32> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::raw_os_error)
+}
+
 #[test]
 fn read_materializes_and_refreshes_host_files() {
     let fixture = Fixture::new();
@@ -192,6 +199,46 @@ fn rename_and_mkdir_never_change_lower_paths() {
         0o750
     );
     assert!(!directory.exists());
+}
+
+#[test]
+fn rename_preserves_sources_and_destinations_when_posix_checks_fail() {
+    let fixture = Fixture::new();
+    let file = fixture.lower.join("file");
+    let directory = fixture.lower.join("directory");
+    let child = directory.join("child");
+    let other_directory = fixture.lower.join("other-directory");
+    std::fs::write(&file, b"file").unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(&child, b"child").unwrap();
+    std::fs::create_dir_all(&other_directory).unwrap();
+
+    fixture.store.rename(&file, &file).unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), b"file");
+
+    let error = fixture.store.rename(&file, &directory).unwrap_err();
+    assert_eq!(errno(&error), Some(libc::EISDIR));
+    assert_eq!(std::fs::read(&file).unwrap(), b"file");
+    assert_eq!(std::fs::read(&child).unwrap(), b"child");
+
+    let error = fixture.store.rename(&directory, &file).unwrap_err();
+    assert_eq!(errno(&error), Some(libc::ENOTDIR));
+    assert_eq!(std::fs::read(&file).unwrap(), b"file");
+    assert_eq!(std::fs::read(&child).unwrap(), b"child");
+
+    let error = fixture
+        .store
+        .rename(&other_directory, &directory)
+        .unwrap_err();
+    assert_eq!(errno(&error), Some(libc::ENOTEMPTY));
+    assert_eq!(std::fs::read(&child).unwrap(), b"child");
+
+    let error = fixture
+        .store
+        .rename(&directory, &directory.join("nested"))
+        .unwrap_err();
+    assert_eq!(errno(&error), Some(libc::EINVAL));
+    assert_eq!(std::fs::read(&child).unwrap(), b"child");
 }
 
 #[test]
