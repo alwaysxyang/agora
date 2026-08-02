@@ -18,7 +18,7 @@ impl SignalHandler for RecordingHandler {
 async fn registered_handler_receives_the_matching_signal() {
     let received = Arc::new(Mutex::new(None));
     let signal_number = tokio::signal::unix::SignalKind::terminate().as_raw_value();
-    let mut signals = SignalHandlers::new();
+    let mut signals = SignalHandlers::default();
     signals
         .register(
             Signal::new(signal_number),

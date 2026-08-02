@@ -1,8 +1,8 @@
 use super::super::execution::{ExecutionScheduler, ExecutionScope, ExecutionTicket};
 use super::super::{AgentDispatcher, Daemon};
 use super::{
-    Argument, CommandContext, CommandExecution, CommandHandler, CommandNode, CommandRegistry,
-    CommandResolution, CommandRuntime,
+    AgentDispatch, Argument, CommandContext, CommandExecution, CommandHandler, CommandNode,
+    CommandOutcome, CommandRegistry, CommandResolution, CommandRuntime,
 };
 use crate::agent::{
     AgentOutput, AgentRunCancellation, AgentRunControl, AgentTask, ConfiguredAgent,
@@ -13,7 +13,7 @@ use crate::channel::{
 };
 use crate::config::{AgentConfig, AgentType, IsolateMode, IsolationScope};
 use crate::store::{SessionKey, SessionStore};
-use crate::task::{ChannelTaskInput, CommandRequest, OutputEvent, TaskContent};
+use crate::task::{ChannelTaskInput, CommandRequest, OutputEvent, TaskAttachment, TaskContent};
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::future::pending;

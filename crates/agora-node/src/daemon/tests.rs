@@ -1,11 +1,11 @@
-use super::AgentDispatcher;
+use super::{AgentDispatcher, AgentRunOutput, CommandRuntime, Daemon, DaemonShutdown};
 use crate::agent::{AgentRegistry, ConfiguredAgent};
 use crate::channel::{
     Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, ConfiguredChannel, RunEvent,
 };
 use crate::config::{
     AgentConfig, AgentSubscription, AgentType, ChannelConfig, IsolateMode, IsolationScope,
-    LarkChannelConfig, NodeConfig,
+    LarkChannelConfig, NamedChannelConfig, NodeConfig,
 };
 use crate::store::{SessionKey, SessionStore};
 use crate::task::{ChannelTaskInput, OutputEvent, TaskContent};
@@ -110,6 +110,62 @@ impl ChannelRun for RecordingRun {
 struct RecordingChannel {
     contexts: Arc<Mutex<Vec<ChannelRunContext>>>,
     events: Arc<Mutex<Vec<RunEvent>>>,
+}
+
+#[derive(Clone)]
+struct ReplyTask {
+    input: ChannelTaskInput,
+}
+
+impl ChannelTask for ReplyTask {
+    fn task_id(&self) -> &str {
+        "reply-task"
+    }
+
+    fn session_id(&self) -> &str {
+        "reply-session"
+    }
+
+    fn input(&self) -> &ChannelTaskInput {
+        &self.input
+    }
+}
+
+struct ReplyChannel {
+    replies: Arc<Mutex<Vec<ChannelReply>>>,
+}
+
+impl Channel for ReplyChannel {
+    type Task = ReplyTask;
+    type Run = RecordingRun;
+
+    fn name(&self) -> &str {
+        "reply"
+    }
+
+    async fn recv(&mut self) -> Result<Option<Self::Task>> {
+        Ok(None)
+    }
+
+    async fn open_run(&self, _task: &Self::Task, _context: ChannelRunContext) -> Result<Self::Run> {
+        Ok(RecordingRun {
+            events: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    async fn reply(&self, _task: &Self::Task, reply: ChannelReply) -> Result<()> {
+        self.replies.lock().unwrap().push(reply);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct FailingRun;
+
+impl ChannelRun for FailingRun {
+    async fn publish(&self, _event: RunEvent) -> Result<()> {
+        anyhow::bail!("publish failed")
+    }
 }
 
 impl Channel for RecordingChannel {

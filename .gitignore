@@ -1,5 +1,7 @@
 /target
 .*
+!.cargo/
+!.cargo/config.toml
 !.gitignore
 Cargo.lock
 config.json

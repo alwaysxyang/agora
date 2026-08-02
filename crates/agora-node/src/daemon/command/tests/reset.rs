@@ -206,3 +206,27 @@ async fn reset_removes_the_mapping_when_backend_deletion_is_unsupported() {
         [ChannelReply::new("重置成功。")]
     );
 }
+
+#[tokio::test]
+async fn reset_succeeds_when_no_session_mapping_exists() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = command_test_agent("custom-dev", temp.path());
+    let dispatcher =
+        AgentDispatcher::new(SessionStore::open(temp.path().join("store.db")).unwrap());
+    let runtime = command_runtime(&dispatcher);
+
+    let outcome = runtime
+        .handle(
+            "lark",
+            "chat-1",
+            &[agent],
+            &ChannelTaskInput::Message(TaskContent::new("/reset")),
+        )
+        .await
+        .unwrap();
+
+    let CommandOutcome::Reply(Some(reply)) = outcome else {
+        panic!("expected reset reply");
+    };
+    assert_eq!(reply, ChannelReply::new("重置成功。"));
+}

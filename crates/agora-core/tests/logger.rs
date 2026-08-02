@@ -65,6 +65,15 @@ fn logger_macros_are_available_from_logger_module() {
 
     agora_core::logger::debug!("still debug");
 
+    let arguments = format_args!("external record");
+    let record = agora_core::logger::log::Record::builder()
+        .args(arguments)
+        .level(agora_core::logger::log::Level::Warn)
+        .file(Some("external.rs"))
+        .line(Some(7))
+        .build();
+    agora_core::logger::log::logger().log(&record);
+
     let entry = agora_core::logger::LoggerEntry::new().with_entry("bad", BrokenValue);
     agora_core::logger::info!(entry = entry, "bad entry");
 
@@ -89,6 +98,9 @@ fn logger_macros_are_available_from_logger_module() {
     assert!(content.contains("\"level\":\"DEBUG\""));
     assert!(content.contains("\"message\":\"run 1\""));
     assert!(content.contains("\"message\":\"still debug\""));
+    assert!(content.contains("\"message\":\"external record\""));
+    assert!(content.contains("\"file\":\"external.rs\""));
+    assert!(content.contains("\"line\":7"));
     assert!(content.contains("\"message\":\"bad entry\""));
     assert!(content.contains("\"logger_error\""));
     assert!(content.contains("\"first\":1"));

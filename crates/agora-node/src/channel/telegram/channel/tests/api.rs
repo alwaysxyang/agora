@@ -315,9 +315,10 @@ async fn telegram_channel_reports_command_reply_delivery_failures() {
     ])
     .await;
     let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
-    let channel = TelegramChannel::with_api(api);
-    let task = TelegramUpdate::from_json(
-        r#"{
+    let channel = ConfiguredChannel::Telegram(TelegramChannel::with_api(api));
+    let task = ConfiguredTask::Telegram(
+        TelegramUpdate::from_json(
+            r#"{
             "update_id": 401,
             "message": {
                 "message_id": 31,
@@ -325,10 +326,11 @@ async fn telegram_channel_reports_command_reply_delivery_failures() {
                 "text": "/help"
             }
         }"#,
-    )
-    .unwrap()
-    .into_task("agora_bot")
-    .unwrap();
+        )
+        .unwrap()
+        .into_task("agora_bot")
+        .unwrap(),
+    );
 
     let error = channel
         .reply(&task, ChannelReply::new("**Agora 命令**"))
@@ -480,9 +482,10 @@ async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
     })
     .await;
     let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
-    let mut channel = TelegramChannel::with_api(api);
-    let source = TelegramUpdate::from_json(
-        r#"{
+    let mut channel = ConfiguredChannel::Telegram(TelegramChannel::with_api(api));
+    let source = ConfiguredTask::Telegram(
+        TelegramUpdate::from_json(
+            r#"{
             "update_id": 500,
             "message": {
                 "message_id": 31,
@@ -490,10 +493,11 @@ async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
                 "text": "run"
             }
         }"#,
-    )
-    .unwrap()
-    .into_task("agora_bot")
-    .unwrap();
+        )
+        .unwrap()
+        .into_task("agora_bot")
+        .unwrap(),
+    );
     let interrupted = Arc::new(AtomicBool::new(false));
     let callback_interrupted = Arc::clone(&interrupted);
     let run = channel
@@ -582,7 +586,7 @@ async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
             .contains("Partial answer")
     );
 
-    let next = channel.next_task().await.unwrap();
+    let next = channel.recv().await.unwrap().unwrap();
     assert_eq!(next.input().message().unwrap().text(), "after stop");
     assert!(interrupted.load(Ordering::Relaxed));
     server

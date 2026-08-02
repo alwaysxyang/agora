@@ -454,3 +454,61 @@ async fn configured_channel_rejects_a_task_from_another_channel_type() {
         "configured channel and task types do not match"
     );
 }
+
+#[tokio::test]
+async fn websocket_receiver_reports_background_task_outcomes() {
+    let mut receiver = LarkWebSocketReceiver::spawn(api());
+    receiver.task.as_ref().unwrap().abort();
+    assert!(
+        receiver
+            .next_delivery()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("receiver task failed")
+    );
+
+    let (sender, events) = mpsc::channel(1);
+    drop(sender);
+    let mut receiver = LarkWebSocketReceiver {
+        events,
+        task: Some(tokio::spawn(async { Ok(()) })),
+    };
+    assert!(receiver.next_delivery().await.unwrap().is_none());
+    assert!(receiver.task.is_none());
+
+    let (sender, events) = mpsc::channel(1);
+    drop(sender);
+    let mut receiver = LarkWebSocketReceiver {
+        events,
+        task: Some(tokio::spawn(async { anyhow::bail!("websocket stopped") })),
+    };
+    assert!(
+        receiver
+            .next_delivery()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("websocket stopped")
+    );
+
+    let (sender, events) = mpsc::channel(1);
+    drop(sender);
+    let task = tokio::spawn(async {
+        std::future::pending::<()>().await;
+        Ok(())
+    });
+    task.abort();
+    let mut receiver = LarkWebSocketReceiver {
+        events,
+        task: Some(task),
+    };
+    assert!(
+        receiver
+            .next_delivery()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("receiver task failed")
+    );
+}

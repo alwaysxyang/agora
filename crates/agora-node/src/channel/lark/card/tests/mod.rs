@@ -6,7 +6,7 @@ use crate::channel::permission::PermissionDenial;
 use crate::channel::test_http::{HttpMockServer, MockResponse};
 use crate::channel::{
     Channel, ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun,
-    RunEvent,
+    ConfiguredChannel, ConfiguredTask, RunEvent,
 };
 use crate::config::LarkChannelConfig;
 use crate::task::{CommandRequest, OutputEvent, ProgressStatus, TokenUsage};

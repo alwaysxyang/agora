@@ -220,3 +220,23 @@ fn configured_telegram_channel_is_active() {
 
     assert!(matches!(channel, ConfiguredChannel::Telegram(_)));
 }
+
+#[test]
+fn configured_task_forwards_telegram_task_fields() {
+    let update = TelegramUpdate::from_json(
+        r#"{
+            "update_id": 108,
+            "message": {
+                "message_id": 14,
+                "chat": {"id": 7, "type": "private"},
+                "text": "hello"
+            }
+        }"#,
+    )
+    .unwrap();
+    let task = crate::channel::ConfiguredTask::Telegram(update.into_task("agora_bot").unwrap());
+
+    assert_eq!(task.task_id(), "108");
+    assert_eq!(task.session_id(), "chat:7");
+    assert_eq!(task.input().message().unwrap().text(), "hello");
+}

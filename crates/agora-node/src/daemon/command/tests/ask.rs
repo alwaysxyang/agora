@@ -263,3 +263,72 @@ async fn agent_input_gets_a_reply_when_every_agent_is_disabled() {
         [ChannelReply::new("当前对话没有启用的 Agent。")]
     );
 }
+
+#[tokio::test]
+async fn targeted_ask_preserves_message_attachments() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = command_test_agent("codex-dev", temp.path());
+    let dispatcher =
+        AgentDispatcher::new(SessionStore::open(temp.path().join("store.db")).unwrap());
+    let attachment = TaskAttachment::image("screen.png", "image/png", vec![1, 2, 3]);
+    let input = ChannelTaskInput::Message(
+        TaskContent::new("/ask codex-dev inspect this").with_attachment(attachment.clone()),
+    );
+
+    let outcome = command_runtime(&dispatcher)
+        .handle("lark", "chat-1", &[agent], &input)
+        .await
+        .unwrap();
+    let CommandOutcome::Dispatch(dispatch) = outcome else {
+        panic!("expected targeted agent dispatch");
+    };
+    let (agents, content) = dispatch.into_parts();
+    assert_eq!(agents.len(), 1);
+    assert_eq!(content.text(), "inspect this");
+    assert_eq!(content.attachments(), [attachment]);
+}
+
+#[tokio::test]
+async fn ask_status_updates_cover_unknown_and_enable_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let agents = vec![command_test_agent("codex-dev", temp.path())];
+    let dispatcher =
+        AgentDispatcher::new(SessionStore::open(temp.path().join("store.db")).unwrap());
+    let runtime = command_runtime(&dispatcher);
+
+    for input in ["/ask status missing", "/ask disable missing"] {
+        let outcome = runtime
+            .handle(
+                "lark",
+                "chat-1",
+                &agents,
+                &ChannelTaskInput::Message(TaskContent::new(input)),
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::Reply(Some(reply)) = outcome else {
+            panic!("expected unknown-agent reply");
+        };
+        assert_eq!(
+            reply,
+            ChannelReply::new("当前对话中不存在 Agent：missing。")
+        );
+    }
+
+    let outcome = runtime
+        .handle(
+            "lark",
+            "chat-1",
+            &agents,
+            &ChannelTaskInput::Message(TaskContent::new("/ask enable codex-dev")),
+        )
+        .await
+        .unwrap();
+    let CommandOutcome::Reply(Some(reply)) = outcome else {
+        panic!("expected enabled status reply");
+    };
+    assert_eq!(
+        reply,
+        ChannelReply::agent_status(ChannelAgentStatus::new("codex-dev", true))
+    );
+}

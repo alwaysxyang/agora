@@ -170,8 +170,8 @@ async fn lark_ask_message_replies_with_a_threaded_interactive_card() {
         server.base_url(),
     )
     .unwrap();
-    let channel = LarkChannel::with_api(api);
-    let task = LarkTask::from_message(
+    let channel = ConfiguredChannel::Lark(LarkChannel::with_api(api));
+    let task = ConfiguredTask::Lark(LarkTask::from_message(
         LarkMessageEvent {
             id: "evt_message".to_string(),
             message_id: "om_ask".to_string(),
@@ -184,7 +184,7 @@ async fn lark_ask_message_replies_with_a_threaded_interactive_card() {
             mention_ids: Vec::new(),
         },
         crate::task::TaskContent::new("/ask list"),
-    );
+    ));
 
     channel
         .reply(

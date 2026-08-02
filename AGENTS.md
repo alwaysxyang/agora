@@ -76,6 +76,7 @@ After editing:
 
 - Run formatting.
 - Run the narrowest relevant tests first.
+- Run tests and Clippy for affected crates while iterating; defer workspace-wide validation until the change is ready.
 - Run workspace test coverage when Rust code or tests changed.
 - Run clippy when Rust code changed.
 - Check whether the code change affects any document under `spec/`.
@@ -87,10 +88,14 @@ After editing:
 ## Test Coverage
 
 - Maintain at least 90% line coverage across the Rust workspace.
+- Cargo builds, unit tests, and coverage tests use the project default of 16 concurrent jobs or test threads.
+- Do not force the whole workspace to use `--test-threads=1`; serialize only the specific tests that share process-global state.
+- Do not launch multiple Cargo build, test, Clippy, or coverage processes concurrently against the same target directory. Let Cargo and libtest provide internal concurrency without target-lock contention.
+- Run workspace coverage once after focused validation is green, not after every intermediate edit.
 - Use the project's configured coverage command when one exists. Otherwise run:
 
 ```bash
-cargo llvm-cov --workspace --all-targets --fail-under-lines 90
+cargo llvm-cov --no-clean --workspace --all-targets --jobs 16 --fail-under-lines 90
 ```
 
 - Do not lower the threshold, exclude production code, or mark code as uncovered solely to make the coverage check pass.

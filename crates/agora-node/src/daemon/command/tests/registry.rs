@@ -251,7 +251,7 @@ async fn command_registry_executes_a_registered_handler_without_central_dispatch
 
 #[test]
 fn command_registry_rejects_invalid_tree_definitions() {
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum TestHandler {
         Run,
     }
@@ -290,6 +290,115 @@ fn command_registry_rejects_invalid_tree_definitions() {
             .to_string(),
         "remaining argument is not last in /ask: prompt"
     );
+
+    for (command, expected) in [
+        (
+            CommandNode::new("invalid name", "Invalid name").handler(TestHandler::Run),
+            "invalid command name: invalid name",
+        ),
+        (
+            CommandNode::new("help", "Reserved name").handler(TestHandler::Run),
+            "command name is reserved: help",
+        ),
+        (
+            CommandNode::new("empty", " ").handler(TestHandler::Run),
+            "command description is empty: empty",
+        ),
+        (
+            CommandNode::new("arguments", "Arguments without a handler")
+                .argument(Argument::optional("value", "Value")),
+            "command without a handler has arguments: arguments",
+        ),
+        (
+            CommandNode::new("empty", "No behavior"),
+            "command has neither a handler nor subcommands: empty",
+        ),
+        (
+            CommandNode::new("run", "Invalid argument")
+                .argument(Argument::required("invalid name", "Value"))
+                .handler(TestHandler::Run),
+            "invalid argument name in /run: invalid name",
+        ),
+        (
+            CommandNode::new("run", "Duplicate argument")
+                .argument(Argument::required("value", "First value"))
+                .argument(Argument::optional("value", "Second value"))
+                .handler(TestHandler::Run),
+            "duplicate argument in /run: value",
+        ),
+    ] {
+        assert_eq!(
+            CommandRegistry::new()
+                .register(command)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+
+    let mut registry = CommandRegistry::new();
+    registry
+        .register(CommandNode::new("run", "First root").handler(TestHandler::Run))
+        .unwrap();
+    assert_eq!(
+        registry
+            .register(CommandNode::new("run", "Second root").handler(TestHandler::Run))
+            .unwrap_err()
+            .to_string(),
+        "duplicate root command: run"
+    );
+}
+
+#[test]
+fn command_registry_handles_invalid_help_and_structured_paths() {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TestHandler {
+        Run,
+    }
+
+    let mut registry = CommandRegistry::new();
+    registry
+        .register(
+            CommandNode::new("root", "Root command").subcommand(
+                CommandNode::new("child", "Child command")
+                    .subcommand(CommandNode::new("run", "Run command").handler(TestHandler::Run)),
+            ),
+        )
+        .unwrap();
+
+    assert_eq!(
+        registry.route("/help extra"),
+        CommandResolution::Reply("用法：/help".to_string())
+    );
+    assert_eq!(
+        registry.route("/root help extra"),
+        CommandResolution::Reply("用法：/root help".to_string())
+    );
+    assert!(matches!(
+        registry.route("/root"),
+        CommandResolution::Reply(reply) if reply.contains("/root child")
+    ));
+    assert!(matches!(
+        registry.route("/root unknown"),
+        CommandResolution::Reply(reply) if reply.contains("未知子命令")
+    ));
+
+    assert!(matches!(
+        registry.route_structured(&CommandRequest::new(std::iter::empty::<&str>())),
+        CommandResolution::Reply(reply) if reply == crate::i18n::UNKNOWN_STRUCTURED_COMMAND
+    ));
+    assert!(matches!(
+        registry.route_structured(&CommandRequest::new(["unknown"])),
+        CommandResolution::Reply(reply) if reply.contains("未知命令")
+    ));
+    assert!(matches!(
+        registry.route_structured(&CommandRequest::new(["root", "unknown"])),
+        CommandResolution::Reply(reply) if reply.contains("未知命令")
+    ));
+    assert!(matches!(
+        registry.route_structured(&CommandRequest::new(["root", "child"])),
+        CommandResolution::Reply(reply) if reply.contains("/root child run")
+    ));
 }
 
 #[tokio::test]
