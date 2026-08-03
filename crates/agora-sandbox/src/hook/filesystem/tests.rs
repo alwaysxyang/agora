@@ -5,16 +5,16 @@ use super::{
     agora_sandbox_clonefile as sandbox_clonefile, agora_sandbox_clonefileat as sandbox_clonefileat,
     agora_sandbox_close as sandbox_close, agora_sandbox_closedir as sandbox_closedir,
     agora_sandbox_copyfile as sandbox_copyfile, agora_sandbox_creat as sandbox_creat,
-    agora_sandbox_dup as sandbox_dup, agora_sandbox_fchmod as sandbox_fchmod,
-    agora_sandbox_fchmodat as sandbox_fchmodat, agora_sandbox_fchown as sandbox_fchown,
-    agora_sandbox_fchownat as sandbox_fchownat, agora_sandbox_fclose as sandbox_fclose,
-    agora_sandbox_fdopendir as sandbox_fdopendir, agora_sandbox_fopen as sandbox_fopen,
-    agora_sandbox_fstat as sandbox_fstat, agora_sandbox_fstatat as sandbox_fstatat,
-    agora_sandbox_fsync as sandbox_fsync, agora_sandbox_ftruncate as sandbox_ftruncate,
-    agora_sandbox_getcwd as sandbox_getcwd, agora_sandbox_lchown as sandbox_lchown,
-    agora_sandbox_link as sandbox_link, agora_sandbox_linkat as sandbox_linkat,
-    agora_sandbox_lstat as sandbox_lstat, agora_sandbox_mkdir as sandbox_mkdir,
-    agora_sandbox_mkdirat as sandbox_mkdirat,
+    agora_sandbox_dup as sandbox_dup, agora_sandbox_fchdir as sandbox_fchdir,
+    agora_sandbox_fchmod as sandbox_fchmod, agora_sandbox_fchmodat as sandbox_fchmodat,
+    agora_sandbox_fchown as sandbox_fchown, agora_sandbox_fchownat as sandbox_fchownat,
+    agora_sandbox_fclose as sandbox_fclose, agora_sandbox_fdopendir as sandbox_fdopendir,
+    agora_sandbox_fopen as sandbox_fopen, agora_sandbox_fstat as sandbox_fstat,
+    agora_sandbox_fstatat as sandbox_fstatat, agora_sandbox_fsync as sandbox_fsync,
+    agora_sandbox_ftruncate as sandbox_ftruncate, agora_sandbox_getcwd as sandbox_getcwd,
+    agora_sandbox_lchown as sandbox_lchown, agora_sandbox_link as sandbox_link,
+    agora_sandbox_linkat as sandbox_linkat, agora_sandbox_lstat as sandbox_lstat,
+    agora_sandbox_mkdir as sandbox_mkdir, agora_sandbox_mkdirat as sandbox_mkdirat,
     agora_sandbox_open_with_mode as sandbox_open_with_mode,
     agora_sandbox_openat_with_mode as sandbox_openat_with_mode,
     agora_sandbox_opendir as sandbox_opendir,
@@ -30,11 +30,12 @@ use super::{
     sandbox_unsupported_mutation, with_test_runtime,
 };
 use crate::audit::AuditClient;
-use crate::filesystem::EntryState;
+use crate::filesystem::{EntryState, FileLayer};
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -381,6 +382,102 @@ fn fdopendir_uses_the_merged_directory_view() {
                 name.len() == 32 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
             })
         );
+    });
+}
+
+#[test]
+fn fdopendir_uses_the_descriptor_layer_when_the_upper_appears_later() {
+    let fixture = Fixture::new();
+    let runtime = FilesystemHookRuntime::new_encrypted(
+        fixture.directory.join("encrypted-late-upper-workdir/fs"),
+        b"test-key",
+        b"0123456789abcdef",
+    )
+    .unwrap();
+    std::fs::write(fixture.lower.join("lower.txt"), b"host").unwrap();
+
+    with_test_runtime(&runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(
+            Fixture::c_path(&fixture.lower).as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        );
+        assert!(descriptor >= 0);
+
+        let upper = fixture.lower.join("upper.txt");
+        let file = sandbox_open_with_mode(
+            Fixture::c_path(&upper).as_ptr(),
+            libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(file >= 0);
+        assert_eq!(sandbox_close(file), 0);
+
+        let directory = sandbox_fdopendir(descriptor);
+        assert!(!directory.is_null());
+        let mut names = HashSet::new();
+        loop {
+            let entry = sandbox_readdir(directory);
+            if entry.is_null() {
+                break;
+            }
+            names.insert(
+                CStr::from_ptr((*entry).d_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        assert_eq!(sandbox_closedir(directory), 0);
+        assert!(names.contains("lower.txt"), "directory names: {names:?}");
+        assert!(names.contains("upper.txt"), "directory names: {names:?}");
+    });
+}
+
+#[test]
+fn fdopendir_failure_keeps_the_callers_descriptor_open() {
+    struct RestorePermissions(PathBuf);
+
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    let fixture = Fixture::new();
+    let runtime = FilesystemHookRuntime::new_encrypted(
+        fixture
+            .directory
+            .join("encrypted-fdopendir-failure-workdir/fs"),
+        b"test-key",
+        b"0123456789abcdef",
+    )
+    .unwrap();
+    let upper = fixture.lower.join("upper.txt");
+
+    with_test_runtime(&runtime, || unsafe {
+        let file = sandbox_open_with_mode(
+            Fixture::c_path(&upper).as_ptr(),
+            libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(file >= 0);
+        assert_eq!(sandbox_close(file), 0);
+
+        let descriptor = sandbox_open_with_mode(
+            Fixture::c_path(&fixture.lower).as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        );
+        assert!(descriptor >= 0);
+        let restore_permissions = RestorePermissions(fixture.lower.clone());
+        std::fs::set_permissions(&fixture.lower, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let directory = sandbox_fdopendir(descriptor);
+        assert!(directory.is_null());
+        assert!(libc::fcntl(descriptor, libc::F_GETFD) >= 0);
+
+        drop(restore_permissions);
+        assert_eq!(sandbox_close(descriptor), 0);
     });
 }
 
@@ -804,7 +901,7 @@ fn directory_cursor_prefers_upper_entries_and_hides_whiteouts() {
         .remove(&lower.join("removed"), false)
         .unwrap();
     let view = fixture.runtime.filesystem.directory_view(&lower).unwrap();
-    let mut cursor = DirectoryCursor::new(None, &view);
+    let mut cursor = DirectoryCursor::new(None, FileLayer::Upper, &view);
 
     assert_eq!(cursor.include(b"same", false).unwrap(), b"same");
     assert!(cursor.include(b"same", true).is_none());
@@ -900,6 +997,31 @@ fn chdir_updates_the_logical_directory_after_the_native_change_succeeds() {
     });
 
     drop(restore);
+}
+
+#[test]
+fn fchdir_fails_before_changing_directory_when_logical_resolution_fails() {
+    struct RestoreDirectory(PathBuf);
+
+    impl Drop for RestoreDirectory {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).unwrap();
+        }
+    }
+
+    let original = std::env::current_dir().unwrap();
+    let _restore = RestoreDirectory(original.clone());
+    let fixture = Fixture::new();
+    let invalid = fixture.runtime.filesystem.root().join(".agora-entry-*");
+    std::fs::create_dir(&invalid).unwrap();
+    let directory = std::fs::File::open(invalid).unwrap();
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        *libc::__error() = 0;
+        assert_eq!(sandbox_fchdir(directory.as_raw_fd()), -1);
+        assert_eq!(*libc::__error(), libc::EIO);
+        assert_eq!(std::env::current_dir().unwrap(), original);
+    });
 }
 
 #[test]

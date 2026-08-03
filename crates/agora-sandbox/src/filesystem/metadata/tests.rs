@@ -194,6 +194,38 @@ fn metadata_rejects_invalid_encoded_names() {
 }
 
 #[test]
+fn metadata_rejects_invalid_backing_names() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let path = store.path(Path::new("/tmp")).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&DirectoryMetadata {
+            version: METADATA_VERSION,
+            entries: Default::default(),
+            attributes: Default::default(),
+            backing_names: BTreeMap::from([(
+                MetadataStore::encode(Path::new("file").as_os_str()),
+                "../../outside".to_string(),
+            )]),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        store
+            .backing_name(Path::new("/tmp/file"))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid filesystem backing name")
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn metadata_store_rejects_a_file_as_its_root() {
     let root = tempfile();
     std::fs::remove_dir_all(&root).unwrap();

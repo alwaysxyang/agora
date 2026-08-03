@@ -699,9 +699,27 @@ impl FilesystemHookRuntime {
         self.filesystem.directory_view(&logical)
     }
 
-    fn descriptor_directory_view(&self, descriptor: libc::c_int) -> Result<DirectoryView> {
-        let logical = self.resolve_descriptor_logical_path(descriptor)?;
-        self.filesystem.directory_view(&logical)
+    fn descriptor_directory_view(
+        &self,
+        descriptor: libc::c_int,
+    ) -> Result<(DirectoryView, FileLayer)> {
+        let (logical, layer) = if let Some(open) = self.tracked_open(descriptor) {
+            (open.logical.clone(), open.layer)
+        } else {
+            let path = Self::descriptor_path(descriptor)?;
+            let layer = if self.filesystem.is_internal(&path) {
+                FileLayer::Upper
+            } else {
+                FileLayer::Lower
+            };
+            let logical = if layer == FileLayer::Upper {
+                self.filesystem.logical_path(&path)?
+            } else {
+                self.logical_or_host(&path)?
+            };
+            (logical, layer)
+        };
+        Ok((self.filesystem.directory_view(&logical)?, layer))
     }
 }
 
@@ -791,7 +809,8 @@ fn configure_descriptor(descriptor: libc::c_int, flags: libc::c_int) -> Result<(
 }
 
 struct DirectoryCursor {
-    lower: Option<usize>,
+    auxiliary: Option<usize>,
+    primary_layer: FileLayer,
     reading_lower: bool,
     hidden: HashSet<Vec<u8>>,
     aliases: HashMap<Vec<u8>, Vec<u8>>,
@@ -799,9 +818,14 @@ struct DirectoryCursor {
 }
 
 impl DirectoryCursor {
-    fn new(lower: Option<*mut libc::DIR>, view: &DirectoryView) -> Self {
+    fn new(
+        auxiliary: Option<*mut libc::DIR>,
+        primary_layer: FileLayer,
+        view: &DirectoryView,
+    ) -> Self {
         Self {
-            lower: lower.map(|directory| directory as usize),
+            auxiliary: auxiliary.map(|directory| directory as usize),
+            primary_layer,
             reading_lower: false,
             hidden: view
                 .hidden()
@@ -816,6 +840,15 @@ impl DirectoryCursor {
                 })
                 .collect(),
             seen: HashSet::new(),
+        }
+    }
+
+    fn source(&self, primary: *mut libc::DIR) -> Option<*mut libc::DIR> {
+        match (self.reading_lower, self.primary_layer) {
+            (false, FileLayer::Upper) | (true, FileLayer::Lower) => Some(primary),
+            (false, FileLayer::Lower) | (true, FileLayer::Upper) => {
+                self.auxiliary.map(|directory| directory as *mut libc::DIR)
+            }
         }
     }
 
@@ -2265,14 +2298,13 @@ unsafe fn sandbox_fchdir(descriptor: libc::c_int) -> libc::c_int {
             return unsafe { original(descriptor) };
         };
         let caller_errno = unsafe { *libc::__error() };
-        let logical = runtime.resolve_descriptor_logical_path(descriptor).ok();
+        let logical = match runtime.resolve_descriptor_logical_path(descriptor) {
+            Ok(logical) => logical,
+            Err(error) => return unsafe { fail(&error, -1) },
+        };
         let result = unsafe { original(descriptor) };
-        if result == 0
-            && let Some(logical) = logical
-        {
-            runtime.set_current_directory(logical);
-        }
         if result == 0 {
+            runtime.set_current_directory(logical);
             unsafe { set_errno(caller_errno) };
         }
         result
@@ -2359,13 +2391,20 @@ unsafe fn sandbox_opendir(path: *const libc::c_char) -> *mut libc::DIR {
                 if view.is_passthrough() {
                     return directory;
                 }
-                match unsafe { register_directory_cursor(runtime, directory, &view) } {
-                    Ok(()) => directory,
+                let layer = if runtime.filesystem.is_internal(view.primary()) {
+                    FileLayer::Upper
+                } else {
+                    FileLayer::Lower
+                };
+                let auxiliary = match unsafe { open_auxiliary_directory(&view, layer) } {
+                    Ok(auxiliary) => auxiliary,
                     Err(error) => {
                         unsafe { original_closedir().map(|close| close(directory)) };
-                        unsafe { fail(&error, std::ptr::null_mut()) }
+                        return unsafe { fail(&error, std::ptr::null_mut()) };
                     }
-                }
+                };
+                unsafe { register_directory_cursor(runtime, directory, auxiliary, layer, &view) };
+                directory
             }
             Err(error) => unsafe { fail(&error, std::ptr::null_mut()) },
         }
@@ -2377,27 +2416,40 @@ pub unsafe extern "C" fn agora_sandbox_opendir(path: *const libc::c_char) -> *mu
     unsafe { sandbox_opendir(path) }
 }
 
+unsafe fn open_auxiliary_directory(
+    view: &DirectoryView,
+    primary_layer: FileLayer,
+) -> Result<Option<*mut libc::DIR>> {
+    let path = match primary_layer {
+        FileLayer::Upper => view.lower(),
+        FileLayer::Lower if view.lower().is_some() => Some(view.primary()),
+        FileLayer::Lower => None,
+    };
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let path = CString::new(path.as_os_str().as_bytes())
+        .context("auxiliary directory path contains NUL")?;
+    let original = original_opendir().context("opendir is unavailable")?;
+    let directory = unsafe { original(path.as_ptr()) };
+    if directory.is_null() {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(Some(directory))
+}
+
 unsafe fn register_directory_cursor(
     runtime: &FilesystemHookRuntime,
     directory: *mut libc::DIR,
+    auxiliary: Option<*mut libc::DIR>,
+    primary_layer: FileLayer,
     view: &DirectoryView,
-) -> Result<()> {
-    let lower = match view.lower() {
-        Some(path) => {
-            let path = CString::new(path.as_os_str().as_bytes())
-                .context("lower directory path contains NUL")?;
-            let original = original_opendir().context("opendir is unavailable")?;
-            let lower = unsafe { original(path.as_ptr()) };
-            if lower.is_null() {
-                return Err(io::Error::last_os_error().into());
-            }
-            Some(lower)
-        }
-        None => None,
-    };
-    lock(directory_cursors()).insert(directory as usize, DirectoryCursor::new(lower, view));
+) {
+    lock(directory_cursors()).insert(
+        directory as usize,
+        DirectoryCursor::new(auxiliary, primary_layer, view),
+    );
     runtime.register_directory(unsafe { libc::dirfd(directory) }, view.logical().into());
-    Ok(())
 }
 
 unsafe fn sandbox_fdopendir(descriptor: libc::c_int) -> *mut libc::DIR {
@@ -2412,21 +2464,28 @@ unsafe fn sandbox_fdopendir(descriptor: libc::c_int) -> *mut libc::DIR {
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return unsafe { original(descriptor) };
         };
-        let view = match runtime.descriptor_directory_view(descriptor) {
+        let (view, layer) = match runtime.descriptor_directory_view(descriptor) {
             Ok(view) => view,
             Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
         };
+        if view.is_passthrough() && layer == FileLayer::Lower {
+            return unsafe { original(descriptor) };
+        }
+        let auxiliary = match unsafe { open_auxiliary_directory(&view, layer) } {
+            Ok(auxiliary) => auxiliary,
+            Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
+        };
         let directory = unsafe { original(descriptor) };
-        if directory.is_null() || view.is_passthrough() {
+        if directory.is_null() {
+            let error = unsafe { *libc::__error() };
+            if let Some(auxiliary) = auxiliary {
+                unsafe { original_closedir().map(|close| close(auxiliary)) };
+            }
+            unsafe { set_errno(error) };
             return directory;
         }
-        match unsafe { register_directory_cursor(runtime, directory, &view) } {
-            Ok(()) => directory,
-            Err(error) => {
-                unsafe { original_closedir().map(|close| close(directory)) };
-                unsafe { fail(&error, std::ptr::null_mut()) }
-            }
-        }
+        unsafe { register_directory_cursor(runtime, directory, auxiliary, layer, &view) };
+        directory
     })
 }
 
@@ -2447,13 +2506,15 @@ unsafe fn sandbox_readdir(directory: *mut libc::DIR) -> *mut libc::dirent {
             return unsafe { original(directory) };
         };
         loop {
-            let source = if cursor.reading_lower {
-                let Some(lower) = cursor.lower else {
+            let source = match cursor.source(directory) {
+                Some(source) => source,
+                None if cursor.reading_lower => {
                     return std::ptr::null_mut();
-                };
-                lower as *mut libc::DIR
-            } else {
-                directory
+                }
+                None => {
+                    cursor.reading_lower = true;
+                    continue;
+                }
             };
             unsafe { set_errno(0) };
             let entry = unsafe { original(source) };
@@ -2525,9 +2586,9 @@ unsafe fn sandbox_closedir(directory: *mut libc::DIR) -> libc::c_int {
         };
         let cursor = lock(directory_cursors()).remove(&(directory as usize));
         let descriptor = unsafe { libc::dirfd(directory) };
-        let lower_result = cursor
-            .and_then(|cursor| cursor.lower)
-            .map(|lower| unsafe { original(lower as *mut libc::DIR) });
+        let auxiliary_result = cursor
+            .and_then(|cursor| cursor.auxiliary)
+            .map(|auxiliary| unsafe { original(auxiliary as *mut libc::DIR) });
         let result = unsafe { original(directory) };
         if result == 0
             && let Some(runtime) = FilesystemHookRuntime::global()
@@ -2536,7 +2597,7 @@ unsafe fn sandbox_closedir(directory: *mut libc::DIR) -> libc::c_int {
             runtime.unregister_directory(descriptor);
         }
         if result == 0 {
-            lower_result.unwrap_or(0)
+            auxiliary_result.unwrap_or(0)
         } else {
             result
         }

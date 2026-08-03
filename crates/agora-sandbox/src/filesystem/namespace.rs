@@ -68,7 +68,7 @@ pub(super) fn is_control_name(name: &OsStr) -> bool {
         || name.starts_with(b".agora-rekey-")
 }
 
-fn is_file_backing_name(name: &[u8]) -> bool {
+pub(super) fn is_file_backing_name(name: &[u8]) -> bool {
     name.len() == 32 && name.iter().all(u8::is_ascii_hexdigit)
 }
 

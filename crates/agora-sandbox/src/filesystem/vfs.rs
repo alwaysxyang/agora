@@ -87,12 +87,18 @@ impl VirtualFilesystem {
         mode: u32,
     ) -> Result<PreparedFile> {
         if flags & libc::O_DIRECTORY != 0 {
+            let target = self.overlay.prepare_directory(logical)?;
+            let layer = if self.overlay.is_internal(&target) {
+                FileLayer::Upper
+            } else {
+                FileLayer::Lower
+            };
             return Ok(PreparedFile {
-                target: OpenTarget::Path(self.overlay.prepare_directory(logical)?),
+                target: OpenTarget::Path(target),
                 staged: None,
                 writeback: None,
                 created_mode: None,
-                layer: FileLayer::Upper,
+                layer,
             });
         }
         let writes = flags & libc::O_ACCMODE != libc::O_RDONLY

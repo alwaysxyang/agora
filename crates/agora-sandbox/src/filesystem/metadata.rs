@@ -2,7 +2,7 @@ use super::namespace::{self, METADATA_FILE};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -345,6 +345,17 @@ impl MetadataStore {
                 metadata.version,
                 path.display()
             );
+        }
+        let mut backing_names = HashSet::new();
+        for backing in metadata.backing_names.values() {
+            if !namespace::is_file_backing_name(backing.as_bytes())
+                || !backing_names.insert(backing)
+            {
+                bail!(
+                    "invalid filesystem backing name {backing:?} in {}",
+                    path.display()
+                );
+            }
         }
         let mut cache = self.cache();
         if cache.len() >= METADATA_CACHE_CAPACITY && !cache.contains_key(&path) {
