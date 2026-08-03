@@ -138,6 +138,11 @@ Current status:
   controller, then delivered through the same callback as network events with the shared trace
   chain. File events retain the logical pre-overlay path and structured open mode from open through
   close. A run terminates residual members of its process group but retains prepared copies.
+- The filesystem VFS owns overlay namespace, short publication locking, per-backing namespace
+  leases, and logical Unix mode authorization. The libc hook
+  selects real or effective credentials for each operation and adapts results without duplicating
+  the permission policy. Synchronous workspace and key-migration storage work runs on blocking
+  workers behind the public asynchronous runner API.
 - The CLI renders one compact JSON Lines record per network connection attempt, intercepted
   descendant process execution attempt, and intercepted file open or close to stdout by default,
   or appends it to `--audit-file`; its callback always allows requests.
@@ -161,8 +166,11 @@ Rules:
   `agora-sandbox`; do not expose them as workspace crates or public integration APIs.
 - Keep executable preparation and its authenticated loopback control protocol private to the
   `execution` source module. Never modify the original executable. Keep persistent prepared copies
-  under `<workdir>/fs`, validate them with directory-local `checksums.json` manifests, and remove
-  them only through `agora-sandbox clean`.
+  under `<workdir>/fs` and validate them through the directory-local versioned `.metadata` state.
+  Persistent state is removed only by explicitly deleting the work directory outside sandbox
+  startup; there is no `agora-sandbox clean` command.
+- Keep workspace setup, encrypted storage, and key migration synchronous internally. Dispatch them
+  at the async runner boundary instead of marking blocking filesystem operations `async`.
 - Build the `agora-sandbox` library as both `rlib` for SDK callers and `cdylib` for macOS injection.
 
 ## Dependency Direction

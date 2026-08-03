@@ -16,14 +16,13 @@ pub(crate) enum FilesystemWorkspace {
 }
 
 impl FilesystemWorkspace {
-    pub(crate) async fn start(
+    pub(crate) fn start(
         workdir: &Path,
         mode: FilesystemMode,
         encrypted_key: Option<&[u8]>,
     ) -> Result<Self> {
         match (mode, encrypted_key) {
             (FilesystemMode::Encrypted, Some(key)) => EncryptedWorkspace::start(workdir, key)
-                .await
                 .map(Box::new)
                 .map(Self::Encrypted),
             (FilesystemMode::Encrypted, None) => bail!("sandbox filesystem key is required"),
@@ -38,13 +37,6 @@ impl FilesystemWorkspace {
         match self {
             Self::Encrypted(workspace) => workspace.root(),
             Self::Plain(workspace) => workspace.root(),
-        }
-    }
-
-    pub(crate) async fn shutdown(&mut self) -> Result<()> {
-        match self {
-            Self::Encrypted(workspace) => workspace.shutdown().await,
-            Self::Plain(_) => Ok(()),
         }
     }
 

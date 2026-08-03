@@ -7,7 +7,6 @@ use crate::filesystem::metadata::{EntryState, Materializer, MetadataStore};
 use crate::filesystem::{OpenTarget, VirtualFilesystem};
 use base64::Engine;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
 fn temporary_directory(label: &str) -> PathBuf {
@@ -36,59 +35,46 @@ fn passphrase_validation_rejects_invalid_keys() {
     );
 }
 
-#[tokio::test]
-async fn encrypted_workspace_uses_fs_as_its_backing_root_and_validates_the_key() {
+#[test]
+fn encrypted_workspace_uses_fs_as_its_backing_root_and_validates_the_key() {
     let workdir = temporary_directory("lifecycle");
-    let mut first = EncryptedWorkspace::start(&workdir, b"old-key")
-        .await
-        .unwrap();
+    let first = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
     assert_eq!(first.root(), workdir.join("fs"));
     assert!(first.root().join(".fs.lock").is_file());
     assert!(first.root().join(".key.json").is_file());
     assert!(!workdir.join("filesystem").exists());
     let salt = first.salt().to_vec();
-    first.shutdown().await.unwrap();
     drop(first);
 
-    let wrong = EncryptedWorkspace::start(&workdir, b"wrong-key")
-        .await
-        .unwrap_err();
+    let wrong = EncryptedWorkspace::start(&workdir, b"wrong-key").unwrap_err();
     assert!(wrong.to_string().contains("key is incorrect"), "{wrong:#}");
 
-    let mut reopened = EncryptedWorkspace::start(&workdir, b"old-key")
-        .await
-        .unwrap();
+    let reopened = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
     assert_eq!(reopened.salt(), salt);
-    reopened.shutdown().await.unwrap();
     drop(reopened);
     std::fs::remove_dir_all(workdir).unwrap();
 }
 
-#[tokio::test]
-async fn encrypted_workspace_lock_is_exclusive_and_shutdown_is_immediate() {
+#[test]
+fn encrypted_workspace_lock_is_exclusive_and_drop_is_immediate() {
     let workdir = temporary_directory("lock");
-    let mut first = EncryptedWorkspace::start(&workdir, b"key").await.unwrap();
+    let first = EncryptedWorkspace::start(&workdir, b"key").unwrap();
     assert!(
         EncryptedWorkspace::start(&workdir, b"key")
-            .await
             .unwrap_err()
             .to_string()
             .contains("already in use")
     );
-    first.shutdown().await.unwrap();
     drop(first);
-    let mut second = EncryptedWorkspace::start(&workdir, b"key").await.unwrap();
-    second.shutdown().await.unwrap();
+    let second = EncryptedWorkspace::start(&workdir, b"key").unwrap();
     drop(second);
     std::fs::remove_dir_all(workdir).unwrap();
 }
 
-#[tokio::test]
-async fn key_migration_reencrypts_existing_backing_files() {
+#[test]
+fn key_migration_reencrypts_existing_backing_files() {
     let workdir = temporary_directory("migration");
-    let mut workspace = EncryptedWorkspace::start(&workdir, b"old-key")
-        .await
-        .unwrap();
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
     let path = workspace.root().join("project/secret");
     let mut plaintext = tempfile::tempfile().unwrap();
     plaintext.write_all(b"secret contents").unwrap();
@@ -97,15 +83,10 @@ async fn key_migration_reencrypts_existing_backing_files() {
         .encrypt(&mut plaintext, &path)
         .unwrap();
     let old_salt = workspace.salt().to_vec();
-    workspace.shutdown().await.unwrap();
     drop(workspace);
 
-    EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key")
-        .await
-        .unwrap();
-    let mut migrated = EncryptedWorkspace::start(&workdir, b"new-key")
-        .await
-        .unwrap();
+    EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key").unwrap();
+    let migrated = EncryptedWorkspace::start(&workdir, b"new-key").unwrap();
     assert_ne!(migrated.salt(), old_salt);
     let mut decrypted = tempfile::tempfile().unwrap();
     FileCipher::derive(b"new-key", migrated.salt())
@@ -116,12 +97,10 @@ async fn key_migration_reencrypts_existing_backing_files() {
     let mut contents = Vec::new();
     decrypted.read_to_end(&mut contents).unwrap();
     assert_eq!(contents, b"secret contents");
-    migrated.shutdown().await.unwrap();
     drop(migrated);
 
     assert!(
         EncryptedWorkspace::start(&workdir, b"old-key")
-            .await
             .unwrap_err()
             .to_string()
             .contains("key is incorrect")
@@ -129,12 +108,10 @@ async fn key_migration_reencrypts_existing_backing_files() {
     std::fs::remove_dir_all(workdir).unwrap();
 }
 
-#[tokio::test]
-async fn key_migration_ignores_persistent_executable_caches() {
+#[test]
+fn key_migration_ignores_persistent_executable_caches() {
     let workdir = temporary_directory("migration-cache");
-    let workspace = EncryptedWorkspace::start(&workdir, b"old-key")
-        .await
-        .unwrap();
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
     let cached = workspace.root().join("usr/bin/tool");
     std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
     std::fs::write(&cached, b"prepared executable").unwrap();
@@ -150,25 +127,17 @@ async fn key_migration_ignores_persistent_executable_caches() {
         .unwrap();
     drop(workspace);
 
-    EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key")
-        .await
-        .unwrap();
+    EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key").unwrap();
 
     assert_eq!(std::fs::read(cached).unwrap(), b"prepared executable");
-    drop(
-        EncryptedWorkspace::start(&workdir, b"new-key")
-            .await
-            .unwrap(),
-    );
+    drop(EncryptedWorkspace::start(&workdir, b"new-key").unwrap());
     std::fs::remove_dir_all(workdir).unwrap();
 }
 
-#[tokio::test]
-async fn key_migration_reencrypts_logical_names_that_resemble_control_files() {
+#[test]
+fn key_migration_reencrypts_logical_names_that_resemble_control_files() {
     let workdir = temporary_directory("migration-control-name");
-    let workspace = EncryptedWorkspace::start(&workdir, b"old-key")
-        .await
-        .unwrap();
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
     let root = workspace.root().to_path_buf();
     let lower = temporary_directory("migration-control-name-lower");
     std::fs::create_dir_all(&lower).unwrap();
@@ -188,20 +157,16 @@ async fn key_migration_reencrypts_logical_names_that_resemble_control_files() {
     file.write_all(b"control-like contents").unwrap();
     filesystem.commit_open(&mut prepared).unwrap();
     let (target, writeback, _) = prepared.into_parts();
-    let OpenTarget::Descriptor(file) = target else {
+    let OpenTarget::Descriptor(_) = target else {
         panic!("encrypted file did not use an anonymous descriptor");
     };
-    writeback.unwrap().commit(file.as_raw_fd()).unwrap();
+    filesystem.commit_writeback(&writeback.unwrap()).unwrap();
     drop(filesystem);
     drop(workspace);
 
-    EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key")
-        .await
-        .unwrap();
+    EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key").unwrap();
 
-    let workspace = EncryptedWorkspace::start(&workdir, b"new-key")
-        .await
-        .unwrap();
+    let workspace = EncryptedWorkspace::start(&workdir, b"new-key").unwrap();
     let filesystem = VirtualFilesystem::encrypted(
         workspace.root(),
         FileCipher::derive(b"new-key", workspace.salt()).unwrap(),
@@ -222,12 +187,10 @@ async fn key_migration_reencrypts_logical_names_that_resemble_control_files() {
     std::fs::remove_dir_all(workdir).unwrap();
 }
 
-#[tokio::test]
-async fn startup_recovers_interrupted_key_migration_before_opening_the_workspace() {
+#[test]
+fn startup_recovers_interrupted_key_migration_before_opening_the_workspace() {
     let workdir = temporary_directory("migration-recovery");
-    let workspace = EncryptedWorkspace::start(&workdir, b"old-key")
-        .await
-        .unwrap();
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
     let root = workspace.root().to_path_buf();
     let destination = root.join("project/secret");
     let backup = root.join("project/.agora-rekey-old-test");
@@ -263,9 +226,7 @@ async fn startup_recovers_interrupted_key_migration_before_opening_the_workspace
     )
     .unwrap();
 
-    let workspace = EncryptedWorkspace::start(&workdir, b"old-key")
-        .await
-        .unwrap();
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
     assert!(!root.join(".rekey.json").exists());
     assert!(!backup.exists());
     assert_eq!(
@@ -299,9 +260,7 @@ async fn startup_recovers_interrupted_key_migration_before_opening_the_workspace
     .unwrap();
     EncryptedWorkspace::write_key_metadata(&root, &new_key).unwrap();
 
-    let workspace = EncryptedWorkspace::start(&workdir, b"new-key")
-        .await
-        .unwrap();
+    let workspace = EncryptedWorkspace::start(&workdir, b"new-key").unwrap();
     assert!(!root.join(".rekey.json").exists());
     assert!(!backup.exists());
     assert_eq!(
@@ -315,15 +274,13 @@ async fn startup_recovers_interrupted_key_migration_before_opening_the_workspace
     std::fs::remove_dir_all(workdir).unwrap();
 }
 
-#[tokio::test]
-async fn encrypted_workspace_rejects_existing_plaintext_data() {
+#[test]
+fn encrypted_workspace_rejects_existing_plaintext_data() {
     let workdir = temporary_directory("plaintext");
     std::fs::create_dir_all(workdir.join("fs/project")).unwrap();
     std::fs::write(workdir.join("fs/project/plaintext"), b"visible").unwrap();
 
-    let error = EncryptedWorkspace::start(&workdir, b"key")
-        .await
-        .unwrap_err();
+    let error = EncryptedWorkspace::start(&workdir, b"key").unwrap_err();
     assert!(
         error.to_string().contains("unencrypted filesystem data"),
         "{error:#}"
@@ -341,10 +298,7 @@ fn cipher_key_identity_is_stable_for_the_same_key_and_salt() {
 #[test]
 fn encrypted_workspace_debug_redacts_the_key_and_resolves_relative_destinations() {
     let workdir = temporary_directory("debug");
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let workspace = runtime
-        .block_on(EncryptedWorkspace::start(&workdir, b"very-secret"))
-        .unwrap();
+    let workspace = EncryptedWorkspace::start(&workdir, b"very-secret").unwrap();
     let debug = format!("{workspace:?}");
     assert!(debug.contains("EncryptedWorkspace"));
     assert!(debug.contains("[REDACTED]"));
@@ -388,19 +342,19 @@ fn key_metadata_validation_rejects_unsupported_or_malformed_salts() {
     );
 }
 
-#[tokio::test]
-async fn encrypted_workspace_reports_invalid_roots_and_key_metadata() {
+#[test]
+fn encrypted_workspace_reports_invalid_roots_and_key_metadata() {
     let workdir = temporary_directory("invalid-root");
     std::fs::create_dir_all(&workdir).unwrap();
     std::fs::write(workdir.join("fs"), b"not a directory").unwrap();
-    assert!(EncryptedWorkspace::start(&workdir, b"key").await.is_err());
+    assert!(EncryptedWorkspace::start(&workdir, b"key").is_err());
     std::fs::remove_dir_all(&workdir).unwrap();
 
     let workdir = temporary_directory("invalid-metadata");
     let root = workdir.join("fs");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join(".key.json"), b"not json").unwrap();
-    assert!(EncryptedWorkspace::start(&workdir, b"key").await.is_err());
+    assert!(EncryptedWorkspace::start(&workdir, b"key").is_err());
 
     let metadata = KeyMetadata {
         version: KEY_METADATA_VERSION,
@@ -411,34 +365,18 @@ async fn encrypted_workspace_reports_invalid_roots_and_key_metadata() {
     std::fs::remove_dir_all(workdir).unwrap();
 }
 
-#[tokio::test]
-async fn key_migration_rejects_invalid_requests_and_cleans_staged_files() {
+#[test]
+fn key_migration_rejects_invalid_requests_and_cleans_staged_files() {
     let missing = temporary_directory("migration-missing");
-    assert!(
-        EncryptedWorkspace::migrate_key(&missing, b"old", b"new")
-            .await
-            .is_err()
-    );
+    assert!(EncryptedWorkspace::migrate_key(&missing, b"old", b"new").is_err());
 
     let workdir = temporary_directory("migration-errors");
-    let workspace = EncryptedWorkspace::start(&workdir, b"old-key")
-        .await
-        .unwrap();
-    assert!(
-        EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"old-key")
-            .await
-            .is_err()
-    );
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    assert!(EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"old-key").is_err());
     drop(workspace);
-    assert!(
-        EncryptedWorkspace::migrate_key(&workdir, b"wrong-key", b"new-key")
-            .await
-            .is_err()
-    );
+    assert!(EncryptedWorkspace::migrate_key(&workdir, b"wrong-key", b"new-key").is_err());
 
-    let workspace = EncryptedWorkspace::start(&workdir, b"old-key")
-        .await
-        .unwrap();
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
     let valid = workspace.root().join("valid");
     let mut plaintext = tempfile::tempfile().unwrap();
     plaintext.write_all(b"valid").unwrap();
@@ -451,15 +389,78 @@ async fn key_migration_rejects_invalid_requests_and_cleans_staged_files() {
     std::fs::write(corrupt_directory.join("corrupt"), b"not ciphertext").unwrap();
     drop(workspace);
 
-    assert!(
-        EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key")
-            .await
-            .is_err()
-    );
+    assert!(EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key").is_err());
     assert!(directory_tree_has_no_rekey_files(&workdir.join("fs")));
     assert!(!EncryptedWorkspace::is_control_file(
         PathBuf::new().as_path()
     ));
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
+fn migration_helpers_reject_external_paths_and_inconsistent_journals() {
+    let workdir = temporary_directory("migration-helper-errors");
+    let root = workdir.join("fs");
+    std::fs::create_dir_all(&root).unwrap();
+
+    assert!(EncryptedWorkspace::read_key_metadata(&root).is_err());
+    assert!(EncryptedWorkspace::encode_relative_path(&root, &workdir.join("outside")).is_err());
+    let escaping = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"../escape");
+    assert!(EncryptedWorkspace::decode_relative_path(&root, &escaping).is_err());
+
+    let directory = root.join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    assert!(EncryptedWorkspace::remove_file_if_exists(&directory).is_err());
+
+    let journal_path = root.join(".rekey.json");
+    std::fs::create_dir(&journal_path).unwrap();
+    assert!(EncryptedWorkspace::recover_migration(&root).is_err());
+    std::fs::remove_dir(&journal_path).unwrap();
+
+    let metadata = |key_id: &str| KeyMetadata {
+        version: KEY_METADATA_VERSION,
+        salt: base64::engine::general_purpose::STANDARD.encode([0_u8; 16]),
+        key_id: key_id.to_string(),
+    };
+    let invalid_version = RekeyJournal {
+        version: REKEY_JOURNAL_VERSION + 1,
+        old_key: metadata("old"),
+        new_key: metadata("new"),
+        entries: Vec::new(),
+    };
+    std::fs::write(&journal_path, serde_json::to_vec(&invalid_version).unwrap()).unwrap();
+    assert!(EncryptedWorkspace::recover_migration(&root).is_err());
+
+    let current = metadata("current");
+    EncryptedWorkspace::write_key_metadata(&root, &current).unwrap();
+    let inconsistent = RekeyJournal {
+        version: REKEY_JOURNAL_VERSION,
+        old_key: metadata("old"),
+        new_key: metadata("new"),
+        entries: Vec::new(),
+    };
+    std::fs::write(&journal_path, serde_json::to_vec(&inconsistent).unwrap()).unwrap();
+    assert!(EncryptedWorkspace::recover_migration(&root).is_err());
+
+    let destination = root.join("missing-parent/destination");
+    let staged = root.join("staged");
+    let backup = root.join("backup");
+    std::fs::write(&staged, b"staged").unwrap();
+    std::fs::write(&backup, b"backup").unwrap();
+    EncryptedWorkspace::write_key_metadata(&root, &current).unwrap();
+    let failed_restore = RekeyJournal {
+        version: REKEY_JOURNAL_VERSION,
+        old_key: current,
+        new_key: metadata("new"),
+        entries: vec![RekeyEntry {
+            destination: EncryptedWorkspace::encode_relative_path(&root, &destination).unwrap(),
+            staged: EncryptedWorkspace::encode_relative_path(&root, &staged).unwrap(),
+            backup: EncryptedWorkspace::encode_relative_path(&root, &backup).unwrap(),
+        }],
+    };
+    std::fs::write(&journal_path, serde_json::to_vec(&failed_restore).unwrap()).unwrap();
+    assert!(EncryptedWorkspace::recover_migration(&root).is_err());
+
     std::fs::remove_dir_all(workdir).unwrap();
 }
 

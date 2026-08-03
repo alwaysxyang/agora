@@ -1,14 +1,54 @@
-use super::{OpenTarget, VirtualFilesystem};
+use super::{Credentials, OpenTarget, VirtualFilesystem};
+use crate::filesystem::FileAttributes;
 use crate::filesystem::crypto::FileCipher;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::mpsc;
+use std::time::Duration;
+
+fn errno(error: &anyhow::Error) -> Option<i32> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::raw_os_error)
+}
 
 fn fixture(name: &str) -> (std::path::PathBuf, VirtualFilesystem) {
     let root = std::env::temp_dir().join(format!("agora-vfs-{name}-{}", uuid::Uuid::new_v4()));
     let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
     let filesystem = VirtualFilesystem::encrypted(&root, cipher).unwrap();
     (root, filesystem)
+}
+
+#[test]
+fn credentials_apply_owner_group_other_and_root_rules() {
+    let attributes = FileAttributes {
+        mode: u32::from(libc::S_IFREG) | 0o640,
+        uid: 100,
+        gid: 200,
+        atime: 0,
+        atime_nsec: 0,
+        mtime: 0,
+        mtime_nsec: 0,
+    };
+
+    let owner = Credentials::for_test(100, 300, &[]);
+    assert!(owner.allows(&attributes, libc::R_OK | libc::W_OK));
+    assert!(owner.can_chmod(&attributes));
+
+    let group = Credentials::for_test(101, 300, &[200]);
+    assert!(group.allows(&attributes, libc::R_OK));
+    assert!(!group.allows(&attributes, libc::W_OK));
+    assert!(!group.can_chmod(&attributes));
+
+    let other = Credentials::for_test(101, 300, &[]);
+    assert!(!other.allows(&attributes, libc::R_OK));
+
+    let root = Credentials::for_test(0, 0, &[]);
+    assert!(root.allows(&attributes, libc::R_OK | libc::W_OK));
+    assert!(!root.allows(&attributes, libc::X_OK));
+    assert!(root.can_chmod(&attributes));
 }
 
 #[test]
@@ -52,10 +92,10 @@ fn encrypted_writeback_publishes_ciphertext_and_restores_the_next_open() {
     file.write_all(marker).unwrap();
     filesystem.commit_open(&mut prepared).unwrap();
     let (target, writeback, _) = prepared.into_parts();
-    let OpenTarget::Descriptor(file) = target else {
+    let OpenTarget::Descriptor(_) = target else {
         panic!("expected descriptor");
     };
-    writeback.unwrap().commit(file.as_raw_fd()).unwrap();
+    filesystem.commit_writeback(&writeback.unwrap()).unwrap();
 
     let backing = filesystem.prepare_read(logical).unwrap();
     let stored = std::fs::read(&backing).unwrap();
@@ -69,6 +109,39 @@ fn encrypted_writeback_publishes_ciphertext_and_restores_the_next_open() {
     let mut restored = Vec::new();
     file.read_to_end(&mut restored).unwrap();
     assert_eq!(restored, marker);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn encrypted_writeback_waits_for_the_vfs_publication_lock() {
+    let (root, filesystem) = fixture("writeback-lock");
+    let logical = Path::new("/tmp/agora-vfs-writeback-lock");
+    let mut prepared = filesystem
+        .prepare_open(logical, libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC, 0o600)
+        .unwrap();
+    filesystem.commit_open(&mut prepared).unwrap();
+    let (_, writeback, _) = prepared.into_parts();
+    let writeback = writeback.unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join(".vfs.lock"))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = filesystem.commit_writeback(&writeback);
+        completed_tx.send(()).unwrap();
+        result
+    });
+    assert!(
+        completed_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err()
+    );
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    worker.join().unwrap().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -93,10 +166,10 @@ fn encrypted_write_intent_copies_up_lower_content_without_changing_lower() {
     file.write_all(b"upper content").unwrap();
     filesystem.commit_open(&mut prepared).unwrap();
     let (target, writeback, _) = prepared.into_parts();
-    let OpenTarget::Descriptor(file) = target else {
+    let OpenTarget::Descriptor(_) = target else {
         panic!("expected descriptor");
     };
-    writeback.unwrap().commit(file.as_raw_fd()).unwrap();
+    filesystem.commit_writeback(&writeback.unwrap()).unwrap();
 
     assert_eq!(std::fs::read(&source).unwrap(), b"lower content");
     let backing = filesystem.prepare_read(&source).unwrap();
@@ -129,10 +202,10 @@ fn encrypted_open_honors_exclusive_create_and_truncate() {
         .unwrap();
     filesystem.commit_open(&mut created).unwrap();
     let (target, writeback, _) = created.into_parts();
-    let OpenTarget::Descriptor(file) = target else {
+    let OpenTarget::Descriptor(_) = target else {
         panic!("expected descriptor");
     };
-    writeback.unwrap().commit(file.as_raw_fd()).unwrap();
+    filesystem.commit_writeback(&writeback.unwrap()).unwrap();
 
     assert!(
         filesystem
@@ -146,6 +219,92 @@ fn encrypted_open_honors_exclusive_create_and_truncate() {
         panic!("expected descriptor");
     };
     assert_eq!(file.metadata().unwrap().len(), 0);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn encrypted_exclusive_create_reserves_the_missing_path_until_open_commits() {
+    let (root, first_filesystem) = fixture("exclusive-reservation");
+    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+    let second_filesystem = VirtualFilesystem::encrypted(&root, cipher).unwrap();
+    let logical = Path::new("/tmp/agora-vfs-exclusive-reservation");
+
+    let first = first_filesystem
+        .prepare_open(logical, libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600)
+        .unwrap();
+    let error = match second_filesystem.prepare_open(
+        logical,
+        libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+        0o600,
+    ) {
+        Ok(_) => panic!("a second exclusive create unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert_eq!(errno(&error), Some(libc::EEXIST));
+
+    drop(first);
+    assert!(
+        second_filesystem
+            .prepare_open(logical, libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600,)
+            .is_ok()
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn abandoned_exclusive_reservation_keeps_a_later_published_create() {
+    let (root, first_filesystem) = fixture("exclusive-reservation-publish");
+    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+    let second_filesystem = VirtualFilesystem::encrypted(&root, cipher).unwrap();
+    let logical = Path::new("/tmp/agora-vfs-exclusive-reservation-publish");
+
+    let first = first_filesystem
+        .prepare_open(logical, libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600)
+        .unwrap();
+    let mut second = second_filesystem
+        .prepare_open(logical, libc::O_CREAT | libc::O_RDWR, 0o600)
+        .unwrap();
+    let OpenTarget::Descriptor(file) = second.target_mut() else {
+        panic!("expected encrypted descriptor");
+    };
+    file.write_all(b"published").unwrap();
+    second_filesystem.commit_open(&mut second).unwrap();
+
+    drop(first);
+
+    let mut reopened = second_filesystem
+        .prepare_open(logical, libc::O_RDONLY, 0)
+        .unwrap();
+    let OpenTarget::Descriptor(file) = reopened.target_mut() else {
+        panic!("expected encrypted descriptor");
+    };
+    let mut restored = String::new();
+    file.read_to_string(&mut restored).unwrap();
+    assert_eq!(restored, "published");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn encrypted_namespace_mutation_rejects_a_live_writable_snapshot() {
+    let (root, first_filesystem) = fixture("write-lease");
+    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+    let second_filesystem = VirtualFilesystem::encrypted(&root, cipher).unwrap();
+    let logical = Path::new("/tmp/agora-vfs-write-lease");
+    let renamed = Path::new("/tmp/agora-vfs-write-lease-renamed");
+    let mut prepared = first_filesystem
+        .prepare_open(logical, libc::O_CREAT | libc::O_RDWR, 0o600)
+        .unwrap();
+    first_filesystem.commit_open(&mut prepared).unwrap();
+    let (target, writeback, _) = prepared.into_parts();
+
+    let rename_error = second_filesystem.rename(logical, renamed).unwrap_err();
+    assert_eq!(errno(&rename_error), Some(libc::EBUSY));
+    let remove_error = second_filesystem.remove(logical, false).unwrap_err();
+    assert_eq!(errno(&remove_error), Some(libc::EBUSY));
+
+    drop(writeback);
+    drop(target);
+    second_filesystem.rename(logical, renamed).unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -174,10 +333,10 @@ fn encrypted_descriptors_preserve_the_requested_access_mode() {
     file.write_all(b"contents").unwrap();
     filesystem.commit_open(&mut created).unwrap();
     let (target, writeback, _) = created.into_parts();
-    let OpenTarget::Descriptor(file) = target else {
+    let OpenTarget::Descriptor(_) = target else {
         panic!("expected encrypted descriptor");
     };
-    writeback.unwrap().commit(file.as_raw_fd()).unwrap();
+    filesystem.commit_writeback(&writeback.unwrap()).unwrap();
 
     let reopened = filesystem.prepare_open(logical, libc::O_RDONLY, 0).unwrap();
     let OpenTarget::Descriptor(file) = reopened.target() else {
@@ -207,10 +366,10 @@ fn encrypted_write_opens_do_not_wait_for_each_other() {
         .unwrap();
     filesystem.commit_open(&mut created).unwrap();
     let (target, writeback, _) = created.into_parts();
-    let OpenTarget::Descriptor(file) = target else {
+    let OpenTarget::Descriptor(_) = target else {
         panic!("expected descriptor");
     };
-    writeback.unwrap().commit(file.as_raw_fd()).unwrap();
+    filesystem.commit_writeback(&writeback.unwrap()).unwrap();
     let first = filesystem.prepare_open(logical, libc::O_RDWR, 0).unwrap();
     let second = filesystem.prepare_open(logical, libc::O_RDWR, 0).unwrap();
     drop(first);

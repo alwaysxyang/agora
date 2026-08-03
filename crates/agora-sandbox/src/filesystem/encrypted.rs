@@ -76,7 +76,7 @@ impl std::fmt::Debug for EncryptedWorkspace {
 }
 
 impl EncryptedWorkspace {
-    pub(crate) async fn start(workdir: &Path, passphrase: &[u8]) -> Result<Self> {
+    pub(crate) fn start(workdir: &Path, passphrase: &[u8]) -> Result<Self> {
         Self::validate_passphrase(passphrase)?;
         let workdir = Self::resolved_destination(workdir)?;
         let root = workdir.join(ROOT_DIRECTORY);
@@ -122,19 +122,15 @@ impl EncryptedWorkspace {
         &self.key
     }
 
-    pub(crate) async fn shutdown(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    pub(crate) async fn migrate_key(
+    pub(crate) fn migrate_key(
         workdir: &Path,
         old_passphrase: &[u8],
         new_passphrase: &[u8],
     ) -> Result<()> {
-        Self::migrate_key_with_progress(workdir, old_passphrase, new_passphrase, |_| {}).await
+        Self::migrate_key_with_progress(workdir, old_passphrase, new_passphrase, |_| {})
     }
 
-    pub(crate) async fn migrate_key_with_progress(
+    pub(crate) fn migrate_key_with_progress(
         workdir: &Path,
         old_passphrase: &[u8],
         new_passphrase: &[u8],
@@ -469,6 +465,7 @@ impl EncryptedWorkspace {
             || name.starts_with(b".metadata.")
             || name.starts_with(b".agora-encrypted-")
             || name.starts_with(b".agora-rekey-")
+            || name.starts_with(namespace::WRITE_LEASE_PREFIX)
     }
 
     fn write_journal(root: &Path, journal: &RekeyJournal) -> Result<()> {

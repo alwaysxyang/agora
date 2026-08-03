@@ -42,7 +42,7 @@
 
 1. Add failing tests proving copied executables retain the source basename while remaining collision-safe.
 2. Mirror each canonical source path beneath `<workdir>/fs`, keeping the leaf filename unchanged.
-3. Reuse persistent copies only when the executable and its directory-local `checksums.json` MD5 entry remain valid.
+3. Reuse persistent copies only when the executable and its directory-local versioned `.metadata` cached checksum remain valid.
 4. Ensure failed preparation removes its temporary artifact without deleting a valid persistent cache entry.
 5. Run the execution store and runner tests.
 

@@ -206,6 +206,31 @@ fn configured_hook_child() {
     );
     unsafe { libc::close(stream) };
 
+    let stream = socket(libc::SOCK_STREAM);
+    let endpoints = SocketEndpoints {
+        source_interface: 0,
+        source_address: std::ptr::null(),
+        source_address_length: 0,
+        destination_address: proxy.as_ptr(),
+        destination_address_length: proxy.len(),
+    };
+    assert_eq!(
+        unsafe {
+            agora_sandbox_connectx(
+                stream,
+                &endpoints,
+                0,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    unsafe { libc::close(stream) };
+
     let source = PathBuf::from(std::env::var("AGORA_SANDBOX_COVERAGE_SOURCE").unwrap());
     let directory = source.parent().unwrap().to_path_buf();
     let source = c_path(&source);
@@ -641,6 +666,7 @@ fn exported_hooks_validate_initialization_and_pointer_shapes() {
         Some(libc::EACCES)
     );
     initialize_hook();
+    flush_filesystem_at_exit();
 
     unsafe { libc::close(stream) };
 }

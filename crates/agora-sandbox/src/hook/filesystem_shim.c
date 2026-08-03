@@ -9,6 +9,7 @@ extern int agora_sandbox_openat_with_mode(int directory, const char *path, int f
 extern const void *agora_sandbox_original_fcntl(void);
 extern void agora_sandbox_track_fcntl_duplicate(int source, int destination);
 extern int agora_sandbox_commit_synced_descriptor(int descriptor);
+extern int agora_sandbox_fcntl_setfd_argument(int descriptor, int flags);
 
 typedef int (*open_fn)(const char *, int, ...);
 typedef int (*openat_fn)(int, const char *, int, ...);
@@ -79,7 +80,6 @@ int agora_sandbox_fcntl_shim(int descriptor, int command, ...) {
             break;
         case F_DUPFD:
         case F_DUPFD_CLOEXEC:
-        case F_SETFD:
         case F_SETFL:
         case F_SETOWN:
         case F_RDAHEAD:
@@ -97,6 +97,18 @@ int agora_sandbox_fcntl_shim(int descriptor, int command, ...) {
             int argument = va_arg(arguments, int);
             va_end(arguments);
             result = original_fcntl(descriptor, command, argument);
+            break;
+        }
+        case F_SETFD: {
+            va_list arguments;
+            va_start(arguments, command);
+            int argument = va_arg(arguments, int);
+            va_end(arguments);
+            result = original_fcntl(
+                descriptor,
+                command,
+                agora_sandbox_fcntl_setfd_argument(descriptor, argument)
+            );
             break;
         }
         case F_SETSIZE: {

@@ -29,6 +29,8 @@ pub(crate) use metadata::{EntryState, FileAttributes, Materializer};
 #[cfg(target_os = "macos")]
 pub(crate) use overlay::{DirectoryView, OverlayStore, StagedWrite};
 #[cfg(target_os = "macos")]
-pub(crate) use vfs::{FileLayer, OpenTarget, PreparedFile, VirtualFilesystem, Writeback};
+pub(crate) use vfs::{
+    Credentials, FileLayer, OpenTarget, PreparedFile, VirtualFilesystem, Writeback,
+};
 #[cfg(target_os = "macos")]
 pub(crate) use workspace::FilesystemWorkspace;

@@ -4,7 +4,7 @@ mod relay;
 
 use super::inspection::DomainObservation;
 use super::{NetworkConfig, NetworkController, NetworkRunContext, NetworkState, TlsMode};
-use crate::callback::{DomainSource, NoopCallback};
+use crate::callback::{Decision, DomainSource, HttpProxy, NoopCallback, Proxy};
 use crate::protocol::{HookOperation, ProcessIdentity, RouteRegistration};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -91,6 +91,135 @@ async fn controller_reports_an_unexpected_listener_exit() {
     let error = controller.wait_failure().await;
 
     assert!(error.to_string().contains("proxy listener"));
+}
+
+#[tokio::test]
+async fn controller_reports_empty_successful_and_panicked_listener_sets() {
+    let context = || NetworkRunContext::new("sandbox", "run");
+
+    let mut empty = NetworkController::start(NetworkConfig::default(), context(), NoopCallback)
+        .await
+        .unwrap();
+    empty.tasks.shutdown().await;
+    assert!(
+        empty
+            .wait_failure()
+            .await
+            .to_string()
+            .contains("no active listener")
+    );
+
+    let mut stopped = NetworkController::start(NetworkConfig::default(), context(), NoopCallback)
+        .await
+        .unwrap();
+    stopped.tasks.shutdown().await;
+    stopped.tasks.spawn(async { Ok(()) });
+    assert!(
+        stopped
+            .wait_failure()
+            .await
+            .to_string()
+            .contains("stopped unexpectedly")
+    );
+
+    let mut panicked = NetworkController::start(NetworkConfig::default(), context(), NoopCallback)
+        .await
+        .unwrap();
+    panicked.tasks.shutdown().await;
+    panicked.tasks.spawn(async {
+        panic!("injected proxy task panic");
+        #[allow(unreachable_code)]
+        Ok(())
+    });
+    assert!(
+        panicked
+            .wait_failure()
+            .await
+            .to_string()
+            .contains("listener task failed")
+    );
+
+    let mut shutdown = NetworkController::start(NetworkConfig::default(), context(), NoopCallback)
+        .await
+        .unwrap();
+    shutdown.tasks.shutdown().await;
+    shutdown.tasks.spawn(async {
+        panic!("injected proxy shutdown panic");
+        #[allow(unreachable_code)]
+        Ok(())
+    });
+    assert!(shutdown.shutdown().await.is_err());
+}
+
+#[tokio::test]
+async fn controller_and_upstream_fail_closed_without_required_runtime_support() {
+    let tls_config = NetworkConfig {
+        tls: TlsMode::Auto,
+        ..NetworkConfig::default()
+    };
+    assert!(
+        NetworkController::start(
+            tls_config,
+            NetworkRunContext::new("sandbox", "run"),
+            NoopCallback,
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("requires a configured CA")
+    );
+
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let stalled_proxy = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    });
+    let mut state = NetworkState {
+        config: NetworkConfig {
+            upstream_connect_timeout: std::time::Duration::from_millis(10),
+            ..NetworkConfig::default()
+        },
+        context: NetworkRunContext::new("sandbox", "run"),
+        token: "token".to_string(),
+        callback: NoopCallback,
+        tls: None,
+        connections: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+    };
+    let timeout = state
+        .open_upstream(
+            &registration(),
+            &Decision::Proxy {
+                proxy: Proxy::Http(HttpProxy {
+                    address: proxy.to_string(),
+                    basic_auth: None,
+                }),
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(timeout.kind(), std::io::ErrorKind::TimedOut);
+    stalled_proxy.abort();
+
+    state.config.upstream_connect_timeout = std::time::Duration::from_secs(1);
+    let denied = state
+        .open_upstream(
+            &registration(),
+            &Decision::Deny {
+                reason: Some("test denial".to_string()),
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+    state
+        .publish_denied(&registration(), None, &Decision::Allow)
+        .await;
 }
 
 #[tokio::test]

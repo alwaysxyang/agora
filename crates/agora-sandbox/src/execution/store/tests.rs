@@ -125,7 +125,7 @@ fn executable_store_keeps_normal_reads_on_lower_before_execution() {
 #[test]
 fn executable_store_keeps_unrestricted_binaries_and_scripts_at_their_original_paths() {
     let root = TestDirectory::new();
-    let directory = root.path().join("prepared");
+    let directory = root.path().join("workdir/fs");
     let store = ExecutableStore::new(directory.clone()).unwrap();
     let binary = std::env::current_exe().unwrap().canonicalize().unwrap();
 
@@ -147,7 +147,7 @@ fn executable_store_keeps_unrestricted_binaries_and_scripts_at_their_original_pa
 #[test]
 fn executable_store_prefers_a_cow_script_over_the_lower_file() {
     let root = TestDirectory::new();
-    let store = ExecutableStore::new(root.path().join("prepared")).unwrap();
+    let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
     let source = root.path().join("script");
     fs::write(&source, b"#!/bin/sh\necho lower\n").unwrap();
     fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
@@ -174,7 +174,7 @@ fn executable_store_resigns_a_restricted_cow_binary_in_place() {
         .status()
         .unwrap();
     assert!(status.success());
-    let store = ExecutableStore::new(root.path().join("prepared")).unwrap();
+    let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
     let mapped = store.overlay.prepare_write(&source, false).unwrap();
 
     assert_eq!(store.prepare(&source).unwrap(), mapped);
@@ -204,7 +204,7 @@ fn executable_store_copies_hardened_runtime_binaries() {
         ExecutableStore::code_signing_flags(&source).unwrap() & CS_DYLD_RESTRICTED,
         0
     );
-    let store = ExecutableStore::new(root.path().join("prepared")).unwrap();
+    let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
 
     let prepared = store.prepare(&source).unwrap();
 
@@ -281,7 +281,7 @@ fn shebang_parser_handles_optional_arguments_and_rejects_invalid_interpreters() 
 #[test]
 fn executable_store_rejects_non_files_and_non_executable_files() {
     let root = TestDirectory::new();
-    let directory = root.path().join("prepared");
+    let directory = root.path().join("workdir/fs");
     let store = ExecutableStore::new(directory.clone()).unwrap();
     let plain = root.path().join("plain");
     fs::write(&plain, b"not executable").unwrap();
@@ -570,6 +570,25 @@ fn missing_cached_executable_maps_back_to_its_original_source() {
             ..
         })
     ));
+}
+
+#[test]
+fn executable_store_rejects_private_workdir_paths_outside_the_backing_root() {
+    let root = TestDirectory::new();
+    let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
+    let private = root.path().join("workdir/private-executable");
+    fs::copy("/bin/sh", &private).unwrap();
+
+    let error = store.prepare(&private).unwrap_err();
+
+    assert_eq!(
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error),
+        Some(libc::EACCES)
+    );
+    assert!(error.to_string().contains("private work directory"));
 }
 
 #[test]

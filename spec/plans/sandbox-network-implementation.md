@@ -185,8 +185,9 @@ This plan implements raw TCP interception and callback policy end to end. It doe
 - Add: `spec/architecture/sandbox.md`
 
 - [x] Mirror restricted executables beneath persistent `<workdir>/fs` paths and validate reusable
-      copies with directory-local versioned `checksums.json` MD5 manifests.
-- [x] Add `agora-sandbox clean [--workdir <WORKDIR>]` to remove only the executable cache.
+      copies with directory-local versioned `.metadata` cached checksums.
+- [x] Remove the deprecated `clean` command; persistent state is removed only by explicitly
+      deleting the work directory outside normal sandbox startup.
 - [x] Publish intercepted descendant `process.exec.attempt` events through the shared asynchronous
       callback while leaving process decisions audit-only.
 - [x] Propagate a bounded, comma-separated trace chain through `AGORA_SANDBOX_TRACE_ID`, audit

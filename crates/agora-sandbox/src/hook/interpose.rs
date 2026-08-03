@@ -12,8 +12,8 @@ use std::cell::Cell;
 use std::mem;
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Once, OnceLock};
 
 type ConnectFn =
     unsafe extern "C" fn(libc::c_int, *const libc::sockaddr, libc::socklen_t) -> libc::c_int;
@@ -46,13 +46,21 @@ thread_local! {
 }
 
 static HOOK_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static EXIT_FLUSH_REGISTERED: Once = Once::new();
 
 pub(super) fn initialized() -> bool {
     HOOK_INITIALIZED.load(Ordering::Acquire)
 }
 
+extern "C" fn flush_filesystem_at_exit() {
+    super::filesystem::flush_at_exit();
+}
+
 extern "C" fn initialize_hook() {
     config::initialize();
+    EXIT_FLUSH_REGISTERED.call_once(|| unsafe {
+        libc::atexit(flush_filesystem_at_exit);
+    });
     HOOK_INITIALIZED.store(true, Ordering::Release);
 }
 

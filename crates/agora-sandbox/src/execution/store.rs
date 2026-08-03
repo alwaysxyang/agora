@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::macos::fs::MetadataExt as MacMetadataExt;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -82,6 +82,14 @@ impl ExecutableStore {
     }
 
     pub(super) fn prepare(&self, source: &Path) -> Result<PathBuf> {
+        if !self.overlay.is_internal(source) && self.overlay.is_private(source)? {
+            return Err(io::Error::from_raw_os_error(libc::EACCES)).with_context(|| {
+                format!(
+                    "sandbox executable is inside the private work directory: {}",
+                    source.display()
+                )
+            });
+        }
         let source = self.resolve_source(source)?;
         let metadata = Self::validate_source(&source)?;
         if resolve_shebang(&source)?.is_some() {

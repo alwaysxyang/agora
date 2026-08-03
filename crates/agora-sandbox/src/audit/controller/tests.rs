@@ -1,6 +1,17 @@
 use super::*;
 use crate::callback::Decision;
 
+async fn controller() -> AuditController {
+    AuditController::start(
+        "sandbox".to_string(),
+        "run".to_string(),
+        |_| std::future::ready(Decision::Allow),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn audit_server_drops_connections_above_its_concurrency_limit() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -32,4 +43,52 @@ async fn audit_server_drops_connections_above_its_concurrency_limit() {
     drop(permits);
     shutdown.send(true).unwrap();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn audit_controller_reports_empty_successful_and_panicked_task_sets() {
+    let mut empty = controller().await;
+    empty.tasks.shutdown().await;
+    assert!(
+        empty
+            .wait_failure()
+            .await
+            .to_string()
+            .contains("no active task")
+    );
+
+    let mut stopped = controller().await;
+    stopped.tasks.shutdown().await;
+    stopped.tasks.spawn(async { Ok(()) });
+    assert!(
+        stopped
+            .wait_failure()
+            .await
+            .to_string()
+            .contains("stopped unexpectedly")
+    );
+
+    let mut panicked = controller().await;
+    panicked.tasks.shutdown().await;
+    panicked.tasks.spawn(async {
+        panic!("injected audit task panic");
+        #[allow(unreachable_code)]
+        Ok(())
+    });
+    assert!(
+        panicked
+            .wait_failure()
+            .await
+            .to_string()
+            .contains("audit task failed")
+    );
+
+    let mut shutdown = controller().await;
+    shutdown.tasks.shutdown().await;
+    shutdown.tasks.spawn(async {
+        panic!("injected audit shutdown panic");
+        #[allow(unreachable_code)]
+        Ok(())
+    });
+    assert!(shutdown.shutdown().await.is_err());
 }

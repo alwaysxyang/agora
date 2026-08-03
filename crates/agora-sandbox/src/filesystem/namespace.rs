@@ -9,6 +9,7 @@ pub(super) const FILESYSTEM_LOCK_FILE: &str = ".fs.lock";
 pub(super) const KEY_FILE: &str = ".key.json";
 pub(super) const VFS_LOCK_FILE: &str = ".vfs.lock";
 pub(super) const REKEY_JOURNAL_FILE: &str = ".rekey.json";
+pub(super) const WRITE_LEASE_PREFIX: &[u8] = b".agora-write-lease-";
 const ESCAPED_PREFIX: &[u8] = b".agora-entry-";
 
 pub(super) fn backing_path(root: &Path, logical: &Path) -> Result<PathBuf> {
@@ -66,6 +67,7 @@ pub(super) fn is_control_name(name: &OsStr) -> bool {
         || name.starts_with(b".agora-executable-")
         || name.starts_with(b".agora-encrypted-")
         || name.starts_with(b".agora-rekey-")
+        || name.starts_with(WRITE_LEASE_PREFIX)
 }
 
 pub(super) fn is_file_backing_name(name: &[u8]) -> bool {

@@ -76,6 +76,14 @@ fn unchanged_attributes_do_not_rewrite_metadata() {
 }
 
 #[test]
+fn created_attributes_use_the_effective_identity() {
+    let attributes = FileAttributes::created_file(0o640);
+
+    assert_eq!(attributes.uid, unsafe { libc::geteuid() });
+    assert_eq!(attributes.gid, unsafe { libc::getegid() });
+}
+
+#[test]
 fn metadata_is_stored_next_to_its_mirrored_directory() {
     let root = tempfile();
     let store = MetadataStore::new(&root).unwrap();

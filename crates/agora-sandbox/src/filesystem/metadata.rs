@@ -94,8 +94,8 @@ impl FileAttributes {
             .unwrap_or_default();
         Self {
             mode: kind | mode & 0o7777,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
             atime: i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
             atime_nsec: i64::from(now.subsec_nanos()),
             mtime: i64::try_from(now.as_secs()).unwrap_or(i64::MAX),

@@ -5,6 +5,8 @@ use super::{
 use crate::audit::AuditController;
 use crate::callback::{Decision, Event, EventType, NoopCallback, TlsOutcome};
 use crate::execution::ExecutionController;
+#[cfg(target_os = "macos")]
+use crate::filesystem::EncryptedWorkspace;
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStringExt;
@@ -12,6 +14,61 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "current_thread")]
+async fn filesystem_blocking_runs_on_a_blocking_worker() {
+    let caller = std::thread::current().id();
+
+    let worker = super::filesystem_blocking(|| Ok::<_, anyhow::Error>(std::thread::current().id()))
+        .await
+        .unwrap();
+
+    assert_ne!(worker, caller);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "current_thread")]
+async fn filesystem_key_migration_reports_progress_on_the_runtime_thread() {
+    let workdir = std::env::temp_dir().join(format!(
+        "agora-runner-key-migration-{}",
+        uuid::Uuid::new_v4()
+    ));
+    drop(EncryptedWorkspace::start(&workdir, b"old-key").unwrap());
+    let runtime_thread = std::thread::current().id();
+    let stages = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = std::rc::Rc::clone(&stages);
+
+    super::migrate_filesystem_key_with_progress(&workdir, b"old-key", b"new-key", |stage| {
+        assert_eq!(std::thread::current().id(), runtime_thread);
+        observed.borrow_mut().push(stage);
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        stages.borrow().last(),
+        Some(&super::FilesystemKeyMigrationProgress::Completed)
+    );
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "current_thread")]
+async fn filesystem_key_migration_runs_without_a_progress_callback() {
+    let workdir = std::env::temp_dir().join(format!(
+        "agora-runner-key-migration-simple-{}",
+        uuid::Uuid::new_v4()
+    ));
+    drop(EncryptedWorkspace::start(&workdir, b"old-key").unwrap());
+
+    super::migrate_filesystem_key(&workdir, b"old-key", b"new-key")
+        .await
+        .unwrap();
+
+    drop(EncryptedWorkspace::start(&workdir, b"new-key").unwrap());
+    std::fs::remove_dir_all(workdir).unwrap();
+}
 
 fn sleeping_child() -> tokio::process::Child {
     let mut command = tokio::process::Command::new("/bin/sleep");

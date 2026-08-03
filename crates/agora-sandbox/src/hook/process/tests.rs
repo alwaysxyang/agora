@@ -41,7 +41,10 @@ fn config_with_control_and_token(control: SocketAddr, execution_token: &str) -> 
             "AGORA_SANDBOX_HOOK_LIBRARIES",
             "/tmp/hook.dylib".to_string(),
         ),
-        ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs".to_string()),
+        (
+            "AGORA_SANDBOX_FILESYSTEM_ROOT",
+            "/tmp/agora-test-workdir/fs".to_string(),
+        ),
         ("AGORA_SANDBOX_FILESYSTEM_MODE", "plain".to_string()),
         ("AGORA_SANDBOX_TRACE_ID", "trace-root".to_string()),
     ]);
@@ -65,7 +68,10 @@ fn config_with_tls_bundle() -> HookConfig {
             "AGORA_SANDBOX_HOOK_LIBRARIES",
             "/tmp/hook.dylib".to_string(),
         ),
-        ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs".to_string()),
+        (
+            "AGORA_SANDBOX_FILESYSTEM_ROOT",
+            "/tmp/agora-test-workdir/fs".to_string(),
+        ),
         ("AGORA_SANDBOX_FILESYSTEM_MODE", "plain".to_string()),
         ("AGORA_SANDBOX_TRACE_ID", "trace-root".to_string()),
         (
@@ -151,7 +157,7 @@ fn runtime_with_responses(
 
 #[test]
 fn child_environment_restores_runtime_values_after_the_caller_clears_them() {
-    assert_eq!(config().filesystem_root(), "/tmp/agora-fs");
+    assert_eq!(config().filesystem_root(), "/tmp/agora-test-workdir/fs");
     let path = CString::new("PATH=/usr/bin:/bin").unwrap();
     let values = [path.as_ptr(), std::ptr::null()];
 

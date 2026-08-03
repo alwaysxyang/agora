@@ -5,12 +5,10 @@ fn temporary_directory(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("agora-workspace-{name}-{}", uuid::Uuid::new_v4()))
 }
 
-#[tokio::test]
-async fn plain_workspace_is_persistent_and_exclusive() {
+#[test]
+fn plain_workspace_is_persistent_and_exclusive() {
     let workdir = temporary_directory("plain");
-    let mut workspace = FilesystemWorkspace::start(&workdir, FilesystemMode::Plain, None)
-        .await
-        .unwrap();
+    let workspace = FilesystemWorkspace::start(&workdir, FilesystemMode::Plain, None).unwrap();
     assert_eq!(
         workspace.root().file_name(),
         Some(std::ffi::OsStr::new("fs"))
@@ -30,7 +28,6 @@ async fn plain_workspace_is_persistent_and_exclusive() {
 
     let error = PlainWorkspace::start(&workdir).unwrap_err();
     assert!(error.to_string().contains("filesystem is already in use"));
-    workspace.shutdown().await.unwrap();
     drop(workspace);
 
     let workspace = PlainWorkspace::start(&workdir).unwrap();
@@ -41,17 +38,15 @@ async fn plain_workspace_is_persistent_and_exclusive() {
     std::fs::remove_dir_all(workdir).unwrap();
 }
 
-#[tokio::test]
-async fn workspace_rejects_keys_that_do_not_match_the_mode() {
+#[test]
+fn workspace_rejects_keys_that_do_not_match_the_mode() {
     let workdir = temporary_directory("mode");
-    let missing = FilesystemWorkspace::start(&workdir, FilesystemMode::Encrypted, None)
-        .await
-        .unwrap_err();
+    let missing =
+        FilesystemWorkspace::start(&workdir, FilesystemMode::Encrypted, None).unwrap_err();
     assert!(missing.to_string().contains("filesystem key is required"));
 
-    let unexpected = FilesystemWorkspace::start(&workdir, FilesystemMode::Plain, Some(b"unused"))
-        .await
-        .unwrap_err();
+    let unexpected =
+        FilesystemWorkspace::start(&workdir, FilesystemMode::Plain, Some(b"unused")).unwrap_err();
     assert!(
         unexpected
             .to_string()

@@ -70,6 +70,16 @@ const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
     "GIT_SSL_CAINFO",
 ];
 
+#[cfg(target_os = "macos")]
+async fn filesystem_blocking<T>(operation: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .context("filesystem blocking task failed")?
+}
+
 #[derive(Clone, Debug)]
 pub struct SandboxConfig {
     pub network: NetworkConfig,
@@ -415,11 +425,16 @@ where
     pub async fn run(self, mut command: SandboxCommand) -> Result<SandboxOutcome> {
         self.config.validate()?;
         let callback = std::sync::Arc::new(self.callback);
-        let mut filesystem = FilesystemWorkspace::start(
-            &self.config.workdir,
-            self.config.filesystem_mode,
-            self.config.encrypted_workspace_key(),
-        )
+        let filesystem_workdir = self.config.workdir.clone();
+        let filesystem_mode = self.config.filesystem_mode;
+        let filesystem_key = self.config.encrypted_workspace_key().map(<[u8]>::to_vec);
+        let filesystem = filesystem_blocking(move || {
+            FilesystemWorkspace::start(
+                &filesystem_workdir,
+                filesystem_mode,
+                filesystem_key.as_deref(),
+            )
+        })
         .await?;
         let runtime_directory = tempfile::Builder::new()
             .prefix("agora-sandbox-run-")
@@ -650,15 +665,11 @@ where
         let shutdown = controller.shutdown().await;
         let execution_shutdown = execution.shutdown().await;
         let audit_shutdown = audit.shutdown().await;
-        let filesystem_shutdown = filesystem.shutdown().await;
         let status = status?;
         terminal_restore?;
         shutdown?;
         execution_shutdown?;
         audit_shutdown?;
-        filesystem_shutdown.with_context(|| {
-            format!("sandbox child exited with status {status} before filesystem shutdown")
-        })?;
 
         Ok(SandboxOutcome {
             status,
@@ -689,7 +700,10 @@ pub async fn migrate_filesystem_key(
     old_key: impl AsRef<[u8]>,
     new_key: impl AsRef<[u8]>,
 ) -> Result<()> {
-    EncryptedWorkspace::migrate_key(workdir.as_ref(), old_key.as_ref(), new_key.as_ref()).await
+    let workdir = workdir.as_ref().to_path_buf();
+    let old_key = old_key.as_ref().to_vec();
+    let new_key = new_key.as_ref().to_vec();
+    filesystem_blocking(move || EncryptedWorkspace::migrate_key(&workdir, &old_key, &new_key)).await
 }
 
 #[cfg(target_os = "macos")]
@@ -749,13 +763,21 @@ pub async fn migrate_filesystem_key_with_progress(
     new_key: impl AsRef<[u8]>,
     mut on_progress: impl FnMut(FilesystemKeyMigrationProgress),
 ) -> Result<()> {
-    EncryptedWorkspace::migrate_key_with_progress(
-        workdir.as_ref(),
-        old_key.as_ref(),
-        new_key.as_ref(),
-        |stage| on_progress(stage.into()),
-    )
-    .await
+    let workdir = workdir.as_ref().to_path_buf();
+    let old_key = old_key.as_ref().to_vec();
+    let new_key = new_key.as_ref().to_vec();
+    let (progress_sender, mut progress_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let migration = tokio::task::spawn_blocking(move || {
+        EncryptedWorkspace::migrate_key_with_progress(&workdir, &old_key, &new_key, |stage| {
+            let _ = progress_sender.send(stage);
+        })
+    });
+
+    while let Some(stage) = progress_receiver.recv().await {
+        on_progress(stage.into());
+    }
+
+    migration.await.context("filesystem blocking task failed")?
 }
 
 #[cfg(target_os = "macos")]

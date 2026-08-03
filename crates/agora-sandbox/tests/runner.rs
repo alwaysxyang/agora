@@ -53,6 +53,25 @@ unsafe extern "C" {
         bytes_written: *mut libc::size_t,
         connection_id: *mut TestConnectionId,
     ) -> libc::c_int;
+
+    fn readdir_r(
+        directory: *mut libc::DIR,
+        entry: *mut libc::dirent,
+        result: *mut *mut libc::dirent,
+    ) -> libc::c_int;
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn call_interposed_descriptor(
+    name: &std::ffi::CStr,
+    descriptor: libc::c_int,
+) -> libc::c_int {
+    type DescriptorFn = unsafe extern "C" fn(libc::c_int) -> libc::c_int;
+
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+    assert!(!symbol.is_null(), "missing interposed symbol {name:?}");
+    let function = unsafe { std::mem::transmute::<*mut libc::c_void, DescriptorFn>(symbol) };
+    unsafe { function(descriptor) }
 }
 
 fn workspace_root() -> PathBuf {
@@ -280,7 +299,7 @@ async fn runner_persists_an_encrypted_workspace_without_modifying_the_source() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn python_descriptor_writes_are_persisted_across_runs() {
+async fn python_descriptor_writes_are_persisted_on_normal_exit() {
     let directory = std::env::temp_dir().join(format!(
         "agora-sandbox-python-writeback-test-{}",
         uuid::Uuid::new_v4()
@@ -288,7 +307,7 @@ async fn python_descriptor_writes_are_persisted_across_runs() {
     let source = directory.join("source");
     let workdir = directory.join("sandbox");
     std::fs::create_dir_all(&source).unwrap();
-    let script = "import os; fd=os.open('python.txt', os.O_WRONLY|os.O_CREAT|os.O_TRUNC, 0o640); assert os.write(fd,b'python-writeback') == 16; os.close(fd)";
+    let script = "import os; fd=os.open('python.txt', os.O_WRONLY|os.O_CREAT|os.O_TRUNC, 0o640); assert os.write(fd,b'python-writeback') == 16";
 
     let written = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
         .run(
@@ -309,6 +328,60 @@ async fn python_descriptor_writes_are_persisted_across_runs() {
         .await
         .unwrap();
     assert!(verified.status().success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn exec_persists_open_encrypted_descriptors_before_replacing_the_process() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-exec-writeback-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    let script = "import os; fd=os.open('exec.txt', os.O_WRONLY|os.O_CREAT|os.O_TRUNC, 0o640); assert os.write(fd,b'exec-writeback') == 14; os.execv('/bin/sh', ['sh', '-c', 'test \"$(cat exec.txt)\" = exec-writeback'])";
+
+    let outcome = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(
+            SandboxCommand::new(python3())
+                .args(["-c", script])
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn descendant_exec_cannot_prepare_a_physical_workdir_executable() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-private-exec-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    let private_executable = workdir.join("private-echo");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&workdir).unwrap();
+    std::fs::copy("/bin/echo", &private_executable).unwrap();
+    let script = "import errno, os\ntry:\n os.execv(os.environ['PRIVATE_EXECUTABLE'], ['private-echo'])\nexcept OSError as error:\n assert error.errno == errno.EACCES\nelse:\n raise AssertionError('private executable unexpectedly ran')";
+
+    let outcome = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(
+            SandboxCommand::new(python3())
+                .args(["-c", script])
+                .env("PRIVATE_EXECUTABLE", &private_executable)
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -709,6 +782,13 @@ async fn runner_interposes_the_complete_filesystem_operation_set() {
         std::fs::Permissions::from_mode(0o644),
     )
     .unwrap();
+    std::os::unix::fs::symlink("source.txt", source.join("source-link")).unwrap();
+    let source_modified = source
+        .join("source.txt")
+        .metadata()
+        .unwrap()
+        .modified()
+        .unwrap();
     let command = SandboxCommand::new(std::env::current_exe().unwrap())
         .arg("filesystem_interposed_child_process")
         .arg("--exact")
@@ -756,11 +836,25 @@ async fn runner_interposes_the_complete_filesystem_operation_set() {
             .join("source.txt")
             .metadata()
             .unwrap()
+            .modified()
+            .unwrap(),
+        source_modified
+    );
+    assert_eq!(
+        source
+            .join("source.txt")
+            .metadata()
+            .unwrap()
             .permissions()
             .mode()
             & 0o777,
         0o644
     );
+    assert_eq!(
+        std::fs::read_link(source.join("source-link")).unwrap(),
+        Path::new("source.txt")
+    );
+    assert!(!source.join("renamed-link").exists());
     for path in [
         "created.txt",
         "creat.txt",
@@ -964,6 +1058,10 @@ fn filesystem_interposed_child_process() {
         std::ffi::CString::new(root.join("creat.txt").as_os_str().as_encoded_bytes()).unwrap();
     let spawn =
         std::ffi::CString::new(root.join("spawn.txt").as_os_str().as_encoded_bytes()).unwrap();
+    let source_link =
+        std::ffi::CString::new(root.join("source-link").as_os_str().as_encoded_bytes()).unwrap();
+    let renamed_link =
+        std::ffi::CString::new(root.join("renamed-link").as_os_str().as_encoded_bytes()).unwrap();
 
     unsafe {
         assert_eq!(libc::access(std::ptr::null(), libc::R_OK), -1);
@@ -978,15 +1076,138 @@ fn filesystem_interposed_child_process() {
 
         let descriptor = libc::open(source.as_ptr(), libc::O_RDONLY);
         assert!(descriptor >= 0);
+
+        let mut link_target = [0_u8; 64];
+        let link_length = libc::readlink(
+            source_link.as_ptr(),
+            link_target.as_mut_ptr().cast(),
+            link_target.len(),
+        );
+        assert_eq!(link_length, 10);
+        assert_eq!(&link_target[..link_length as usize], b"source.txt");
+        assert_eq!(
+            libc::renamex_np(source_link.as_ptr(), renamed_link.as_ptr(), 0),
+            0
+        );
+        assert_eq!(
+            libc::readlink(
+                source_link.as_ptr(),
+                link_target.as_mut_ptr().cast(),
+                link_target.len(),
+            ),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOENT);
+
+        let timeval = [libc::timeval {
+            tv_sec: 1,
+            tv_usec: 0,
+        }; 2];
+        let timespec = [libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        }; 2];
+        assert_eq!(libc::utimes(source.as_ptr(), timeval.as_ptr()), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(libc::lutimes(source.as_ptr(), timeval.as_ptr()), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(libc::futimes(descriptor, timeval.as_ptr()), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(libc::futimens(descriptor, timespec.as_ptr()), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(
+            libc::utimensat(libc::AT_FDCWD, source.as_ptr(), timespec.as_ptr(), 0),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(libc::chflags(source.as_ptr(), 0), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(libc::fchflags(descriptor, 0), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(
+            libc::setxattr(
+                source.as_ptr(),
+                c"com.agora.test".as_ptr(),
+                b"value".as_ptr().cast(),
+                5,
+                0,
+                0,
+            ),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(
+            libc::fsetxattr(
+                descriptor,
+                c"com.agora.test".as_ptr(),
+                b"value".as_ptr().cast(),
+                5,
+                0,
+                0,
+            ),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(
+            libc::removexattr(source.as_ptr(), c"com.agora.test".as_ptr(), 0),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(
+            libc::fremovexattr(descriptor, c"com.agora.test".as_ptr(), 0),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
         assert_eq!(libc::close(descriptor), 0);
 
         let root_path = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()).unwrap();
         let directory = libc::open(root_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
         assert!(directory >= 0);
+        assert_eq!(libc::fchdir(directory), 0);
+        assert_eq!(libc::fchdir(-1), -1);
         assert_eq!(
             libc::fstatat(directory, c"source.txt".as_ptr(), status.as_mut_ptr(), 0),
             0
         );
+        let link_length = libc::readlinkat(
+            directory,
+            c"renamed-link".as_ptr(),
+            link_target.as_mut_ptr().cast(),
+            link_target.len(),
+        );
+        assert_eq!(link_length, 10);
+        assert_eq!(&link_target[..link_length as usize], b"source.txt");
+        assert_eq!(
+            libc::renameatx_np(
+                directory,
+                c"renamed-link".as_ptr(),
+                directory,
+                c"source-link".as_ptr(),
+                0,
+            ),
+            0
+        );
+        assert_eq!(
+            libc::renamex_np(source_link.as_ptr(), renamed_link.as_ptr(), 1),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(
+            libc::renamex_np(c"missing".as_ptr(), c"also-missing".as_ptr(), 0),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOENT);
+        assert_eq!(
+            libc::renameatx_np(
+                directory,
+                c"missing".as_ptr(),
+                directory,
+                c"also-missing".as_ptr(),
+                0,
+            ),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOENT);
         let created_file = libc::openat(
             directory,
             c"created.txt".as_ptr(),
@@ -997,12 +1218,40 @@ fn filesystem_interposed_child_process() {
         assert_eq!(libc::write(created_file, b"created".as_ptr().cast(), 7), 7);
         assert_eq!(libc::ftruncate(created_file, 4), 0);
         assert_eq!(libc::fchmod(created_file, 0o640), 0);
-        assert_eq!(libc::fchown(created_file, !0, !0), 0);
+        assert_eq!(libc::fsync(created_file), 0);
+        assert_eq!(
+            call_interposed_descriptor(c"agora_sandbox_commit_synced_descriptor", created_file,),
+            0
+        );
+        assert_eq!(libc::fcntl(created_file, libc::F_SETFD, 0), 0);
+        assert_ne!(
+            libc::fcntl(created_file, libc::F_GETFD) & libc::FD_CLOEXEC,
+            0
+        );
+        let duplicate = libc::dup(created_file);
+        assert!(duplicate >= 0);
+        let fcntl_duplicate = libc::fcntl(created_file, libc::F_DUPFD_CLOEXEC, 0);
+        assert!(fcntl_duplicate >= 0);
+        let replacement = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+        assert!(replacement >= 0);
+        assert_eq!(libc::dup2(created_file, replacement), replacement);
+        assert_eq!(libc::dup2(created_file, created_file), created_file);
+        for duplicate in [duplicate, fcntl_duplicate, replacement] {
+            assert_eq!(libc::close(duplicate), 0);
+        }
+        assert_eq!(libc::fchown(created_file, !0, !0), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
         assert_eq!(libc::close(created_file), 0);
+        assert_eq!(libc::fsync(-1), -1);
+        assert_eq!(libc::dup(-1), -1);
+        assert_eq!(libc::fchmod(-1, 0o600), -1);
+        assert_eq!(*libc::__error(), libc::EPERM);
         let creat_file = libc::creat(creat.as_ptr(), 0o600);
         assert!(creat_file >= 0);
         assert_eq!(libc::write(creat_file, b"creat".as_ptr().cast(), 5), 5);
         assert_eq!(libc::close(creat_file), 0);
+        assert_eq!(libc::truncate(creat.as_ptr(), -1), -1);
+        assert_eq!(*libc::__error(), libc::EINVAL);
         assert_eq!(libc::truncate(creat.as_ptr(), 2), 0);
 
         assert_eq!(libc::chmod(source.as_ptr(), 0o600), 0);
@@ -1016,8 +1265,43 @@ fn filesystem_interposed_child_process() {
             libc::fchmodat(directory, c"source.txt".as_ptr(), 0o640, 0),
             0
         );
+        assert_eq!(
+            libc::fchmodat(directory, c"source.txt".as_ptr(), 0o640, 1 << 20,),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::EINVAL);
         assert_eq!(libc::stat(source.as_ptr(), status.as_mut_ptr()), 0);
         assert_eq!(u32::from((*status.as_ptr()).st_mode) & 0o777, 0o640);
+        assert_eq!(libc::chmod(source.as_ptr(), 0), 0);
+        assert_eq!(
+            libc::faccessat(
+                directory,
+                c"source.txt".as_ptr(),
+                libc::R_OK,
+                libc::AT_EACCESS,
+            ),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::EACCES);
+        assert_eq!(libc::chmod(source.as_ptr(), 0o640), 0);
+        assert_eq!(
+            libc::faccessat(libc::AT_FDCWD, c"/dev/null".as_ptr(), libc::R_OK, 0,),
+            0
+        );
+        assert_eq!(
+            libc::faccessat(
+                directory,
+                c"source.txt".as_ptr(),
+                libc::R_OK,
+                libc::AT_EACCESS,
+            ),
+            0
+        );
+        assert_eq!(
+            libc::faccessat(directory, c"source.txt".as_ptr(), libc::R_OK, 1 << 20,),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::EINVAL);
         assert_eq!(
             libc::fchownat(directory, c"source.txt".as_ptr(), !0, !0, 0),
             -1
@@ -1092,6 +1376,16 @@ fn filesystem_interposed_child_process() {
         assert_eq!(
             libc::posix_spawn_file_actions_addopen(
                 &mut actions,
+                8,
+                source.as_ptr(),
+                libc::O_RDONLY,
+                0,
+            ),
+            0
+        );
+        assert_eq!(
+            libc::posix_spawn_file_actions_addopen(
+                &mut actions,
                 9,
                 spawn.as_ptr(),
                 libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
@@ -1130,6 +1424,8 @@ fn filesystem_interposed_child_process() {
         assert!(libc::fopen(source.as_ptr(), std::ptr::null()).is_null());
         let stream = libc::fopen(source.as_ptr(), c"r".as_ptr());
         assert!(!stream.is_null());
+        assert!(libc::freopen(spawn.as_ptr(), c"w".as_ptr(), stream).is_null());
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
         assert_eq!(libc::fclose(stream), 0);
 
         let appended =
@@ -1141,6 +1437,29 @@ fn filesystem_interposed_child_process() {
         assert_eq!(libc::unlink(appended.as_ptr()), 0);
 
         assert_eq!(libc::mkdir(created.as_ptr(), 0o700), 0);
+        let created_directory = libc::open(created.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
+        assert!(created_directory >= 0);
+        assert_eq!(libc::chmod(created.as_ptr(), 0o400), 0);
+        assert_eq!(libc::fchdir(created_directory), -1);
+        assert_eq!(*libc::__error(), libc::EACCES);
+        assert_eq!(libc::chmod(created.as_ptr(), 0o500), 0);
+        let denied = std::ffi::CString::new(
+            root.join("created/denied.txt")
+                .as_os_str()
+                .as_encoded_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            libc::open(
+                denied.as_ptr(),
+                libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+                0o600,
+            ),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::EACCES);
+        assert_eq!(libc::chmod(created.as_ptr(), 0o700), 0);
+        assert_eq!(libc::close(created_directory), 0);
         assert_eq!(libc::rename(creat.as_ptr(), renamed.as_ptr()), 0);
         assert_eq!(libc::unlink(renamed.as_ptr()), 0);
 
@@ -1160,7 +1479,57 @@ fn filesystem_interposed_child_process() {
         }
         assert!(names.iter().any(|name| name == b"source.txt"));
         assert!(names.iter().any(|name| name == b"created"));
+        libc::rewinddir(directory);
+        let mut rewound_names = Vec::new();
+        loop {
+            let entry = libc::readdir(directory);
+            if entry.is_null() {
+                break;
+            }
+            rewound_names.push(
+                std::ffi::CStr::from_ptr((*entry).d_name.as_ptr())
+                    .to_bytes()
+                    .to_vec(),
+            );
+        }
+        assert_eq!(rewound_names, names);
         assert_eq!(libc::closedir(directory), 0);
+
+        let descriptor = libc::open(root_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
+        assert!(descriptor >= 0);
+        let directory = libc::fdopendir(descriptor);
+        assert!(!directory.is_null());
+        let mut entry = std::mem::zeroed::<libc::dirent>();
+        let mut result = std::ptr::null_mut();
+        assert_eq!(
+            readdir_r(std::ptr::null_mut(), &mut entry, &mut result),
+            libc::EINVAL
+        );
+        loop {
+            assert_eq!(readdir_r(directory, &mut entry, &mut result), 0);
+            if result.is_null() {
+                break;
+            }
+        }
+        libc::rewinddir(directory);
+        assert_eq!(readdir_r(directory, &mut entry, &mut result), 0);
+        assert!(!result.is_null());
+        assert_eq!(libc::closedir(directory), 0);
+        assert!(libc::fdopendir(-1).is_null());
+
+        let external_directory = libc::open(c"/usr/bin".as_ptr(), libc::O_RDONLY);
+        assert!(external_directory >= 0);
+        let external_directory = libc::fdopendir(external_directory);
+        assert!(!external_directory.is_null());
+        assert!(!libc::readdir(external_directory).is_null());
+        assert_eq!(libc::closedir(external_directory), 0);
+
+        assert_eq!(libc::unlink(source.as_ptr()), 0);
+        assert_eq!(
+            libc::faccessat(libc::AT_FDCWD, source.as_ptr(), libc::F_OK, 0),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOENT);
 
         assert!(libc::opendir(std::ptr::null()).is_null());
         assert_eq!(libc::mkdir(std::ptr::null(), 0o700), -1);
@@ -1307,6 +1676,27 @@ fn exercise_interposed_process_symbols() {
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 0);
     }
+
+    let execve = unsafe {
+        std::mem::transmute::<*mut libc::c_void, ExecveFn>(symbol(c"agora_sandbox_execve"))
+    };
+    assert_eq!(
+        unsafe { execve(std::ptr::null(), std::ptr::null(), std::ptr::null()) },
+        -1
+    );
+    assert_eq!(unsafe { *libc::__error() }, libc::EFAULT);
+
+    let execvp = unsafe {
+        std::mem::transmute::<*mut libc::c_void, ExecvFn>(symbol(c"agora_sandbox_execvp"))
+    };
+    let missing = c"agora-command-that-does-not-exist";
+    let arguments = [missing.as_ptr(), std::ptr::null()];
+    assert_eq!(
+        unsafe { libc::setenv(c"PATH".as_ptr(), c":relative".as_ptr(), 1) },
+        0
+    );
+    assert_eq!(unsafe { execvp(missing.as_ptr(), arguments.as_ptr()) }, -1);
+    assert_eq!(unsafe { *libc::__error() }, libc::ENOENT);
 }
 
 #[test]
@@ -1435,6 +1825,125 @@ fn missing_hook_configuration_child_process() {
     if std::env::var_os("AGORA_SANDBOX_TEST_MISSING_CONFIG_CHILD").is_none() {
         return;
     }
+
+    let directory = std::env::temp_dir().join(format!(
+        "agora-missing-hook-filesystem-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let original_directory = std::env::current_dir().unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
+    let source_path = directory.join("source");
+    let target_path = directory.join("target");
+    std::fs::write(&source_path, b"source").unwrap();
+    std::fs::write(&target_path, b"target").unwrap();
+    std::os::unix::fs::symlink("source", directory.join("link")).unwrap();
+    let path = |path: &Path| std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let root = path(&directory);
+    let original = path(&original_directory);
+    let source = path(&source_path);
+    let target = path(&target_path);
+    let link = path(&directory.join("link"));
+
+    unsafe {
+        let descriptor = libc::open(source.as_ptr(), libc::O_RDWR);
+        assert!(descriptor >= 0);
+        assert_eq!(libc::fcntl(descriptor, libc::F_SETFD, 0), 0);
+        assert_eq!(libc::ftruncate(descriptor, 4), 0);
+        assert_eq!(libc::fchmod(descriptor, 0o600), 0);
+        assert_eq!(libc::fsync(descriptor), 0);
+        assert_eq!(
+            call_interposed_descriptor(c"agora_sandbox_commit_synced_descriptor", descriptor),
+            0
+        );
+        let duplicate = libc::dup(descriptor);
+        assert!(duplicate >= 0);
+        assert_eq!(libc::dup2(descriptor, duplicate), duplicate);
+        assert_eq!(libc::close(duplicate), 0);
+
+        let mut status = std::mem::zeroed::<libc::stat>();
+        assert_eq!(libc::fstat(descriptor, &mut status), 0);
+        assert_eq!(libc::stat(source.as_ptr(), &mut status), 0);
+        assert_eq!(libc::lstat(source.as_ptr(), &mut status), 0);
+        assert_eq!(libc::access(source.as_ptr(), libc::R_OK), 0);
+
+        let directory_descriptor = libc::open(root.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
+        assert!(directory_descriptor >= 0);
+        assert_eq!(
+            libc::fstatat(
+                directory_descriptor,
+                c"source".as_ptr(),
+                &mut status,
+                libc::AT_SYMLINK_NOFOLLOW,
+            ),
+            0
+        );
+        assert_eq!(
+            libc::faccessat(directory_descriptor, c"source".as_ptr(), libc::R_OK, 0),
+            0
+        );
+        assert_eq!(
+            libc::fchmodat(directory_descriptor, c"source".as_ptr(), 0o640, 0),
+            0
+        );
+
+        let mut link_target = [0_u8; 16];
+        assert_eq!(
+            libc::readlink(
+                link.as_ptr(),
+                link_target.as_mut_ptr().cast(),
+                link_target.len(),
+            ),
+            6
+        );
+        assert_eq!(
+            libc::readlinkat(
+                directory_descriptor,
+                c"link".as_ptr(),
+                link_target.as_mut_ptr().cast(),
+                link_target.len(),
+            ),
+            6
+        );
+
+        let stream = libc::fopen(source.as_ptr(), c"r".as_ptr());
+        assert!(!stream.is_null());
+        let stream = libc::freopen(target.as_ptr(), c"r".as_ptr(), stream);
+        assert!(!stream.is_null());
+        assert_eq!(libc::fclose(stream), 0);
+
+        let mut actions: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
+        assert_eq!(libc::posix_spawn_file_actions_init(&mut actions), 0);
+        assert_eq!(
+            libc::posix_spawn_file_actions_addopen(
+                &mut actions,
+                8,
+                source.as_ptr(),
+                libc::O_RDONLY,
+                0,
+            ),
+            0
+        );
+        assert_eq!(libc::posix_spawn_file_actions_destroy(&mut actions), 0);
+
+        assert_eq!(libc::chdir(root.as_ptr()), 0);
+        assert_eq!(libc::fchdir(directory_descriptor), 0);
+        let mut cwd = [0_i8; libc::PATH_MAX as usize];
+        assert_eq!(libc::getcwd(cwd.as_mut_ptr(), cwd.len()), cwd.as_mut_ptr());
+
+        let directory_stream = libc::fdopendir(libc::dup(directory_descriptor));
+        assert!(!directory_stream.is_null());
+        let mut entry = std::mem::zeroed::<libc::dirent>();
+        let mut result = std::ptr::null_mut();
+        assert_eq!(readdir_r(directory_stream, &mut entry, &mut result), 0);
+        libc::rewinddir(directory_stream);
+        assert_eq!(libc::closedir(directory_stream), 0);
+
+        assert_eq!(libc::chdir(original.as_ptr()), 0);
+        assert_eq!(libc::close(directory_descriptor), 0);
+        assert_eq!(libc::close(descriptor), 0);
+    }
+
+    std::fs::remove_dir_all(&directory).unwrap();
 
     let destination = std::env::var("AGORA_SANDBOX_TEST_DESTINATION").unwrap();
     let error = TcpStream::connect(destination).unwrap_err();

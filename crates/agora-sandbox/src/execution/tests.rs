@@ -91,7 +91,8 @@ fn execution_prepare_protocol_rejects_malformed_requests() {
     invalid_lengths[2..4].copy_from_slice(&0_u16.to_be_bytes());
     assert!(decode_prepare_request(&invalid_lengths).is_err());
 
-    let invalid_token = [0, 4, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0xff, b'x'];
+    let mut invalid_token = [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0xff, b'x'];
+    invalid_token[..2].copy_from_slice(&EXECUTION_PROTOCOL_VERSION.to_be_bytes());
     assert!(decode_prepare_request(&invalid_token).is_err());
 }
 
@@ -110,11 +111,14 @@ fn execution_prepare_protocol_rejects_malformed_responses() {
     invalid_status[2] = 2;
     assert!(decode_prepare_response(&invalid_status).is_err());
 
-    let invalid_error = [0, 4, 1, 0, 0, 0, 5, 0, 0, 0, 1, 0xff];
+    let mut invalid_error = [0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 1, 0xff];
+    invalid_error[..2].copy_from_slice(&EXECUTION_PROTOCOL_VERSION.to_be_bytes());
     assert!(decode_prepare_response(&invalid_error).is_err());
-    let truncated_error = [0, 4, 1, 0, 0, 0, 3, 0, 0, 0];
+    let mut truncated_error = [0, 0, 1, 0, 0, 0, 3, 0, 0, 0];
+    truncated_error[..2].copy_from_slice(&EXECUTION_PROTOCOL_VERSION.to_be_bytes());
     assert!(decode_prepare_response(&truncated_error).is_err());
-    let invalid_errno = [0, 4, 1, 0, 0, 0, 4, 0, 0, 0, 0];
+    let mut invalid_errno = [0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 0];
+    invalid_errno[..2].copy_from_slice(&EXECUTION_PROTOCOL_VERSION.to_be_bytes());
     assert!(decode_prepare_response(&invalid_errno).is_err());
 
     let oversized = OsString::from_vec(vec![b'x'; 64 * 1024]);

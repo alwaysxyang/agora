@@ -48,6 +48,23 @@ fn basic_x509_trust_is_not_an_ssl_policy() {
 #[test]
 fn malformed_anchor_is_rejected() {
     assert!(TrustAnchor::from_der(b"not a certificate").is_err());
+    assert!(matches!(
+        TrustRuntime::from_encoded_der(Some("")),
+        TrustRuntime::Invalid
+    ));
+}
+
+#[test]
+fn anchor_injection_releases_certificates_when_a_later_anchor_is_invalid() {
+    let trust = ssl_trust("example.test");
+    let anchors = TrustAnchors(vec![
+        TrustAnchor::from_der(&decode(CA_DER)).unwrap(),
+        TrustAnchor {
+            der: b"not a certificate".to_vec(),
+        },
+    ]);
+
+    assert!(unsafe { anchors.inject(trust.0) }.is_err());
 }
 
 #[test]

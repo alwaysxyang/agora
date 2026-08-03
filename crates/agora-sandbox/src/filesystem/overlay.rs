@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -28,18 +29,74 @@ pub(crate) struct DirectoryView {
     aliases: HashMap<OsString, OsString>,
 }
 
-#[derive(Clone)]
 pub(crate) struct StagedWrite {
     logical: PathBuf,
     destination: PathBuf,
-    previous_state: Option<EntryState>,
-    destination_existed: bool,
+    reservation: Option<WriteReservation>,
+}
+
+struct WriteReservation {
+    file: File,
+    lock_path: PathBuf,
 }
 
 impl StagedWrite {
     pub(crate) fn destination(&self) -> &Path {
         &self.destination
     }
+
+    fn commit(&mut self) {
+        drop(self.reservation.take());
+    }
+}
+
+impl Drop for StagedWrite {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let Ok(lock) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&reservation.lock_path)
+        else {
+            return;
+        };
+        if OverlayStore::flock(&lock, libc::LOCK_EX).is_err() {
+            return;
+        }
+        let reserved = reservation
+            .file
+            .metadata()
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        let current = self
+            .destination
+            .symlink_metadata()
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        if reserved.is_some() && reserved == current {
+            let _ = fs::remove_file(&self.destination);
+        }
+        let _ = OverlayStore::flock(&lock, libc::LOCK_UN);
+    }
+}
+
+fn is_private_path_with_roots(root: &Path, canonical_root: &Path, path: &Path) -> Result<bool> {
+    let path = namespace::normalize(path)?;
+    if root
+        .parent()
+        .is_some_and(|workdir| path.starts_with(workdir))
+        || canonical_root
+            .parent()
+            .is_some_and(|workdir| path.starts_with(workdir))
+    {
+        return Ok(true);
+    }
+    let resolved = OverlayStore::resolve_existing_ancestor(&path)?;
+    Ok(canonical_root
+        .parent()
+        .is_some_and(|workdir| resolved.starts_with(workdir)))
 }
 
 impl DirectoryView {
@@ -116,23 +173,7 @@ impl OverlayStore {
     }
 
     pub(crate) fn is_private(&self, path: &Path) -> Result<bool> {
-        let path = self.normalize(path)?;
-        if self
-            .root
-            .parent()
-            .is_some_and(|workdir| path.starts_with(workdir))
-            || self
-                .canonical_root
-                .parent()
-                .is_some_and(|workdir| path.starts_with(workdir))
-        {
-            return Ok(true);
-        }
-        let resolved = Self::resolve_existing_ancestor(&path)?;
-        Ok(self
-            .canonical_root
-            .parent()
-            .is_some_and(|workdir| resolved.starts_with(workdir)))
+        is_private_path_with_roots(&self.root, &self.canonical_root, path)
     }
 
     pub(crate) fn logical_path(&self, path: &Path) -> Result<PathBuf> {
@@ -251,46 +292,92 @@ impl OverlayStore {
             return Ok(StagedWrite {
                 destination: path.clone(),
                 logical: path,
-                previous_state: None,
-                destination_existed: true,
+                reservation: None,
             });
         }
         let destination = self.with_lock(|| self.stage_write_locked(&path, create))?;
-        let previous_state = self.with_lock(|| self.metadata.state(&path))?;
-        let destination_existed = destination.exists();
         Ok(StagedWrite {
             logical: path,
             destination,
-            previous_state,
-            destination_existed,
+            reservation: None,
         })
     }
 
-    pub(crate) fn commit_write(&self, staged: StagedWrite) -> Result<()> {
-        if self.is_internal(&staged.logical) {
-            return Ok(());
-        }
-        self.with_lock(|| self.metadata.set(&staged.logical, EntryState::Cow))
-    }
-
-    pub(crate) fn rollback_write(&self, staged: StagedWrite) -> Result<()> {
-        if self.is_internal(&staged.logical) {
-            return Ok(());
+    pub(crate) fn stage_file_open(
+        &self,
+        path: &Path,
+        create: bool,
+        exclusive: bool,
+    ) -> Result<(StagedWrite, bool, Option<File>)> {
+        let path = self.normalize(path)?;
+        if self.is_internal(&path) {
+            return Ok((
+                StagedWrite {
+                    destination: path.clone(),
+                    logical: path,
+                    reservation: None,
+                },
+                true,
+                None,
+            ));
         }
         self.with_lock(|| {
-            match staged.previous_state {
-                Some(state) => self.metadata.set(&staged.logical, state)?,
-                None => self.metadata.remove(&staged.logical)?,
+            let existed = self.visible_exists_locked(&path)?;
+            if create && exclusive && existed {
+                return Err(std::io::Error::from_raw_os_error(libc::EEXIST).into());
             }
-            if !staged.destination_existed {
-                Self::remove_existing(&staged.destination)?;
-            }
-            Ok(())
+            let destination = self.stage_write_locked(&path, create)?;
+            let reserve = self.cipher.is_some() && create && exclusive && !existed;
+            let reservation = reserve
+                .then(|| {
+                    OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&destination)
+                        .map_err(|error| {
+                            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                                std::io::Error::from_raw_os_error(libc::EEXIST)
+                            } else {
+                                error
+                            }
+                        })
+                })
+                .transpose()?;
+            let lease = match self.acquire_write_lease(&destination, libc::LOCK_SH) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    if reserve {
+                        let _ = fs::remove_file(&destination);
+                    }
+                    return Err(error);
+                }
+            };
+            let staged = StagedWrite {
+                logical: path,
+                destination,
+                reservation: reservation.map(|file| WriteReservation {
+                    file,
+                    lock_path: self.lock_path.clone(),
+                }),
+            };
+            Ok((staged, existed, lease))
         })
     }
 
-    pub(crate) fn commit_created_file(&self, staged: StagedWrite, mode: u32) -> Result<()> {
+    pub(crate) fn commit_write(&self, mut staged: StagedWrite) -> Result<()> {
         if self.is_internal(&staged.logical) {
+            staged.commit();
+            return Ok(());
+        }
+        self.with_lock(|| self.metadata.set(&staged.logical, EntryState::Cow))?;
+        staged.commit();
+        Ok(())
+    }
+
+    pub(crate) fn commit_created_file(&self, mut staged: StagedWrite, mode: u32) -> Result<()> {
+        if self.is_internal(&staged.logical) {
+            staged.commit();
             return Ok(());
         }
         self.with_lock(|| {
@@ -299,7 +386,17 @@ impl OverlayStore {
                 EntryState::Cow,
                 Some(FileAttributes::created_file(mode)),
             )
-        })
+        })?;
+        staged.commit();
+        Ok(())
+    }
+
+    pub(crate) fn publish_encrypted(&self, plaintext: &mut File, destination: &Path) -> Result<()> {
+        let cipher = self
+            .cipher
+            .as_ref()
+            .context("encrypted writeback requires a filesystem cipher")?;
+        self.with_lock(|| cipher.encrypt(plaintext, destination))
     }
 
     pub(crate) fn prepare_directory(&self, path: &Path) -> Result<PathBuf> {
@@ -762,6 +859,7 @@ impl OverlayStore {
         } else if metadata.is_dir() {
             return Err(std::io::Error::from_raw_os_error(libc::EISDIR).into());
         }
+        let _leases = self.acquire_namespace_leases(&destination, metadata.is_dir())?;
         Self::remove_existing(&destination)?;
         self.metadata
             .set_with_attributes(path, EntryState::Whiteout, None)
@@ -818,6 +916,7 @@ impl OverlayStore {
         if from_visible_metadata.is_dir() && to.starts_with(from) {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL).into());
         }
+        let mut namespace_leases = Vec::new();
         if self.visible_exists_locked(to)? {
             let to_visible = self.prepare_read_locked(to)?;
             let to_metadata = to_visible.symlink_metadata()?;
@@ -830,6 +929,8 @@ impl OverlayStore {
             if to_metadata.is_dir() && !self.directory_is_empty_locked(to)? {
                 return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY).into());
             }
+            namespace_leases
+                .extend(self.acquire_namespace_leases(&to_visible, to_metadata.is_dir())?);
         }
         if !self.is_internal(&from_visible) && from_visible_metadata.is_dir() {
             self.validate_materializable_tree_locked(from)?;
@@ -846,6 +947,9 @@ impl OverlayStore {
         } else {
             return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into());
         };
+        namespace_leases.extend(
+            self.acquire_namespace_leases(&from_destination, from_visible_metadata.is_dir())?,
+        );
         self.ensure_parent_locked(to)?;
         let to_destination = if from_visible_metadata.is_dir() {
             self.plain_destination(to)?
@@ -1041,6 +1145,84 @@ impl OverlayStore {
         Ok(())
     }
 
+    fn write_lease_path(destination: &Path) -> Result<PathBuf> {
+        let name = destination
+            .file_name()
+            .context("encrypted filesystem destination has no file name")?;
+        let mut lease = namespace::WRITE_LEASE_PREFIX.to_vec();
+        lease.extend_from_slice(name.as_bytes());
+        Ok(destination.with_file_name(OsString::from_vec(lease)))
+    }
+
+    fn acquire_write_lease(
+        &self,
+        destination: &Path,
+        operation: libc::c_int,
+    ) -> Result<Option<File>> {
+        if self.cipher.is_none() || !self.is_internal(destination) {
+            return Ok(None);
+        }
+        let path = Self::write_lease_path(destination)?;
+        let lease = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("failed to open write lease {}", path.display()))?;
+        if let Err(error) = Self::flock(&lease, operation) {
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Err(std::io::Error::from_raw_os_error(libc::EBUSY).into());
+            }
+            return Err(error)
+                .with_context(|| format!("failed to acquire write lease {}", path.display()));
+        }
+        Ok(Some(lease))
+    }
+
+    fn acquire_namespace_leases(&self, destination: &Path, directory: bool) -> Result<Vec<File>> {
+        if self.cipher.is_none() || !self.is_internal(destination) {
+            return Ok(Vec::new());
+        }
+        if !directory {
+            return self
+                .acquire_write_lease(destination, libc::LOCK_EX | libc::LOCK_NB)
+                .map(|lease| lease.into_iter().collect());
+        }
+        let mut pending = vec![destination.to_path_buf()];
+        let mut leases = Vec::new();
+        while let Some(current) = pending.pop() {
+            for entry in fs::read_dir(current)? {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    pending.push(entry.path());
+                    continue;
+                }
+                if !entry
+                    .file_name()
+                    .as_bytes()
+                    .starts_with(namespace::WRITE_LEASE_PREFIX)
+                {
+                    continue;
+                }
+                let lease = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(entry.path())?;
+                if let Err(error) = Self::flock(&lease, libc::LOCK_EX | libc::LOCK_NB) {
+                    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                        return Err(std::io::Error::from_raw_os_error(libc::EBUSY).into());
+                    }
+                    return Err(error.into());
+                }
+                leases.push(lease);
+            }
+        }
+        Ok(leases)
+    }
+
     fn with_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         let lock = OpenOptions::new()
             .read(true)
@@ -1050,6 +1232,7 @@ impl OverlayStore {
         Self::flock(&lock, libc::LOCK_EX)?;
         let result = operation();
         let unlock = Self::flock(&lock, libc::LOCK_UN);
+        drop(lock);
         match result {
             Ok(value) => {
                 unlock?;
