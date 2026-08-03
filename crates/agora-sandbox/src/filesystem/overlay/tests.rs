@@ -1,5 +1,6 @@
 use super::OverlayStore;
-use crate::filesystem::{EntryState, Materializer};
+use crate::filesystem::{EntryState, FileCipher, Materializer};
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,24 @@ impl Fixture {
             lower,
             store,
         }
+    }
+
+    fn encrypted() -> (Self, FileCipher) {
+        let directory =
+            std::env::temp_dir().join(format!("agora-overlay-{}", uuid::Uuid::new_v4()));
+        let lower = directory.join("lower");
+        let root = directory.join("fs");
+        std::fs::create_dir_all(&lower).unwrap();
+        let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+        let store = OverlayStore::encrypted(root, cipher.clone()).unwrap();
+        (
+            Self {
+                directory,
+                lower,
+                store,
+            },
+            cipher,
+        )
     }
 }
 
@@ -100,6 +119,16 @@ fn read_uses_lower_without_materializing_host_files() {
 }
 
 #[test]
+fn encrypted_root_reads_use_the_backing_root_without_leaf_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fs");
+    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+    let store = OverlayStore::encrypted(&root, cipher).unwrap();
+
+    assert_eq!(store.prepare_read(Path::new("/")).unwrap(), Path::new("/"));
+}
+
+#[test]
 fn write_intent_copies_up_and_preserves_cow_after_host_changes() {
     let fixture = Fixture::new();
     let source = fixture.lower.join("file");
@@ -172,9 +201,12 @@ fn directory_view_keeps_lower_entries_lazy_and_tracks_whiteouts() {
     std::fs::write(cow, b"sandbox cow").unwrap();
 
     let view = fixture.store.directory_view(&fixture.lower).unwrap();
-    let upper_names = std::fs::read_dir(view.upper())
+    let upper_names = std::fs::read_dir(view.primary())
         .unwrap()
-        .map(|entry| entry.unwrap().file_name())
+        .map(|entry| {
+            let name = entry.unwrap().file_name();
+            view.aliases().get(&name).cloned().unwrap_or(name)
+        })
         .filter(|name| !view.hidden().contains(name))
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(upper_names.len(), 1);
@@ -192,17 +224,21 @@ fn directory_view_keeps_lower_entries_lazy_and_tracks_whiteouts() {
 }
 
 #[test]
-fn physical_upper_directories_remain_owner_manageable() {
+fn reading_a_lower_directory_does_not_materialize_an_upper_directory() {
     let fixture = Fixture::new();
     let directory = fixture.lower.join("read-only");
     std::fs::create_dir(&directory).unwrap();
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    let upper = fixture.store.prepare_directory(&directory).unwrap();
+    let visible = fixture.store.prepare_directory(&directory).unwrap();
 
-    assert_eq!(
-        upper.metadata().unwrap().permissions().mode() & 0o700,
-        0o700
+    assert_eq!(visible, directory);
+    assert!(
+        !fixture
+            .store
+            .plain_destination(&directory)
+            .unwrap()
+            .exists()
     );
 }
 
@@ -227,6 +263,22 @@ fn removing_a_lower_directory_requires_the_merged_view_to_be_empty() {
     fixture.store.remove(&directory, true).unwrap();
     assert!(fixture.store.prepare_read(&directory).is_err());
     assert!(directory.exists());
+}
+
+#[test]
+fn removing_an_encrypted_upper_directory_rejects_aliased_children() {
+    let (fixture, _) = Fixture::encrypted();
+    let directory = fixture.lower.join("directory");
+    let child = directory.join("child");
+    fixture.store.create_directory(&directory, 0o700).unwrap();
+    let staged = fixture.store.stage_write(&child, true).unwrap();
+    std::fs::write(staged.destination(), b"child").unwrap();
+    fixture.store.commit_write(staged).unwrap();
+
+    let error = fixture.store.remove(&directory, true).unwrap_err();
+
+    assert_eq!(errno(&error), Some(libc::ENOTEMPTY));
+    assert!(fixture.store.prepare_read(&child).unwrap().is_file());
 }
 
 #[test]
@@ -348,11 +400,10 @@ fn directory_rename_preserves_lower_symlinks() {
     fixture.store.rename(&source, &target).unwrap();
 
     let mapped = fixture.store.prepare_directory(&target).unwrap();
-    assert_eq!(
-        std::fs::read_link(mapped.join("link")).unwrap(),
-        Path::new("file")
-    );
-    assert_eq!(std::fs::read(mapped.join("link")).unwrap(), b"contents");
+    let link = fixture.store.prepare_read(&target.join("link")).unwrap();
+    assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("file"));
+    assert_eq!(std::fs::read(link).unwrap(), b"contents");
+    assert!(mapped.is_dir());
 }
 
 #[test]
@@ -449,12 +500,78 @@ fn directory_rename_materializes_the_visible_tree_without_changing_the_lower_tre
 
     assert!(fixture.store.prepare_read(&source).is_err());
     let mapped = fixture.store.prepare_read(&target).unwrap();
-    assert_eq!(std::fs::read(mapped.join("root-file")).unwrap(), b"root");
     assert_eq!(
-        std::fs::read(mapped.join("nested/nested-file")).unwrap(),
+        std::fs::read(
+            fixture
+                .store
+                .prepare_read(&target.join("root-file"))
+                .unwrap()
+        )
+        .unwrap(),
+        b"root"
+    );
+    assert_eq!(
+        std::fs::read(
+            fixture
+                .store
+                .prepare_read(&target.join("nested/nested-file"))
+                .unwrap()
+        )
+        .unwrap(),
         b"nested"
     );
-    assert!(!mapped.join("removed").exists());
+    assert!(fixture.store.prepare_read(&target.join("removed")).is_err());
+    assert!(mapped.is_dir());
+    assert_eq!(std::fs::read(source.join("root-file")).unwrap(), b"root");
+    assert_eq!(
+        std::fs::read(nested.join("nested-file")).unwrap(),
+        b"nested"
+    );
+    assert!(!target.exists());
+}
+
+#[test]
+fn encrypted_directory_rename_preserves_nested_files() {
+    let (fixture, cipher) = Fixture::encrypted();
+    let source = fixture.lower.join("source-directory");
+    let nested = source.join("nested");
+    let target = fixture.lower.join("target-directory");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(source.join("root-file"), b"root").unwrap();
+    std::fs::write(nested.join("nested-file"), b"nested").unwrap();
+
+    fixture.store.rename(&source, &target).unwrap();
+
+    let mut root_plaintext = tempfile::tempfile().unwrap();
+    cipher
+        .decrypt(
+            &fixture
+                .store
+                .prepare_read(&target.join("root-file"))
+                .unwrap(),
+            &mut root_plaintext,
+        )
+        .unwrap();
+    let mut nested_plaintext = tempfile::tempfile().unwrap();
+    cipher
+        .decrypt(
+            &fixture
+                .store
+                .prepare_read(&target.join("nested/nested-file"))
+                .unwrap(),
+            &mut nested_plaintext,
+        )
+        .unwrap();
+
+    let mut root_contents = String::new();
+    root_plaintext.read_to_string(&mut root_contents).unwrap();
+    let mut nested_contents = String::new();
+    nested_plaintext
+        .read_to_string(&mut nested_contents)
+        .unwrap();
+
+    assert_eq!(root_contents, "root");
+    assert_eq!(nested_contents, "nested");
     assert_eq!(std::fs::read(source.join("root-file")).unwrap(), b"root");
     assert_eq!(
         std::fs::read(nested.join("nested-file")).unwrap(),

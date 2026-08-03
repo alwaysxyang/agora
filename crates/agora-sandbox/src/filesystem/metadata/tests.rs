@@ -128,6 +128,7 @@ fn metadata_rejects_invalid_paths_and_records() {
             version: METADATA_VERSION + 1,
             entries: Default::default(),
             attributes: Default::default(),
+            backing_names: Default::default(),
         })
         .unwrap(),
     )
@@ -175,6 +176,7 @@ fn metadata_rejects_invalid_encoded_names() {
             version: METADATA_VERSION,
             entries: BTreeMap::from([("*".to_string(), EntryState::Cow)]),
             attributes: Default::default(),
+            backing_names: Default::default(),
         })
         .unwrap(),
     )
@@ -234,7 +236,7 @@ fn metadata_publication_failure_removes_the_temporary_file() {
 }
 
 #[test]
-fn metadata_write_failure_removes_the_temporary_file() {
+fn metadata_creation_failure_leaves_no_temporary_file() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile();
@@ -250,7 +252,7 @@ fn metadata_write_failure_removes_the_temporary_file() {
             .set(&directory.join("entry"), EntryState::Cow)
             .unwrap_err()
             .to_string()
-            .contains("failed to write filesystem metadata")
+            .contains("failed to create filesystem metadata")
     );
 
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();

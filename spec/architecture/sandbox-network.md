@@ -28,9 +28,9 @@ This implementation is an observation and routing layer, not yet a complete cont
   for one hour, so sibling names covered by one wildcard reuse the same certificate. The proxy
   negotiates the upstream ALPN first, then presents the same ALPN downstream. Handshake and
   verification failures are blocked without raw fallback.
-- One or more DER trust anchors can be injected into covered macOS `SecTrust` SSL evaluations
-  without modifying a user or system Keychain. The interception CA is injected automatically;
-  `--tls-trust-anchor` can add another trust-only CA independently of termination.
+- The interception CA is injected into covered macOS `SecTrust` SSL evaluations without modifying
+  a user or system Keychain. This transport is internal to TLS interception; there is no public
+  independent trust-anchor option.
 
 The term "sandbox traffic" therefore means TCP calls made through covered APIs by a process that
 the runner can prepare and that successfully loads the hook. It does not mean all host or kernel
@@ -40,9 +40,8 @@ traffic.
 
 `agora-sandbox` exposes:
 
-- `SandboxConfig`: network policy, hook-library path, an optional process-local DER TLS trust
-  anchor, an optional fixed TLS interception CA certificate/private-key pair, and the persistent
-  sandbox work directory.
+- `SandboxConfig`: network policy, hook-library path, an optional fixed TLS interception CA
+  certificate/private-key pair, and the persistent sandbox work directory.
 - `SandboxCommand`: program, arguments, environment, and working-directory configuration.
 - `Sandbox<C: Callback>`: one sandbox run with a caller-provided asynchronous callback.
 - `SandboxOutcome`: child exit status plus generated sandbox and run identifiers.
@@ -75,9 +74,8 @@ The library-level `generate_tls_ca` function creates missing parent directories 
 ten-year signing CA and matching PKCS#8 private key in PEM format. Certificate and key destinations
 must differ. Existing destination files are replaced, and both generated files use mode `0600` on
 Unix. There is no separate CLI certificate-generation subcommand.
-`--tls-trust-anchor` accepts one additional DER CA certificate. Malformed, mismatched, missing, or
-unreadable inputs are rejected before the child starts. The CA private key remains in the host
-proxy and is never transported to the child. Auto mode writes a CA-keyed trust bundle containing
+The CA private key remains in the host proxy and is never transported to the child. Auto mode
+writes a CA-keyed trust bundle containing
 the interception CA and current native roots under `<workdir>/ca`, then points `SSL_CERT_FILE`,
 `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, and `GIT_SSL_CAINFO` at that bundle.
 Covered descendant launches restore these protected values even if the caller clears or replaces
@@ -107,7 +105,7 @@ Each run creates independent identifiers, credentials, and listeners:
 ```text
 Sandbox::run
   -> validate intercept and TLS policy
-  -> validate the optional DER trust anchor and explicit fixed PEM interception CA paths
+  -> validate explicit fixed PEM interception CA paths when configured
   -> use the configured persistent workdir and load or generate its default CA when explicit paths are absent
   -> create an authenticated loopback audit controller for process and file events
   -> create an authenticated loopback execution controller backed by <workdir>/fs
@@ -115,8 +113,8 @@ Sandbox::run
   -> resolve the root executable and prepare a persistent native copy only when injection
      restrictions require it
   -> validate the CA/key pair, load native upstream roots, and bind loopback proxy listeners
-  -> publish a CA-keyed trust bundle, transport configured CA DER bytes and the bundle path to the
-     child, and retain the private key only in the host
+  -> publish a CA-keyed trust bundle, transport the interception CA DER bytes and bundle path to
+     the child as internal runtime configuration, and retain the private key only in the host
   -> inject libagora_sandbox.dylib and immutable per-run control configuration
   -> start the original or prepared child as a new process-group leader
 

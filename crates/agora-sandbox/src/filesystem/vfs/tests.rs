@@ -3,8 +3,6 @@ use crate::filesystem::crypto::FileCipher;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::{Arc, mpsc};
-use std::time::Duration;
 
 fn fixture(name: &str) -> (std::path::PathBuf, VirtualFilesystem) {
     let root = std::env::temp_dir().join(format!("agora-vfs-{name}-{}", uuid::Uuid::new_v4()));
@@ -53,12 +51,11 @@ fn encrypted_writeback_publishes_ciphertext_and_restores_the_next_open() {
     };
     file.write_all(marker).unwrap();
     filesystem.commit_open(&mut prepared).unwrap();
-    let (target, writeback, lease, _) = prepared.into_parts();
+    let (target, writeback, _) = prepared.into_parts();
     let OpenTarget::Descriptor(file) = target else {
         panic!("expected descriptor");
     };
     writeback.unwrap().commit(file.as_raw_fd()).unwrap();
-    drop(lease);
 
     let backing = filesystem.prepare_read(logical).unwrap();
     let stored = std::fs::read(&backing).unwrap();
@@ -95,12 +92,11 @@ fn encrypted_write_intent_copies_up_lower_content_without_changing_lower() {
     file.set_len(0).unwrap();
     file.write_all(b"upper content").unwrap();
     filesystem.commit_open(&mut prepared).unwrap();
-    let (target, writeback, lease, _) = prepared.into_parts();
+    let (target, writeback, _) = prepared.into_parts();
     let OpenTarget::Descriptor(file) = target else {
         panic!("expected descriptor");
     };
     writeback.unwrap().commit(file.as_raw_fd()).unwrap();
-    drop(lease);
 
     assert_eq!(std::fs::read(&source).unwrap(), b"lower content");
     let backing = filesystem.prepare_read(&source).unwrap();
@@ -132,12 +128,11 @@ fn encrypted_open_honors_exclusive_create_and_truncate() {
         .prepare_open(logical, libc::O_CREAT | libc::O_RDWR, 0o600)
         .unwrap();
     filesystem.commit_open(&mut created).unwrap();
-    let (target, writeback, lease, _) = created.into_parts();
+    let (target, writeback, _) = created.into_parts();
     let OpenTarget::Descriptor(file) = target else {
         panic!("expected descriptor");
     };
     writeback.unwrap().commit(file.as_raw_fd()).unwrap();
-    drop(lease);
 
     assert!(
         filesystem
@@ -178,12 +173,11 @@ fn encrypted_descriptors_preserve_the_requested_access_mode() {
     );
     file.write_all(b"contents").unwrap();
     filesystem.commit_open(&mut created).unwrap();
-    let (target, writeback, lease, _) = created.into_parts();
+    let (target, writeback, _) = created.into_parts();
     let OpenTarget::Descriptor(file) = target else {
         panic!("expected encrypted descriptor");
     };
     writeback.unwrap().commit(file.as_raw_fd()).unwrap();
-    drop(lease);
 
     let reopened = filesystem.prepare_open(logical, libc::O_RDONLY, 0).unwrap();
     let OpenTarget::Descriptor(file) = reopened.target() else {
@@ -205,39 +199,22 @@ fn encrypted_descriptors_preserve_the_requested_access_mode() {
 }
 
 #[test]
-fn encrypted_write_open_waits_for_the_existing_writer() {
-    let (root, filesystem) = fixture("write-lock");
-    let filesystem = Arc::new(filesystem);
+fn encrypted_write_opens_do_not_wait_for_each_other() {
+    let (root, filesystem) = fixture("concurrent-write-open");
     let logical = Path::new("/tmp/agora-vfs-write-lock");
     let mut created = filesystem
         .prepare_open(logical, libc::O_CREAT | libc::O_RDWR, 0o600)
         .unwrap();
     filesystem.commit_open(&mut created).unwrap();
-    let (target, writeback, lease, _) = created.into_parts();
+    let (target, writeback, _) = created.into_parts();
     let OpenTarget::Descriptor(file) = target else {
         panic!("expected descriptor");
     };
     writeback.unwrap().commit(file.as_raw_fd()).unwrap();
-    drop(lease);
     let first = filesystem.prepare_open(logical, libc::O_RDWR, 0).unwrap();
-
-    let (opened_tx, opened_rx) = mpsc::channel();
-    let second_filesystem = Arc::clone(&filesystem);
-    let logical = logical.to_path_buf();
-    let second = std::thread::spawn(move || {
-        let opened = second_filesystem
-            .prepare_open(&logical, libc::O_RDWR, 0)
-            .unwrap();
-        opened_tx.send(()).unwrap();
-        opened
-    });
-    let opened_while_first_is_live = opened_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+    let second = filesystem.prepare_open(logical, libc::O_RDWR, 0).unwrap();
     drop(first);
-    let second = second.join().unwrap();
-    assert!(!opened_while_first_is_live);
-
     drop(second);
-    drop(filesystem);
     std::fs::remove_dir_all(root).unwrap();
 }
 

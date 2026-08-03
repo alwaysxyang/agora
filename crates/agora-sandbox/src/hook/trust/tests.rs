@@ -4,11 +4,9 @@ use super::{
     evaluate_with_error, has_ssl_policy, hook_create, hook_evaluate, hook_evaluate_with_error,
     original_create, original_evaluate, original_evaluate_async,
     original_evaluate_async_with_error, original_evaluate_with_error, policy_is_ssl, prepare,
-    validate_trust_anchor,
 };
 use base64::Engine;
 use std::ffi::{CString, c_void};
-use std::path::Path;
 
 const CA_DER: &str = include_str!("../../../tests/fixtures/test-ca.der.b64");
 const LEAF_DER: &str = include_str!("../../../tests/fixtures/test-leaf.der.b64");
@@ -50,9 +48,6 @@ fn basic_x509_trust_is_not_an_ssl_policy() {
 #[test]
 fn malformed_anchor_is_rejected() {
     assert!(TrustAnchor::from_der(b"not a certificate").is_err());
-    assert!(!validate_trust_anchor(Path::new(
-        "/missing/agora-test-anchor.der"
-    )));
 }
 
 #[test]

@@ -1,5 +1,4 @@
 #[cfg(target_os = "macos")]
-use base64::Engine;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 #[cfg(target_os = "macos")]
@@ -81,7 +80,7 @@ fn sandbox_cli_documents_only_available_options() {
     assert!(stdout.contains("[default: plain]"));
     assert!(stdout.contains("--filesystem-key <FILESYSTEM_KEY>"));
     assert!(!stdout.contains("--filesystem-key-file"));
-    assert!(stdout.contains("--tls-trust-anchor <TLS_TRUST_ANCHOR>"));
+    assert!(!stdout.contains("--tls-trust-anchor"));
     assert!(stdout.contains("--tls <TLS>"));
     assert!(stdout.contains("[possible values: off, auto]"));
     assert!(!stdout.contains("off, auto, require"));
@@ -439,57 +438,6 @@ fn sandbox_cli_requires_a_command() {
 
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--command <COMMAND>"));
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn sandbox_cli_injects_the_configured_tls_trust_anchor() {
-    let directory = std::env::temp_dir().join(format!(
-        "agora-sandbox-cli-trust-anchor-test-{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&directory).unwrap();
-    let workdir = directory.join("workdir");
-    let anchor = directory.join("ca.der");
-    let leaf = directory.join("leaf.der");
-    std::fs::write(
-        &anchor,
-        base64::engine::general_purpose::STANDARD
-            .decode(include_str!("fixtures/test-ca.der.b64").trim())
-            .unwrap(),
-    )
-    .unwrap();
-    std::fs::write(
-        &leaf,
-        base64::engine::general_purpose::STANDARD
-            .decode(include_str!("fixtures/test-leaf.der.b64").trim())
-            .unwrap(),
-    )
-    .unwrap();
-
-    let command = format!(
-        "/usr/bin/security verify-cert -c {} -p ssl -d 2026-08-01-00:00:00 -s example.test",
-        leaf.display()
-    );
-    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
-        .arg("--hook-library")
-        .arg(hook_library())
-        .arg("--workdir")
-        .arg(&workdir)
-        .arg("--tls-trust-anchor")
-        .arg(&anchor)
-        .arg("-c")
-        .arg(command)
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "stdout={}\nstderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

@@ -1,11 +1,11 @@
 #[cfg(test)]
 use super::EntryState;
-use super::overlay::FileLease;
 use super::{DirectoryView, FileCipher, OverlayStore, StagedWrite};
 use anyhow::{Result, bail};
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -28,7 +28,6 @@ pub(crate) struct PreparedFile {
     target: OpenTarget,
     staged: Option<StagedWrite>,
     writeback: Option<Writeback>,
-    lease: Option<FileLease>,
     created_mode: Option<u32>,
     layer: FileLayer,
 }
@@ -52,10 +51,8 @@ impl PreparedFile {
         self.staged.take()
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (OpenTarget, Option<Writeback>, Option<FileLease>, FileLayer) {
-        (self.target, self.writeback, self.lease, self.layer)
+    pub(crate) fn into_parts(self) -> (OpenTarget, Option<Writeback>, FileLayer) {
+        (self.target, self.writeback, self.layer)
     }
 }
 
@@ -94,7 +91,6 @@ impl VirtualFilesystem {
                 target: OpenTarget::Path(self.overlay.prepare_directory(logical)?),
                 staged: None,
                 writeback: None,
-                lease: None,
                 created_mode: None,
                 layer: FileLayer::Upper,
             });
@@ -102,24 +98,13 @@ impl VirtualFilesystem {
         let writes = flags & libc::O_ACCMODE != libc::O_RDONLY
             || flags & (libc::O_CREAT | libc::O_TRUNC) != 0;
         let create = flags & libc::O_CREAT != 0;
-        let (mapped, staged, lease, existed) = if writes {
-            let lease = self
-                .overlay
-                .cipher()
-                .is_some()
-                .then(|| self.overlay.acquire_file_lease(logical, true))
-                .transpose()?;
+        let (mapped, staged, existed) = if writes {
             let existed = self.overlay.exists(logical)?;
             if create && flags & libc::O_EXCL != 0 && existed {
                 return Err(std::io::Error::from_raw_os_error(libc::EEXIST).into());
             }
             let staged = self.overlay.stage_write(logical, create)?;
-            (
-                staged.destination().to_path_buf(),
-                Some(staged),
-                lease,
-                existed,
-            )
+            (staged.destination().to_path_buf(), Some(staged), existed)
         } else {
             let mapped = self.overlay.prepare_read(logical)?;
             if !self.overlay.is_internal(&mapped) {
@@ -127,25 +112,17 @@ impl VirtualFilesystem {
                     target: OpenTarget::Path(mapped),
                     staged: None,
                     writeback: None,
-                    lease: None,
                     created_mode: None,
                     layer: FileLayer::Lower,
                 });
             }
-            let lease = self
-                .overlay
-                .cipher()
-                .is_some()
-                .then(|| self.overlay.acquire_file_lease(logical, false))
-                .transpose()?;
-            (mapped, None, lease, true)
+            (mapped, None, true)
         };
         if !self.overlay.is_internal(&mapped) {
             return Ok(PreparedFile {
                 target: OpenTarget::Path(mapped),
                 staged,
                 writeback: None,
-                lease,
                 created_mode: None,
                 layer: FileLayer::Lower,
             });
@@ -155,7 +132,6 @@ impl VirtualFilesystem {
                 target: OpenTarget::Path(mapped),
                 staged,
                 writeback: None,
-                lease,
                 created_mode: None,
                 layer: FileLayer::Upper,
             });
@@ -165,26 +141,15 @@ impl VirtualFilesystem {
                 target: OpenTarget::Path(mapped),
                 staged,
                 writeback: None,
-                lease,
                 created_mode: None,
                 layer: FileLayer::Upper,
             });
         }
 
-        let mut plaintext = tempfile::NamedTempFile::new()?;
-        if mapped.is_file() {
-            cipher.decrypt(&mapped, plaintext.as_file_mut())?;
-        } else if !create {
-            bail!("filesystem path is not visible: {}", logical.display());
-        }
-        if flags & libc::O_TRUNC != 0 {
-            plaintext.as_file_mut().set_len(0)?;
-        }
-        if flags & libc::O_APPEND != 0 {
-            plaintext.as_file_mut().seek(SeekFrom::End(0))?;
-        } else {
-            plaintext.as_file_mut().seek(SeekFrom::Start(0))?;
-        }
+        let created_mode = (create && !existed)
+            .then(|| Self::effective_creation_mode(mode))
+            .transpose()?;
+        let plaintext = tempfile::NamedTempFile::new()?;
         let access = flags & libc::O_ACCMODE;
         let mut exposed = OpenOptions::new();
         exposed
@@ -192,7 +157,20 @@ impl VirtualFilesystem {
             .write(access != libc::O_RDONLY)
             .append(flags & libc::O_APPEND != 0);
         let exposed = exposed.open(plaintext.path())?;
-        let plaintext = plaintext.into_file();
+        let mut plaintext = plaintext.into_file();
+        if mapped.is_file() {
+            cipher.decrypt(&mapped, &mut plaintext)?;
+        } else if !create {
+            bail!("filesystem path is not visible: {}", logical.display());
+        }
+        if flags & libc::O_TRUNC != 0 {
+            plaintext.set_len(0)?;
+        }
+        if flags & libc::O_APPEND != 0 {
+            plaintext.seek(SeekFrom::End(0))?;
+        } else {
+            plaintext.seek(SeekFrom::Start(0))?;
+        }
         Ok(PreparedFile {
             target: OpenTarget::Descriptor(exposed),
             staged,
@@ -201,8 +179,7 @@ impl VirtualFilesystem {
                 cipher,
                 plaintext: Mutex::new(plaintext),
             }),
-            lease,
-            created_mode: (create && !existed).then_some(mode),
+            created_mode,
             layer: FileLayer::Upper,
         })
     }
@@ -311,6 +288,15 @@ impl VirtualFilesystem {
         self.overlay.set_attributes(path, attributes)
     }
 
+    pub(crate) fn refresh_timestamps(&self, path: &Path, status: &libc::stat) -> Result<()> {
+        let mut attributes = match self.overlay.attributes(path)? {
+            Some(attributes) => attributes,
+            None => super::FileAttributes::from_stat(status),
+        };
+        attributes.refresh_timestamps(status);
+        self.overlay.set_attributes(path, attributes)
+    }
+
     #[cfg(test)]
     pub(crate) fn prepare_write(&self, path: &Path, create: bool) -> Result<PathBuf> {
         self.overlay.prepare_write(path, create)
@@ -324,6 +310,10 @@ impl VirtualFilesystem {
         self.overlay.commit_write(staged)
     }
 
+    pub(crate) fn rollback_write(&self, staged: StagedWrite) -> Result<()> {
+        self.overlay.rollback_write(staged)
+    }
+
     pub(crate) fn prepare_directory(&self, path: &Path) -> Result<PathBuf> {
         self.overlay.prepare_directory(path)
     }
@@ -333,7 +323,8 @@ impl VirtualFilesystem {
     }
 
     pub(crate) fn create_directory(&self, path: &Path, mode: u32) -> Result<PathBuf> {
-        self.overlay.create_directory(path, mode)
+        self.overlay
+            .create_directory(path, Self::effective_creation_mode(mode)?)
     }
 
     pub(crate) fn remove(&self, path: &Path, directory: bool) -> Result<()> {
@@ -342,6 +333,13 @@ impl VirtualFilesystem {
 
     pub(crate) fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         self.overlay.rename(from, to)
+    }
+
+    fn effective_creation_mode(mode: u32) -> Result<u32> {
+        let probe = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(mode))
+            .tempfile()?;
+        Ok(probe.as_file().metadata()?.permissions().mode() & 0o7777)
     }
 
     #[cfg(test)]

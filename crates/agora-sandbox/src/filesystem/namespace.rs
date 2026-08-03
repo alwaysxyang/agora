@@ -8,7 +8,6 @@ pub(super) const METADATA_FILE: &str = ".metadata";
 pub(super) const FILESYSTEM_LOCK_FILE: &str = ".fs.lock";
 pub(super) const KEY_FILE: &str = ".key.json";
 pub(super) const VFS_LOCK_FILE: &str = ".vfs.lock";
-pub(super) const FILE_LOCK_DIRECTORY: &str = ".locks";
 pub(super) const REKEY_JOURNAL_FILE: &str = ".rekey.json";
 const ESCAPED_PREFIX: &[u8] = b".agora-entry-";
 
@@ -39,7 +38,7 @@ pub(super) fn logical_path(root: &Path, backing: &Path) -> Result<PathBuf> {
 
 pub(super) fn encode_name(name: &OsStr) -> OsString {
     let bytes = name.as_bytes();
-    if is_reserved(bytes) || bytes.starts_with(ESCAPED_PREFIX) {
+    if is_control_name(name) || bytes.starts_with(ESCAPED_PREFIX) {
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
         let mut physical = ESCAPED_PREFIX.to_vec();
         physical.extend_from_slice(encoded.as_bytes());
@@ -62,12 +61,15 @@ pub(super) fn decode_name(name: &OsStr) -> Result<OsString> {
 
 pub(super) fn is_control_name(name: &OsStr) -> bool {
     let name = name.as_bytes();
-    is_reserved(name)
-        || name.starts_with(b".metadata.")
-        || name.starts_with(b".key.json.")
-        || name.starts_with(b".rekey.json.")
+    is_reserved_or_variant(name)
+        || is_file_backing_name(name)
+        || name.starts_with(b".agora-executable-")
         || name.starts_with(b".agora-encrypted-")
         || name.starts_with(b".agora-rekey-")
+}
+
+fn is_file_backing_name(name: &[u8]) -> bool {
+    name.len() == 32 && name.iter().all(u8::is_ascii_hexdigit)
 }
 
 pub(super) fn normalize(path: &Path) -> Result<PathBuf> {
@@ -93,8 +95,25 @@ fn is_reserved(name: &[u8]) -> bool {
         || name == FILESYSTEM_LOCK_FILE.as_bytes()
         || name == KEY_FILE.as_bytes()
         || name == VFS_LOCK_FILE.as_bytes()
-        || name == FILE_LOCK_DIRECTORY.as_bytes()
         || name == REKEY_JOURNAL_FILE.as_bytes()
+}
+
+fn is_reserved_or_variant(name: &[u8]) -> bool {
+    if is_reserved(name) {
+        return true;
+    }
+    [
+        METADATA_FILE,
+        FILESYSTEM_LOCK_FILE,
+        KEY_FILE,
+        VFS_LOCK_FILE,
+        REKEY_JOURNAL_FILE,
+    ]
+    .into_iter()
+    .any(|reserved| {
+        name.strip_prefix(reserved.as_bytes())
+            .is_some_and(|suffix| suffix.starts_with(b"."))
+    })
 }
 
 #[cfg(test)]

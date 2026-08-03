@@ -483,10 +483,11 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
     else {
         return libc::EACCES;
     };
-    if let Err(error) = unsafe { super::filesystem::commit_spawn_file_actions(file_actions) } {
-        return PrepareError::from_anyhow(error, libc::EIO).errno;
-    }
-    unsafe {
+    let committed = match unsafe { super::filesystem::commit_spawn_file_actions(file_actions) } {
+        Ok(committed) => committed,
+        Err(error) => return PrepareError::from_anyhow(error, libc::EIO).errno,
+    };
+    let result = unsafe {
         original(
             pid,
             prepared.program.as_ptr(),
@@ -495,7 +496,11 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
             arguments.as_posix_ptr(),
             environment.as_posix_ptr(),
         )
+    };
+    if result != 0 && super::filesystem::rollback_spawn_file_actions(committed).is_err() {
+        return libc::EIO;
     }
+    result
 }
 
 #[unsafe(no_mangle)]
@@ -541,10 +546,11 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
     else {
         return libc::EACCES;
     };
-    if let Err(error) = unsafe { super::filesystem::commit_spawn_file_actions(file_actions) } {
-        return PrepareError::from_anyhow(error, libc::EIO).errno;
-    }
-    unsafe {
+    let committed = match unsafe { super::filesystem::commit_spawn_file_actions(file_actions) } {
+        Ok(committed) => committed,
+        Err(error) => return PrepareError::from_anyhow(error, libc::EIO).errno,
+    };
+    let result = unsafe {
         original(
             pid,
             prepared.program.as_ptr(),
@@ -553,7 +559,11 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
             arguments.as_posix_ptr(),
             environment.as_posix_ptr(),
         )
+    };
+    if result != 0 && super::filesystem::rollback_spawn_file_actions(committed).is_err() {
+        return libc::EIO;
     }
+    result
 }
 
 #[unsafe(no_mangle)]

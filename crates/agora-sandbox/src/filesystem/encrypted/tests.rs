@@ -3,8 +3,11 @@ use super::{
     RekeyJournal,
 };
 use crate::filesystem::crypto::FileCipher;
+use crate::filesystem::metadata::{EntryState, Materializer, MetadataStore};
+use crate::filesystem::{OpenTarget, VirtualFilesystem};
 use base64::Engine;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
 fn temporary_directory(label: &str) -> PathBuf {
@@ -123,6 +126,99 @@ async fn key_migration_reencrypts_existing_backing_files() {
             .to_string()
             .contains("key is incorrect")
     );
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[tokio::test]
+async fn key_migration_ignores_persistent_executable_caches() {
+    let workdir = temporary_directory("migration-cache");
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key")
+        .await
+        .unwrap();
+    let cached = workspace.root().join("usr/bin/tool");
+    std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+    std::fs::write(&cached, b"prepared executable").unwrap();
+    MetadataStore::new(workspace.root())
+        .unwrap()
+        .set(
+            std::path::Path::new("/usr/bin/tool"),
+            EntryState::Cached {
+                checksum: "checksum".to_string(),
+                materializer: Materializer::Executable,
+            },
+        )
+        .unwrap();
+    drop(workspace);
+
+    EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key")
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(cached).unwrap(), b"prepared executable");
+    drop(
+        EncryptedWorkspace::start(&workdir, b"new-key")
+            .await
+            .unwrap(),
+    );
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[tokio::test]
+async fn key_migration_reencrypts_logical_names_that_resemble_control_files() {
+    let workdir = temporary_directory("migration-control-name");
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key")
+        .await
+        .unwrap();
+    let root = workspace.root().to_path_buf();
+    let lower = temporary_directory("migration-control-name-lower");
+    std::fs::create_dir_all(&lower).unwrap();
+    let old_cipher = FileCipher::derive(b"old-key", workspace.salt()).unwrap();
+    let filesystem = VirtualFilesystem::encrypted(&root, old_cipher).unwrap();
+    let logical = lower.join(".metadata.user");
+    let mut prepared = filesystem
+        .prepare_open(
+            &logical,
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        )
+        .unwrap();
+    let OpenTarget::Descriptor(file) = prepared.target_mut() else {
+        panic!("encrypted file did not use an anonymous descriptor");
+    };
+    file.write_all(b"control-like contents").unwrap();
+    filesystem.commit_open(&mut prepared).unwrap();
+    let (target, writeback, _) = prepared.into_parts();
+    let OpenTarget::Descriptor(file) = target else {
+        panic!("encrypted file did not use an anonymous descriptor");
+    };
+    writeback.unwrap().commit(file.as_raw_fd()).unwrap();
+    drop(filesystem);
+    drop(workspace);
+
+    EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key")
+        .await
+        .unwrap();
+
+    let workspace = EncryptedWorkspace::start(&workdir, b"new-key")
+        .await
+        .unwrap();
+    let filesystem = VirtualFilesystem::encrypted(
+        workspace.root(),
+        FileCipher::derive(b"new-key", workspace.salt()).unwrap(),
+    )
+    .unwrap();
+    let mut reopened = filesystem
+        .prepare_open(&logical, libc::O_RDONLY, 0)
+        .unwrap();
+    let OpenTarget::Descriptor(file) = reopened.target_mut() else {
+        panic!("encrypted file did not use an anonymous descriptor");
+    };
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).unwrap();
+    assert_eq!(contents, b"control-like contents");
+    drop(filesystem);
+    drop(workspace);
+    std::fs::remove_dir_all(lower).unwrap();
     std::fs::remove_dir_all(workdir).unwrap();
 }
 

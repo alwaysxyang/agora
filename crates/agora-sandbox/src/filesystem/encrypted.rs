@@ -1,4 +1,6 @@
 use super::crypto::FileCipher;
+use super::metadata::{EntryState, MetadataStore};
+use super::namespace;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -15,7 +17,6 @@ const LOCK_FILE: &str = ".fs.lock";
 const KEY_FILE: &str = ".key.json";
 const VFS_LOCK_FILE: &str = ".vfs.lock";
 const DIRECTORY_METADATA_FILE: &str = ".metadata";
-const FILE_LOCK_DIRECTORY: &str = ".locks";
 const REKEY_JOURNAL_FILE: &str = ".rekey.json";
 const KEY_METADATA_VERSION: u32 = 1;
 const REKEY_JOURNAL_VERSION: u32 = 1;
@@ -421,16 +422,33 @@ impl EncryptedWorkspace {
     }
 
     fn encrypted_files(root: &Path) -> Result<Vec<PathBuf>> {
+        let metadata = MetadataStore::new(root)?;
         let mut files = Vec::new();
         let mut directories = vec![root.to_path_buf()];
         while let Some(directory) = directories.pop() {
+            let logical_directory = namespace::logical_path(root, &directory)?;
+            let aliases = metadata
+                .backing_names(&logical_directory)?
+                .into_iter()
+                .map(|(logical, backing)| (backing, logical))
+                .collect::<std::collections::HashMap<_, _>>();
             for entry in fs::read_dir(&directory)? {
                 let entry = entry?;
                 let file_type = entry.file_type()?;
-                if file_type.is_dir() && entry.file_name() != FILE_LOCK_DIRECTORY {
+                if file_type.is_dir() {
                     directories.push(entry.path());
                 } else if file_type.is_file() && !Self::is_control_file(&entry.path()) {
-                    files.push(entry.path());
+                    let physical_name = entry.file_name();
+                    let logical_name = aliases
+                        .get(&physical_name)
+                        .cloned()
+                        .unwrap_or(namespace::decode_name(&physical_name)?);
+                    if !matches!(
+                        metadata.state(&logical_directory.join(logical_name))?,
+                        Some(EntryState::Cached { .. } | EntryState::Whiteout)
+                    ) {
+                        files.push(entry.path());
+                    }
                 }
             }
         }

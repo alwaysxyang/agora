@@ -54,10 +54,6 @@ struct Arguments {
     #[arg(long, value_enum, default_value_t = FilesystemArgument::Plain)]
     filesystem: FilesystemArgument,
 
-    /// Path to a DER CA certificate trusted by sandboxed SecTrust TLS clients
-    #[arg(long)]
-    tls_trust_anchor: Option<PathBuf>,
-
     /// TLS interception mode
     #[arg(long, value_enum, default_value_t = TlsArgument::Off)]
     tls: TlsArgument,
@@ -310,9 +306,6 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
         }
     }
     config.network.tls = arguments.tls.into();
-    if let Some(anchor) = arguments.tls_trust_anchor {
-        config = config.with_tls_trust_anchor(anchor);
-    }
     if let (Some(certificate), Some(private_key)) = (arguments.tls_ca_cert, arguments.tls_ca_key) {
         config = config.with_tls_ca(certificate, private_key);
     }

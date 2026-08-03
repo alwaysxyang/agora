@@ -27,7 +27,7 @@ pub(crate) use encrypted::{EncryptedWorkspace, KeyMigrationStage};
 #[cfg(target_os = "macos")]
 pub(crate) use metadata::{EntryState, FileAttributes, Materializer};
 #[cfg(target_os = "macos")]
-pub(crate) use overlay::{DirectoryView, FileLease, OverlayStore, StagedWrite};
+pub(crate) use overlay::{DirectoryView, OverlayStore, StagedWrite};
 #[cfg(target_os = "macos")]
 pub(crate) use vfs::{FileLayer, OpenTarget, PreparedFile, VirtualFilesystem, Writeback};
 #[cfg(target_os = "macos")]

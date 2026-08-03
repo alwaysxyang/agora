@@ -4,7 +4,6 @@ use agora_sandbox::callback::{
 use agora_sandbox::network::{NetworkEnforcement, TlsMode};
 use agora_sandbox::runner::{Sandbox, SandboxCommand, SandboxConfig};
 #[cfg(target_os = "macos")]
-use base64::Engine;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, UdpSocket};
 use std::os::fd::FromRawFd;
@@ -139,6 +138,16 @@ fn sandbox_config_in(workdir: impl AsRef<Path>) -> SandboxConfig {
 }
 
 #[cfg(target_os = "macos")]
+fn python3() -> PathBuf {
+    let homebrew = PathBuf::from("/opt/homebrew/bin/python3");
+    if homebrew.is_file() {
+        homebrew
+    } else {
+        PathBuf::from("/usr/bin/python3")
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 fn unsupported_enforcement_fails_validation_and_default_tls_ca_is_allowed() {
     let directory = std::env::temp_dir().join(format!(
@@ -266,6 +275,266 @@ async fn runner_persists_an_encrypted_workspace_without_modifying_the_source() {
 
     assert!(verified.status().success());
     assert!(!source.join("output.txt").exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn python_descriptor_writes_are_persisted_across_runs() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-python-writeback-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    let script = "import os; fd=os.open('python.txt', os.O_WRONLY|os.O_CREAT|os.O_TRUNC, 0o640); assert os.write(fd,b'python-writeback') == 16; os.close(fd)";
+
+    let written = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(
+            SandboxCommand::new(python3())
+                .args(["-c", script])
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+    assert!(written.status().success());
+
+    let verified = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(
+            SandboxCommand::new("/bin/sh")
+                .args(["-c", "test \"$(cat python.txt)\" = python-writeback"])
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+    assert!(verified.status().success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn encrypted_creates_apply_the_child_umask_to_logical_modes() {
+    let directory =
+        std::env::temp_dir().join(format!("agora-sandbox-umask-test-{}", uuid::Uuid::new_v4()));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    let command = "umask 077; : > private-file; mkdir private-dir; test \"$(/usr/bin/stat -f %Lp private-file)\" = 600; test \"$(/usr/bin/stat -f %Lp private-dir)\" = 700";
+
+    let created = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(
+            SandboxCommand::new("/bin/sh")
+                .args(["-c", command])
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+    assert!(created.status().success());
+
+    let reopened = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(
+            SandboxCommand::new("/bin/sh")
+                .args([
+                    "-c",
+                    "test \"$(/usr/bin/stat -f %Lp private-file)\" = 600; test \"$(/usr/bin/stat -f %Lp private-dir)\" = 700",
+                ])
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+    assert!(reopened.status().success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn encrypted_close_refreshes_the_logical_modification_time() {
+    let directory =
+        std::env::temp_dir().join(format!("agora-sandbox-mtime-test-{}", uuid::Uuid::new_v4()));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    let command = "printf first > mtime.txt; first=$(/usr/bin/stat -f %m mtime.txt); /bin/sleep 1; printf second >> mtime.txt; second=$(/usr/bin/stat -f %m mtime.txt); test \"$second\" -gt \"$first\"";
+
+    let outcome = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(
+            SandboxCommand::new("/bin/sh")
+                .args(["-c", command])
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+    assert!(outcome.status().success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn encrypted_reopen_after_shell_write_does_not_deadlock() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-file-lease-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    let run = Sandbox::new(sandbox_config_in(&workdir), NoopCallback).run(
+        SandboxCommand::new("/bin/bash")
+            .args([
+                "-c",
+                "printf lease-reopen > lease.txt; test \"$(cat lease.txt)\" = lease-reopen",
+            ])
+            .current_dir(&source),
+    );
+
+    let outcome = tokio::time::timeout(Duration::from_secs(15), run)
+        .await
+        .expect("sandbox child deadlocked while reopening an encrypted file")
+        .unwrap();
+    assert!(outcome.status().success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn lower_directory_reads_do_not_materialize_upper_directories() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-read-only-directory-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&directory).unwrap();
+    let command = SandboxCommand::new(std::env::current_exe().unwrap())
+        .arg("read_only_directory_child_process")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("AGORA_SANDBOX_TEST_READ_ONLY_DIRECTORY", "1");
+
+    let outcome = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(command)
+        .await
+        .unwrap();
+    assert!(outcome.status().success());
+    assert!(!workdir.join("fs/usr").exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn system_ls_traverses_lower_directories_without_fts_errors() {
+    let directory =
+        std::env::temp_dir().join(format!("agora-sandbox-fts-test-{}", uuid::Uuid::new_v4()));
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&directory).unwrap();
+
+    let outcome = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(SandboxCommand::new("/bin/sh").args(["-c", "/bin/ls -la /usr/bin >/dev/null"]))
+        .await
+        .unwrap();
+    assert!(outcome.status().success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn encrypted_file_leaf_names_are_not_stored_as_plaintext() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-encrypted-name-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    let outcome = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(
+            SandboxCommand::new("/bin/sh")
+                .args(["-c", "printf hidden-name > visible-name.txt"])
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+    assert!(outcome.status().success());
+
+    let backing_directory = workdir
+        .join("fs")
+        .join(source.canonicalize().unwrap().strip_prefix("/").unwrap());
+    assert!(!backing_directory.join("visible-name.txt").exists());
+    assert!(std::fs::read_dir(backing_directory).unwrap().any(|entry| {
+        let name = entry.unwrap().file_name();
+        let bytes = name.as_encoded_bytes();
+        bytes.len() == 32
+            && bytes.iter().all(u8::is_ascii_hexdigit)
+            && !bytes.starts_with(b".")
+            && !bytes.windows(b"agora".len()).any(|part| part == b"agora")
+    }));
+
+    let reopened = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(
+            SandboxCommand::new("/bin/sh")
+                .args(["-c", "test \"$(cat visible-name.txt)\" = hidden-name"])
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+    assert!(reopened.status().success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn sip_executable_copies_are_persistent_under_the_filesystem_root() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-persistent-executable-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&directory).unwrap();
+    let outcome = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(SandboxCommand::new("/usr/bin/true"))
+        .await
+        .unwrap();
+    assert!(outcome.status().success());
+    assert!(workdir.join("fs/usr/bin/true").is_file());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn encrypted_upper_executables_never_fall_back_to_stale_lower_contents() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-upper-executable-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    let executable = source.join("tool.sh");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(&executable, b"#!/bin/sh\nexit 41\n").unwrap();
+    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&executable, permissions).unwrap();
+
+    let replaced = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(
+            SandboxCommand::new("/bin/sh")
+                .args([
+                    "-c",
+                    "printf '#!/bin/sh\\nexit 42\\n' > tool.sh; chmod 755 tool.sh",
+                ])
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+    assert!(replaced.status().success());
+
+    let executed = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(SandboxCommand::new(&executable).current_dir(&source))
+        .await;
+    if let Ok(outcome) = executed {
+        assert_eq!(outcome.status().code(), Some(42));
+    }
+    assert_eq!(std::fs::read(&executable).unwrap(), b"#!/bin/sh\nexit 41\n");
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -919,6 +1188,22 @@ fn filesystem_interposed_child_process() {
 }
 
 #[cfg(target_os = "macos")]
+#[test]
+fn read_only_directory_child_process() {
+    if std::env::var_os("AGORA_SANDBOX_TEST_READ_ONLY_DIRECTORY").is_none() {
+        return;
+    }
+
+    unsafe {
+        let directory = libc::opendir(c"/usr/bin".as_ptr());
+        assert!(!directory.is_null());
+        while !libc::readdir(directory).is_null() {}
+        assert_eq!(*libc::__error(), 0);
+        assert_eq!(libc::closedir(directory), 0);
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn exercise_interposed_process_symbols() {
     type PosixSpawnFn = unsafe extern "C" fn(
         *mut libc::pid_t,
@@ -1553,56 +1838,6 @@ async fn runner_executes_shebang_scripts_through_a_prepared_restricted_interpret
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn runner_injects_a_process_local_sec_trust_anchor() {
-    let directory = std::env::temp_dir().join(format!(
-        "agora-sandbox-trust-anchor-test-{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&directory).unwrap();
-    let anchor = directory.join("ca.der");
-    let leaf = directory.join("leaf.der");
-    std::fs::write(
-        &anchor,
-        base64::engine::general_purpose::STANDARD
-            .decode(include_str!("fixtures/test-ca.der.b64").trim())
-            .unwrap(),
-    )
-    .unwrap();
-    std::fs::write(
-        &leaf,
-        base64::engine::general_purpose::STANDARD
-            .decode(include_str!("fixtures/test-leaf.der.b64").trim())
-            .unwrap(),
-    )
-    .unwrap();
-
-    let command = SandboxCommand::new("/usr/bin/security")
-        .arg("verify-cert")
-        .arg("-c")
-        .arg(&leaf)
-        .arg("-p")
-        .arg("ssl")
-        .arg("-d")
-        .arg("2026-08-01-00:00:00")
-        .arg("-s")
-        .arg("example.test");
-    let config = sandbox_config().with_tls_trust_anchor(&anchor);
-
-    let outcome = Sandbox::new(config, NoopCallback)
-        .run(command)
-        .await
-        .unwrap();
-
-    assert!(
-        outcome.status().success(),
-        "security verify-cert failed with {:?}",
-        outcome.status()
-    );
-    std::fs::remove_dir_all(directory).unwrap();
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
 async fn runner_injects_the_configured_tls_ca_path() {
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 
@@ -1688,9 +1923,11 @@ async fn copied_bash_routes_system_curl_through_the_proxy() {
          --silent --show-error --output /dev/null http://{destination}/"
     );
 
-    let outcome = Sandbox::new(sandbox_config(), callback)
-        .run(SandboxCommand::new("/bin/bash").args(["-c", &script]))
+    let run = Sandbox::new(sandbox_config(), callback)
+        .run(SandboxCommand::new("/bin/bash").args(["-c", &script]));
+    let outcome = tokio::time::timeout(Duration::from_secs(15), run)
         .await
+        .expect("sandbox shutdown hung after curl exited")
         .unwrap();
 
     assert!(outcome.status().success());

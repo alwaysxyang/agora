@@ -17,7 +17,7 @@ base64 = "0.23.0"
 tokio = { version = "1.53.1", features = ["full"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-clap = { version = "4.6.4", features = ["derive"] }
+clap = { version = "4.6.5", features = ["derive"] }
 chrono = "0.4.45"
 uuid = { version = "1.24.0", features = ["v4"] }
 libc = "0.2.189"
@@ -28,10 +28,10 @@ rustls-pemfile = "2.2.0"
 tokio-rustls = "0.26.4"
 rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 psl = "2.1.223"
-time = "0.3.54"
+time = "0.3.55"
 x509-parser = "0.18.1"
 httparse = "1.10.1"
 md-5 = "0.11.0"
-cc = "1.2.66"
+cc = "1.4.0"
 ring = "0.17.14"
 tempfile = "3.27.0"

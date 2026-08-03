@@ -23,6 +23,25 @@ fn logical_control_names_use_a_distinct_physical_name() {
 }
 
 #[test]
+fn control_name_prefixes_are_escaped_completely() {
+    let root = Path::new("/work/fs");
+    for name in [
+        ".metadata.user",
+        ".fs.lock.user",
+        ".key.json.old",
+        ".vfs.lock.user",
+        ".rekey.json.pending",
+        "0123456789abcdef0123456789abcdef",
+        ".agora-executable-user",
+    ] {
+        let logical = Path::new("/bin").join(name);
+        let backing = backing_path(root, &logical).unwrap();
+        assert_ne!(backing, root.join("bin").join(name));
+        assert_eq!(logical_path(root, &backing).unwrap(), logical);
+    }
+}
+
+#[test]
 fn escaping_is_injective_for_names_that_resemble_encoded_entries() {
     let reserved = encode_name(OsStr::new(".metadata"));
     let prefix = encode_name(OsStr::new(".agora-entry-Lm1ldGFkYXRh"));

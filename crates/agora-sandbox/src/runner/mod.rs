@@ -77,7 +77,6 @@ pub struct SandboxConfig {
     workdir: PathBuf,
     filesystem_mode: FilesystemMode,
     encrypted_workspace_key: Option<SecretBytes>,
-    tls_trust_anchor: Option<PathBuf>,
     tls_ca: Option<TlsCaFiles>,
     #[cfg(test)]
     upstream_tls_roots: Option<Vec<rustls::pki_types::CertificateDer<'static>>>,
@@ -116,7 +115,6 @@ impl SandboxConfig {
             workdir: Self::default_workdir(),
             filesystem_mode: FilesystemMode::default(),
             encrypted_workspace_key: None,
-            tls_trust_anchor: None,
             tls_ca: None,
             #[cfg(test)]
             upstream_tls_roots: None,
@@ -163,15 +161,6 @@ impl SandboxConfig {
         self.encrypted_workspace_key
             .as_ref()
             .map(SecretBytes::as_bytes)
-    }
-
-    pub fn with_tls_trust_anchor(mut self, certificate: impl Into<PathBuf>) -> Self {
-        self.tls_trust_anchor = Some(certificate.into());
-        self
-    }
-
-    pub fn tls_trust_anchor(&self) -> Option<&Path> {
-        self.tls_trust_anchor.as_deref()
     }
 
     pub fn with_tls_ca(
@@ -221,23 +210,6 @@ impl SandboxConfig {
             (FilesystemMode::Plain, Some(_)) => {
                 bail!("encrypted filesystem key cannot be used with plain filesystem mode")
             }
-        }
-        if let Some(anchor) = &self.tls_trust_anchor
-            && !anchor.is_file()
-        {
-            bail!(
-                "sandbox TLS trust anchor does not exist: {}",
-                anchor.display()
-            );
-        }
-        #[cfg(target_os = "macos")]
-        if let Some(anchor) = &self.tls_trust_anchor
-            && !crate::hook::validate_trust_anchor(anchor)
-        {
-            bail!(
-                "sandbox TLS trust anchor is not a valid DER certificate: {}",
-                anchor.display()
-            );
         }
         Ok(())
     }
@@ -460,16 +432,6 @@ where
                 self.config.hook_library.display()
             )
         })?;
-        let tls_trust_anchor_der = self
-            .config
-            .tls_trust_anchor
-            .as_ref()
-            .map(|path| {
-                std::fs::read(path)
-                    .with_context(|| format!("failed to read TLS trust anchor {}", path.display()))
-                    .map(|der| base64::engine::general_purpose::STANDARD.encode(der))
-            })
-            .transpose()?;
         let tls_ca = tls_ca_files
             .as_ref()
             .map(|ca| {
@@ -515,16 +477,14 @@ where
         )
         .await?;
         let mut execution = {
-            let controller =
-                match ExecutionController::start_for_run(runtime_directory.path().join("root"))
-                    .await
-                {
-                    Ok(controller) => controller,
-                    Err(error) => {
-                        let _ = audit.shutdown().await;
-                        return Err(error);
-                    }
-                };
+            let controller = match ExecutionController::start(filesystem.root().to_path_buf()).await
+            {
+                Ok(controller) => controller,
+                Err(error) => {
+                    let _ = audit.shutdown().await;
+                    return Err(error);
+                }
+            };
             let executable = command.resolved_program()?;
             let prepared = controller.prepare(executable).await?;
             if let Some(shebang) = resolve_shebang(&prepared)? {
@@ -638,16 +598,11 @@ where
                     base64::engine::general_purpose::STANDARD.encode(salt),
                 );
         }
-        let tls_trust_anchors = tls_trust_anchor_der
-            .into_iter()
-            .chain(
-                runtime
-                    .tls_trust_anchor_der()
-                    .map(|der| base64::engine::general_purpose::STANDARD.encode(der)),
-            )
-            .collect::<Vec<_>>();
-        if !tls_trust_anchors.is_empty() {
-            child.env(TLS_TRUST_ANCHOR_DER, tls_trust_anchors.join(","));
+        if let Some(anchor) = runtime.tls_trust_anchor_der() {
+            child.env(
+                TLS_TRUST_ANCHOR_DER,
+                base64::engine::general_purpose::STANDARD.encode(anchor),
+            );
         }
         if let Some((_, _, _, trust_bundle)) = &tls_ca {
             child.env(TLS_TRUST_BUNDLE, trust_bundle);

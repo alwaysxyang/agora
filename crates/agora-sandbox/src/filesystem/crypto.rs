@@ -88,6 +88,9 @@ impl FileCipher {
                 })?;
             self.encrypt_to(plaintext, &mut encrypted)?;
             encrypted
+                .set_permissions(fs::Permissions::from_mode(0o600))
+                .context("failed to secure encrypted filesystem file")?;
+            encrypted
                 .sync_all()
                 .context("failed to sync encrypted filesystem file")?;
             fs::rename(&temporary, destination).with_context(|| {
@@ -96,12 +99,14 @@ impl FileCipher {
                     destination.display()
                 )
             })?;
-            fs::set_permissions(destination, fs::Permissions::from_mode(0o600)).with_context(|| {
-                format!(
-                    "failed to secure encrypted filesystem file {}",
-                    destination.display()
-                )
-            })
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .with_context(|| {
+                    format!(
+                        "failed to sync encrypted filesystem directory {}",
+                        parent.display()
+                    )
+                })
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);

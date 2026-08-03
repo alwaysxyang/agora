@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -80,6 +80,14 @@ impl FileAttributes {
         Self::created(u32::from(libc::S_IFDIR), mode)
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn refresh_timestamps(&mut self, status: &libc::stat) {
+        self.atime = status.st_atime;
+        self.atime_nsec = status.st_atime_nsec;
+        self.mtime = status.st_mtime;
+        self.mtime_nsec = status.st_mtime_nsec;
+    }
+
     fn created(kind: u32, mode: u32) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -102,6 +110,8 @@ pub(super) struct DirectoryMetadata {
     entries: BTreeMap<String, EntryState>,
     #[serde(default)]
     attributes: BTreeMap<String, FileAttributes>,
+    #[serde(default)]
+    backing_names: BTreeMap<String, String>,
 }
 
 impl Default for DirectoryMetadata {
@@ -110,6 +120,7 @@ impl Default for DirectoryMetadata {
             version: METADATA_VERSION,
             entries: BTreeMap::new(),
             attributes: BTreeMap::new(),
+            backing_names: BTreeMap::new(),
         }
     }
 }
@@ -175,7 +186,11 @@ impl MetadataStore {
     pub(super) fn set(&self, path: &Path, state: EntryState) -> Result<()> {
         let (parent, name) = Self::split(path)?;
         let mut metadata = self.load(parent)?;
-        metadata.entries.insert(Self::encode(name), state);
+        let name = Self::encode(name);
+        metadata.entries.insert(name.clone(), state.clone());
+        if matches!(state, EntryState::Whiteout) {
+            metadata.backing_names.remove(&name);
+        }
         self.write(parent, &metadata)
     }
 
@@ -189,6 +204,9 @@ impl MetadataStore {
         let mut metadata = self.load(parent)?;
         let name = Self::encode(name);
         metadata.entries.insert(name.clone(), state);
+        if matches!(metadata.entries.get(&name), Some(EntryState::Whiteout)) {
+            metadata.backing_names.remove(&name);
+        }
         match attributes {
             Some(attributes) => {
                 metadata.attributes.insert(name, attributes);
@@ -235,6 +253,7 @@ impl MetadataStore {
         let name = Self::encode(name);
         metadata.entries.remove(&name);
         metadata.attributes.remove(&name);
+        metadata.backing_names.remove(&name);
         self.write(parent, &metadata)
     }
 
@@ -243,6 +262,36 @@ impl MetadataStore {
             .entries
             .into_iter()
             .map(|(name, state)| Ok((Self::decode(&name)?, state)))
+            .collect()
+    }
+
+    pub(super) fn backing_name(&self, path: &Path) -> Result<Option<OsString>> {
+        let (parent, name) = Self::split(path)?;
+        Ok(self
+            .load(parent)?
+            .backing_names
+            .get(&Self::encode(name))
+            .map(OsString::from))
+    }
+
+    pub(super) fn ensure_backing_name(&self, path: &Path) -> Result<OsString> {
+        let (parent, name) = Self::split(path)?;
+        let mut metadata = self.load(parent)?;
+        let name = Self::encode(name);
+        if let Some(backing) = metadata.backing_names.get(&name) {
+            return Ok(OsString::from(backing));
+        }
+        let backing = Uuid::new_v4().simple().to_string();
+        metadata.backing_names.insert(name, backing.clone());
+        self.write(parent, &metadata)?;
+        Ok(OsString::from(backing))
+    }
+
+    pub(super) fn backing_names(&self, directory: &Path) -> Result<Vec<(OsString, OsString)>> {
+        self.load(directory)?
+            .backing_names
+            .into_iter()
+            .map(|(logical, backing)| Ok((Self::decode(&logical)?, OsString::from(backing))))
             .collect()
     }
 
@@ -319,15 +368,32 @@ impl MetadataStore {
         let contents = serde_json::to_vec_pretty(metadata)
             .context("failed to serialize filesystem metadata")?;
         let result = (|| {
-            fs::write(&temporary, contents).with_context(|| {
+            let mut file = File::create(&temporary).with_context(|| {
+                format!(
+                    "failed to create filesystem metadata {}",
+                    temporary.display()
+                )
+            })?;
+            file.write_all(&contents).with_context(|| {
                 format!(
                     "failed to write filesystem metadata {}",
                     temporary.display()
                 )
             })?;
+            file.sync_all().with_context(|| {
+                format!("failed to sync filesystem metadata {}", temporary.display())
+            })?;
             fs::rename(&temporary, &path).with_context(|| {
                 format!("failed to publish filesystem metadata {}", path.display())
-            })
+            })?;
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .with_context(|| {
+                    format!(
+                        "failed to sync filesystem metadata directory {}",
+                        parent.display()
+                    )
+                })
         })();
         if result.is_err() {
             let _ = fs::remove_file(temporary);

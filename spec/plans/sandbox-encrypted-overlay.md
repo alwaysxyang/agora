@@ -14,7 +14,8 @@ Provide one rootless filesystem view for injectable macOS process trees. Reads f
 - Control files live beside mirrored data but are hidden and physically unreachable from the sandbox.
 - Logical business files may use control-like names through physical name encoding.
 - Copy-on-write and whiteouts operate at whole-file granularity.
-- Runtime executable copies and trust bundles are per-run temporary files outside the work directory.
+- SIP-restricted executable copies are persistent controller-managed cache entries at exact mirrored paths below `<workdir>/fs`.
+- Runtime trust material remains below `<workdir>/ca`.
 
 ## Persistent Layout
 
@@ -25,28 +26,26 @@ Provide one rootless filesystem view for injectable macOS process trees. Reads f
     ├── .fs.lock
     ├── .key.json          # encrypted mode only
     ├── .vfs.lock
-    ├── .locks/            # stable per-logical-file locks
     ├── .rekey.json        # present only during recoverable key migration
     └── <mirrored path>/
         ├── .metadata
         └── <business files>
 ```
 
-`.fs.lock` guards the whole work directory. `.vfs.lock` guards short VFS publication and metadata transactions. A fresh descriptor is opened for each lock acquisition so the lock remains effective across threads and forked descendants. `.locks` contains stable files keyed by normalized logical path; encrypted upper readers hold shared locks and writers hold exclusive locks for the lifetime of their open-file description. Direct lower readers do not create a file lease. `.key.json` stores only a version, salt, and derived key identifier. `.metadata` stores entry state and logical file attributes for its own logical directory.
+`.fs.lock` guards the whole work directory. `.vfs.lock` guards short VFS publication and metadata transactions. A fresh descriptor is opened for each acquisition so the lock remains effective across threads and forked descendants. Open encrypted files do not hold lifetime leases. `.key.json` stores only a version, salt, and derived key identifier. `.metadata` stores entry state, logical file attributes, and encrypted business-file leaf aliases for its own logical directory.
 
 ## Read And Write Flow
 
 1. Normalize the logical absolute path, resolve existing path components without following a path into the private work directory, and reject physical work-directory aliases.
-2. Resolve reserved logical names to encoded physical names.
+2. Keep directory paths mirrored. Resolve control-like logical names to encoded physical names and encrypted business-file leaves to random physical aliases.
 3. Consult the parent directory's `.metadata`.
 4. Prefer authoritative `cow` upper data, reject `whiteout`, and otherwise return the lower host path directly. A non-authoritative `cached` entry does not shadow lower for normal reads.
-5. On write intent, acquire the logical file's exclusive lock and copy lower data into upper before opening it. Newly created files start in upper.
-6. For an encrypted upper read, acquire the logical file's shared lock before creating a view. Direct lower reads do not create a VFS lock.
-7. In encrypted mode, verify and decrypt upper regular data into an anonymous descriptor.
-8. Duplicate descriptors, including `fcntl(F_DUPFD*)`, share one open-file record and lock lease.
-9. On write intent, stage metadata without making it authoritative until open succeeds.
-10. On `fsync` or last tracked close, encrypt the descriptor into a temporary ciphertext and atomically rename it into place.
-11. Release the per-file lock only after the last tracked descriptor closes.
+5. On write intent, copy lower data into upper before opening it. Newly created files start in upper. Read-only lower traversal creates no upper directory or metadata.
+6. In encrypted mode, open an empty staging descriptor, unlink its temporary name, and only then verify and decrypt upper regular data into the anonymous inode.
+7. Duplicate descriptors, including `fcntl(F_DUPFD*)`, share one open-file record and writeback state.
+8. On write intent, stage metadata without making it authoritative until open succeeds.
+9. On `fsync`, successful `fcntl(F_FULLFSYNC/F_BARRIERFSYNC)`, or last tracked close, encrypt the descriptor into a temporary ciphertext, sync it, atomically rename it into place, and sync the parent directory.
+10. Apply the child umask at logical creation and refresh logical timestamps after successful writeback.
 
 At no point does encrypted mode publish a named plaintext business file beneath the work directory.
 
@@ -54,13 +53,13 @@ At no point does encrypted mode publish a named plaintext business file beneath 
 
 Directories are ordinary owner-accessible backing directories so the controller can maintain them. Their requested mode is retained where possible, with owner management bits forced on physically. Directory enumeration merges lower and upper entries, applies whiteouts, decodes logical aliases, and filters controls.
 
-Cached entries carry lower MD5, materializer type, and logical file attributes, but remain non-authoritative for normal reads. COW entries remain authoritative and retain logical mode and timestamps independently from the physical `0600` ciphertext container. Explicit materializers refresh their own cached entries when lower changes. Logical permission overrides are also stored in metadata and are enforced by intercepted stat, access, and open operations without changing lower permissions. Rename validates the operation before materialization, preserves ordinary symlinks, and then updates only upper state; rename and removal never mutate lower data.
+Cached entries carry lower MD5, materializer type, and logical file attributes, but remain non-authoritative for normal reads. COW entries remain authoritative and retain logical mode and timestamps independently from the physical `0600` ciphertext container. Explicit materializers refresh their own cached entries when lower changes. Logical permission overrides are also stored in metadata and are enforced by intercepted stat, access, and open operations without changing lower permissions. Rename validates the operation before materialization, preserves ordinary symlinks, and then updates only upper state; rename and removal never mutate lower data. Intercepted `opendir`/`fdopendir` plus `readdir`/`readdir_r` merge the visible lower and upper view; programs that bypass those APIs through libc-private traversal helpers remain outside this hook surface.
 
 ## Key Lifecycle
 
 The first encrypted run creates `.key.json`. A later run derives the cipher and compares the key identifier before child startup. Keys cannot change implicitly.
 
-`migrate-key` acquires `.fs.lock`, prepares and verifies replacement ciphertext for every business file, and writes `.rekey.json` before publication. Each replacement keeps a recoverable old copy until `.key.json` has switched to the new key. Startup reads the journal and deterministically rolls back an old-key transaction or completes cleanup for a committed new-key transaction. The UI reports stage percentages because migration does not expose byte-level progress.
+`migrate-key` acquires `.fs.lock`, prepares and verifies replacement ciphertext for every encrypted business file, and writes `.rekey.json` before publication. Persistent executable cache entries and whiteouts are skipped. Each replacement keeps a recoverable old copy until `.key.json` has switched to the new key. Startup reads the journal and deterministically rolls back an old-key transaction or completes cleanup for a committed new-key transaction. The UI reports stage percentages because migration does not expose byte-level progress.
 
 ## Security Boundary
 
@@ -71,7 +70,9 @@ The runtime fails closed when key validation, metadata parsing, decryption authe
 ## Current Limitations
 
 - Encrypted deferred `posix_spawn_file_actions_addopen` is unsupported.
+- Executing encrypted upper business data requires an FD-based execution protocol and currently fails closed instead of falling back to a stale lower executable.
 - Ownership changes, links, and native copy/clone operations are unsupported while hooked. Permission changes are logical overlay metadata only.
 - Unsynchronized writes may be lost on uncatchable process termination.
-- File content is serialized per logical path. Multiple readers may coexist, while a writer excludes readers and other writers until its last descriptor closes.
+- Independently opened writable descriptors use independent plaintext snapshots. They do not wait on file-lifetime locks; overlapping writeback is last-successful-commit-wins rather than full POSIX shared-inode coherence.
+- libc-private directory walkers such as the system `fts_*` implementation do not receive the merged encrypted-upper view, although ordinary intercepted directory iteration does.
 - This is not a kernel namespace and does not hide host paths from an unhooked executable.

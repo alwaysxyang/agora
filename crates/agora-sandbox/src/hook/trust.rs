@@ -5,7 +5,6 @@ use super::dyld::{dyld_interpose, function_from_interpose};
 use base64::Engine;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
 use std::sync::OnceLock;
 
 type CfType = *const c_void;
@@ -111,12 +110,6 @@ impl TrustAnchor {
         Ok(anchor)
     }
 
-    fn from_file(path: &Path) -> Result<Self, ()> {
-        std::fs::read(path)
-            .map_err(|_| ())
-            .and_then(|der| Self::from_der(&der))
-    }
-
     #[cfg(test)]
     pub(super) unsafe fn inject(&self, trust: SecTrust) -> Result<(), ()> {
         unsafe { TrustAnchors::from_ref(self).inject(trust) }
@@ -200,10 +193,6 @@ impl TrustAnchors {
             .then_some(())
             .ok_or(())
     }
-}
-
-pub(crate) fn validate_trust_anchor(path: &Path) -> bool {
-    TrustAnchor::from_file(path).is_ok()
 }
 
 pub(super) unsafe fn has_ssl_policy(trust: SecTrust) -> Result<bool, ()> {

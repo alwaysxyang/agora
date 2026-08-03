@@ -6,7 +6,6 @@ use crate::audit::AuditController;
 use crate::callback::{Decision, Event, EventType, NoopCallback, TlsOutcome};
 use crate::execution::ExecutionController;
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
-use base64::Engine;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
@@ -362,7 +361,6 @@ fn sandbox_config_and_command_builders_preserve_runtime_inputs() {
         config.clone().with_workdir("/tmp/agora-cache").workdir(),
         Path::new("/tmp/agora-cache")
     );
-    assert_eq!(config.tls_trust_anchor(), None);
     assert_eq!(config.tls_ca(), None);
     assert_eq!(config.filesystem_mode(), FilesystemMode::Plain);
     let encrypted = config.clone().with_encrypted_workspace("top secret");
@@ -669,67 +667,6 @@ fn tls_trust_bundle_reports_directory_and_write_failures() {
             .contains("failed to write TLS client trust bundle")
     );
     std::fs::set_permissions(root.join("ca"), std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn sandbox_config_accepts_a_der_tls_trust_anchor() {
-    let root = std::env::temp_dir().join(format!("agora-trust-anchor-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&root).unwrap();
-    let hook = root.join("hook.dylib");
-    let anchor = root.join("ca.der");
-    std::fs::write(&hook, b"hook").unwrap();
-    std::fs::write(
-        &anchor,
-        base64::engine::general_purpose::STANDARD
-            .decode(include_str!("../../tests/fixtures/test-ca.der.b64").trim())
-            .unwrap(),
-    )
-    .unwrap();
-
-    let config = SandboxConfig::new(&hook)
-        .with_encrypted_workspace("test-key")
-        .with_tls_trust_anchor(&anchor);
-
-    assert_eq!(config.tls_trust_anchor(), Some(anchor.as_path()));
-    assert!(config.validate().is_ok());
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn sandbox_config_rejects_a_malformed_tls_trust_anchor() {
-    let root = std::env::temp_dir().join(format!("agora-bad-anchor-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&root).unwrap();
-    let hook = root.join("hook.dylib");
-    let anchor = root.join("ca.der");
-    std::fs::write(&hook, b"hook").unwrap();
-    std::fs::write(&anchor, b"not a certificate").unwrap();
-
-    let error = SandboxConfig::new(&hook)
-        .with_encrypted_workspace("test-key")
-        .with_tls_trust_anchor(&anchor)
-        .validate()
-        .unwrap_err();
-
-    assert!(error.to_string().contains("valid DER certificate"));
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn sandbox_config_rejects_a_missing_tls_trust_anchor() {
-    let root = std::env::temp_dir().join(format!("agora-missing-anchor-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&root).unwrap();
-    let hook = root.join("hook.dylib");
-    let anchor = root.join("missing-ca.der");
-    std::fs::write(&hook, b"hook").unwrap();
-
-    let error = SandboxConfig::new(&hook)
-        .with_encrypted_workspace("test-key")
-        .with_tls_trust_anchor(&anchor)
-        .validate()
-        .unwrap_err();
-
-    assert!(error.to_string().contains("trust anchor does not exist"));
     std::fs::remove_dir_all(root).unwrap();
 }
 
