@@ -32,6 +32,9 @@ use std::time::Duration;
 use tokio::process::Command;
 use uuid::Uuid;
 
+#[cfg(target_os = "macos")]
+mod native_sandbox;
+
 const TOKEN: &str = "AGORA_SANDBOX_TOKEN";
 const PROXY_IPV4: &str = "AGORA_SANDBOX_PROXY_IPV4";
 const PROXY_IPV6: &str = "AGORA_SANDBOX_PROXY_IPV6";
@@ -50,9 +53,7 @@ const FILESYSTEM_ROOT: &str = "AGORA_SANDBOX_FILESYSTEM_ROOT";
 #[cfg(target_os = "macos")]
 const FILESYSTEM_MODE: &str = "AGORA_SANDBOX_FILESYSTEM_MODE";
 #[cfg(target_os = "macos")]
-const FILESYSTEM_KEY: &str = "AGORA_SANDBOX_FILESYSTEM_KEY";
-#[cfg(target_os = "macos")]
-const FILESYSTEM_SALT: &str = "AGORA_SANDBOX_FILESYSTEM_SALT";
+const FILESYSTEM_CIPHER_KEY: &str = "AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY";
 #[cfg(target_os = "macos")]
 const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
 #[cfg(target_os = "macos")]
@@ -492,8 +493,17 @@ where
         )
         .await?;
         let mut execution = {
-            let controller = match ExecutionController::start(filesystem.root().to_path_buf()).await
-            {
+            let execution = match filesystem.encrypted_cipher_key() {
+                Some(key) => {
+                    ExecutionController::start_encrypted(
+                        filesystem.root().to_path_buf(),
+                        crate::filesystem::FileCipher::from_key(key)?,
+                    )
+                    .await
+                }
+                None => ExecutionController::start(filesystem.root().to_path_buf()).await,
+            };
+            let controller = match execution {
                 Ok(controller) => controller,
                 Err(error) => {
                     let _ = audit.shutdown().await;
@@ -602,16 +612,11 @@ where
             )
             .env(TRACE_ID_ENVIRONMENT, trace.encode())
             .env("DYLD_INSERT_LIBRARIES", injected_libraries);
-        if let (Some(key), Some(salt)) = (filesystem.encrypted_key(), filesystem.encrypted_salt()) {
-            child
-                .env(
-                    FILESYSTEM_KEY,
-                    base64::engine::general_purpose::STANDARD.encode(key),
-                )
-                .env(
-                    FILESYSTEM_SALT,
-                    base64::engine::general_purpose::STANDARD.encode(salt),
-                );
+        if let Some(key) = filesystem.encrypted_cipher_key() {
+            child.env(
+                FILESYSTEM_CIPHER_KEY,
+                base64::engine::general_purpose::STANDARD.encode(key),
+            );
         }
         if let Some(anchor) = runtime.tls_trust_anchor_der() {
             child.env(
@@ -626,6 +631,7 @@ where
             }
         }
         child.as_std_mut().process_group(0);
+        native_sandbox::configure(&mut child);
         let mut terminal = ForegroundTerminal::capture()?;
 
         let mut child = match child.spawn() {

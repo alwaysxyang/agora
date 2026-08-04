@@ -1,24 +1,37 @@
 use super::crypto::FileCipher;
-use super::metadata::{EntryState, FileAttributes, Materializer, MetadataStore};
+use super::metadata::{EntryState, FileAttributes, Materializer, MetadataStore, SourceIdentity};
 use super::namespace;
 use anyhow::{Context, Result};
 use md5::{Digest, Md5};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
+
+const LOCK_DESCRIPTOR_POOL_CAPACITY: usize = 16;
 
 pub(crate) struct OverlayStore {
     root: PathBuf,
     canonical_root: PathBuf,
     metadata: MetadataStore,
     lock_path: PathBuf,
+    lock_pool: Mutex<LockDescriptorPool>,
     cipher: Option<FileCipher>,
+    #[cfg(test)]
+    lock_open_count: AtomicUsize,
+}
+
+struct LockDescriptorPool {
+    pid: libc::pid_t,
+    files: Vec<File>,
 }
 
 pub(crate) struct DirectoryView {
@@ -100,6 +113,16 @@ fn is_private_path_with_roots(root: &Path, canonical_root: &Path, path: &Path) -
 }
 
 impl DirectoryView {
+    pub(crate) fn passthrough(path: PathBuf) -> Self {
+        Self {
+            logical: path.clone(),
+            primary: path,
+            lower: None,
+            hidden: BTreeSet::new(),
+            aliases: HashMap::new(),
+        }
+    }
+
     pub(crate) fn logical(&self) -> &Path {
         &self.logical
     }
@@ -144,9 +167,8 @@ impl OverlayStore {
         let canonical_root = root
             .canonicalize()
             .with_context(|| format!("failed to resolve filesystem root {}", root.display()))?;
-        let metadata = MetadataStore::new(&canonical_root)?;
         let lock_path = canonical_root.join(namespace::VFS_LOCK_FILE);
-        OpenOptions::new()
+        let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -154,18 +176,39 @@ impl OverlayStore {
             .mode(0o600)
             .open(&lock_path)
             .with_context(|| format!("failed to open overlay lock {}", lock_path.display()))?;
+        Self::flock(&lock, libc::LOCK_EX)?;
+        let metadata =
+            MetadataStore::with_generation(&canonical_root, lock.try_clone()?, cipher.clone())
+                .and_then(|metadata| {
+                    metadata.migrate_all()?;
+                    Ok(metadata)
+                });
+        let unlock = Self::flock(&lock, libc::LOCK_UN);
+        let metadata = metadata?;
+        unlock?;
         Ok(Self {
             root,
             canonical_root,
             metadata,
             lock_path,
+            lock_pool: Mutex::new(LockDescriptorPool {
+                pid: unsafe { libc::getpid() },
+                files: vec![lock],
+            }),
             cipher,
+            #[cfg(test)]
+            lock_open_count: AtomicUsize::new(1),
         })
     }
 
     #[cfg(test)]
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    #[cfg(test)]
+    fn lock_open_count(&self) -> usize {
+        self.lock_open_count.load(Ordering::Relaxed)
     }
 
     pub(crate) fn is_internal(&self, path: &Path) -> bool {
@@ -179,7 +222,7 @@ impl OverlayStore {
     pub(crate) fn logical_path(&self, path: &Path) -> Result<PathBuf> {
         let logical = namespace::logical_path(&self.root, path)
             .or_else(|_| namespace::logical_path(&self.canonical_root, path))?;
-        let Some(backing_name) = path.file_name() else {
+        let Some(encrypted_name) = path.file_name() else {
             return Ok(logical);
         };
         let Some(parent) = logical.parent() else {
@@ -187,9 +230,9 @@ impl OverlayStore {
         };
         if let Some((logical_name, _)) = self
             .metadata
-            .backing_names(parent)?
+            .encrypted_names(parent)?
             .into_iter()
-            .find(|(_, backing)| backing == backing_name)
+            .find(|(_, physical)| physical == encrypted_name)
         {
             return Ok(parent.join(logical_name));
         }
@@ -258,6 +301,55 @@ impl OverlayStore {
         self.with_lock(|| self.visible_exists_locked(&path))
     }
 
+    pub(crate) fn native_metadata_passthrough(
+        &self,
+        path: &Path,
+        follow_final: bool,
+        ancestor_access: impl Fn(&FileAttributes) -> bool,
+    ) -> Result<bool> {
+        let path = self.normalize(path)?;
+        if self.is_internal(&path) {
+            return Ok(false);
+        }
+        self.with_lock(|| {
+            let overlay_resolved = if follow_final {
+                match self.resolve_final_locked(path.clone(), false) {
+                    Ok(resolved) => resolved,
+                    Err(error) if Self::is_not_found(&error) => return Ok(false),
+                    Err(error) => return Err(error),
+                }
+            } else {
+                path.clone()
+            };
+            let native_resolved = if follow_final {
+                Self::resolve_existing_ancestor(&path)?
+            } else {
+                let parent = path.parent().context("filesystem path has no parent")?;
+                let name = path
+                    .file_name()
+                    .context("filesystem path has no file name")?;
+                Self::resolve_existing_ancestor(parent)?.join(name)
+            };
+            let mut checked = HashSet::new();
+            for candidate in [&path, &overlay_resolved, &native_resolved] {
+                for ancestor in candidate.ancestors() {
+                    if ancestor == Path::new("/") || !checked.insert(ancestor.to_path_buf()) {
+                        continue;
+                    }
+                    if self.metadata.state(ancestor)?.is_some() {
+                        return Ok(false);
+                    }
+                    if let Some(attributes) = self.metadata.attributes(ancestor)?
+                        && (ancestor == candidate.as_path() || !ancestor_access(&attributes))
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        })
+    }
+
     pub(crate) fn mark_executable(&self, path: &Path) -> Result<()> {
         let path = if self.is_internal(path) {
             self.logical_path(path)?
@@ -265,12 +357,16 @@ impl OverlayStore {
             self.normalize(path)?
         };
         self.with_lock(|| {
-            if let Some(EntryState::Cached { checksum, .. }) = self.metadata.state(&path)? {
+            if let Some(EntryState::Cached {
+                checksum, source, ..
+            }) = self.metadata.state(&path)?
+            {
                 self.metadata.set(
                     &path,
                     EntryState::Cached {
                         checksum,
                         materializer: Materializer::Executable,
+                        source,
                     },
                 )?;
             }
@@ -391,12 +487,39 @@ impl OverlayStore {
         Ok(())
     }
 
-    pub(crate) fn publish_encrypted(&self, plaintext: &mut File, destination: &Path) -> Result<()> {
+    pub(crate) fn publish_encrypted(
+        &self,
+        plaintext: &mut File,
+        lease: &File,
+    ) -> Result<Option<PathBuf>> {
         let cipher = self
             .cipher
             .as_ref()
             .context("encrypted writeback requires a filesystem cipher")?;
-        self.with_lock(|| cipher.encrypt(plaintext, destination))
+        self.with_lock(|| {
+            let Some(destination) = Self::read_write_lease_destination(lease)? else {
+                return Ok(None);
+            };
+            if !self.is_internal(&destination) {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+            }
+            let current_lease = match File::open(Self::write_lease_path(&destination)?) {
+                Ok(current) => current,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let held_identity = lease
+                .metadata()
+                .map(|metadata| (metadata.dev(), metadata.ino()))?;
+            let current_identity = current_lease
+                .metadata()
+                .map(|metadata| (metadata.dev(), metadata.ino()))?;
+            if held_identity != current_identity {
+                return Ok(None);
+            }
+            cipher.encrypt(plaintext, &destination)?;
+            Ok(Some(destination))
+        })
     }
 
     pub(crate) fn prepare_directory(&self, path: &Path) -> Result<PathBuf> {
@@ -431,6 +554,42 @@ impl OverlayStore {
         })
     }
 
+    pub(crate) fn create_symlink(&self, path: &Path, target: &Path) -> Result<PathBuf> {
+        use std::os::unix::fs::symlink;
+
+        let path = self.normalize(path)?;
+        self.with_lock(|| {
+            if self.visible_exists_locked(&path)? {
+                return Err(std::io::Error::from_raw_os_error(libc::EEXIST).into());
+            }
+            let previous_state = self.metadata.state(&path)?;
+            let previous_attributes = self.metadata.attributes(&path)?;
+            self.ensure_parent_locked(&path)?;
+            let destination = self.file_destination(&path, true)?;
+            let result = (|| {
+                symlink(target, &destination)?;
+                let attributes = FileAttributes::from_metadata(&destination.symlink_metadata()?);
+                self.metadata
+                    .set_with_attributes(&path, EntryState::Cow, Some(attributes))?;
+                Ok(destination.clone())
+            })();
+            if result.is_err() {
+                let _ = Self::remove_existing(&destination);
+                match previous_state {
+                    Some(state) => {
+                        let _ =
+                            self.metadata
+                                .set_with_attributes(&path, state, previous_attributes);
+                    }
+                    None => {
+                        let _ = self.metadata.remove(&path);
+                    }
+                }
+            }
+            result
+        })
+    }
+
     pub(crate) fn remove(&self, path: &Path, directory: bool) -> Result<()> {
         let path = self.normalize(path)?;
         self.with_lock(|| self.remove_locked(&path, directory))
@@ -449,17 +608,41 @@ impl OverlayStore {
         let source = self.normalize(source)?;
         self.with_lock(|| {
             let destination = self.plain_destination(&source)?;
-            let checksum = Self::checksum(&source)?;
-            if destination.is_file()
-                && destination.metadata()?.mode() & 0o111 != 0
+            let source_identity = SourceIdentity::from_metadata(&source.metadata()?);
+            let cached = self.metadata.state(&source)?;
+            let reusable_destination =
+                destination.is_file() && destination.metadata()?.mode() & 0o111 != 0;
+            if reusable_destination
                 && matches!(
-                    self.metadata.state(&source)?,
+                    cached,
+                    Some(EntryState::Cached {
+                        materializer: Materializer::Executable,
+                        source: Some(ref cached_source),
+                        ..
+                    }) if cached_source == &source_identity
+                )
+            {
+                return Ok(destination);
+            }
+            let checksum = Self::checksum(&source)?;
+            if reusable_destination
+                && matches!(
+                    cached,
                     Some(EntryState::Cached {
                         checksum: ref cached,
                         materializer: Materializer::Executable,
+                        ..
                     }) if cached == &checksum
                 )
             {
+                self.metadata.set(
+                    &source,
+                    EntryState::Cached {
+                        checksum,
+                        materializer: Materializer::Executable,
+                        source: Some(source_identity),
+                    },
+                )?;
                 return Ok(destination);
             }
             let parent = destination
@@ -477,6 +660,7 @@ impl OverlayStore {
                     EntryState::Cached {
                         checksum,
                         materializer: Materializer::Executable,
+                        source: Some(source_identity),
                     },
                 )?;
                 Ok(destination.clone())
@@ -506,6 +690,12 @@ impl OverlayStore {
     #[cfg(test)]
     pub(crate) fn state_for_test(&self, path: &Path) -> Result<Option<EntryState>> {
         self.state(path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_state_for_test(&self, path: &Path, state: EntryState) -> Result<()> {
+        let path = self.normalize(path)?;
+        self.with_lock(|| self.metadata.set(&path, state))
     }
 
     #[cfg(test)]
@@ -611,7 +801,7 @@ impl OverlayStore {
 
     fn stage_write_locked(&self, path: &Path, create: bool) -> Result<PathBuf> {
         if self.cow_ancestor_locked(path)? {
-            let destination = match self.metadata.backing_name(path)? {
+            let destination = match self.metadata.encrypted_name(path)? {
                 Some(_) => self.destination(path)?,
                 None if self.plain_destination(path)?.is_dir() => self.plain_destination(path)?,
                 None => self.file_destination(path, create)?,
@@ -638,6 +828,7 @@ impl OverlayStore {
             Some(EntryState::Cached {
                 checksum,
                 materializer,
+                ..
             }) => match path.symlink_metadata() {
                 Ok(metadata) if metadata.is_file() => {
                     let destination = self.destination(path)?;
@@ -740,7 +931,7 @@ impl OverlayStore {
         let mut aliases = HashMap::new();
         aliases.extend(
             self.metadata
-                .backing_names(path)?
+                .encrypted_names(path)?
                 .into_iter()
                 .map(|(logical, backing)| (backing, logical)),
         );
@@ -830,6 +1021,7 @@ impl OverlayStore {
                 EntryState::Cached {
                     checksum: Self::hex_digest(digest.finalize().as_slice()),
                     materializer,
+                    source: Some(SourceIdentity::from_metadata(&source_metadata)),
                 },
                 Some(FileAttributes::from_metadata(&source_metadata)),
             )?;
@@ -859,8 +1051,13 @@ impl OverlayStore {
         } else if metadata.is_dir() {
             return Err(std::io::Error::from_raw_os_error(libc::EISDIR).into());
         }
-        let _leases = self.acquire_namespace_leases(&destination, metadata.is_dir())?;
+        if self.cipher.is_some() && !metadata.is_dir() {
+            self.metadata.ensure_encrypted_name(path)?;
+        }
         Self::remove_existing(&destination)?;
+        if let Ok(lease) = Self::write_lease_path(&destination) {
+            Self::remove_existing(&lease)?;
+        }
         self.metadata
             .set_with_attributes(path, EntryState::Whiteout, None)
     }
@@ -876,7 +1073,7 @@ impl OverlayStore {
         if upper.is_dir() {
             let aliases = self
                 .metadata
-                .backing_names(path)?
+                .encrypted_names(path)?
                 .into_iter()
                 .map(|(logical, backing)| (backing, logical))
                 .collect::<HashMap<_, _>>();
@@ -929,8 +1126,9 @@ impl OverlayStore {
             if to_metadata.is_dir() && !self.directory_is_empty_locked(to)? {
                 return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY).into());
             }
-            namespace_leases
-                .extend(self.acquire_namespace_leases(&to_visible, to_metadata.is_dir())?);
+            if to_metadata.is_dir() {
+                namespace_leases.extend(self.acquire_namespace_leases(&to_visible, true)?);
+            }
         }
         if !self.is_internal(&from_visible) && from_visible_metadata.is_dir() {
             self.validate_materializable_tree_locked(from)?;
@@ -947,9 +1145,9 @@ impl OverlayStore {
         } else {
             return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into());
         };
-        namespace_leases.extend(
-            self.acquire_namespace_leases(&from_destination, from_visible_metadata.is_dir())?,
-        );
+        if from_visible_metadata.is_dir() {
+            namespace_leases.extend(self.acquire_namespace_leases(&from_destination, true)?);
+        }
         self.ensure_parent_locked(to)?;
         let to_destination = if from_visible_metadata.is_dir() {
             self.plain_destination(to)?
@@ -958,6 +1156,12 @@ impl OverlayStore {
         };
         Self::remove_existing(&to_destination)?;
         fs::rename(&from_destination, &to_destination)?;
+        if !from_visible_metadata.is_dir()
+            && let Err(error) = self.retarget_write_lease(&from_destination, &to_destination)
+        {
+            let _ = fs::rename(&to_destination, &from_destination);
+            return Err(error);
+        }
         let attributes = self.metadata.attributes(from)?;
         self.metadata
             .set_with_attributes(from, EntryState::Whiteout, None)?;
@@ -1063,7 +1267,7 @@ impl OverlayStore {
         if self.cipher.is_none() || path == Path::new("/") {
             return self.plain_destination(path);
         }
-        match self.metadata.backing_name(path)? {
+        match self.metadata.encrypted_name(path)? {
             Some(name) => {
                 let parent = path.parent().context("filesystem path has no parent")?;
                 Ok(namespace::backing_path(&self.root, parent)?.join(name))
@@ -1078,10 +1282,10 @@ impl OverlayStore {
         }
         let parent = path.parent().context("filesystem path has no parent")?;
         let name = if create {
-            self.metadata.ensure_backing_name(path)?
+            self.metadata.ensure_encrypted_name(path)?
         } else {
             self.metadata
-                .backing_name(path)?
+                .encrypted_name(path)?
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?
         };
         Ok(namespace::backing_path(&self.root, parent)?.join(name))
@@ -1154,6 +1358,58 @@ impl OverlayStore {
         Ok(destination.with_file_name(OsString::from_vec(lease)))
     }
 
+    fn read_write_lease_destination(lease: &File) -> Result<Option<PathBuf>> {
+        let length = usize::try_from(lease.metadata()?.len())
+            .context("encrypted filesystem write lease path is too long")?;
+        if length == 0 {
+            return Ok(None);
+        }
+        let mut contents = vec![0_u8; length];
+        let mut offset = 0;
+        while offset < contents.len() {
+            let read = lease.read_at(&mut contents[offset..], offset as u64)?;
+            if read == 0 {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+            }
+            offset += read;
+        }
+        Ok(Some(PathBuf::from(OsString::from_vec(contents))))
+    }
+
+    fn write_write_lease_destination(lease: &File, destination: &Path) -> Result<()> {
+        let contents = destination.as_os_str().as_bytes();
+        lease.set_len(0)?;
+        let mut offset = 0;
+        while offset < contents.len() {
+            let written = lease.write_at(&contents[offset..], offset as u64)?;
+            if written == 0 {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+            }
+            offset += written;
+        }
+        lease.set_len(contents.len() as u64)?;
+        lease.sync_data()?;
+        Ok(())
+    }
+
+    fn retarget_write_lease(&self, from: &Path, to: &Path) -> Result<()> {
+        if self.cipher.is_none() {
+            return Ok(());
+        }
+        let from_lease = Self::write_lease_path(from)?;
+        let to_lease = Self::write_lease_path(to)?;
+        Self::remove_existing(&to_lease)?;
+        let lease = match OpenOptions::new().read(true).write(true).open(&from_lease) {
+            Ok(lease) => lease,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        Self::write_write_lease_destination(&lease, to)?;
+        drop(lease);
+        fs::rename(from_lease, to_lease)?;
+        Ok(())
+    }
+
     fn acquire_write_lease(
         &self,
         destination: &Path,
@@ -1177,6 +1433,9 @@ impl OverlayStore {
             }
             return Err(error)
                 .with_context(|| format!("failed to acquire write lease {}", path.display()));
+        }
+        if Self::read_write_lease_destination(&lease)?.as_deref() != Some(destination) {
+            Self::write_write_lease_destination(&lease, destination)?;
         }
         Ok(Some(lease))
     }
@@ -1224,15 +1483,16 @@ impl OverlayStore {
     }
 
     fn with_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.lock_path)
-            .with_context(|| format!("failed to open overlay lock {}", self.lock_path.display()))?;
-        Self::flock(&lock, libc::LOCK_EX)?;
+        let lock = self.take_lock_descriptor()?;
+        if let Err(error) = Self::flock(&lock, libc::LOCK_EX) {
+            self.return_lock_descriptor(lock);
+            return Err(error.into());
+        }
         let result = operation();
         let unlock = Self::flock(&lock, libc::LOCK_UN);
-        drop(lock);
+        if unlock.is_ok() {
+            self.return_lock_descriptor(lock);
+        }
         match result {
             Ok(value) => {
                 unlock?;
@@ -1242,6 +1502,45 @@ impl OverlayStore {
                 let _ = unlock;
                 Err(error)
             }
+        }
+    }
+
+    fn take_lock_descriptor(&self) -> Result<File> {
+        let pid = unsafe { libc::getpid() };
+        let mut pool = self
+            .lock_pool
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if pool.pid != pid {
+            pool.pid = pid;
+            pool.files.clear();
+        }
+        if let Some(lock) = pool.files.pop() {
+            return Ok(lock);
+        }
+        drop(pool);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.lock_path)
+            .with_context(|| format!("failed to open overlay lock {}", self.lock_path.display()))?;
+        #[cfg(test)]
+        self.lock_open_count.fetch_add(1, Ordering::Relaxed);
+        Ok(lock)
+    }
+
+    fn return_lock_descriptor(&self, lock: File) {
+        let pid = unsafe { libc::getpid() };
+        let mut pool = self
+            .lock_pool
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if pool.pid != pid {
+            pool.pid = pid;
+            pool.files.clear();
+        }
+        if pool.files.len() < LOCK_DESCRIPTOR_POOL_CAPACITY {
+            pool.files.push(lock);
         }
     }
 

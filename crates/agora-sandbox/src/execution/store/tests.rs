@@ -4,11 +4,12 @@ use super::{
 };
 use crate::execution::resolve_executable;
 use crate::filesystem::{EntryState, Materializer};
+use base64::Engine;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,6 +33,27 @@ impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+fn convert_metadata_to_version_one(value: &mut serde_json::Value) {
+    let records = std::mem::take(value["entries"].as_object_mut().unwrap());
+    let mut entries = serde_json::Map::new();
+    let mut attributes = serde_json::Map::new();
+    for (name, mut record) in records {
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(name.as_bytes());
+        if let Some(entry) = record.as_object_mut().unwrap().remove("entry") {
+            entries.insert(encoded.clone(), entry);
+        }
+        if let Some(value) = record.as_object_mut().unwrap().remove("attributes") {
+            attributes.insert(encoded, value);
+        }
+    }
+    *value = serde_json::json!({
+        "version": 1,
+        "entries": entries,
+        "attributes": attributes,
+        "backing_names": {}
+    });
 }
 
 #[test]
@@ -77,13 +99,17 @@ fn executable_store_prepares_and_caches_a_native_copy() {
     assert_eq!(first, second);
     assert_eq!(first, directory.join("bin/sh"));
     let source = Path::new("/bin/sh").canonicalize().unwrap();
-    assert_eq!(
-        store.overlay.state_for_test(&source).unwrap(),
-        Some(EntryState::Cached {
-            checksum: ExecutableStore::checksum(&source).unwrap(),
-            materializer: Materializer::Executable,
-        })
-    );
+    let Some(EntryState::Cached {
+        checksum,
+        materializer,
+        source: source_identity,
+    }) = store.overlay.state_for_test(&source).unwrap()
+    else {
+        panic!("missing executable cache metadata");
+    };
+    assert_eq!(checksum, ExecutableStore::checksum(&source).unwrap());
+    assert_eq!(materializer, Materializer::Executable);
+    assert!(source_identity.is_some());
     assert!(!first.with_extension("md5").exists());
     assert!(first.is_file());
     assert_ne!(first, Path::new("/bin/sh"));
@@ -99,8 +125,26 @@ fn executable_store_prepares_and_caches_a_native_copy() {
     assert!(directory.is_dir());
     assert!(first.is_file());
 
+    let inode = first.metadata().unwrap().ino();
+    let metadata_path = directory.join("bin/.metadata");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    convert_metadata_to_version_one(&mut metadata);
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+    drop(store);
+
     let reused_store = ExecutableStore::new(directory).unwrap();
-    assert_eq!(reused_store.prepare(Path::new("/bin/sh")).unwrap(), first);
+    let reused = reused_store.prepare(Path::new("/bin/sh")).unwrap();
+    assert_eq!(reused, first);
+    assert_eq!(reused.metadata().unwrap().ino(), inode);
+    let migrated: serde_json::Value =
+        serde_json::from_slice(&fs::read(metadata_path).unwrap()).unwrap();
+    assert_eq!(migrated["version"], 3);
+    assert!(migrated["entries"].get("sh").is_some());
 }
 
 #[test]
@@ -209,6 +253,46 @@ fn executable_store_copies_hardened_runtime_binaries() {
     let prepared = store.prepare(&source).unwrap();
 
     assert_ne!(prepared, source);
+    assert_eq!(
+        ExecutableStore::code_signing_flags(&prepared).unwrap() & CS_DYLD_RESTRICTED,
+        0
+    );
+}
+
+#[test]
+fn executable_store_preserves_entitlements_when_resigning() {
+    let root = TestDirectory::new();
+    let source = root.path().join("entitled-sh");
+    let entitlements = root.path().join("entitlements.plist");
+    fs::copy("/bin/sh", &source).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        &entitlements,
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+          <plist version=\"1.0\"><dict>\
+          <key>com.apple.security.cs.allow-jit</key><true/>\
+          </dict></plist>\n",
+    )
+    .unwrap();
+    let status = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-", "--options", "runtime"])
+        .arg("--entitlements")
+        .arg(&entitlements)
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let store = ExecutableStore::new(root.path().join("workdir/fs")).unwrap();
+
+    let prepared = store.prepare(&source).unwrap();
+
+    let output = Command::new("/usr/bin/codesign")
+        .args(["--display", "--entitlements", ":-", "--xml"])
+        .arg(&prepared)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("com.apple.security.cs.allow-jit"));
     assert_eq!(
         ExecutableStore::code_signing_flags(&prepared).unwrap() & CS_DYLD_RESTRICTED,
         0

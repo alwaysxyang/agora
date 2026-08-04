@@ -58,6 +58,7 @@ extern "C" fn flush_filesystem_at_exit() {
 
 extern "C" fn initialize_hook() {
     config::initialize();
+    super::filesystem::initialize_process();
     EXIT_FLUSH_REGISTERED.call_once(|| unsafe {
         libc::atexit(flush_filesystem_at_exit);
     });

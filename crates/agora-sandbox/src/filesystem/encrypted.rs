@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -51,15 +52,27 @@ struct RekeyJournal {
 #[derive(Debug, Deserialize, Serialize)]
 struct RekeyEntry {
     destination: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    renamed_destination: Option<String>,
     staged: String,
     backup: String,
+}
+
+struct PreparedRekeyEntry {
+    destination: PathBuf,
+    renamed_destination: PathBuf,
+    staged: PathBuf,
+    backup: PathBuf,
+    ciphertext: bool,
 }
 
 pub(crate) struct EncryptedWorkspace {
     root: PathBuf,
     _lock: File,
     cipher: FileCipher,
+    #[cfg(test)]
     salt: Vec<u8>,
+    #[cfg(test)]
     key: Vec<u8>,
 }
 
@@ -69,7 +82,6 @@ impl std::fmt::Debug for EncryptedWorkspace {
             .debug_struct("EncryptedWorkspace")
             .field("root", &self.root)
             .field("cipher", &self.cipher)
-            .field("salt", &self.salt)
             .field("key", &"[REDACTED]")
             .finish_non_exhaustive()
     }
@@ -105,7 +117,9 @@ impl EncryptedWorkspace {
             root,
             _lock: lock,
             cipher,
+            #[cfg(test)]
             salt,
+            #[cfg(test)]
             key: passphrase.to_vec(),
         })
     }
@@ -114,12 +128,18 @@ impl EncryptedWorkspace {
         &self.root
     }
 
+    #[cfg(test)]
     pub(crate) fn salt(&self) -> &[u8] {
         &self.salt
     }
 
+    #[cfg(test)]
     pub(crate) fn key(&self) -> &[u8] {
         &self.key
+    }
+
+    pub(crate) fn cipher_key(&self) -> &[u8; 32] {
+        self.cipher.key_material()
     }
 
     pub(crate) fn migrate_key(
@@ -169,9 +189,12 @@ impl EncryptedWorkspace {
         };
 
         on_progress(KeyMigrationStage::ReencryptingFiles);
-        let sources = Self::encrypted_files(&root)?;
-        let mut entries = Vec::with_capacity(sources.len());
+        let metadata_store = MetadataStore::encrypted(&root, old_cipher.clone())?;
+        let filename_plan = metadata_store.prepare_filename_migration(&new_cipher)?;
+        let sources = Self::encrypted_files(&root, &old_cipher)?;
+        let mut entries = Vec::new();
         let prepared = (|| {
+            let mut handled = HashSet::new();
             for source in sources {
                 let mut plaintext = tempfile::tempfile()
                     .context("failed to create anonymous filesystem migration file")?;
@@ -183,48 +206,102 @@ impl EncryptedWorkspace {
                     parent.join(format!(".agora-rekey-{}.tmp", Uuid::new_v4().simple()));
                 let backup = parent.join(format!(".agora-rekey-old-{}", Uuid::new_v4().simple()));
                 new_cipher.encrypt(&mut plaintext, &temporary)?;
-                entries.push((source, temporary, backup));
+                let renamed_destination = filename_plan
+                    .renames
+                    .get(&source)
+                    .cloned()
+                    .unwrap_or_else(|| source.clone());
+                handled.insert(source.clone());
+                entries.push(PreparedRekeyEntry {
+                    destination: source,
+                    renamed_destination,
+                    staged: temporary,
+                    backup,
+                    ciphertext: true,
+                });
+            }
+            for (source, renamed_destination) in &filename_plan.renames {
+                if handled.contains(source) {
+                    continue;
+                }
+                let source_metadata = match source.symlink_metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                if !source_metadata.file_type().is_symlink() {
+                    bail!(
+                        "encrypted filename migration found an untracked file: {}",
+                        source.display()
+                    );
+                }
+                let parent = source
+                    .parent()
+                    .context("encrypted filesystem symlink has no parent")?;
+                let temporary =
+                    parent.join(format!(".agora-rekey-{}.tmp", Uuid::new_v4().simple()));
+                std::os::unix::fs::symlink(fs::read_link(source)?, &temporary)?;
+                entries.push(PreparedRekeyEntry {
+                    destination: source.clone(),
+                    renamed_destination: renamed_destination.clone(),
+                    staged: temporary,
+                    backup: parent.join(format!(".agora-rekey-old-{}", Uuid::new_v4().simple())),
+                    ciphertext: false,
+                });
+            }
+            for (destination, renamed_destination, contents) in &filename_plan.leases {
+                entries.push(Self::stage_rekey_file(
+                    destination,
+                    renamed_destination,
+                    contents,
+                )?);
+            }
+            for (destination, contents) in &filename_plan.metadata {
+                entries.push(Self::stage_rekey_file(destination, destination, contents)?);
             }
             Ok::<_, anyhow::Error>(())
         })();
         if let Err(error) = prepared {
-            for (_, temporary, _) in entries {
-                let _ = fs::remove_file(temporary);
+            for entry in entries {
+                let _ = fs::remove_file(entry.staged);
             }
             return Err(error);
         }
 
         on_progress(KeyMigrationStage::VerifyingNewKey);
         let verified = (|| {
-            for (_, temporary, _) in &entries {
+            for entry in entries.iter().filter(|entry| entry.ciphertext) {
                 let mut verified = tempfile::tempfile()
                     .context("failed to create anonymous filesystem verification file")?;
-                new_cipher.decrypt(temporary, &mut verified)?;
+                new_cipher.decrypt(&entry.staged, &mut verified)?;
             }
             Ok::<_, anyhow::Error>(())
         })();
         if let Err(error) = verified {
-            for (_, staged, _) in entries {
-                let _ = fs::remove_file(staged);
+            for entry in entries {
+                let _ = fs::remove_file(entry.staged);
             }
             return Err(error);
         }
 
         let journal_entries = entries
             .iter()
-            .map(|(destination, staged, backup)| {
+            .map(|entry| {
                 Ok(RekeyEntry {
-                    destination: Self::encode_relative_path(&root, destination)?,
-                    staged: Self::encode_relative_path(&root, staged)?,
-                    backup: Self::encode_relative_path(&root, backup)?,
+                    destination: Self::encode_relative_path(&root, &entry.destination)?,
+                    renamed_destination: (entry.renamed_destination != entry.destination)
+                        .then(|| Self::encode_relative_path(&root, &entry.renamed_destination))
+                        .transpose()?,
+                    staged: Self::encode_relative_path(&root, &entry.staged)?,
+                    backup: Self::encode_relative_path(&root, &entry.backup)?,
                 })
             })
             .collect::<Result<Vec<_>>>();
         let journal_entries = match journal_entries {
             Ok(entries) => entries,
             Err(error) => {
-                for (_, staged, _) in entries {
-                    let _ = fs::remove_file(staged);
+                for entry in entries {
+                    let _ = fs::remove_file(entry.staged);
                 }
                 return Err(error);
             }
@@ -236,23 +313,23 @@ impl EncryptedWorkspace {
             entries: journal_entries,
         };
         if let Err(error) = Self::write_journal(&root, &journal) {
-            for (_, staged, _) in entries {
-                let _ = fs::remove_file(staged);
+            for entry in entries {
+                let _ = fs::remove_file(entry.staged);
             }
             return Err(error);
         }
         let migration = (|| {
-            for (destination, temporary, backup) in &entries {
-                fs::rename(destination, backup).with_context(|| {
+            for entry in &entries {
+                fs::rename(&entry.destination, &entry.backup).with_context(|| {
                     format!(
                         "failed to preserve encrypted file {}",
-                        destination.display()
+                        entry.destination.display()
                     )
                 })?;
-                fs::rename(temporary, destination).with_context(|| {
+                fs::rename(&entry.staged, &entry.renamed_destination).with_context(|| {
                     format!(
                         "failed to publish re-encrypted filesystem file {}",
-                        destination.display()
+                        entry.renamed_destination.display()
                     )
                 })?;
             }
@@ -417,14 +494,14 @@ impl EncryptedWorkspace {
         Ok(false)
     }
 
-    fn encrypted_files(root: &Path) -> Result<Vec<PathBuf>> {
-        let metadata = MetadataStore::new(root)?;
+    fn encrypted_files(root: &Path, cipher: &FileCipher) -> Result<Vec<PathBuf>> {
+        let metadata = MetadataStore::encrypted(root, cipher.clone())?;
         let mut files = Vec::new();
         let mut directories = vec![root.to_path_buf()];
         while let Some(directory) = directories.pop() {
             let logical_directory = namespace::logical_path(root, &directory)?;
             let aliases = metadata
-                .backing_names(&logical_directory)?
+                .encrypted_names(&logical_directory)?
                 .into_iter()
                 .map(|(logical, backing)| (backing, logical))
                 .collect::<std::collections::HashMap<_, _>>();
@@ -449,6 +526,32 @@ impl EncryptedWorkspace {
             }
         }
         Ok(files)
+    }
+
+    fn stage_rekey_file(
+        destination: &Path,
+        renamed_destination: &Path,
+        contents: &[u8],
+    ) -> Result<PreparedRekeyEntry> {
+        let parent = destination
+            .parent()
+            .context("filesystem key migration file has no parent")?;
+        let staged = parent.join(format!(".agora-rekey-{}.tmp", Uuid::new_v4().simple()));
+        let backup = parent.join(format!(".agora-rekey-old-{}", Uuid::new_v4().simple()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staged)?;
+        std::io::Write::write_all(&mut file, contents)?;
+        file.sync_all()?;
+        Ok(PreparedRekeyEntry {
+            destination: destination.to_path_buf(),
+            renamed_destination: renamed_destination.to_path_buf(),
+            staged,
+            backup,
+            ciphertext: false,
+        })
     }
 
     fn is_control_file(path: &Path) -> bool {
@@ -514,6 +617,12 @@ impl EncryptedWorkspace {
         }
         for entry in &journal.entries {
             let destination = Self::decode_relative_path(root, &entry.destination)?;
+            let renamed_destination = entry
+                .renamed_destination
+                .as_deref()
+                .map(|path| Self::decode_relative_path(root, path))
+                .transpose()?
+                .unwrap_or_else(|| destination.clone());
             let staged = Self::decode_relative_path(root, &entry.staged)?;
             let backup = Self::decode_relative_path(root, &entry.backup)?;
             if committed {
@@ -521,7 +630,7 @@ impl EncryptedWorkspace {
                 Self::remove_file_if_exists(&staged)?;
             } else {
                 if backup.exists() {
-                    Self::remove_file_if_exists(&destination)?;
+                    Self::remove_file_if_exists(&renamed_destination)?;
                     fs::rename(&backup, &destination).with_context(|| {
                         format!("failed to restore encrypted file {}", destination.display())
                     })?;

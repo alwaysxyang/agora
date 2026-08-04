@@ -1,6 +1,7 @@
 use super::config::HookConfig;
 use super::interpose::ProcessContext;
 use super::socket::{RawSocketAddress, socket_addr_from_raw};
+use crate::filesystem::FileCipher;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
@@ -107,6 +108,36 @@ fn hook_configuration_propagates_an_optional_tls_trust_anchor() {
             "missing {key}"
         );
     }
+}
+
+#[test]
+fn encrypted_hook_configuration_reuses_derived_cipher_key_material() {
+    let encoded_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    let values = HashMap::from([
+        ("AGORA_SANDBOX_TOKEN", "token"),
+        ("AGORA_SANDBOX_PROXY_IPV4", "127.0.0.1:41000"),
+        ("AGORA_SANDBOX_PROXY_IPV6", "[::1]:41001"),
+        ("AGORA_SANDBOX_EXECUTION_CONTROL", "127.0.0.1:41002"),
+        ("AGORA_SANDBOX_EXECUTION_TOKEN", "execution-token"),
+        ("AGORA_SANDBOX_AUDIT_CONTROL", "127.0.0.1:41003"),
+        ("AGORA_SANDBOX_AUDIT_TOKEN", "audit-token"),
+        ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
+        ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs"),
+        ("AGORA_SANDBOX_FILESYSTEM_MODE", "encrypted"),
+        ("AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY", encoded_key),
+        ("AGORA_SANDBOX_TRACE_ID", "trace-root"),
+    ]);
+
+    let config = HookConfig::from_getter(|key| values.get(key).map(ToString::to_string)).unwrap();
+
+    assert_eq!(
+        config.filesystem_cipher().unwrap().key_id(),
+        FileCipher::from_key(&[0; 32]).unwrap().key_id()
+    );
+    assert!(config.child_environment().contains(&(
+        "AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY",
+        encoded_key.to_string()
+    )));
 }
 
 #[test]

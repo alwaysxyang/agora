@@ -55,6 +55,18 @@ fn workspace_rejects_keys_that_do_not_match_the_mode() {
 }
 
 #[test]
+fn encrypted_workspace_exposes_only_derived_runtime_key_material() {
+    let workdir = temporary_directory("derived-key");
+    let workspace =
+        FilesystemWorkspace::start(&workdir, FilesystemMode::Encrypted, Some(b"secret")).unwrap();
+
+    assert_eq!(workspace.encrypted_cipher_key().unwrap().len(), 32);
+
+    drop(workspace);
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
 fn plain_workspace_rejects_a_file_as_its_root() {
     let workdir = temporary_directory("blocked-root");
     std::fs::create_dir_all(&workdir).unwrap();

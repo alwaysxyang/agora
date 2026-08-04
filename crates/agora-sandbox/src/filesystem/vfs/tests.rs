@@ -79,6 +79,115 @@ fn encrypted_open_reads_lower_without_entering_the_vfs() {
 }
 
 #[test]
+fn native_metadata_passthrough_requires_an_unmodified_lower_path() {
+    let (root, filesystem) = fixture("native-metadata-passthrough");
+    let source = root.parent().unwrap().join(format!(
+        "agora-vfs-native-metadata-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&source, b"lower content").unwrap();
+
+    assert!(
+        filesystem
+            .native_metadata_passthrough(&source, true, &Credentials::effective())
+            .unwrap()
+    );
+    filesystem.remove(&source, false).unwrap();
+    assert!(
+        !filesystem
+            .native_metadata_passthrough(&source, true, &Credentials::effective())
+            .unwrap()
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_file(source).unwrap();
+}
+
+#[test]
+fn native_metadata_passthrough_checks_a_lower_symlink_target() {
+    use std::os::unix::fs::symlink;
+
+    let (root, filesystem) = fixture("native-metadata-symlink");
+    let parent = root.parent().unwrap();
+    let target = parent.join(format!("agora-vfs-native-target-{}", uuid::Uuid::new_v4()));
+    let link = parent.join(format!("agora-vfs-native-link-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&target, b"lower content").unwrap();
+    symlink(&target, &link).unwrap();
+
+    assert!(
+        filesystem
+            .native_metadata_passthrough(&link, true, &Credentials::effective())
+            .unwrap()
+    );
+    filesystem.remove(&target, false).unwrap();
+    assert!(
+        !filesystem
+            .native_metadata_passthrough(&link, true, &Credentials::effective())
+            .unwrap()
+    );
+    assert!(
+        filesystem
+            .native_metadata_passthrough(&link, false, &Credentials::effective())
+            .unwrap()
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_file(link).unwrap();
+    std::fs::remove_file(target).unwrap();
+}
+
+#[test]
+fn searchable_ancestor_attributes_keep_lower_metadata_on_the_native_fast_path() {
+    let (root, filesystem) = fixture("native-metadata-searchable-ancestor");
+    let parent = root.parent().unwrap().join(format!(
+        "agora-vfs-native-searchable-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = parent.join("lower");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::write(&source, b"lower content").unwrap();
+    let mut attributes = FileAttributes::from_metadata(&parent.metadata().unwrap());
+    attributes.mode = u32::from(libc::S_IFDIR) | 0o700;
+    filesystem
+        .set_attributes(&parent, attributes.clone())
+        .unwrap();
+
+    assert!(
+        filesystem
+            .native_metadata_passthrough(&source, true, &Credentials::effective())
+            .unwrap()
+    );
+
+    attributes.mode = u32::from(libc::S_IFDIR) | 0o600;
+    filesystem.set_attributes(&parent, attributes).unwrap();
+    assert!(
+        !filesystem
+            .native_metadata_passthrough(&source, true, &Credentials::effective())
+            .unwrap()
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn encrypted_writes_to_special_files_remain_passthrough() {
+    let (root, filesystem) = fixture("special-file-passthrough");
+    let logical = Path::new("/dev/null");
+
+    let mut prepared = filesystem.prepare_open(logical, libc::O_WRONLY, 0).unwrap();
+    let OpenTarget::Path(mapped) = prepared.target() else {
+        panic!("special file should remain a native path");
+    };
+    assert_eq!(mapped, logical);
+    filesystem.commit_open(&mut prepared).unwrap();
+
+    assert_eq!(filesystem.state_for_test(logical).unwrap(), None);
+    assert!(filesystem.exists(logical).unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn encrypted_writeback_publishes_ciphertext_and_restores_the_next_open() {
     let (root, filesystem) = fixture("write");
     let logical = Path::new("/tmp/agora-vfs-created");
@@ -113,6 +222,76 @@ fn encrypted_writeback_publishes_ciphertext_and_restores_the_next_open() {
 }
 
 #[test]
+fn unchanged_encrypted_write_open_does_not_republish_ciphertext() {
+    let (root, filesystem) = fixture("unchanged-write-open");
+    let logical = Path::new("/tmp/agora-vfs-unchanged-write-open");
+    let mut created = filesystem
+        .prepare_open(logical, libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC, 0o600)
+        .unwrap();
+    let OpenTarget::Descriptor(file) = created.target_mut() else {
+        panic!("encrypted regular file did not use an anonymous descriptor");
+    };
+    file.write_all(b"unchanged content").unwrap();
+    filesystem.commit_open(&mut created).unwrap();
+    drop(created);
+
+    let backing = filesystem.prepare_read(logical).unwrap();
+    let original_ciphertext = std::fs::read(&backing).unwrap();
+    let mut reopened = filesystem.prepare_open(logical, libc::O_RDWR, 0).unwrap();
+    filesystem.commit_open(&mut reopened).unwrap();
+    assert_eq!(std::fs::read(&backing).unwrap(), original_ciphertext);
+
+    let (_, writeback, _) = reopened.into_parts();
+    filesystem.commit_writeback(&writeback.unwrap()).unwrap();
+    assert_eq!(std::fs::read(&backing).unwrap(), original_ciphertext);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unchanged_encrypted_snapshot_does_not_overwrite_a_newer_writer() {
+    let (root, filesystem) = fixture("stale-writeback");
+    let logical = Path::new("/tmp/agora-vfs-stale-writeback");
+    let mut created = filesystem
+        .prepare_open(logical, libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC, 0o600)
+        .unwrap();
+    let OpenTarget::Descriptor(file) = created.target_mut() else {
+        panic!("encrypted regular file did not use an anonymous descriptor");
+    };
+    file.write_all(b"original content").unwrap();
+    filesystem.commit_open(&mut created).unwrap();
+    drop(created);
+
+    let mut writer = filesystem.prepare_open(logical, libc::O_RDWR, 0).unwrap();
+    filesystem.commit_open(&mut writer).unwrap();
+    let mut stale = filesystem.prepare_open(logical, libc::O_RDWR, 0).unwrap();
+    filesystem.commit_open(&mut stale).unwrap();
+
+    let OpenTarget::Descriptor(file) = writer.target_mut() else {
+        panic!("encrypted regular file did not use an anonymous descriptor");
+    };
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.set_len(0).unwrap();
+    file.write_all(b"newer content").unwrap();
+    let (_, writer_writeback, _) = writer.into_parts();
+    let (_, stale_writeback, _) = stale.into_parts();
+    filesystem
+        .commit_writeback(&writer_writeback.unwrap())
+        .unwrap();
+    filesystem
+        .commit_writeback(&stale_writeback.unwrap())
+        .unwrap();
+
+    let mut reopened = filesystem.prepare_open(logical, libc::O_RDONLY, 0).unwrap();
+    let OpenTarget::Descriptor(file) = reopened.target_mut() else {
+        panic!("encrypted regular file did not use an anonymous descriptor");
+    };
+    let mut restored = String::new();
+    file.read_to_string(&mut restored).unwrap();
+    assert_eq!(restored, "newer content");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn encrypted_writeback_waits_for_the_vfs_publication_lock() {
     let (root, filesystem) = fixture("writeback-lock");
     let logical = Path::new("/tmp/agora-vfs-writeback-lock");
@@ -120,6 +299,10 @@ fn encrypted_writeback_waits_for_the_vfs_publication_lock() {
         .prepare_open(logical, libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC, 0o600)
         .unwrap();
     filesystem.commit_open(&mut prepared).unwrap();
+    let OpenTarget::Descriptor(file) = prepared.target_mut() else {
+        panic!("encrypted regular file did not use an anonymous descriptor");
+    };
+    file.write_all(b"dirty writeback").unwrap();
     let (_, writeback, _) = prepared.into_parts();
     let writeback = writeback.unwrap();
     let lock = std::fs::OpenOptions::new()
@@ -285,7 +468,7 @@ fn abandoned_exclusive_reservation_keeps_a_later_published_create() {
 }
 
 #[test]
-fn encrypted_namespace_mutation_rejects_a_live_writable_snapshot() {
+fn encrypted_rename_retargets_a_live_writable_snapshot() {
     let (root, first_filesystem) = fixture("write-lease");
     let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
     let second_filesystem = VirtualFilesystem::encrypted(&root, cipher).unwrap();
@@ -294,17 +477,125 @@ fn encrypted_namespace_mutation_rejects_a_live_writable_snapshot() {
     let mut prepared = first_filesystem
         .prepare_open(logical, libc::O_CREAT | libc::O_RDWR, 0o600)
         .unwrap();
+    let OpenTarget::Descriptor(file) = prepared.target_mut() else {
+        panic!("expected encrypted descriptor");
+    };
+    file.write_all(b"before rename").unwrap();
     first_filesystem.commit_open(&mut prepared).unwrap();
-    let (target, writeback, _) = prepared.into_parts();
+    let (mut target, writeback, _) = prepared.into_parts();
+    let writeback = writeback.unwrap();
 
-    let rename_error = second_filesystem.rename(logical, renamed).unwrap_err();
-    assert_eq!(errno(&rename_error), Some(libc::EBUSY));
-    let remove_error = second_filesystem.remove(logical, false).unwrap_err();
-    assert_eq!(errno(&remove_error), Some(libc::EBUSY));
+    second_filesystem.rename(logical, renamed).unwrap();
+    assert!(!second_filesystem.exists(logical).unwrap());
+    assert!(second_filesystem.exists(renamed).unwrap());
+
+    let OpenTarget::Descriptor(file) = &mut target else {
+        panic!("expected encrypted descriptor");
+    };
+    file.write_all(b" after rename").unwrap();
+    first_filesystem.commit_writeback(&writeback).unwrap();
+
+    let mut reopened = second_filesystem
+        .prepare_open(renamed, libc::O_RDONLY, 0)
+        .unwrap();
+    let OpenTarget::Descriptor(file) = reopened.target_mut() else {
+        panic!("expected encrypted descriptor");
+    };
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).unwrap();
+    assert_eq!(contents, "before rename after rename");
 
     drop(writeback);
     drop(target);
-    second_filesystem.rename(logical, renamed).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn encrypted_rename_detaches_the_replaced_target_snapshot() {
+    let (root, first_filesystem) = fixture("rename-target-write-lease");
+    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+    let second_filesystem = VirtualFilesystem::encrypted(&root, cipher).unwrap();
+    let source = Path::new("/tmp/agora-vfs-rename-source");
+    let target = Path::new("/tmp/agora-vfs-rename-target");
+
+    let mut target_prepared = first_filesystem
+        .prepare_open(target, libc::O_CREAT | libc::O_RDWR, 0o600)
+        .unwrap();
+    let OpenTarget::Descriptor(file) = target_prepared.target_mut() else {
+        panic!("expected encrypted descriptor");
+    };
+    file.write_all(b"replaced target").unwrap();
+    first_filesystem.commit_open(&mut target_prepared).unwrap();
+    let (mut target_descriptor, target_writeback, _) = target_prepared.into_parts();
+    let target_writeback = target_writeback.unwrap();
+
+    let mut source_prepared = second_filesystem
+        .prepare_open(source, libc::O_CREAT | libc::O_RDWR, 0o600)
+        .unwrap();
+    let OpenTarget::Descriptor(file) = source_prepared.target_mut() else {
+        panic!("expected encrypted descriptor");
+    };
+    file.write_all(b"renamed source").unwrap();
+    second_filesystem.commit_open(&mut source_prepared).unwrap();
+    drop(source_prepared);
+
+    second_filesystem.rename(source, target).unwrap();
+
+    let OpenTarget::Descriptor(file) = &mut target_descriptor else {
+        panic!("expected encrypted descriptor");
+    };
+    file.write_all(b" stale write").unwrap();
+    assert_eq!(
+        first_filesystem
+            .commit_writeback(&target_writeback)
+            .unwrap(),
+        None
+    );
+
+    let mut reopened = second_filesystem
+        .prepare_open(target, libc::O_RDONLY, 0)
+        .unwrap();
+    let OpenTarget::Descriptor(file) = reopened.target_mut() else {
+        panic!("expected encrypted descriptor");
+    };
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).unwrap();
+    assert_eq!(contents, "renamed source");
+
+    drop(target_writeback);
+    drop(target_descriptor);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn encrypted_unlink_detaches_a_live_writable_snapshot() {
+    let (root, first_filesystem) = fixture("unlink-write-lease");
+    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+    let second_filesystem = VirtualFilesystem::encrypted(&root, cipher).unwrap();
+    let logical = Path::new("/tmp/agora-vfs-unlink-write-lease");
+    let mut prepared = first_filesystem
+        .prepare_open(logical, libc::O_CREAT | libc::O_RDWR, 0o600)
+        .unwrap();
+    let OpenTarget::Descriptor(file) = prepared.target_mut() else {
+        panic!("expected encrypted descriptor");
+    };
+    file.write_all(b"before unlink").unwrap();
+    first_filesystem.commit_open(&mut prepared).unwrap();
+    let (mut target, writeback, _) = prepared.into_parts();
+    let writeback = writeback.unwrap();
+
+    second_filesystem.remove(logical, false).unwrap();
+    assert!(!second_filesystem.exists(logical).unwrap());
+
+    let OpenTarget::Descriptor(file) = &mut target else {
+        panic!("expected encrypted descriptor");
+    };
+    file.write_all(b" after unlink").unwrap();
+    first_filesystem.commit_writeback(&writeback).unwrap();
+    assert!(!second_filesystem.exists(logical).unwrap());
+
+    drop(writeback);
+    drop(target);
     std::fs::remove_dir_all(root).unwrap();
 }
 

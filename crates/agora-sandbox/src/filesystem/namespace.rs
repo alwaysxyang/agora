@@ -64,6 +64,7 @@ pub(super) fn is_control_name(name: &OsStr) -> bool {
     let name = name.as_bytes();
     is_reserved_or_variant(name)
         || is_file_backing_name(name)
+        || name.starts_with(super::crypto::ENCRYPTED_NAME_PREFIX.as_bytes())
         || name.starts_with(b".agora-executable-")
         || name.starts_with(b".agora-encrypted-")
         || name.starts_with(b".agora-rekey-")

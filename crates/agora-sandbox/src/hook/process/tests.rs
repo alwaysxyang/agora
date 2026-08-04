@@ -3,7 +3,7 @@ use super::{
     PreparedExecutable, ProcessHookGuard, ProcessHookRuntime, TRUNCATED_ARGUMENTS,
     agora_sandbox_execv, agora_sandbox_execve, agora_sandbox_execvp, agora_sandbox_posix_spawn,
     agora_sandbox_posix_spawnp, current_environment, execute, io_errno, prepared_executable,
-    process_event_request, requested_executable, with_test_runtime,
+    process_event_request, requested_executable, resolve_current_directory, with_test_runtime,
 };
 use crate::audit::AuditEventRequest;
 use crate::callback::ProcessOperation;
@@ -11,7 +11,7 @@ use crate::execution::{EXECUTION_PROTOCOL_VERSION, decode_prepare_request};
 use crate::hook::config::HookConfig;
 use crate::trace::TraceContext;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
@@ -431,6 +431,22 @@ fn command_request_records_process_context_and_bounds_argument_count() {
         panic!("expected process audit event");
     };
     assert_eq!(command.arguments, [TRUNCATED_ARGUMENTS]);
+}
+
+#[test]
+fn process_audit_prefers_the_tracked_logical_directory() {
+    let native = || {
+        Err(std::io::Error::from_raw_os_error(libc::EACCES)) as std::io::Result<std::path::PathBuf>
+    };
+
+    let directory = resolve_current_directory(
+        Some("/Users/example".into()),
+        native,
+        Some(OsString::from("/stale")),
+    )
+    .unwrap();
+
+    assert_eq!(directory, Path::new("/Users/example"));
 }
 
 #[test]

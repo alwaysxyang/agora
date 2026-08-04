@@ -17,7 +17,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-const AUDIT_MAX_CONNECTIONS: usize = 64;
+const AUDIT_MAX_CONNECTIONS: usize = 1024;
 const AUDIT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
@@ -228,9 +228,25 @@ where
     }
 
     async fn handle(mut stream: TcpStream, state: Arc<AuditState<C>>) -> Result<()> {
-        let frame = tokio::time::timeout(AUDIT_HANDSHAKE_TIMEOUT, read_frame(&mut stream))
+        let first = tokio::time::timeout(AUDIT_HANDSHAKE_TIMEOUT, read_frame(&mut stream))
             .await
             .context("sandbox audit handshake timed out")??;
+        Self::publish_frame(&mut stream, &state, first).await?;
+        loop {
+            let frame = match read_frame(&mut stream).await {
+                Ok(frame) => frame,
+                Err(error) if disconnected(&error) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            Self::publish_frame(&mut stream, &state, frame).await?;
+        }
+    }
+
+    async fn publish_frame(
+        stream: &mut TcpStream,
+        state: &AuditState<C>,
+        frame: Vec<u8>,
+    ) -> Result<()> {
         let request = decode_request(&frame)?;
         let response = if request.token != state.token {
             AuditResponse::Error {
@@ -247,9 +263,20 @@ where
             }
         };
         stream.write_all(&encode_response(&response)?).await?;
-        stream.shutdown().await?;
         Ok(())
     }
+}
+
+fn disconnected(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+        )
+    })
 }
 
 async fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {

@@ -2,20 +2,23 @@ use super::namespace::{self, METADATA_FILE};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
-const METADATA_VERSION: u32 = 1;
+const LEGACY_METADATA_VERSION: u32 = 1;
+const READABLE_METADATA_VERSION: u32 = 2;
+const METADATA_VERSION: u32 = 3;
 const METADATA_CACHE_CAPACITY: usize = 1024;
+const ENCODED_NAME_PREFIX: &str = "base64:";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,9 +33,38 @@ pub(crate) enum EntryState {
     Cached {
         checksum: String,
         materializer: Materializer,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<SourceIdentity>,
     },
     Cow,
     Whiteout,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct SourceIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+    mode: u32,
+}
+
+impl SourceIdentity {
+    pub(crate) fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+            mode: metadata.mode(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -104,8 +136,16 @@ impl FileAttributes {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug)]
 pub(super) struct DirectoryMetadata {
+    version: u32,
+    entries: BTreeMap<String, EntryState>,
+    attributes: BTreeMap<String, FileAttributes>,
+    encrypted_names: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct StoredDirectoryMetadataV2 {
     version: u32,
     entries: BTreeMap<String, EntryState>,
     #[serde(default)]
@@ -114,65 +154,335 @@ pub(super) struct DirectoryMetadata {
     backing_names: BTreeMap<String, String>,
 }
 
+#[derive(Deserialize)]
+struct StoredMetadataVersion {
+    version: u32,
+}
+
+#[derive(Deserialize, Serialize)]
+struct StoredDirectoryMetadataV3 {
+    version: u32,
+    entries: BTreeMap<String, StoredMetadataRecord>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct StoredMetadataRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entry: Option<EntryState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attributes: Option<FileAttributes>,
+}
+
 impl Default for DirectoryMetadata {
     fn default() -> Self {
         Self {
             version: METADATA_VERSION,
             entries: BTreeMap::new(),
             attributes: BTreeMap::new(),
-            backing_names: BTreeMap::new(),
+            encrypted_names: BTreeMap::new(),
         }
     }
 }
 
 pub(super) struct MetadataStore {
     root: PathBuf,
-    cache: Mutex<HashMap<PathBuf, CachedDirectoryMetadata>>,
+    generation: File,
+    cipher: Option<super::FileCipher>,
+    cache: Mutex<MetadataCache>,
     #[cfg(test)]
     parse_count: AtomicUsize,
+    #[cfg(test)]
+    probe_count: AtomicUsize,
 }
 
-#[derive(Clone)]
-struct CachedDirectoryMetadata {
-    identity: MetadataIdentity,
-    metadata: DirectoryMetadata,
+pub(super) struct FilenameMigrationPlan {
+    pub(super) renames: HashMap<PathBuf, PathBuf>,
+    pub(super) metadata: Vec<(PathBuf, Vec<u8>)>,
+    pub(super) leases: Vec<(PathBuf, PathBuf, Vec<u8>)>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct MetadataIdentity {
-    device: u64,
-    inode: u64,
-    size: u64,
-    modified: i64,
-    modified_nsec: i64,
-}
-
-impl MetadataIdentity {
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            size: metadata.size(),
-            modified: metadata.mtime(),
-            modified_nsec: metadata.mtime_nsec(),
-        }
-    }
+struct MetadataCache {
+    generation: Option<u64>,
+    directories: HashMap<PathBuf, Option<DirectoryMetadata>>,
 }
 
 impl MetadataStore {
+    #[cfg(test)]
     pub(super) fn new(root: &Path) -> Result<Self> {
+        Self::with_cipher(root, None)
+    }
+
+    pub(super) fn encrypted(root: &Path, cipher: super::FileCipher) -> Result<Self> {
+        Self::with_cipher(root, Some(cipher))
+    }
+
+    fn with_cipher(root: &Path, cipher: Option<super::FileCipher>) -> Result<Self> {
         fs::create_dir_all(root).with_context(|| {
             format!(
                 "failed to create sandbox filesystem root {}",
                 root.display()
             )
         })?;
+        let generation = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(root.join(namespace::VFS_LOCK_FILE))?;
+        Self::with_generation(root, generation, cipher)
+    }
+
+    pub(super) fn with_generation(
+        root: &Path,
+        generation: File,
+        cipher: Option<super::FileCipher>,
+    ) -> Result<Self> {
+        fs::create_dir_all(root).with_context(|| {
+            format!(
+                "failed to create sandbox filesystem root {}",
+                root.display()
+            )
+        })?;
+        Self::initialize_generation(&generation)?;
         Ok(Self {
             root: root.to_path_buf(),
-            cache: Mutex::new(HashMap::new()),
+            generation,
+            cipher,
+            cache: Mutex::new(MetadataCache {
+                generation: None,
+                directories: HashMap::new(),
+            }),
             #[cfg(test)]
             parse_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            probe_count: AtomicUsize::new(0),
         })
+    }
+
+    pub(super) fn migrate_all(&self) -> Result<()> {
+        let mut pending = vec![self.root.clone()];
+        while let Some(backing_directory) = pending.pop() {
+            let entries = fs::read_dir(&backing_directory).with_context(|| {
+                format!(
+                    "failed to inspect filesystem metadata directory {}",
+                    backing_directory.display()
+                )
+            })?;
+            for entry in entries {
+                let entry = entry.with_context(|| {
+                    format!(
+                        "failed to inspect filesystem metadata directory {}",
+                        backing_directory.display()
+                    )
+                })?;
+                if entry.file_type()?.is_dir() {
+                    pending.push(entry.path());
+                }
+            }
+            if !backing_directory.join(METADATA_FILE).try_exists()? {
+                continue;
+            }
+            let logical = namespace::logical_path(&self.root, &backing_directory)?;
+            let metadata = self.load(&logical)?;
+            if metadata.version != METADATA_VERSION {
+                self.migrate_legacy_directory(&logical, &backing_directory, metadata)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn prepare_filename_migration(
+        &self,
+        new_cipher: &super::FileCipher,
+    ) -> Result<FilenameMigrationPlan> {
+        let mut plan = FilenameMigrationPlan {
+            renames: HashMap::new(),
+            metadata: Vec::new(),
+            leases: Vec::new(),
+        };
+        let mut pending = vec![self.root.clone()];
+        while let Some(backing_directory) = pending.pop() {
+            for entry in fs::read_dir(&backing_directory)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    pending.push(entry.path());
+                }
+            }
+            let metadata_path = backing_directory.join(METADATA_FILE);
+            if !metadata_path.try_exists()? {
+                continue;
+            }
+            let logical_directory = namespace::logical_path(&self.root, &backing_directory)?;
+            let mut metadata = self.load(&logical_directory)?;
+            let previous = metadata.encrypted_names.clone();
+            let mut assigned = HashSet::new();
+            for (logical_name, old_name) in previous {
+                let logical = Self::decode(&logical_name)?;
+                let new_name = loop {
+                    let candidate = new_cipher.encrypt_name(logical.as_bytes())?;
+                    if assigned.insert(candidate.clone())
+                        && !backing_directory.join(&candidate).try_exists()?
+                    {
+                        break candidate;
+                    }
+                };
+                let old_path = backing_directory.join(&old_name);
+                let new_path = backing_directory.join(&new_name);
+                if plan
+                    .renames
+                    .insert(old_path.clone(), new_path.clone())
+                    .is_some()
+                {
+                    bail!("duplicate encrypted filesystem filename migration source");
+                }
+                let old_lease = Self::lease_path(&old_path)?;
+                if old_lease.try_exists()? {
+                    let new_lease = Self::lease_path(&new_path)?;
+                    plan.leases.push((
+                        old_lease,
+                        new_lease,
+                        new_path.as_os_str().as_bytes().to_vec(),
+                    ));
+                }
+                metadata.encrypted_names.insert(logical_name, new_name);
+            }
+            if metadata.version != METADATA_VERSION || !metadata.encrypted_names.is_empty() {
+                plan.metadata
+                    .push((metadata_path, self.serialize_metadata(&metadata)?));
+            }
+        }
+        Ok(plan)
+    }
+
+    fn migrate_legacy_directory(
+        &self,
+        logical_directory: &Path,
+        backing_directory: &Path,
+        mut metadata: DirectoryMetadata,
+    ) -> Result<()> {
+        if metadata.encrypted_names.is_empty() {
+            return self.write(logical_directory, &metadata);
+        }
+        let cipher = self.cipher.as_ref().with_context(|| {
+            format!(
+                "legacy encrypted filesystem metadata requires a cipher in {}",
+                backing_directory.display()
+            )
+        })?;
+        let previous = metadata.encrypted_names.clone();
+        let mut created = Vec::new();
+        let migration = (|| {
+            let mut assigned = HashSet::new();
+            for (logical_name, old_name) in &previous {
+                let logical = Self::decode(logical_name)?;
+                let new_name = loop {
+                    let candidate = cipher.encrypt_name(logical.as_bytes())?;
+                    if assigned.insert(candidate.clone())
+                        && !backing_directory.join(&candidate).try_exists()?
+                    {
+                        break candidate;
+                    }
+                };
+                let old_path = backing_directory.join(old_name);
+                let new_path = backing_directory.join(&new_name);
+                let copied_file = Self::duplicate_legacy_entry(&old_path, &new_path)?;
+                let old_lease = Self::lease_path(&old_path)?;
+                let new_lease = Self::lease_path(&new_path)?;
+                let copied_lease =
+                    match Self::duplicate_legacy_lease(&old_lease, &new_lease, &new_path) {
+                        Ok(copied) => copied,
+                        Err(error) => {
+                            if copied_file {
+                                let _ = fs::remove_file(&new_path);
+                            }
+                            return Err(error);
+                        }
+                    };
+                created.push((
+                    old_path,
+                    new_path,
+                    copied_file,
+                    old_lease,
+                    new_lease,
+                    copied_lease,
+                ));
+                metadata
+                    .encrypted_names
+                    .insert(logical_name.clone(), new_name);
+            }
+            File::open(backing_directory)?.sync_all()?;
+            self.write(logical_directory, &metadata)
+        })();
+        if let Err(error) = migration {
+            for (_, new_path, copied_file, _, new_lease, copied_lease) in created.iter().rev() {
+                if *copied_lease {
+                    let _ = fs::remove_file(new_lease);
+                }
+                if *copied_file {
+                    let _ = fs::remove_file(new_path);
+                }
+            }
+            return Err(error);
+        }
+        for (old_path, _, copied_file, old_lease, _, copied_lease) in created {
+            if copied_lease {
+                let _ = fs::remove_file(old_lease);
+            }
+            if copied_file {
+                let _ = fs::remove_file(old_path);
+            }
+        }
+        File::open(backing_directory)?.sync_all()?;
+        Ok(())
+    }
+
+    fn duplicate_legacy_entry(old: &Path, new: &Path) -> Result<bool> {
+        let metadata = match old.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.is_file() {
+            fs::hard_link(old, new)?;
+        } else if metadata.file_type().is_symlink() {
+            std::os::unix::fs::symlink(fs::read_link(old)?, new)?;
+        } else {
+            bail!(
+                "legacy encrypted filesystem alias is not a file: {}",
+                old.display()
+            );
+        }
+        Ok(true)
+    }
+
+    fn duplicate_legacy_lease(old: &Path, new: &Path, destination: &Path) -> Result<bool> {
+        match old.symlink_metadata() {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => bail!(
+                "legacy encrypted filesystem write lease is not a file: {}",
+                old.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        let mut lease = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(new)?;
+        lease.write_all(destination.as_os_str().as_bytes())?;
+        lease.sync_all()?;
+        Ok(true)
+    }
+
+    fn lease_path(destination: &Path) -> Result<PathBuf> {
+        let name = destination
+            .file_name()
+            .context("encrypted filesystem destination has no filename")?;
+        let mut lease = namespace::WRITE_LEASE_PREFIX.to_vec();
+        lease.extend_from_slice(name.as_bytes());
+        Ok(destination.with_file_name(OsString::from_vec(lease)))
     }
 
     pub(super) fn state(&self, path: &Path) -> Result<Option<EntryState>> {
@@ -187,10 +497,7 @@ impl MetadataStore {
         let (parent, name) = Self::split(path)?;
         let mut metadata = self.load(parent)?;
         let name = Self::encode(name);
-        metadata.entries.insert(name.clone(), state.clone());
-        if matches!(state, EntryState::Whiteout) {
-            metadata.backing_names.remove(&name);
-        }
+        metadata.entries.insert(name, state);
         self.write(parent, &metadata)
     }
 
@@ -204,9 +511,6 @@ impl MetadataStore {
         let mut metadata = self.load(parent)?;
         let name = Self::encode(name);
         metadata.entries.insert(name.clone(), state);
-        if matches!(metadata.entries.get(&name), Some(EntryState::Whiteout)) {
-            metadata.backing_names.remove(&name);
-        }
         match attributes {
             Some(attributes) => {
                 metadata.attributes.insert(name, attributes);
@@ -253,7 +557,7 @@ impl MetadataStore {
         let name = Self::encode(name);
         metadata.entries.remove(&name);
         metadata.attributes.remove(&name);
-        metadata.backing_names.remove(&name);
+        metadata.encrypted_names.remove(&name);
         self.write(parent, &metadata)
     }
 
@@ -265,31 +569,37 @@ impl MetadataStore {
             .collect()
     }
 
-    pub(super) fn backing_name(&self, path: &Path) -> Result<Option<OsString>> {
+    pub(super) fn encrypted_name(&self, path: &Path) -> Result<Option<OsString>> {
         let (parent, name) = Self::split(path)?;
         Ok(self
             .load(parent)?
-            .backing_names
+            .encrypted_names
             .get(&Self::encode(name))
             .map(OsString::from))
     }
 
-    pub(super) fn ensure_backing_name(&self, path: &Path) -> Result<OsString> {
+    pub(super) fn ensure_encrypted_name(&self, path: &Path) -> Result<OsString> {
         let (parent, name) = Self::split(path)?;
         let mut metadata = self.load(parent)?;
-        let name = Self::encode(name);
-        if let Some(backing) = metadata.backing_names.get(&name) {
-            return Ok(OsString::from(backing));
+        let canonical_name = Self::encode(name);
+        if let Some(encrypted) = metadata.encrypted_names.get(&canonical_name) {
+            return Ok(OsString::from(encrypted));
         }
-        let backing = Uuid::new_v4().simple().to_string();
-        metadata.backing_names.insert(name, backing.clone());
+        let cipher = self
+            .cipher
+            .as_ref()
+            .context("encrypted filesystem filename requires a filesystem cipher")?;
+        let encrypted = cipher.encrypt_name(name.as_bytes())?;
+        metadata
+            .encrypted_names
+            .insert(canonical_name, encrypted.clone());
         self.write(parent, &metadata)?;
-        Ok(OsString::from(backing))
+        Ok(OsString::from(encrypted))
     }
 
-    pub(super) fn backing_names(&self, directory: &Path) -> Result<Vec<(OsString, OsString)>> {
+    pub(super) fn encrypted_names(&self, directory: &Path) -> Result<Vec<(OsString, OsString)>> {
         self.load(directory)?
-            .backing_names
+            .encrypted_names
             .into_iter()
             .map(|(logical, backing)| Ok((Self::decode(&logical)?, OsString::from(backing))))
             .collect()
@@ -313,10 +623,26 @@ impl MetadataStore {
 
     fn load(&self, directory: &Path) -> Result<DirectoryMetadata> {
         let path = self.path(directory)?;
+        let generation = self.current_generation()?;
+        {
+            let mut cache = self.cache();
+            if cache.generation != Some(generation) {
+                cache.generation = Some(generation);
+                cache.directories.clear();
+            }
+            if let Some(cached) = cache.directories.get(&path) {
+                return Ok(cached.clone().unwrap_or_default());
+            }
+        }
+        #[cfg(test)]
+        self.probe_count.fetch_add(1, Ordering::Relaxed);
         let mut file = match File::open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.cache().remove(&path);
+                let mut cache = self.cache();
+                if cache.generation == Some(generation) {
+                    cache.directories.insert(path, None);
+                }
                 return Ok(DirectoryMetadata::default());
             }
             Err(error) => {
@@ -325,49 +651,22 @@ impl MetadataStore {
                 });
             }
         };
-        let identity = MetadataIdentity::from_metadata(&file.metadata()?);
-        if let Some(cached) = self.cache().get(&path)
-            && cached.identity == identity
-        {
-            return Ok(cached.metadata.clone());
-        }
-
-        let mut contents = Vec::with_capacity(usize::try_from(identity.size).unwrap_or(0));
+        let mut contents = Vec::with_capacity(usize::try_from(file.metadata()?.len()).unwrap_or(0));
         file.read_to_end(&mut contents)
             .with_context(|| format!("failed to read filesystem metadata {}", path.display()))?;
-        let metadata: DirectoryMetadata = serde_json::from_slice(&contents)
-            .with_context(|| format!("failed to parse filesystem metadata {}", path.display()))?;
+        let metadata = self.decode_metadata(&contents, &path)?;
         #[cfg(test)]
         self.parse_count.fetch_add(1, Ordering::Relaxed);
-        if metadata.version != METADATA_VERSION {
-            bail!(
-                "unsupported filesystem metadata version {} in {}",
-                metadata.version,
-                path.display()
-            );
-        }
-        let mut backing_names = HashSet::new();
-        for backing in metadata.backing_names.values() {
-            if !namespace::is_file_backing_name(backing.as_bytes())
-                || !backing_names.insert(backing)
-            {
-                bail!(
-                    "invalid filesystem backing name {backing:?} in {}",
-                    path.display()
-                );
-            }
-        }
         let mut cache = self.cache();
-        if cache.len() >= METADATA_CACHE_CAPACITY && !cache.contains_key(&path) {
-            cache.clear();
+        if cache.generation != Some(generation) {
+            return Ok(metadata);
         }
-        cache.insert(
-            path,
-            CachedDirectoryMetadata {
-                identity,
-                metadata: metadata.clone(),
-            },
-        );
+        if cache.directories.len() >= METADATA_CACHE_CAPACITY
+            && !cache.directories.contains_key(&path)
+        {
+            cache.directories.clear();
+        }
+        cache.directories.insert(path, Some(metadata.clone()));
         Ok(metadata)
     }
 
@@ -376,8 +675,7 @@ impl MetadataStore {
         let parent = path.parent().context("metadata path has no parent")?;
         fs::create_dir_all(parent)?;
         let temporary = parent.join(format!("{METADATA_FILE}.{}.tmp", Uuid::new_v4().simple()));
-        let contents = serde_json::to_vec_pretty(metadata)
-            .context("failed to serialize filesystem metadata")?;
+        let contents = self.serialize_metadata(metadata)?;
         let result = (|| {
             let mut file = File::create(&temporary).with_context(|| {
                 format!(
@@ -408,13 +706,206 @@ impl MetadataStore {
         })();
         if result.is_err() {
             let _ = fs::remove_file(temporary);
+        } else {
+            self.advance_generation()?;
         }
-        self.cache().remove(&path);
         result
     }
 
-    fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, CachedDirectoryMetadata>> {
+    fn decode_metadata(&self, contents: &[u8], path: &Path) -> Result<DirectoryMetadata> {
+        let stored: StoredMetadataVersion = serde_json::from_slice(contents)
+            .with_context(|| format!("failed to parse filesystem metadata {}", path.display()))?;
+        match stored.version {
+            LEGACY_METADATA_VERSION | READABLE_METADATA_VERSION => {
+                self.decode_legacy_metadata(contents, stored.version, path)
+            }
+            METADATA_VERSION => self.decode_version_three_metadata(contents, path),
+            version => bail!(
+                "unsupported filesystem metadata version {version} in {}",
+                path.display()
+            ),
+        }
+    }
+
+    fn decode_legacy_metadata(
+        &self,
+        contents: &[u8],
+        version: u32,
+        path: &Path,
+    ) -> Result<DirectoryMetadata> {
+        let stored: StoredDirectoryMetadataV2 = serde_json::from_slice(contents)
+            .with_context(|| format!("failed to parse filesystem metadata {}", path.display()))?;
+        if stored.version != version {
+            bail!(
+                "filesystem metadata version changed while parsing {}",
+                path.display()
+            );
+        }
+        let metadata = DirectoryMetadata {
+            version,
+            entries: Self::canonical_map(stored.entries, version)?,
+            attributes: Self::canonical_map(stored.attributes, version)?,
+            encrypted_names: Self::canonical_map(stored.backing_names, version)?,
+        };
+        Self::validate_legacy_backing_names(&metadata.encrypted_names, path)?;
+        Ok(metadata)
+    }
+
+    fn decode_version_three_metadata(
+        &self,
+        contents: &[u8],
+        path: &Path,
+    ) -> Result<DirectoryMetadata> {
+        let stored: StoredDirectoryMetadataV3 = serde_json::from_slice(contents)
+            .with_context(|| format!("failed to parse filesystem metadata {}", path.display()))?;
+        let mut metadata = DirectoryMetadata::default();
+        let mut logical_names = HashSet::new();
+        for (stored_name, record) in stored.entries {
+            let encrypted = stored_name.starts_with(super::crypto::ENCRYPTED_NAME_PREFIX);
+            if !encrypted && record.entry.is_none() && record.attributes.is_none() {
+                bail!(
+                    "empty filesystem metadata record {stored_name:?} in {}",
+                    path.display()
+                );
+            }
+            let logical_name = if encrypted {
+                let cipher = self.cipher.as_ref().with_context(|| {
+                    format!(
+                        "encrypted filesystem metadata requires a cipher in {}",
+                        path.display()
+                    )
+                })?;
+                let bytes = cipher.decrypt_name(&stored_name).with_context(|| {
+                    format!(
+                        "failed to decrypt filesystem metadata name in {}",
+                        path.display()
+                    )
+                })?;
+                Self::validate_logical_name(&bytes, path)?;
+                let logical = Self::encode(OsStr::from_bytes(&bytes));
+                metadata
+                    .encrypted_names
+                    .insert(logical.clone(), stored_name.clone());
+                logical
+            } else {
+                Self::canonical_name(&stored_name, READABLE_METADATA_VERSION)?
+            };
+            if !logical_names.insert(logical_name.clone()) {
+                bail!("duplicate filesystem metadata name {stored_name:?}");
+            }
+            if let Some(entry) = record.entry {
+                metadata.entries.insert(logical_name.clone(), entry);
+            }
+            if let Some(attributes) = record.attributes {
+                metadata.attributes.insert(logical_name, attributes);
+            }
+        }
+        Ok(metadata)
+    }
+
+    fn serialize_metadata(&self, metadata: &DirectoryMetadata) -> Result<Vec<u8>> {
+        let names = metadata
+            .entries
+            .keys()
+            .chain(metadata.attributes.keys())
+            .chain(metadata.encrypted_names.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut entries = BTreeMap::new();
+        for logical_name in names {
+            let stored_name =
+                if let Some(encrypted_name) = metadata.encrypted_names.get(&logical_name) {
+                    if !encrypted_name.starts_with(super::crypto::ENCRYPTED_NAME_PREFIX) {
+                        bail!("invalid encrypted filesystem filename {encrypted_name:?}");
+                    }
+                    encrypted_name.clone()
+                } else {
+                    Self::storage_name(&logical_name)?
+                };
+            let record = StoredMetadataRecord {
+                entry: metadata.entries.get(&logical_name).cloned(),
+                attributes: metadata.attributes.get(&logical_name).cloned(),
+            };
+            if entries.insert(stored_name.clone(), record).is_some() {
+                bail!("duplicate filesystem metadata record {stored_name:?}");
+            }
+        }
+        serde_json::to_vec_pretty(&StoredDirectoryMetadataV3 {
+            version: METADATA_VERSION,
+            entries,
+        })
+        .context("failed to serialize filesystem metadata")
+    }
+
+    fn validate_legacy_backing_names(
+        backing_names: &BTreeMap<String, String>,
+        path: &Path,
+    ) -> Result<()> {
+        let mut unique = HashSet::new();
+        for backing in backing_names.values() {
+            if !namespace::is_file_backing_name(backing.as_bytes()) || !unique.insert(backing) {
+                bail!(
+                    "invalid filesystem backing name {backing:?} in {}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_logical_name(name: &[u8], path: &Path) -> Result<()> {
+        if name.is_empty()
+            || name == b"."
+            || name == b".."
+            || name.contains(&b'/')
+            || name.contains(&0)
+        {
+            bail!(
+                "invalid encrypted filesystem metadata name in {}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn cache(&self) -> std::sync::MutexGuard<'_, MetadataCache> {
         self.cache.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn initialize_generation(generation: &File) -> Result<()> {
+        match generation.metadata()?.len() {
+            0 => {
+                generation.write_all_at(&0_u64.to_be_bytes(), 0)?;
+                generation.set_len(8)?;
+            }
+            8 => {}
+            _ => bail!("filesystem metadata generation is invalid"),
+        }
+        Ok(())
+    }
+
+    fn current_generation(&self) -> Result<u64> {
+        let mut bytes = [0_u8; 8];
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let read = self
+                .generation
+                .read_at(&mut bytes[offset..], offset as u64)?;
+            if read == 0 {
+                bail!("filesystem metadata generation is incomplete");
+            }
+            offset += read;
+        }
+        Ok(u64::from_be_bytes(bytes))
+    }
+
+    fn advance_generation(&self) -> Result<()> {
+        let generation = self.current_generation()?.wrapping_add(1);
+        self.generation.write_all_at(&generation.to_be_bytes(), 0)?;
+        let mut cache = self.cache();
+        cache.generation = Some(generation);
+        cache.directories.clear();
+        Ok(())
     }
 
     fn path(&self, directory: &Path) -> Result<PathBuf> {
@@ -438,9 +929,58 @@ impl MetadataStore {
         Ok(OsString::from_vec(bytes))
     }
 
+    fn storage_name(name: &str) -> Result<String> {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(name)
+            .context("invalid encoded filesystem metadata name")?;
+        match std::str::from_utf8(&bytes) {
+            Ok(name)
+                if !name.starts_with(ENCODED_NAME_PREFIX)
+                    && !name.starts_with(super::crypto::ENCRYPTED_NAME_PREFIX) =>
+            {
+                Ok(name.to_string())
+            }
+            _ => Ok(format!(
+                "{ENCODED_NAME_PREFIX}{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+            )),
+        }
+    }
+
+    fn canonical_map<T>(values: BTreeMap<String, T>, version: u32) -> Result<BTreeMap<String, T>> {
+        let mut canonical = BTreeMap::new();
+        for (stored, value) in values {
+            let name = Self::canonical_name(&stored, version)?;
+            if canonical.insert(name, value).is_some() {
+                bail!("duplicate filesystem metadata name {stored:?}");
+            }
+        }
+        Ok(canonical)
+    }
+
+    fn canonical_name(name: &str, version: u32) -> Result<String> {
+        let bytes = if version == LEGACY_METADATA_VERSION {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(name)
+                .context("invalid encoded filesystem metadata name")?
+        } else if let Some(encoded) = name.strip_prefix(ENCODED_NAME_PREFIX) {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .context("invalid encoded filesystem metadata name")?
+        } else {
+            name.as_bytes().to_vec()
+        };
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+    }
+
     #[cfg(test)]
     fn parse_count(&self) -> usize {
         self.parse_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn probe_count(&self) -> usize {
+        self.probe_count.load(Ordering::Relaxed)
     }
 }
 

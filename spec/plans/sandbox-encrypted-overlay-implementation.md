@@ -17,7 +17,7 @@ Executable preparation remains separate under `execution`; restricted native cop
 - [x] Remove the previous image, mount, detach, watchdog, and helper-process behavior.
 - [x] Add root `.fs.lock`, encrypted `.key.json`, and VFS `.vfs.lock`.
 - [x] Store versioned `.metadata` beside each mirrored directory.
-- [x] Encode reserved logical business names and randomize encrypted business-file leaf names without exposing controls.
+- [x] Encode reserved logical business names and encrypt each business-file leaf directly into the metadata key and physical filename without a separate alias.
 - [x] Implement cached, COW, and whiteout states.
 - [x] Keep ordinary lower reads on native host paths and copy up only on write intent or another mutation.
 - [x] Encrypt all persistent regular business files with chunked AES-256-GCM.

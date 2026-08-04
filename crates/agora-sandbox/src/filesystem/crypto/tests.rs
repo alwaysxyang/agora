@@ -66,6 +66,40 @@ fn cipher_rejects_invalid_derivation_inputs_and_redacts_debug_output() {
 }
 
 #[test]
+fn cipher_key_material_can_be_reused_without_repeating_pbkdf2() {
+    let derived = FileCipher::derive(b"secret key", b"0123456789abcdef").unwrap();
+    let restored = FileCipher::from_key(derived.key_material()).unwrap();
+
+    assert_eq!(restored.key_id(), derived.key_id());
+    assert!(FileCipher::from_key(b"short").is_err());
+}
+
+#[test]
+fn filename_encryption_is_randomized_authenticated_and_byte_preserving() {
+    let cipher = FileCipher::derive(b"workspace key", b"0123456789abcdef").unwrap();
+    let wrong = FileCipher::derive(b"wrong key", b"0123456789abcdef").unwrap();
+    let name = b"\xe5\xae\x89\xe5\x85\xa8-\x80.docx";
+
+    let first = cipher.encrypt_name(name).unwrap();
+    let second = cipher.encrypt_name(name).unwrap();
+
+    assert_ne!(first, second);
+    assert_eq!(cipher.decrypt_name(&first).unwrap(), name);
+    assert_eq!(cipher.decrypt_name(&second).unwrap(), name);
+    assert!(wrong.decrypt_name(&first).is_err());
+    assert!(cipher.decrypt_name("").is_err());
+
+    let mut corrupted = first.into_bytes();
+    let last = corrupted.last_mut().unwrap();
+    *last = if *last == b'A' { b'B' } else { b'A' };
+    assert!(
+        cipher
+            .decrypt_name(std::str::from_utf8(&corrupted).unwrap())
+            .is_err()
+    );
+}
+
+#[test]
 fn encryption_failures_remove_temporary_ciphertext_files() {
     let root = temporary_directory("publish-failure");
     let destination = root.join("occupied");

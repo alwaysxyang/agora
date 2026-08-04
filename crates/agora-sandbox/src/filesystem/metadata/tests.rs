@@ -1,8 +1,8 @@
 use super::{
     DirectoryMetadata, EntryState, FileAttributes, METADATA_VERSION, Materializer, MetadataStore,
 };
-use std::collections::BTreeMap;
-use std::os::unix::ffi::OsStringExt;
+use crate::filesystem::FileCipher;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -20,6 +20,7 @@ fn metadata_round_trips_cached_cow_and_whiteout_states() {
             EntryState::Cached {
                 checksum: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
                 materializer: Materializer::Copy,
+                source: None,
             },
         )
         .unwrap();
@@ -45,6 +46,81 @@ fn metadata_round_trips_cached_cow_and_whiteout_states() {
 }
 
 #[test]
+fn plain_metadata_serializes_readable_utf8_names_in_version_three_records() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let directory = Path::new("/tmp");
+    let path = directory.join("bash");
+
+    store.set(&path, EntryState::Cow).unwrap();
+    store
+        .set_attributes(&path, FileAttributes::created_file(0o755))
+        .unwrap();
+
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.path(directory).unwrap()).unwrap()).unwrap();
+    assert_eq!(metadata["version"], 3);
+    assert!(metadata.get("backing_names").is_none());
+    assert!(metadata.get("attributes").is_none());
+    assert!(metadata["entries"].get("bash").is_some());
+    assert!(metadata["entries"]["bash"].get("name").is_none());
+    assert!(metadata["entries"]["bash"].get("entry").is_some());
+    assert!(metadata["entries"]["bash"].get("attributes").is_some());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn encrypted_metadata_uses_the_physical_name_as_an_opaque_record_key() {
+    let root = tempfile();
+    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+    let store = MetadataStore::encrypted(&root, cipher.clone()).unwrap();
+    let directory = Path::new("/tmp");
+    let path = directory.join("安全方案.docx");
+    let attributes = FileAttributes::created_file(0o600);
+
+    let physical_name = store.ensure_encrypted_name(&path).unwrap();
+    store
+        .set_with_attributes(&path, EntryState::Cow, Some(attributes.clone()))
+        .unwrap();
+
+    let contents = std::fs::read(store.path(directory).unwrap()).unwrap();
+    assert!(
+        !contents
+            .windows("安全方案.docx".len())
+            .any(|window| { window == "安全方案.docx".as_bytes() })
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&contents).unwrap();
+    assert_eq!(metadata["version"], 3);
+    assert!(metadata.get("backing_names").is_none());
+    assert!(metadata.get("attributes").is_none());
+    let physical_name = physical_name.to_str().unwrap();
+    let record = &metadata["entries"][physical_name];
+    assert!(record.get("name").is_none());
+    assert_eq!(record["entry"]["state"], "cow");
+    assert!(record["attributes"].is_object());
+
+    drop(store);
+    assert_eq!(
+        cipher.decrypt_name(physical_name).unwrap(),
+        path.file_name().unwrap().as_bytes()
+    );
+    let reopened = MetadataStore::encrypted(&root, cipher).unwrap();
+    assert_eq!(reopened.state(&path).unwrap(), Some(EntryState::Cow));
+    assert_eq!(reopened.attributes(&path).unwrap(), Some(attributes));
+    assert_eq!(
+        reopened.encrypted_name(&path).unwrap().as_deref(),
+        Some(std::ffi::OsStr::new(physical_name))
+    );
+    assert_eq!(
+        reopened.entries(directory).unwrap()[0].0,
+        path.file_name().unwrap()
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn unchanged_metadata_is_parsed_once() {
     let root = tempfile();
     let store = MetadataStore::new(&root).unwrap();
@@ -54,6 +130,33 @@ fn unchanged_metadata_is_parsed_once() {
     assert_eq!(store.state(path).unwrap(), Some(EntryState::Cow));
     assert_eq!(store.state(path).unwrap(), Some(EntryState::Cow));
     assert_eq!(store.parse_count(), 1);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unchanged_missing_metadata_is_probed_once() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let path = Path::new("/tmp/missing");
+
+    assert_eq!(store.state(path).unwrap(), None);
+    assert_eq!(store.state(path).unwrap(), None);
+    assert_eq!(store.probe_count(), 1);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_generation_invalidates_another_store_cache() {
+    let root = tempfile();
+    let first = MetadataStore::new(&root).unwrap();
+    let second = MetadataStore::new(&root).unwrap();
+    let path = Path::new("/tmp/shared");
+
+    assert_eq!(first.state(path).unwrap(), None);
+    second.set(path, EntryState::Cow).unwrap();
+    assert_eq!(first.state(path).unwrap(), Some(EntryState::Cow));
 
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -100,15 +203,66 @@ fn metadata_is_stored_next_to_its_mirrored_directory() {
 fn metadata_supports_non_utf8_names() {
     let root = tempfile();
     let store = MetadataStore::new(&root).unwrap();
-    let path = Path::new("/tmp").join(std::ffi::OsString::from_vec(vec![b'f', 0x80]));
+    let directory = Path::new("/tmp");
+    let path = directory.join(std::ffi::OsString::from_vec(vec![b'f', 0x80]));
 
     store.set(&path, EntryState::Cow).unwrap();
 
     assert_eq!(store.state(&path).unwrap(), Some(EntryState::Cow));
     assert_eq!(
-        store.entries(Path::new("/tmp")).unwrap()[0].0,
+        store.entries(directory).unwrap()[0].0,
         path.file_name().unwrap()
     );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.path(directory).unwrap()).unwrap()).unwrap();
+    assert!(metadata["entries"].get("base64:ZoA").is_some());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_escapes_names_that_begin_with_the_reserved_prefix() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let directory = Path::new("/tmp");
+    let path = directory.join("base64:literal");
+
+    store.set(&path, EntryState::Cow).unwrap();
+
+    assert_eq!(store.state(&path).unwrap(), Some(EntryState::Cow));
+    assert_eq!(
+        store.entries(directory).unwrap()[0].0,
+        path.file_name().unwrap()
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.path(directory).unwrap()).unwrap()).unwrap();
+    assert!(
+        metadata["entries"]
+            .get("base64:YmFzZTY0OmxpdGVyYWw")
+            .is_some()
+    );
+    assert!(metadata["entries"].get("base64:literal").is_none());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn plain_metadata_escapes_names_that_look_like_encrypted_ciphertext() {
+    let root = tempfile();
+    let directory = Path::new("/tmp");
+    let path = directory.join("enc_literal");
+    let store = MetadataStore::new(&root).unwrap();
+
+    store.set(&path, EntryState::Cow).unwrap();
+
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.path(directory).unwrap()).unwrap()).unwrap();
+    assert!(metadata["entries"].get("enc_literal").is_none());
+    assert!(metadata["entries"].get("base64:ZW5jX2xpdGVyYWw").is_some());
+    drop(store);
+
+    let reopened = MetadataStore::new(&root).unwrap();
+    assert_eq!(reopened.state(&path).unwrap(), Some(EntryState::Cow));
+
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -132,12 +286,12 @@ fn metadata_rejects_invalid_paths_and_records() {
 
     std::fs::write(
         &path,
-        serde_json::to_vec(&DirectoryMetadata {
-            version: METADATA_VERSION + 1,
-            entries: Default::default(),
-            attributes: Default::default(),
-            backing_names: Default::default(),
-        })
+        serde_json::to_vec(&serde_json::json!({
+            "version": METADATA_VERSION + 1,
+            "entries": {},
+            "attributes": {},
+            "backing_names": {}
+        }))
         .unwrap(),
     )
     .unwrap();
@@ -180,12 +334,12 @@ fn metadata_rejects_invalid_encoded_names() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(
         &path,
-        serde_json::to_vec(&DirectoryMetadata {
-            version: METADATA_VERSION,
-            entries: BTreeMap::from([("*".to_string(), EntryState::Cow)]),
-            attributes: Default::default(),
-            backing_names: Default::default(),
-        })
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "entries": {"base64:*": {"state": "cow"}},
+            "attributes": {},
+            "backing_names": {}
+        }))
         .unwrap(),
     )
     .unwrap();
@@ -202,29 +356,58 @@ fn metadata_rejects_invalid_encoded_names() {
 }
 
 #[test]
-fn metadata_rejects_invalid_backing_names() {
+fn metadata_rejects_duplicate_decoded_names() {
     let root = tempfile();
     let store = MetadataStore::new(&root).unwrap();
     let path = store.path(Path::new("/tmp")).unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(
         &path,
-        serde_json::to_vec(&DirectoryMetadata {
-            version: METADATA_VERSION,
-            entries: Default::default(),
-            attributes: Default::default(),
-            backing_names: BTreeMap::from([(
-                MetadataStore::encode(Path::new("file").as_os_str()),
-                "../../outside".to_string(),
-            )]),
-        })
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "entries": {
+                "cat": {"state": "cow"},
+                "base64:Y2F0": {"state": "whiteout"}
+            },
+            "attributes": {},
+            "backing_names": {}
+        }))
         .unwrap(),
     )
     .unwrap();
 
     assert!(
         store
-            .backing_name(Path::new("/tmp/file"))
+            .entries(Path::new("/tmp"))
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate")
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_rejects_invalid_legacy_backing_names() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let path = store.path(Path::new("/tmp")).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "entries": {},
+            "attributes": {},
+            "backing_names": {"file": "../../outside"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        store
+            .encrypted_name(Path::new("/tmp/file"))
             .unwrap_err()
             .to_string()
             .contains("invalid filesystem backing name")

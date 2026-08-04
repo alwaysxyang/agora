@@ -8,6 +8,10 @@ It is available through the `agora-sandbox` SDK and the `agora-sandbox` command-
 
 This implementation is an observation and routing layer, not yet a complete containment boundary:
 
+- The runner installs a native macOS Seatbelt rule that denies host Keychain Mach-service lookup to
+  the child process tree. It is an independent credential-isolation rule, not general filesystem
+  containment or strict network-egress enforcement.
+
 - `NetworkEnforcement::Intercept` is supported. A covered TCP call fails closed when hook
   configuration, proxy redirection, or CONNECT-preface construction cannot be completed.
   The callback may also deny a covered request before the proxy opens the upstream destination.
@@ -282,8 +286,9 @@ Remaining coverage gaps exist outside code that successfully enters the hook:
 - TLS clients that use neither the interposed `SecTrust` APIs nor the injected trust-bundle
   environment.
 
-These startup-level gaps cannot be blocked or reported by the hook because no hook code runs. This
-is why strict enforcement must be supplied by an independent native sandbox layer.
+These startup-level gaps cannot be blocked or reported by the hook because no hook code runs. The
+current native Seatbelt rule covers only host Keychain services, so strict egress enforcement still
+requires a broader independent native sandbox layer.
 
 ## Proxy Protocol
 
@@ -409,6 +414,9 @@ privileges:
 - direct upstream and selected HTTP proxy TCP connections use the current user's permissions;
 - optional TLS trust is scoped to the injected process tree and requires no Keychain write or trust
   prompt; CA-keyed trust bundles remain under `<workdir>/ca` for reuse.
+- a narrow Seatbelt profile is installed without root privileges before child `exec` and is
+  inherited by descendants; it denies host Keychain Mach-service lookup and fails child startup if
+  installation fails;
 - fixed-CA leaf issuance, upstream verification, and TLS relay run in the unprivileged host proxy;
   the CA key file requires only the current user's read permission.
 

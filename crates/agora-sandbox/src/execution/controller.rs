@@ -2,6 +2,7 @@ use super::protocol::{
     PrepareResponse, decode_prepare_request, encode_prepare_response, frame_length,
 };
 use super::store::ExecutableStore;
+use crate::filesystem::FileCipher;
 use anyhow::{Context, Result};
 use std::io;
 use std::net::SocketAddr;
@@ -42,7 +43,18 @@ pub(crate) struct ExecutionController {
 
 impl ExecutionController {
     pub(crate) async fn start(directory: PathBuf) -> Result<Self> {
-        let store = Arc::new(Mutex::new(ExecutableStore::new(directory)?));
+        Self::start_with_cipher(directory, None).await
+    }
+
+    pub(crate) async fn start_encrypted(directory: PathBuf, cipher: FileCipher) -> Result<Self> {
+        Self::start_with_cipher(directory, Some(cipher)).await
+    }
+
+    async fn start_with_cipher(directory: PathBuf, cipher: Option<FileCipher>) -> Result<Self> {
+        let store = Arc::new(Mutex::new(match cipher {
+            Some(cipher) => ExecutableStore::encrypted(directory, cipher)?,
+            None => ExecutableStore::new(directory)?,
+        }));
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .context("failed to bind sandbox execution controller")?;

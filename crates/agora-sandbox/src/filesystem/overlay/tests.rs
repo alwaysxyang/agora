@@ -1,5 +1,5 @@
 use super::OverlayStore;
-use crate::filesystem::{EntryState, FileCipher, Materializer};
+use crate::filesystem::{EntryState, FileAttributes, FileCipher, Materializer};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
@@ -102,6 +102,17 @@ fn overlay_lock_serializes_threads() {
 }
 
 #[test]
+fn sequential_overlay_transactions_reuse_the_lock_descriptor() {
+    let fixture = Fixture::new();
+    let initial_opens = fixture.store.lock_open_count();
+
+    assert_eq!(fixture.store.state(&fixture.lower).unwrap(), None);
+    assert_eq!(fixture.store.state(&fixture.lower).unwrap(), None);
+
+    assert_eq!(fixture.store.lock_open_count(), initial_opens);
+}
+
+#[test]
 fn read_uses_lower_without_materializing_host_files() {
     let fixture = Fixture::new();
     let source = fixture.lower.join("file");
@@ -126,6 +137,151 @@ fn encrypted_root_reads_use_the_backing_root_without_leaf_metadata() {
     let store = OverlayStore::encrypted(&root, cipher).unwrap();
 
     assert_eq!(store.prepare_read(Path::new("/")).unwrap(), Path::new("/"));
+}
+
+#[test]
+fn encrypted_metadata_key_matches_the_encrypted_physical_name_without_plaintext() {
+    let (fixture, cipher) = Fixture::encrypted();
+    let logical = Path::new("/tmp/secret.txt");
+    let destination = fixture.store.prepare_write(logical, true).unwrap();
+    std::fs::write(&destination, b"encrypted-placeholder").unwrap();
+    let root = fixture.store.root();
+
+    let contents = std::fs::read(root.join("tmp/.metadata")).unwrap();
+    assert!(
+        !contents
+            .windows(b"secret.txt".len())
+            .any(|part| part == b"secret.txt")
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&contents).unwrap();
+    assert_eq!(metadata["version"], 3);
+    assert!(metadata.get("backing_names").is_none());
+    let alias = metadata["entries"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap();
+
+    assert!(alias.starts_with("enc_"));
+    assert_eq!(cipher.decrypt_name(alias).unwrap(), b"secret.txt");
+    assert_eq!(destination, root.join("tmp").join(alias));
+    assert!(destination.is_file());
+    assert!(!root.join("tmp/secret.txt").exists());
+    assert!(metadata["entries"][alias].get("name").is_none());
+}
+
+#[test]
+fn opening_an_overlay_recursively_migrates_version_one_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fs");
+    let nested = root.join("usr/bin");
+    std::fs::create_dir_all(&nested).unwrap();
+    let attributes = FileAttributes::created_file(0o755);
+    std::fs::write(
+        root.join(".metadata"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "entries": {"Y2F0": {"state": "whiteout"}},
+            "attributes": {},
+            "backing_names": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        nested.join(".metadata"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "entries": {"YmFzaA": {"state": "cow"}},
+            "attributes": {"YmFzaA": serde_json::to_value(&attributes).unwrap()},
+            "backing_names": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let store = OverlayStore::new(&root).unwrap();
+
+    assert_eq!(
+        store.state(Path::new("/cat")).unwrap(),
+        Some(EntryState::Whiteout)
+    );
+    assert_eq!(
+        store.state(Path::new("/usr/bin/bash")).unwrap(),
+        Some(EntryState::Cow)
+    );
+    assert_eq!(
+        store.attributes(Path::new("/usr/bin/bash")).unwrap(),
+        Some(attributes)
+    );
+    let root_metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(".metadata")).unwrap()).unwrap();
+    let nested_metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(nested.join(".metadata")).unwrap()).unwrap();
+    assert_eq!(root_metadata["version"], 3);
+    assert!(root_metadata["entries"].get("cat").is_some());
+    assert_eq!(nested_metadata["version"], 3);
+    assert!(nested_metadata["entries"].get("bash").is_some());
+    assert!(
+        nested_metadata["entries"]["bash"]
+            .get("attributes")
+            .is_some()
+    );
+}
+
+#[test]
+fn encrypted_overlay_migrates_version_two_aliases_to_encrypted_filenames() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fs");
+    let backing = root.join("tmp");
+    std::fs::create_dir_all(&backing).unwrap();
+    let old_name = "c1ed24271f7440a19b1b85076d21d0ae";
+    std::fs::write(backing.join(old_name), b"ciphertext").unwrap();
+    std::fs::write(
+        backing.join(".metadata"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "entries": {"安全方案.docx": {"state": "cow"}},
+            "attributes": {},
+            "backing_names": {"安全方案.docx": old_name}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+
+    let store = OverlayStore::encrypted(&root, cipher.clone()).unwrap();
+
+    assert_eq!(
+        store.state(Path::new("/tmp/安全方案.docx")).unwrap(),
+        Some(EntryState::Cow)
+    );
+    let contents = std::fs::read(backing.join(".metadata")).unwrap();
+    assert!(
+        !contents
+            .windows("安全方案.docx".len())
+            .any(|part| { part == "安全方案.docx".as_bytes() })
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&contents).unwrap();
+    assert_eq!(metadata["version"], 3);
+    assert!(metadata.get("backing_names").is_none());
+    let encrypted_name = metadata["entries"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap();
+    assert_eq!(
+        cipher.decrypt_name(encrypted_name).unwrap(),
+        "安全方案.docx".as_bytes()
+    );
+    assert!(backing.join(encrypted_name).is_file());
+    assert!(!backing.join(old_name).exists());
+    assert_eq!(
+        store.prepare_read(Path::new("/tmp/安全方案.docx")).unwrap(),
+        backing.join(encrypted_name)
+    );
 }
 
 #[test]
@@ -712,6 +868,46 @@ fn executable_metadata_and_failed_publication_are_consistent() {
             .to_string_lossy()
             .starts_with(".agora-executable-")
     }));
+}
+
+#[test]
+fn unchanged_executable_identity_reuses_cache_without_rehashing_contents() {
+    let fixture = Fixture::new();
+    let source = fixture.lower.join("large-tool");
+    std::fs::write(&source, b"source executable").unwrap();
+    let destination = fixture
+        .store
+        .prepare_executable(&source, |temporary| {
+            std::fs::write(temporary, b"prepared executable")?;
+            std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        })
+        .unwrap();
+    let Some(EntryState::Cached {
+        materializer,
+        source: Some(source_identity),
+        ..
+    }) = fixture.store.state(&source).unwrap()
+    else {
+        panic!("missing executable source identity");
+    };
+    fixture
+        .store
+        .set_state_for_test(
+            &source,
+            EntryState::Cached {
+                checksum: "intentionally-invalid".to_string(),
+                materializer,
+                source: Some(source_identity),
+            },
+        )
+        .unwrap();
+
+    let reused = fixture.store.prepare_executable(&source, |_| {
+        anyhow::bail!("unchanged source must not be prepared again")
+    });
+
+    assert_eq!(reused.unwrap(), destination);
 }
 
 #[test]

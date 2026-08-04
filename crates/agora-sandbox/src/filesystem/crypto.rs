@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 use ring::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
     digest, pbkdf2,
@@ -17,6 +18,10 @@ const NONCE_PREFIX_SIZE: usize = 8;
 const HEADER_SIZE: usize = MAGIC.len() + 1 + NONCE_PREFIX_SIZE;
 const CHUNK_SIZE: usize = 64 * 1024;
 const TAG_SIZE: usize = 16;
+const NAME_NONCE_SIZE: usize = 12;
+const NAME_AAD: &[u8] = b"AGORA-FILENAME\0\x01";
+pub(super) const ENCRYPTED_NAME_PREFIX: &str = "enc_";
+const FILESYSTEM_NAME_MAX: usize = 255;
 const FINAL_RECORD: u8 = 0;
 const DATA_RECORD: u8 = 1;
 const PBKDF2_ITERATIONS: u32 = 100_000;
@@ -24,6 +29,7 @@ const PBKDF2_ITERATIONS: u32 = 100_000;
 #[derive(Clone)]
 pub(crate) struct FileCipher {
     key: LessSafeKey,
+    key_material: [u8; 32],
     key_id: String,
 }
 
@@ -50,17 +56,79 @@ impl FileCipher {
             passphrase,
             &mut key,
         );
-        let key_id = Self::hex(digest::digest(&digest::SHA256, &key).as_ref());
-        let key = UnboundKey::new(&aead::AES_256_GCM, &key)
+        Self::from_key(&key)
+    }
+
+    pub(crate) fn from_key(key: &[u8]) -> Result<Self> {
+        let key_material: [u8; 32] = key
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("sandbox filesystem cipher key must contain 32 bytes"))?;
+        let key_id = Self::hex(digest::digest(&digest::SHA256, key).as_ref());
+        let key = UnboundKey::new(&aead::AES_256_GCM, &key_material)
             .map_err(|_| anyhow::anyhow!("failed to initialize filesystem cipher"))?;
         Ok(Self {
             key: LessSafeKey::new(key),
+            key_material,
             key_id,
         })
     }
 
+    pub(crate) fn key_material(&self) -> &[u8; 32] {
+        &self.key_material
+    }
+
     pub(crate) fn key_id(&self) -> &str {
         &self.key_id
+    }
+
+    pub(crate) fn encrypt_name(&self, plaintext: &[u8]) -> Result<String> {
+        let mut nonce = [0_u8; NAME_NONCE_SIZE];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| anyhow::anyhow!("failed to generate filesystem filename nonce"))?;
+        let mut sealed = plaintext.to_vec();
+        self.key
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(NAME_AAD),
+                &mut sealed,
+            )
+            .map_err(|_| anyhow::anyhow!("failed to encrypt filesystem filename"))?;
+        let mut payload = Vec::with_capacity(NAME_NONCE_SIZE + sealed.len());
+        payload.extend_from_slice(&nonce);
+        payload.extend_from_slice(&sealed);
+        let encoded = format!(
+            "{ENCRYPTED_NAME_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        );
+        if encoded.len() > FILESYSTEM_NAME_MAX {
+            return Err(std::io::Error::from_raw_os_error(libc::ENAMETOOLONG).into());
+        }
+        Ok(encoded)
+    }
+
+    pub(crate) fn decrypt_name(&self, encoded: &str) -> Result<Vec<u8>> {
+        let encoded = encoded
+            .strip_prefix(ENCRYPTED_NAME_PREFIX)
+            .context("filesystem filename is not encrypted")?;
+        let mut payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .context("filesystem filename ciphertext is not valid Base64")?;
+        if payload.len() < NAME_NONCE_SIZE + TAG_SIZE {
+            bail!("filesystem filename ciphertext is incomplete");
+        }
+        let nonce: [u8; NAME_NONCE_SIZE] = payload[..NAME_NONCE_SIZE]
+            .try_into()
+            .expect("filename nonce length was checked");
+        let opened = self
+            .key
+            .open_in_place(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(NAME_AAD),
+                &mut payload[NAME_NONCE_SIZE..],
+            )
+            .map_err(|_| anyhow::anyhow!("filesystem filename authentication failed"))?;
+        Ok(opened.to_vec())
     }
 
     pub(crate) fn encrypt(&self, plaintext: &mut File, destination: &Path) -> Result<()> {

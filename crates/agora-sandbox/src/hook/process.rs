@@ -10,7 +10,7 @@ use crate::execution::{
 };
 use crate::trace::TraceContext;
 use std::cell::Cell;
-use std::ffi::{CStr, CString, OsStr};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
@@ -416,8 +416,11 @@ unsafe fn process_event_request(
             format!("failed to resolve current executable: {error}"),
         )
     })?;
-    let current_dir = std::env::current_dir()
-        .or_else(|error| std::env::var_os("PWD").map(PathBuf::from).ok_or(error));
+    let current_dir = resolve_current_directory(
+        super::filesystem::tracked_current_directory(),
+        std::env::current_dir,
+        std::env::var_os("PWD"),
+    );
     let current_dir = current_dir.map_err(|error| {
         PrepareError::new(
             io_errno(&error),
@@ -438,6 +441,17 @@ unsafe fn process_event_request(
             operation,
         },
     })
+}
+
+fn resolve_current_directory(
+    tracked: Option<PathBuf>,
+    native: impl FnOnce() -> io::Result<PathBuf>,
+    pwd: Option<OsString>,
+) -> io::Result<PathBuf> {
+    tracked
+        .map(Ok)
+        .unwrap_or_else(native)
+        .or_else(|error| pwd.map(PathBuf::from).ok_or(error))
 }
 
 #[unsafe(no_mangle)]

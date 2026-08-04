@@ -122,6 +122,7 @@ fn key_migration_ignores_persistent_executable_caches() {
             EntryState::Cached {
                 checksum: "checksum".to_string(),
                 materializer: Materializer::Executable,
+                source: None,
             },
         )
         .unwrap();
@@ -219,6 +220,7 @@ fn startup_recovers_interrupted_key_migration_before_opening_the_workspace() {
             new_key: new_key.clone(),
             entries: vec![RekeyEntry {
                 destination: EncryptedWorkspace::encode_relative_path(&root, &destination).unwrap(),
+                renamed_destination: None,
                 staged: EncryptedWorkspace::encode_relative_path(&root, &staged).unwrap(),
                 backup: EncryptedWorkspace::encode_relative_path(&root, &backup).unwrap(),
             }],
@@ -252,6 +254,7 @@ fn startup_recovers_interrupted_key_migration_before_opening_the_workspace() {
             new_key: new_key.clone(),
             entries: vec![RekeyEntry {
                 destination: EncryptedWorkspace::encode_relative_path(&root, &destination).unwrap(),
+                renamed_destination: None,
                 staged: EncryptedWorkspace::encode_relative_path(&root, &staged).unwrap(),
                 backup: EncryptedWorkspace::encode_relative_path(&root, &backup).unwrap(),
             }],
@@ -454,6 +457,7 @@ fn migration_helpers_reject_external_paths_and_inconsistent_journals() {
         new_key: metadata("new"),
         entries: vec![RekeyEntry {
             destination: EncryptedWorkspace::encode_relative_path(&root, &destination).unwrap(),
+            renamed_destination: None,
             staged: EncryptedWorkspace::encode_relative_path(&root, &staged).unwrap(),
             backup: EncryptedWorkspace::encode_relative_path(&root, &backup).unwrap(),
         }],

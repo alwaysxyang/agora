@@ -4,7 +4,7 @@ use super::{DirectoryView, FileCipher, OverlayStore, StagedWrite};
 use anyhow::{Context, Result, bail};
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -33,14 +33,37 @@ pub(crate) struct PreparedFile {
     target: OpenTarget,
     staged: Option<StagedWrite>,
     writeback: Option<Writeback>,
+    publish_on_open: bool,
     created_mode: Option<u32>,
     layer: FileLayer,
 }
 
 pub(crate) struct Writeback {
-    destination: PathBuf,
     plaintext: Mutex<File>,
-    _lease: File,
+    lease: Mutex<File>,
+    baseline: Mutex<PlaintextIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlaintextIdentity {
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl PlaintextIdentity {
+    fn from_file(file: &File) -> Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            len: metadata.len(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        })
+    }
 }
 
 impl PreparedFile {
@@ -153,6 +176,7 @@ impl VirtualFilesystem {
                 target: OpenTarget::Path(target),
                 staged: None,
                 writeback: None,
+                publish_on_open: false,
                 created_mode: None,
                 layer,
             });
@@ -177,6 +201,7 @@ impl VirtualFilesystem {
                     target: OpenTarget::Path(mapped),
                     staged: None,
                     writeback: None,
+                    publish_on_open: false,
                     created_mode: None,
                     layer: FileLayer::Lower,
                 });
@@ -186,8 +211,9 @@ impl VirtualFilesystem {
         if !self.overlay.is_internal(&mapped) {
             return Ok(PreparedFile {
                 target: OpenTarget::Path(mapped),
-                staged,
+                staged: None,
                 writeback: None,
+                publish_on_open: false,
                 created_mode: None,
                 layer: FileLayer::Lower,
             });
@@ -197,6 +223,7 @@ impl VirtualFilesystem {
                 target: OpenTarget::Path(mapped),
                 staged,
                 writeback: None,
+                publish_on_open: false,
                 created_mode: None,
                 layer: FileLayer::Upper,
             });
@@ -206,6 +233,7 @@ impl VirtualFilesystem {
                 target: OpenTarget::Path(mapped),
                 staged,
                 writeback: None,
+                publish_on_open: false,
                 created_mode: None,
                 layer: FileLayer::Upper,
             });
@@ -237,21 +265,36 @@ impl VirtualFilesystem {
         } else {
             plaintext.seek(SeekFrom::Start(0))?;
         }
+        let baseline = PlaintextIdentity::from_file(&plaintext)?;
         Ok(PreparedFile {
             target: OpenTarget::Descriptor(exposed),
             staged,
             writeback: if writes {
                 Some(Writeback {
-                    destination: mapped,
                     plaintext: Mutex::new(plaintext),
-                    _lease: lease.context("encrypted write open did not acquire a lease")?,
+                    lease: Mutex::new(
+                        lease.context("encrypted write open did not acquire a lease")?,
+                    ),
+                    baseline: Mutex::new(baseline),
                 })
             } else {
                 None
             },
+            publish_on_open: writes && (!existed || flags & libc::O_TRUNC != 0),
             created_mode,
             layer: FileLayer::Upper,
         })
+    }
+
+    pub(crate) fn prepare_native_open(&self, logical: &Path) -> PreparedFile {
+        PreparedFile {
+            target: OpenTarget::Path(logical.to_path_buf()),
+            staged: None,
+            writeback: None,
+            publish_on_open: false,
+            created_mode: None,
+            layer: FileLayer::Lower,
+        }
     }
 
     pub(crate) fn resolve_open_path(&self, logical: &Path, flags: libc::c_int) -> Result<PathBuf> {
@@ -268,7 +311,8 @@ impl VirtualFilesystem {
 
     pub(crate) fn commit_open(&self, prepared: &mut PreparedFile) -> Result<()> {
         if let Some(writeback) = &prepared.writeback {
-            self.commit_writeback(writeback)?;
+            self.publish_writeback(writeback, prepared.publish_on_open)?;
+            prepared.publish_on_open = false;
         }
         if let Some(staged) = prepared.staged.take() {
             if let Some(mode) = prepared.created_mode.take() {
@@ -280,13 +324,34 @@ impl VirtualFilesystem {
         Ok(())
     }
 
-    pub(crate) fn commit_writeback(&self, writeback: &Writeback) -> Result<()> {
+    pub(crate) fn commit_writeback(&self, writeback: &Writeback) -> Result<Option<PathBuf>> {
+        self.publish_writeback(writeback, false)
+    }
+
+    fn publish_writeback(&self, writeback: &Writeback, force: bool) -> Result<Option<PathBuf>> {
         let mut plaintext = writeback
             .plaintext
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.overlay
-            .publish_encrypted(&mut plaintext, &writeback.destination)
+        let current = PlaintextIdentity::from_file(&plaintext)?;
+        let mut baseline = writeback
+            .baseline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !force && current == *baseline {
+            return Ok(None);
+        }
+        let lease = writeback
+            .lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let published = self
+            .overlay
+            .publish_encrypted(&mut plaintext, &lease)?
+            .map(|destination| self.overlay.logical_path(&destination))
+            .transpose()?;
+        *baseline = current;
+        Ok(published)
     }
 
     #[cfg(test)]
@@ -304,6 +369,17 @@ impl VirtualFilesystem {
 
     pub(crate) fn logical_path(&self, path: &Path) -> Result<PathBuf> {
         self.overlay.logical_path(path)
+    }
+
+    pub(crate) fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
+        let resolved = self.overlay.resolve_final(path, false)?;
+        let visible = self.overlay.visible_path(&resolved)?;
+        let canonical = visible.canonicalize()?;
+        if self.overlay.is_internal(&canonical) {
+            self.overlay.logical_path(&canonical)
+        } else {
+            Ok(canonical)
+        }
     }
 
     #[cfg(test)]
@@ -345,6 +421,18 @@ impl VirtualFilesystem {
 
     pub(crate) fn exists(&self, path: &Path) -> Result<bool> {
         self.overlay.exists(path)
+    }
+
+    pub(crate) fn native_metadata_passthrough(
+        &self,
+        path: &Path,
+        follow_final: bool,
+        credentials: &Credentials,
+    ) -> Result<bool> {
+        self.overlay
+            .native_metadata_passthrough(path, follow_final, |attributes| {
+                credentials.allows(attributes, libc::X_OK)
+            })
     }
 
     fn is_symlink(&self, path: &Path) -> Result<bool> {
@@ -399,6 +487,18 @@ impl VirtualFilesystem {
             .context("filesystem mutation path has no parent")?;
         self.require_search(parent, credentials)?;
         self.require_access(parent, libc::W_OK | libc::X_OK, credentials)
+    }
+
+    pub(crate) fn validate_create_directory(
+        &self,
+        path: &Path,
+        credentials: &Credentials,
+    ) -> Result<()> {
+        self.require_search(path, credentials)?;
+        if self.exists(path)? {
+            return Err(std::io::Error::from_raw_os_error(libc::EEXIST).into());
+        }
+        self.require_parent_mutation(path, credentials)
     }
 
     pub(crate) fn validate_open_permissions(
@@ -488,6 +588,10 @@ impl VirtualFilesystem {
     pub(crate) fn create_directory(&self, path: &Path, mode: u32) -> Result<PathBuf> {
         self.overlay
             .create_directory(path, Self::effective_creation_mode(mode)?)
+    }
+
+    pub(crate) fn create_symlink(&self, path: &Path, target: &Path) -> Result<PathBuf> {
+        self.overlay.create_symlink(path, target)
     }
 
     pub(crate) fn remove(&self, path: &Path, directory: bool) -> Result<()> {

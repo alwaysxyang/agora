@@ -39,25 +39,61 @@ fn serve_until_stopped(
     })
 }
 
-fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
+fn read_frame_result(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut prefix = [0_u8; 4];
-    stream.read_exact(&mut prefix).unwrap();
+    stream.read_exact(&mut prefix)?;
     let mut frame = vec![0_u8; u32::from_be_bytes(prefix) as usize];
-    stream.read_exact(&mut frame).unwrap();
-    frame
+    stream.read_exact(&mut frame)?;
+    Ok(frame)
+}
+
+fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
+    read_frame_result(stream).unwrap()
 }
 
 fn accepted_audit_server(
     listener: TcpListener,
     stopped: Arc<AtomicBool>,
 ) -> thread::JoinHandle<usize> {
-    serve_until_stopped(listener, stopped, |mut stream| {
-        let _request = read_frame(&mut stream);
-        let response = br#""Accepted""#;
-        stream
-            .write_all(&(response.len() as u32).to_be_bytes())
-            .unwrap();
-        stream.write_all(response).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    thread::spawn(move || {
+        let mut requests = 0;
+        while !stopped.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    loop {
+                        match read_frame_result(&mut stream) {
+                            Ok(_request) => {
+                                let response = br#""Accepted""#;
+                                stream
+                                    .write_all(&(response.len() as u32).to_be_bytes())
+                                    .unwrap();
+                                stream.write_all(response).unwrap();
+                                requests += 1;
+                            }
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::UnexpectedEof
+                                        | std::io::ErrorKind::ConnectionAborted
+                                        | std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::BrokenPipe
+                                ) =>
+                            {
+                                break;
+                            }
+                            Err(error) => panic!("audit fixture failed: {error}"),
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("test listener failed: {error}"),
+            }
+        }
+        requests
     })
 }
 

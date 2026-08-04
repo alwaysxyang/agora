@@ -10,16 +10,17 @@ use crate::filesystem::{
     VirtualFilesystem, Writeback,
 };
 use crate::trace::TraceContext;
-use anyhow::{Context, Result};
-use std::cell::Cell;
+use anyhow::{Context, Result, bail};
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
 use std::io;
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileTypeExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock};
 
 type OpenFn = unsafe extern "C" fn(*const libc::c_char, libc::c_int, libc::mode_t) -> libc::c_int;
 type OpenAtFn = unsafe extern "C" fn(
@@ -164,11 +165,66 @@ type PosixSpawnAddOpenFn = unsafe extern "C" fn(
 ) -> libc::c_int;
 type ChdirFn = unsafe extern "C" fn(*const libc::c_char) -> libc::c_int;
 type GetcwdFn = unsafe extern "C" fn(*mut libc::c_char, libc::size_t) -> *mut libc::c_char;
+type RealpathFn = unsafe extern "C" fn(*const libc::c_char, *mut libc::c_char) -> *mut libc::c_char;
 type OpendirFn = unsafe extern "C" fn(*const libc::c_char) -> *mut libc::DIR;
 type FdopendirFn = unsafe extern "C" fn(libc::c_int) -> *mut libc::DIR;
 type ReaddirFn = unsafe extern "C" fn(*mut libc::DIR) -> *mut libc::dirent;
 type RewinddirFn = unsafe extern "C" fn(*mut libc::DIR);
 type ClosedirFn = unsafe extern "C" fn(*mut libc::DIR) -> libc::c_int;
+type FtsCompareFn =
+    unsafe extern "C" fn(*const *const DarwinFtsEntry, *const *const DarwinFtsEntry) -> libc::c_int;
+type FtsOpenFn = unsafe extern "C" fn(
+    *const *mut libc::c_char,
+    libc::c_int,
+    Option<FtsCompareFn>,
+) -> *mut libc::c_void;
+type FtsChildrenFn = unsafe extern "C" fn(*mut libc::c_void, libc::c_int) -> *mut DarwinFtsEntry;
+type FtsCloseFn = unsafe extern "C" fn(*mut libc::c_void) -> libc::c_int;
+type FtsReadFn = unsafe extern "C" fn(*mut libc::c_void) -> *mut DarwinFtsEntry;
+type GetattrlistbulkFn = unsafe extern "C" fn(
+    libc::c_int,
+    *mut libc::c_void,
+    *mut libc::c_void,
+    libc::size_t,
+    u64,
+) -> libc::c_int;
+
+const FTS_D: libc::c_ushort = 1;
+const FTS_DNR: libc::c_ushort = 4;
+const FTS_DOT: libc::c_ushort = 5;
+const FTS_ERR: libc::c_ushort = 7;
+const FTS_F: libc::c_ushort = 8;
+const FTS_NS: libc::c_ushort = 10;
+const FTS_NSOK: libc::c_ushort = 11;
+const FTS_SL: libc::c_ushort = 12;
+const FTS_DEFAULT: libc::c_ushort = 3;
+const FTS_SKIP: libc::c_int = 4;
+const FTS_NOCHDIR: libc::c_int = 0x004;
+const NATIVE_PASSTHROUGH_ROOTS: &[&str] = &["/dev"];
+
+#[repr(C)]
+pub(super) struct DarwinFtsEntry {
+    fts_cycle: *mut DarwinFtsEntry,
+    fts_parent: *mut DarwinFtsEntry,
+    fts_link: *mut DarwinFtsEntry,
+    fts_number: libc::c_long,
+    fts_pointer: *mut libc::c_void,
+    fts_accpath: *mut libc::c_char,
+    fts_path: *mut libc::c_char,
+    fts_errno: libc::c_int,
+    fts_symfd: libc::c_int,
+    fts_pathlen: libc::c_ushort,
+    fts_namelen: libc::c_ushort,
+    fts_ino: libc::ino_t,
+    fts_dev: libc::dev_t,
+    fts_nlink: libc::nlink_t,
+    fts_level: libc::c_short,
+    fts_info: libc::c_ushort,
+    fts_flags: libc::c_ushort,
+    fts_instr: libc::c_ushort,
+    fts_statp: *mut libc::stat,
+    fts_name: [libc::c_char; 1],
+}
 
 unsafe extern "C" {
     #[link_name = "readdir_r"]
@@ -177,13 +233,100 @@ unsafe extern "C" {
         entry: *mut libc::dirent,
         result: *mut *mut libc::dirent,
     ) -> libc::c_int;
+
+    #[link_name = "fts_children"]
+    fn darwin_fts_children(stream: *mut libc::c_void, options: libc::c_int) -> *mut DarwinFtsEntry;
+
+    #[link_name = "fts_open"]
+    fn darwin_fts_open(
+        paths: *const *mut libc::c_char,
+        options: libc::c_int,
+        compare: Option<FtsCompareFn>,
+    ) -> *mut libc::c_void;
+
+    #[link_name = "fts_close"]
+    fn darwin_fts_close(stream: *mut libc::c_void) -> libc::c_int;
+
+    #[link_name = "fts_read"]
+    fn darwin_fts_read(stream: *mut libc::c_void) -> *mut DarwinFtsEntry;
+
+    #[link_name = "fts_set"]
+    fn darwin_fts_set(
+        stream: *mut libc::c_void,
+        entry: *mut DarwinFtsEntry,
+        instruction: libc::c_int,
+    ) -> libc::c_int;
+
+    #[link_name = "getattrlistbulk"]
+    fn darwin_getattrlistbulk(
+        directory: libc::c_int,
+        attributes: *mut libc::c_void,
+        buffer: *mut libc::c_void,
+        size: libc::size_t,
+        options: u64,
+    ) -> libc::c_int;
 }
 
 thread_local! {
     static INSIDE_FILESYSTEM_HOOK: Cell<bool> = const { Cell::new(false) };
     static INITIALIZING_FILESYSTEM_RUNTIME: Cell<bool> = const { Cell::new(false) };
+    static FTS_VIRTUAL_BULK_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static FTS_BULK_CURSORS: RefCell<HashMap<libc::c_int, FtsBulkCursor>> = RefCell::new(HashMap::new());
     #[cfg(test)]
     static TEST_FILESYSTEM_RUNTIME: Cell<*const FilesystemHookRuntime> = const { Cell::new(std::ptr::null()) };
+}
+
+struct FtsVirtualBulk;
+
+impl FtsVirtualBulk {
+    fn enter() -> Self {
+        FTS_VIRTUAL_BULK_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self
+    }
+
+    fn is_active() -> bool {
+        FTS_VIRTUAL_BULK_DEPTH.with(|depth| depth.get() != 0)
+    }
+}
+
+impl Drop for FtsVirtualBulk {
+    fn drop(&mut self) {
+        FTS_VIRTUAL_BULK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+static FILESYSTEM_FORK_BARRIER_REGISTRATION: Once = Once::new();
+static mut FILESYSTEM_FORK_BARRIER: libc::pthread_rwlock_t = libc::PTHREAD_RWLOCK_INITIALIZER;
+
+pub(super) fn initialize_process() {
+    FILESYSTEM_FORK_BARRIER_REGISTRATION.call_once(|| unsafe {
+        libc::pthread_atfork(
+            Some(lock_filesystem_before_fork),
+            Some(unlock_filesystem_after_fork),
+            Some(reset_filesystem_after_fork),
+        );
+    });
+}
+
+unsafe extern "C" fn lock_filesystem_before_fork() {
+    unsafe {
+        libc::pthread_rwlock_wrlock(&raw mut FILESYSTEM_FORK_BARRIER);
+    }
+}
+
+unsafe extern "C" fn unlock_filesystem_after_fork() {
+    unsafe {
+        libc::pthread_rwlock_unlock(&raw mut FILESYSTEM_FORK_BARRIER);
+    }
+}
+
+unsafe extern "C" fn reset_filesystem_after_fork() {
+    unsafe {
+        std::ptr::write(
+            &raw mut FILESYSTEM_FORK_BARRIER,
+            libc::PTHREAD_RWLOCK_INITIALIZER,
+        );
+    }
 }
 
 struct FilesystemHookGuard;
@@ -193,13 +336,15 @@ impl FilesystemHookGuard {
         if !super::interpose::initialized() && !test_runtime_is_set() {
             return None;
         }
-        INSIDE_FILESYSTEM_HOOK.with(|inside| {
-            if inside.replace(true) {
-                None
-            } else {
-                Some(Self)
-            }
-        })
+        let entered = INSIDE_FILESYSTEM_HOOK.with(|inside| !inside.replace(true));
+        if !entered {
+            return None;
+        }
+        if unsafe { libc::pthread_rwlock_rdlock(&raw mut FILESYSTEM_FORK_BARRIER) } != 0 {
+            INSIDE_FILESYSTEM_HOOK.with(|inside| inside.set(false));
+            return None;
+        }
+        Some(Self)
     }
 }
 
@@ -215,6 +360,9 @@ fn test_runtime_is_set() -> bool {
 
 impl Drop for FilesystemHookGuard {
     fn drop(&mut self) {
+        unsafe {
+            libc::pthread_rwlock_unlock(&raw mut FILESYSTEM_FORK_BARRIER);
+        }
         INSIDE_FILESYSTEM_HOOK.with(|inside| inside.set(false));
     }
 }
@@ -223,6 +371,7 @@ struct FilesystemHookRuntime {
     filesystem: VirtualFilesystem,
     audit: Option<AuditClient>,
     trace: TraceContext,
+    prepared_executable: Option<PathBuf>,
     current_directory: Mutex<PathBuf>,
     open_files: Mutex<HashMap<libc::c_int, Arc<OpenFile>>>,
     directory_descriptors: Mutex<HashMap<libc::c_int, PathBuf>>,
@@ -236,7 +385,7 @@ struct PreparedOpen {
 
 struct OpenFile {
     file: FileContext,
-    logical: PathBuf,
+    logical: Mutex<PathBuf>,
     writeback: Option<Writeback>,
     layer: FileLayer,
     close_on_exec: bool,
@@ -273,6 +422,32 @@ struct OpenRequest {
     flags: libc::c_int,
     mode: libc::mode_t,
     file: FileContext,
+    native_passthrough: bool,
+    allowlisted_passthrough: bool,
+}
+
+impl OpenRequest {
+    fn native_path(&self) -> Result<Option<CString>> {
+        self.allowlisted_passthrough
+            .then(|| {
+                CString::new(self.logical.as_os_str().as_bytes())
+                    .context("native passthrough path contains NUL")
+            })
+            .transpose()
+    }
+}
+
+impl OpenFile {
+    fn logical(&self) -> PathBuf {
+        lock(&self.logical).clone()
+    }
+
+    fn retarget(&self, from: &Path, to: &Path) {
+        let mut logical = lock(&self.logical);
+        if *logical == from {
+            *logical = to.to_path_buf();
+        }
+    }
 }
 
 impl FilesystemHookRuntime {
@@ -301,6 +476,7 @@ impl FilesystemHookRuntime {
                     };
                     filesystem.ok().and_then(|filesystem| {
                         let current_directory = Self::native_current_directory(&filesystem).ok()?;
+                        let prepared_executable = Self::prepared_executable(&filesystem);
                         Some(Self {
                             filesystem,
                             audit: Some(AuditClient::new(
@@ -308,6 +484,7 @@ impl FilesystemHookRuntime {
                                 config.audit_token(),
                             )),
                             trace: config.trace().clone(),
+                            prepared_executable,
                             current_directory: Mutex::new(current_directory),
                             open_files: Mutex::new(HashMap::new()),
                             directory_descriptors: Mutex::new(HashMap::new()),
@@ -328,6 +505,7 @@ impl FilesystemHookRuntime {
             filesystem,
             audit: None,
             trace: TraceContext::parse("test-trace").map_err(anyhow::Error::msg)?,
+            prepared_executable: None,
             current_directory: Mutex::new(current_directory),
             open_files: Mutex::new(HashMap::new()),
             directory_descriptors: Mutex::new(HashMap::new()),
@@ -343,6 +521,7 @@ impl FilesystemHookRuntime {
             filesystem,
             audit: None,
             trace: TraceContext::parse("test-trace").map_err(anyhow::Error::msg)?,
+            prepared_executable: None,
             current_directory: Mutex::new(current_directory),
             open_files: Mutex::new(HashMap::new()),
             directory_descriptors: Mutex::new(HashMap::new()),
@@ -356,6 +535,59 @@ impl FilesystemHookRuntime {
         } else {
             Ok(directory)
         }
+    }
+
+    fn prepared_executable(filesystem: &VirtualFilesystem) -> Option<PathBuf> {
+        std::env::current_exe()
+            .ok()
+            .filter(|executable| filesystem.is_internal(executable))
+    }
+
+    fn native_passthrough_path(&self, path: &Path) -> Result<Option<PathBuf>> {
+        let normalized = normalize_absolute(path)?;
+        Ok(NATIVE_PASSTHROUGH_ROOTS
+            .iter()
+            .map(Path::new)
+            .any(|root| normalized.starts_with(root))
+            .then_some(normalized))
+    }
+
+    unsafe fn native_passthrough_c_path(
+        &self,
+        path: *const libc::c_char,
+        directory: libc::c_int,
+    ) -> Result<Option<CString>> {
+        let logical = unsafe { self.logical_path(path, directory) }?;
+        self.native_passthrough_path(&logical)?
+            .map(|native| {
+                CString::new(native.as_os_str().as_bytes())
+                    .context("native passthrough path contains NUL")
+            })
+            .transpose()
+    }
+
+    unsafe fn native_passthrough_pair(
+        &self,
+        first: *const libc::c_char,
+        first_directory: libc::c_int,
+        second: *const libc::c_char,
+        second_directory: libc::c_int,
+    ) -> Result<Option<(CString, CString)>> {
+        let first = unsafe { self.native_passthrough_c_path(first, first_directory) }?;
+        let second = unsafe { self.native_passthrough_c_path(second, second_directory) }?;
+        Ok(first.zip(second))
+    }
+
+    fn native_passthrough_descriptor(&self, descriptor: libc::c_int) -> bool {
+        if self.tracked_open(descriptor).is_some()
+            || lock(&self.directory_descriptors).contains_key(&descriptor)
+        {
+            return false;
+        }
+        Self::descriptor_path(descriptor)
+            .ok()
+            .and_then(|path| self.native_passthrough_path(&path).ok().flatten())
+            .is_some()
     }
 
     #[cfg(test)]
@@ -373,6 +605,19 @@ impl FilesystemHookRuntime {
         credentials: &Credentials,
     ) -> Result<(CString, Option<libc::off_t>, Option<FileAttributes>)> {
         let logical = unsafe { self.logical_path(path, directory) }?;
+        if let Some(native) = self.native_passthrough_path(&logical)? {
+            let mapped = CString::new(native.as_os_str().as_bytes())
+                .context("native passthrough path contains NUL")?;
+            return Ok((mapped, None, None));
+        }
+        if self
+            .filesystem
+            .native_metadata_passthrough(&logical, follow_final, credentials)?
+        {
+            let mapped = CString::new(logical.as_os_str().as_bytes())
+                .context("mapped filesystem path contains NUL")?;
+            return Ok((mapped, None, None));
+        }
         self.filesystem.require_search(&logical, credentials)?;
         let (mapped, plaintext_size, resolved) =
             self.filesystem.prepare_metadata(&logical, follow_final)?;
@@ -428,7 +673,7 @@ impl FilesystemHookRuntime {
         } else {
             self.descriptor_logical_path(directory)
                 .map(Ok)
-                .unwrap_or_else(|| Self::descriptor_path(directory))?
+                .unwrap_or_else(|| self.resolve_descriptor_logical_path(directory))?
         };
         let candidate = self.logical_or_host(&base)?.join(requested);
         self.logical_or_host(&candidate)
@@ -436,6 +681,14 @@ impl FilesystemHookRuntime {
 
     fn logical_or_host(&self, path: &Path) -> Result<PathBuf> {
         if self.filesystem.is_private(path)? {
+            if let Some(executable) = &self.prepared_executable
+                && executable.starts_with(path)
+            {
+                let logical = self.filesystem.logical_path(path)?;
+                if logical != Path::new("/") {
+                    return Ok(logical);
+                }
+            }
             return Err(io::Error::from_raw_os_error(libc::EACCES).into());
         }
         Ok(path.to_path_buf())
@@ -471,8 +724,16 @@ impl FilesystemHookRuntime {
         mode: libc::mode_t,
     ) -> Result<OpenRequest> {
         let requested = unsafe { self.logical_path(path, directory) }?;
+        let allowlisted = self.native_passthrough_path(&requested)?;
+        let allowlisted_passthrough = allowlisted.is_some();
+        let native_passthrough =
+            allowlisted_passthrough || self.native_read_passthrough(&requested, flags)?;
         let credentials = Credentials::effective();
-        let logical = self.resolve_final_path(&requested, flags, &credentials)?;
+        let logical = match allowlisted {
+            Some(path) => path,
+            None if native_passthrough => requested.clone(),
+            None => self.resolve_final_path(&requested, flags, &credentials)?,
+        };
         let mut access = match flags & libc::O_ACCMODE {
             libc::O_WRONLY => libc::W_OK,
             libc::O_RDWR => libc::R_OK | libc::W_OK,
@@ -481,8 +742,10 @@ impl FilesystemHookRuntime {
         if flags & libc::O_TRUNC != 0 {
             access |= libc::W_OK;
         }
-        self.filesystem
-            .validate_open_permissions(&logical, flags, access, &credentials)?;
+        if !native_passthrough {
+            self.filesystem
+                .validate_open_permissions(&logical, flags, access, &credentials)?;
+        }
         Ok(OpenRequest {
             logical,
             flags,
@@ -501,6 +764,8 @@ impl FilesystemHookRuntime {
                     exclusive: flags & libc::O_EXCL != 0,
                 },
             },
+            native_passthrough,
+            allowlisted_passthrough,
         })
     }
 
@@ -529,8 +794,16 @@ impl FilesystemHookRuntime {
         if mode.contains(&b'x') {
             flags |= libc::O_EXCL;
         }
+        let allowlisted = self.native_passthrough_path(&requested)?;
+        let allowlisted_passthrough = allowlisted.is_some();
+        let native_passthrough =
+            allowlisted_passthrough || self.native_read_passthrough(&requested, flags)?;
         let credentials = Credentials::effective();
-        let logical = self.resolve_final_path(&requested, flags, &credentials)?;
+        let logical = match allowlisted {
+            Some(path) => path,
+            None if native_passthrough => requested.clone(),
+            None => self.resolve_final_path(&requested, flags, &credentials)?,
+        };
         let access = if mode.contains(&b'+') {
             libc::R_OK | libc::W_OK
         } else if writes {
@@ -538,8 +811,10 @@ impl FilesystemHookRuntime {
         } else {
             libc::R_OK
         };
-        self.filesystem
-            .validate_open_permissions(&logical, flags, access, &credentials)?;
+        if !native_passthrough {
+            self.filesystem
+                .validate_open_permissions(&logical, flags, access, &credentials)?;
+        }
         Ok(OpenRequest {
             logical,
             flags,
@@ -562,10 +837,35 @@ impl FilesystemHookRuntime {
                     exclusive: mode.contains(&b'x'),
                 },
             },
+            native_passthrough,
+            allowlisted_passthrough,
         })
     }
 
+    fn native_read_passthrough(&self, logical: &Path, flags: libc::c_int) -> Result<bool> {
+        let mutating_or_special = libc::O_CREAT
+            | libc::O_TRUNC
+            | libc::O_EXCL
+            | libc::O_DIRECTORY
+            | libc::O_NOFOLLOW
+            | libc::O_NOFOLLOW_ANY
+            | libc::O_SYMLINK;
+        if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & mutating_or_special != 0 {
+            return Ok(false);
+        }
+        self.filesystem
+            .native_metadata_passthrough(logical, true, &Credentials::effective())
+    }
+
     fn map_open(&self, request: OpenRequest) -> Result<PreparedOpen> {
+        if request.native_passthrough {
+            return Ok(PreparedOpen {
+                prepared: self.filesystem.prepare_native_open(&request.logical),
+                file: request.file,
+                logical: request.logical,
+            });
+        }
+        self.publish_open_writers(&request.logical)?;
         Ok(PreparedOpen {
             prepared: self.filesystem.prepare_open(
                 &request.logical,
@@ -579,6 +879,23 @@ impl FilesystemHookRuntime {
 
     fn commit_open(&self, prepared: &mut PreparedOpen) -> Result<()> {
         self.filesystem.commit_open(&mut prepared.prepared)
+    }
+
+    fn publish_open_writers(&self, logical: &Path) -> Result<()> {
+        let files = lock(&self.open_files)
+            .iter()
+            .map(|(&descriptor, open)| (descriptor, Arc::clone(open)))
+            .collect::<Vec<_>>();
+        let mut seen = HashSet::new();
+        for (descriptor, open) in files {
+            if open.writeback.is_some()
+                && open.logical() == logical
+                && seen.insert(Arc::as_ptr(&open))
+            {
+                self.commit_open_file(descriptor, &open)?;
+            }
+        }
+        Ok(())
     }
 
     fn prepare_descriptor_mutation(&self, descriptor: libc::c_int) -> Result<StagedWrite> {
@@ -628,7 +945,7 @@ impl FilesystemHookRuntime {
             descriptor,
             Arc::new(OpenFile {
                 file,
-                logical,
+                logical: Mutex::new(logical),
                 writeback,
                 layer,
                 close_on_exec,
@@ -702,12 +1019,14 @@ impl FilesystemHookRuntime {
         let Some(writeback) = &open.writeback else {
             return Ok(());
         };
-        self.filesystem.commit_writeback(writeback)?;
+        let Some(logical) = self.filesystem.commit_writeback(writeback)? else {
+            return Ok(());
+        };
         let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
         if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
             return Err(io::Error::last_os_error().into());
         }
-        self.filesystem.refresh_timestamps(&open.logical, &status)
+        self.filesystem.refresh_timestamps(&logical, &status)
     }
 
     fn commit_all_open_files(&self) -> Result<()> {
@@ -742,11 +1061,50 @@ impl FilesystemHookRuntime {
         mode: libc::mode_t,
     ) -> Result<()> {
         let logical = unsafe { self.logical_path(path, directory) }?;
+        if let Some(native) = self.native_passthrough_path(&logical)? {
+            let native = CString::new(native.as_os_str().as_bytes())
+                .context("native passthrough path contains NUL")?;
+            let original =
+                original_mkdir().ok_or_else(|| io::Error::from_raw_os_error(libc::ENOSYS))?;
+            return native_operation_result(unsafe { original(native.as_ptr(), mode) });
+        }
         self.filesystem
-            .require_parent_mutation(&logical, &Credentials::effective())?;
+            .validate_create_directory(&logical, &Credentials::effective())?;
         self.filesystem
             .create_directory(&logical, u32::from(mode))
             .map(|_| ())
+    }
+
+    fn create_symlink(
+        &self,
+        target: *const libc::c_char,
+        directory: libc::c_int,
+        link: *const libc::c_char,
+    ) -> Result<()> {
+        if target.is_null() {
+            return Err(io::Error::from_raw_os_error(libc::EFAULT).into());
+        }
+        let link = unsafe { self.logical_path(link, directory) }?;
+        if let Some(native) = self.native_passthrough_path(&link)? {
+            let native = CString::new(native.as_os_str().as_bytes())
+                .context("native passthrough path contains NUL")?;
+            let original =
+                original_symlink().ok_or_else(|| io::Error::from_raw_os_error(libc::ENOSYS))?;
+            return native_operation_result(unsafe { original(target, native.as_ptr()) });
+        }
+        self.filesystem
+            .require_parent_mutation(&link, &Credentials::effective())?;
+        let requested = Path::new(OsStr::from_bytes(unsafe {
+            CStr::from_ptr(target).to_bytes()
+        }));
+        let target = if requested.is_absolute() && self.filesystem.is_internal(requested) {
+            self.filesystem.logical_path(requested)?
+        } else if requested.is_absolute() {
+            self.logical_or_host(requested)?
+        } else {
+            requested.to_path_buf()
+        };
+        self.filesystem.create_symlink(&link, &target).map(|_| ())
     }
 
     fn remove(
@@ -756,6 +1114,17 @@ impl FilesystemHookRuntime {
         remove_directory: bool,
     ) -> Result<()> {
         let logical = unsafe { self.logical_path(path, directory) }?;
+        if let Some(native) = self.native_passthrough_path(&logical)? {
+            let native = CString::new(native.as_os_str().as_bytes())
+                .context("native passthrough path contains NUL")?;
+            let original = if remove_directory {
+                original_rmdir()
+            } else {
+                original_unlink()
+            }
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOSYS))?;
+            return native_operation_result(unsafe { original(native.as_ptr()) });
+        }
         self.filesystem
             .require_parent_mutation(&logical, &Credentials::effective())?;
         self.filesystem.remove(&logical, remove_directory)
@@ -770,15 +1139,44 @@ impl FilesystemHookRuntime {
     ) -> Result<()> {
         let from = unsafe { self.logical_path(from, from_directory) }?;
         let to = unsafe { self.logical_path(to, to_directory) }?;
+        let native_from = self.native_passthrough_path(&from)?;
+        let native_to = self.native_passthrough_path(&to)?;
+        match (native_from, native_to) {
+            (Some(from), Some(to)) => {
+                let from = CString::new(from.as_os_str().as_bytes())
+                    .context("native passthrough path contains NUL")?;
+                let to = CString::new(to.as_os_str().as_bytes())
+                    .context("native passthrough path contains NUL")?;
+                let original =
+                    original_rename().ok_or_else(|| io::Error::from_raw_os_error(libc::ENOSYS))?;
+                return native_operation_result(unsafe { original(from.as_ptr(), to.as_ptr()) });
+            }
+            (None, None) => {}
+            _ => return Err(io::Error::from_raw_os_error(libc::EXDEV).into()),
+        }
         let credentials = Credentials::effective();
         self.filesystem
             .require_parent_mutation(&from, &credentials)?;
         self.filesystem.require_parent_mutation(&to, &credentials)?;
-        self.filesystem.rename(&from, &to)
+        self.filesystem.rename(&from, &to)?;
+        let open_files = lock(&self.open_files).values().cloned().collect::<Vec<_>>();
+        let open_files = open_files
+            .into_iter()
+            .filter(|open| open.logical() == from)
+            .collect::<Vec<_>>();
+        for open in open_files {
+            open.retarget(&from, &to);
+        }
+        Ok(())
     }
 
     fn prepare_change_directory(&self, path: *const libc::c_char) -> Result<(CString, PathBuf)> {
         let requested = unsafe { self.logical_path(path, libc::AT_FDCWD) }?;
+        if let Some(native) = self.native_passthrough_path(&requested)? {
+            let mapped = CString::new(native.as_os_str().as_bytes())
+                .context("native passthrough path contains NUL")?;
+            return Ok((mapped, native));
+        }
         let credentials = Credentials::effective();
         let logical =
             self.resolve_final_path(&requested, libc::O_RDONLY | libc::O_DIRECTORY, &credentials)?;
@@ -795,9 +1193,15 @@ impl FilesystemHookRuntime {
         *lock(&self.current_directory) = directory;
     }
 
+    fn synchronize_current_directory(&self) -> Result<()> {
+        let directory = Self::native_current_directory(&self.filesystem)?;
+        self.set_current_directory(directory);
+        Ok(())
+    }
+
     fn descriptor_logical_path(&self, descriptor: libc::c_int) -> Option<PathBuf> {
         self.tracked_open(descriptor)
-            .map(|open| open.logical.clone())
+            .map(|open| open.logical())
             .or_else(|| lock(&self.directory_descriptors).get(&descriptor).cloned())
     }
 
@@ -826,8 +1230,21 @@ impl FilesystemHookRuntime {
         CString::new(logical.as_os_str().as_bytes()).context("current directory contains NUL")
     }
 
+    unsafe fn canonical_path(&self, path: *const libc::c_char) -> Result<CString> {
+        let logical = unsafe { self.logical_path(path, libc::AT_FDCWD) }?;
+        self.filesystem
+            .require_search(&logical, &Credentials::effective())?;
+        let canonical = self.filesystem.canonicalize(&logical)?;
+        let canonical = self.logical_or_host(&canonical)?;
+        CString::new(canonical.as_os_str().as_bytes())
+            .context("canonical filesystem path contains NUL")
+    }
+
     fn directory_view(&self, path: *const libc::c_char) -> Result<DirectoryView> {
         let logical = unsafe { self.logical_path(path, libc::AT_FDCWD) }?;
+        if let Some(native) = self.native_passthrough_path(&logical)? {
+            return Ok(DirectoryView::passthrough(native));
+        }
         let credentials = Credentials::effective();
         self.filesystem.require_search(&logical, &credentials)?;
         self.filesystem
@@ -840,7 +1257,7 @@ impl FilesystemHookRuntime {
         descriptor: libc::c_int,
     ) -> Result<(DirectoryView, FileLayer)> {
         let (logical, layer) = if let Some(open) = self.tracked_open(descriptor) {
-            (open.logical.clone(), open.layer)
+            (open.logical(), open.layer)
         } else {
             let path = Self::descriptor_path(descriptor)?;
             let layer = if self.filesystem.is_internal(&path) {
@@ -855,8 +1272,41 @@ impl FilesystemHookRuntime {
             };
             (logical, layer)
         };
+        if let Some(native) = self.native_passthrough_path(&logical)? {
+            return Ok((DirectoryView::passthrough(native), FileLayer::Lower));
+        }
         Ok((self.filesystem.directory_view(&logical)?, layer))
     }
+}
+
+fn normalize_absolute(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("filesystem path is not absolute: {}", path.display());
+    }
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(value) => normalized.push(value),
+            Component::Prefix(_) => bail!("unsupported filesystem path: {}", path.display()),
+        }
+    }
+    Ok(normalized)
+}
+
+fn native_operation_result(result: libc::c_int) -> Result<()> {
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error().into())
+    }
+}
+
+pub(super) fn tracked_current_directory() -> Option<PathBuf> {
+    FilesystemHookRuntime::global().map(|runtime| lock(&runtime.current_directory).clone())
 }
 
 pub(super) fn flush_before_exec() -> Result<()> {
@@ -971,6 +1421,311 @@ struct DirectoryCursor {
     seen: HashSet<Vec<u8>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FtsDescriptorIdentity {
+    device: libc::dev_t,
+    inode: libc::ino_t,
+}
+
+struct FtsBulkEntry {
+    name: Vec<u8>,
+    object_type: u32,
+}
+
+struct FtsBulkCursor {
+    identity: FtsDescriptorIdentity,
+    entries: Vec<FtsBulkEntry>,
+    next: usize,
+}
+
+struct FtsRootMapping {
+    physical: Vec<u8>,
+    logical: Vec<u8>,
+}
+
+struct PresentedFtsEntry {
+    entry: usize,
+    original_path: usize,
+    original_access_path: usize,
+    original_path_length: libc::c_ushort,
+    original_name_length: libc::c_ushort,
+    original_name: Vec<libc::c_char>,
+    logical_path: CString,
+    logical_access_path: CString,
+}
+
+struct FtsStreamState {
+    mappings: Vec<FtsRootMapping>,
+    presented: Vec<PresentedFtsEntry>,
+}
+
+impl FtsStreamState {
+    fn restore(&mut self) {
+        for presented in self.presented.drain(..) {
+            let entry = presented.entry as *mut DarwinFtsEntry;
+            unsafe {
+                (*entry).fts_path = presented.original_path as *mut libc::c_char;
+                (*entry).fts_accpath = presented.original_access_path as *mut libc::c_char;
+                (*entry).fts_pathlen = presented.original_path_length;
+                (*entry).fts_namelen = presented.original_name_length;
+                std::ptr::copy_nonoverlapping(
+                    presented.original_name.as_ptr(),
+                    (*entry).fts_name.as_mut_ptr(),
+                    presented.original_name.len(),
+                );
+            }
+        }
+    }
+
+    fn present(&mut self, entry: *mut DarwinFtsEntry) -> Result<()> {
+        if entry.is_null() {
+            return Ok(());
+        }
+        let path = unsafe { CStr::from_ptr((*entry).fts_path) }.to_bytes();
+        let access_path = unsafe { CStr::from_ptr((*entry).fts_accpath) }.to_bytes();
+        let Some(logical_path) = self.translate(path).or_else(|| self.translate(access_path))
+        else {
+            return Ok(());
+        };
+        let logical_access_path = self
+            .translate(access_path)
+            .unwrap_or_else(|| logical_path.clone());
+        let original_name_length = unsafe { (*entry).fts_namelen };
+        let original_name = unsafe {
+            std::slice::from_raw_parts(
+                (*entry).fts_name.as_ptr(),
+                usize::from(original_name_length) + 1,
+            )
+            .to_vec()
+        };
+        let original_name_bytes = unsafe {
+            std::slice::from_raw_parts(
+                original_name.as_ptr().cast::<u8>(),
+                usize::from(original_name_length),
+            )
+        };
+        let logical_name = if original_name_bytes == path
+            || original_name_bytes == logical_basename(path)
+            || original_name_bytes == access_path
+            || original_name_bytes == logical_basename(access_path)
+        {
+            logical_basename(&logical_path).to_vec()
+        } else {
+            original_name_bytes.to_vec()
+        };
+        if logical_name.len() > usize::from(original_name_length)
+            || logical_name.len() > usize::from(u16::MAX)
+        {
+            return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG).into());
+        }
+        let logical_path = CString::new(logical_path).context("logical FTS path contains NUL")?;
+        let logical_access_path =
+            CString::new(logical_access_path).context("logical FTS access path contains NUL")?;
+        let presented = PresentedFtsEntry {
+            entry: entry as usize,
+            original_path: unsafe { (*entry).fts_path } as usize,
+            original_access_path: unsafe { (*entry).fts_accpath } as usize,
+            original_path_length: unsafe { (*entry).fts_pathlen },
+            original_name_length,
+            original_name,
+            logical_path,
+            logical_access_path,
+        };
+        unsafe {
+            (*entry).fts_path = presented.logical_path.as_ptr().cast_mut();
+            (*entry).fts_accpath = presented.logical_access_path.as_ptr().cast_mut();
+            (*entry).fts_pathlen = u16::try_from(presented.logical_path.as_bytes().len())?;
+            (*entry).fts_namelen = u16::try_from(logical_name.len())?;
+            std::ptr::copy_nonoverlapping(
+                logical_name.as_ptr().cast::<libc::c_char>(),
+                (*entry).fts_name.as_mut_ptr(),
+                logical_name.len(),
+            );
+            *(*entry).fts_name.as_mut_ptr().add(logical_name.len()) = 0;
+        }
+        self.presented.push(presented);
+        Ok(())
+    }
+
+    fn present_list(&mut self, mut entry: *mut DarwinFtsEntry) -> Result<()> {
+        while !entry.is_null() {
+            let next = unsafe { (*entry).fts_link };
+            self.present(entry)?;
+            entry = next;
+        }
+        Ok(())
+    }
+
+    fn translate(&self, path: &[u8]) -> Option<Vec<u8>> {
+        self.mappings.iter().find_map(|mapping| {
+            let suffix = path.strip_prefix(mapping.physical.as_slice())?;
+            if !suffix.is_empty() && !suffix.starts_with(b"/") {
+                return None;
+            }
+            let mut logical = mapping.logical.clone();
+            logical.extend_from_slice(suffix);
+            Some(logical)
+        })
+    }
+}
+
+fn logical_basename(path: &[u8]) -> &[u8] {
+    let path = path.strip_suffix(b"/").unwrap_or(path);
+    path.rsplit(|byte| *byte == b'/').next().unwrap_or(path)
+}
+
+fn fts_streams() -> &'static Mutex<HashMap<usize, FtsStreamState>> {
+    static STREAMS: OnceLock<Mutex<HashMap<usize, FtsStreamState>>> = OnceLock::new();
+    STREAMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fts_stream_may_change_current_directory(stream: *mut libc::c_void) -> bool {
+    !lock(fts_streams()).contains_key(&(stream as usize))
+}
+
+fn restore_fts_stream(stream: *mut libc::c_void) {
+    if let Some(state) = lock(fts_streams()).get_mut(&(stream as usize)) {
+        state.restore();
+    }
+}
+
+fn present_fts_entry(stream: *mut libc::c_void, entry: *mut DarwinFtsEntry) -> Result<()> {
+    if let Some(state) = lock(fts_streams()).get_mut(&(stream as usize)) {
+        state.present(entry)?;
+    }
+    Ok(())
+}
+
+fn present_fts_list(stream: *mut libc::c_void, entry: *mut DarwinFtsEntry) -> Result<()> {
+    if let Some(state) = lock(fts_streams()).get_mut(&(stream as usize)) {
+        state.present_list(entry)?;
+    }
+    Ok(())
+}
+
+impl FtsBulkCursor {
+    fn new(
+        runtime: &FilesystemHookRuntime,
+        descriptor: libc::c_int,
+        identity: FtsDescriptorIdentity,
+    ) -> Result<Option<Self>> {
+        let (view, _) = runtime.descriptor_directory_view(descriptor)?;
+        if view.is_passthrough() {
+            return Ok(None);
+        }
+        let mut filter = DirectoryCursor::new(None, FileLayer::Upper, &view);
+        let mut entries = Vec::new();
+        let primary_is_upper = runtime.filesystem.is_internal(view.primary());
+        Self::extend_entries(&mut entries, &mut filter, view.primary(), !primary_is_upper)?;
+        if let Some(lower) = view.lower() {
+            Self::extend_entries(&mut entries, &mut filter, lower, true)?;
+        }
+        Ok(Some(Self {
+            identity,
+            entries,
+            next: 0,
+        }))
+    }
+
+    fn extend_entries(
+        entries: &mut Vec<FtsBulkEntry>,
+        filter: &mut DirectoryCursor,
+        directory: &Path,
+        lower: bool,
+    ) -> Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = filter.include(name.as_bytes(), lower) else {
+                continue;
+            };
+            entries.push(FtsBulkEntry {
+                name,
+                object_type: darwin_object_type(&entry.file_type()?),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn darwin_object_type(file_type: &std::fs::FileType) -> u32 {
+    if file_type.is_file() {
+        1 // VREG
+    } else if file_type.is_dir() {
+        2 // VDIR
+    } else if file_type.is_block_device() {
+        3 // VBLK
+    } else if file_type.is_char_device() {
+        4 // VCHR
+    } else if file_type.is_symlink() {
+        5 // VLNK
+    } else if file_type.is_socket() {
+        6 // VSOCK
+    } else if file_type.is_fifo() {
+        7 // VFIFO
+    } else {
+        0 // VNON
+    }
+}
+
+fn fts_descriptor_identity(descriptor: libc::c_int) -> Result<FtsDescriptorIdentity> {
+    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(FtsDescriptorIdentity {
+        device: status.st_dev,
+        inode: status.st_ino,
+    })
+}
+
+fn fts_attr_record(entry: &FtsBulkEntry, attributes: &libc::attrlist) -> Result<Vec<u8>> {
+    const ATTRIBUTE_SET_SIZE: usize = 20;
+    const ATTRIBUTE_REFERENCE_OFFSET: usize = 4 + ATTRIBUTE_SET_SIZE;
+    const FULL_FIXED_SIZE: usize = 156;
+    const NOSTAT_FIXED_SIZE: usize = 56;
+
+    let nostat = attributes.commonattr & libc::ATTR_CMN_CRTIME == 0;
+    let fixed_size = if nostat {
+        NOSTAT_FIXED_SIZE
+    } else {
+        FULL_FIXED_SIZE
+    };
+    let unaligned_size = fixed_size
+        .checked_add(entry.name.len())
+        .and_then(|size| size.checked_add(1))
+        .context("FTS attribute record size overflow")?;
+    let record_size = unaligned_size
+        .checked_add(3)
+        .map(|size| size & !3)
+        .context("FTS attribute record size overflow")?;
+    let record_length = u32::try_from(record_size).context("FTS attribute record is too large")?;
+    let name_length = u32::try_from(entry.name.len() + 1).context("FTS name is too large")?;
+    let name_offset = i32::try_from(fixed_size - ATTRIBUTE_REFERENCE_OFFSET)
+        .context("FTS name offset is too large")?;
+
+    let mut record = vec![0_u8; record_size];
+    record[0..4].copy_from_slice(&record_length.to_ne_bytes());
+    let returned_common =
+        libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_OBJTYPE;
+    record[4..8].copy_from_slice(&returned_common.to_ne_bytes());
+    record[24..28].copy_from_slice(&name_offset.to_ne_bytes());
+    record[28..32].copy_from_slice(&name_length.to_ne_bytes());
+    record[36..40].copy_from_slice(&entry.object_type.to_ne_bytes());
+    record[fixed_size..fixed_size + entry.name.len()].copy_from_slice(&entry.name);
+    Ok(record)
+}
+
+fn fts_attributes_supported(attributes: &libc::attrlist) -> bool {
+    attributes.bitmapcount == libc::ATTR_BIT_MAP_COUNT
+        && attributes.commonattr
+            & (libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_OBJTYPE)
+            == (libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_OBJTYPE)
+        && attributes.volattr == 0
+        && attributes.dirattr == 0
+        && attributes.forkattr == 0
+}
+
 impl DirectoryCursor {
     fn new(
         auxiliary: Option<*mut libc::DIR>,
@@ -1052,6 +1807,11 @@ unsafe fn sandbox_open_with_mode(
         };
         match runtime.prepare_open(path, libc::AT_FDCWD, flags, mode) {
             Ok(request) => {
+                match request.native_path() {
+                    Ok(Some(native)) => return unsafe { original(native.as_ptr(), flags, mode) },
+                    Ok(None) => {}
+                    Err(error) => return unsafe { fail(&error, -1) },
+                }
                 if let Err(error) = runtime.publish(FileOperation::Open, request.file.clone()) {
                     return unsafe { fail_audit(&error, -1) };
                 }
@@ -1127,6 +1887,13 @@ unsafe fn sandbox_openat_with_mode(
         };
         match runtime.prepare_open(path, directory, flags, mode) {
             Ok(request) => {
+                match request.native_path() {
+                    Ok(Some(native)) => {
+                        return unsafe { original(libc::AT_FDCWD, native.as_ptr(), flags, mode) };
+                    }
+                    Ok(None) => {}
+                    Err(error) => return unsafe { fail(&error, -1) },
+                }
                 if let Err(error) = runtime.publish(FileOperation::Open, request.file.clone()) {
                     return unsafe { fail_audit(&error, -1) };
                 }
@@ -1209,6 +1976,11 @@ unsafe fn sandbox_truncate(path: *const libc::c_char, length: libc::off_t) -> li
                 Ok(request) => request,
                 Err(error) => return unsafe { fail(&error, -1) },
             };
+        match request.native_path() {
+            Ok(Some(native)) => return unsafe { original(native.as_ptr(), length) },
+            Ok(None) => {}
+            Err(error) => return unsafe { fail(&error, -1) },
+        }
         if let Err(error) = runtime.publish(FileOperation::Open, request.file.clone()) {
             return unsafe { fail_audit(&error, -1) };
         }
@@ -1263,6 +2035,9 @@ unsafe fn sandbox_descriptor_mutation(
     let Some(runtime) = FilesystemHookRuntime::global() else {
         return operation(descriptor);
     };
+    if runtime.native_passthrough_descriptor(descriptor) {
+        return operation(descriptor);
+    }
     let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
     if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
         return -1;
@@ -1278,8 +2053,9 @@ unsafe fn sandbox_descriptor_mutation(
         }
         let result = operation(descriptor);
         if result == 0 {
+            let logical = open.logical();
             if let Err(error) =
-                runtime.refresh_attributes(descriptor, open.logical.to_string_lossy().as_ref())
+                runtime.refresh_attributes(descriptor, logical.to_string_lossy().as_ref())
             {
                 return unsafe { fail(&error, -1) };
             }
@@ -1302,27 +2078,161 @@ unsafe fn sandbox_descriptor_mutation(
     result
 }
 
-unsafe fn sandbox_unsupported_mutation(operation: impl FnOnce() -> libc::c_int) -> libc::c_int {
+unsafe fn sandbox_unsupported_path_mutation(
+    path: *const libc::c_char,
+    directory: libc::c_int,
+    operation: impl FnOnce(libc::c_int, *const libc::c_char) -> libc::c_int,
+) -> libc::c_int {
     let Some(_guard) = FilesystemHookGuard::enter() else {
-        return operation();
+        return operation(directory, path);
     };
-    if FilesystemHookRuntime::global().is_none() {
-        return operation();
+    let Some(runtime) = FilesystemHookRuntime::global() else {
+        return operation(directory, path);
+    };
+    match unsafe { runtime.native_passthrough_c_path(path, directory) } {
+        Ok(Some(native)) => operation(libc::AT_FDCWD, native.as_ptr()),
+        Ok(None) => {
+            unsafe { set_errno(libc::ENOTSUP) };
+            -1
+        }
+        Err(error) => unsafe { fail(&error, -1) },
+    }
+}
+
+unsafe fn sandbox_unsupported_descriptor_mutation(
+    descriptor: libc::c_int,
+    operation: impl FnOnce(libc::c_int) -> libc::c_int,
+) -> libc::c_int {
+    let Some(_guard) = FilesystemHookGuard::enter() else {
+        return operation(descriptor);
+    };
+    let Some(runtime) = FilesystemHookRuntime::global() else {
+        return operation(descriptor);
+    };
+    if runtime.native_passthrough_descriptor(descriptor) {
+        return operation(descriptor);
     }
     unsafe { set_errno(libc::ENOTSUP) };
     -1
 }
 
-macro_rules! unsupported_filesystem_hook {
+unsafe fn sandbox_unsupported_pair_mutation(
+    first: *const libc::c_char,
+    first_directory: libc::c_int,
+    second: *const libc::c_char,
+    second_directory: libc::c_int,
+    operation: impl FnOnce(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        *const libc::c_char,
+    ) -> libc::c_int,
+) -> libc::c_int {
+    let Some(_guard) = FilesystemHookGuard::enter() else {
+        return operation(first_directory, first, second_directory, second);
+    };
+    let Some(runtime) = FilesystemHookRuntime::global() else {
+        return operation(first_directory, first, second_directory, second);
+    };
+    match unsafe {
+        runtime.native_passthrough_pair(first, first_directory, second, second_directory)
+    } {
+        Ok(Some((first, second))) => operation(
+            libc::AT_FDCWD,
+            first.as_ptr(),
+            libc::AT_FDCWD,
+            second.as_ptr(),
+        ),
+        Ok(None) => {
+            unsafe { set_errno(libc::ENOTSUP) };
+            -1
+        }
+        Err(error) => unsafe { fail(&error, -1) },
+    }
+}
+
+macro_rules! unsupported_path_filesystem_hook {
     (
         $sandbox:ident, $export:ident, $original:ident,
         ($($argument:ident: $argument_type:ty),* $(,)?),
-        ($($call_argument:expr),* $(,)?)
+        $path:ident, $directory:expr,
+        |$original_fn:ident, $native_directory:ident, $native_path:ident| $native_call:expr
     ) => {
         unsafe fn $sandbox($($argument: $argument_type),*) -> libc::c_int {
             catch_filesystem_panic(-1, || match $original() {
-                Some(original) => unsafe {
-                    sandbox_unsupported_mutation(|| original($($call_argument),*))
+                Some($original_fn) => unsafe {
+                    sandbox_unsupported_path_mutation(
+                        $path,
+                        $directory,
+                        |$native_directory, $native_path| $native_call,
+                    )
+                },
+                None => unsafe {
+                    set_errno(libc::ENOSYS);
+                    -1
+                },
+            })
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $export($($argument: $argument_type),*) -> libc::c_int {
+            unsafe { $sandbox($($argument),*) }
+        }
+    }
+}
+
+macro_rules! unsupported_descriptor_filesystem_hook {
+    (
+        $sandbox:ident, $export:ident, $original:ident,
+        ($($argument:ident: $argument_type:ty),* $(,)?),
+        $descriptor:ident,
+        |$original_fn:ident, $native_descriptor:ident| $native_call:expr
+    ) => {
+        unsafe fn $sandbox($($argument: $argument_type),*) -> libc::c_int {
+            catch_filesystem_panic(-1, || match $original() {
+                Some($original_fn) => unsafe {
+                    sandbox_unsupported_descriptor_mutation(
+                        $descriptor,
+                        |$native_descriptor| $native_call,
+                    )
+                },
+                None => unsafe {
+                    set_errno(libc::ENOSYS);
+                    -1
+                },
+            })
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $export($($argument: $argument_type),*) -> libc::c_int {
+            unsafe { $sandbox($($argument),*) }
+        }
+    }
+}
+
+macro_rules! unsupported_pair_filesystem_hook {
+    (
+        $sandbox:ident, $export:ident, $original:ident,
+        ($($argument:ident: $argument_type:ty),* $(,)?),
+        ($first:ident, $first_directory:expr),
+        ($second:ident, $second_directory:expr),
+        |$original_fn:ident,
+         $native_first_directory:ident, $native_first:ident,
+         $native_second_directory:ident, $native_second:ident| $native_call:expr
+    ) => {
+        unsafe fn $sandbox($($argument: $argument_type),*) -> libc::c_int {
+            catch_filesystem_panic(-1, || match $original() {
+                Some($original_fn) => unsafe {
+                    sandbox_unsupported_pair_mutation(
+                        $first,
+                        $first_directory,
+                        $second,
+                        $second_directory,
+                        |$native_first_directory,
+                         $native_first,
+                         $native_second_directory,
+                         $native_second| $native_call,
+                    )
                 },
                 None => unsafe {
                     set_errno(libc::ENOSYS);
@@ -1374,7 +2284,7 @@ descriptor_filesystem_hook!(
     (descriptor, length)
 );
 
-unsupported_filesystem_hook!(
+unsupported_path_filesystem_hook!(
     sandbox_utimes,
     agora_sandbox_utimes,
     original_utimes,
@@ -1382,10 +2292,12 @@ unsupported_filesystem_hook!(
         path: *const libc::c_char,
         times: *const libc::timeval,
     ),
-    (path, times)
+    path,
+    libc::AT_FDCWD,
+    |original, _native_directory, native| original(native, times)
 );
 
-unsupported_filesystem_hook!(
+unsupported_path_filesystem_hook!(
     sandbox_lutimes,
     agora_sandbox_lutimes,
     original_lutimes,
@@ -1393,10 +2305,12 @@ unsupported_filesystem_hook!(
         path: *const libc::c_char,
         times: *const libc::timeval,
     ),
-    (path, times)
+    path,
+    libc::AT_FDCWD,
+    |original, _native_directory, native| original(native, times)
 );
 
-unsupported_filesystem_hook!(
+unsupported_descriptor_filesystem_hook!(
     sandbox_futimes,
     agora_sandbox_futimes,
     original_futimes,
@@ -1404,10 +2318,11 @@ unsupported_filesystem_hook!(
         descriptor: libc::c_int,
         times: *const libc::timeval,
     ),
-    (descriptor, times)
+    descriptor,
+    |original, native| original(native, times)
 );
 
-unsupported_filesystem_hook!(
+unsupported_descriptor_filesystem_hook!(
     sandbox_futimens,
     agora_sandbox_futimens,
     original_futimens,
@@ -1415,10 +2330,11 @@ unsupported_filesystem_hook!(
         descriptor: libc::c_int,
         times: *const libc::timespec,
     ),
-    (descriptor, times)
+    descriptor,
+    |original, native| original(native, times)
 );
 
-unsupported_filesystem_hook!(
+unsupported_path_filesystem_hook!(
     sandbox_utimensat,
     agora_sandbox_utimensat,
     original_utimensat,
@@ -1428,10 +2344,12 @@ unsupported_filesystem_hook!(
         times: *const libc::timespec,
         flags: libc::c_int,
     ),
-    (directory, path, times, flags)
+    path,
+    directory,
+    |original, native_directory, native| original(native_directory, native, times, flags)
 );
 
-unsupported_filesystem_hook!(
+unsupported_path_filesystem_hook!(
     sandbox_chflags,
     agora_sandbox_chflags,
     original_chflags,
@@ -1439,10 +2357,12 @@ unsupported_filesystem_hook!(
         path: *const libc::c_char,
         flags: libc::c_uint,
     ),
-    (path, flags)
+    path,
+    libc::AT_FDCWD,
+    |original, _native_directory, native| original(native, flags)
 );
 
-unsupported_filesystem_hook!(
+unsupported_descriptor_filesystem_hook!(
     sandbox_fchflags,
     agora_sandbox_fchflags,
     original_fchflags,
@@ -1450,10 +2370,11 @@ unsupported_filesystem_hook!(
         descriptor: libc::c_int,
         flags: libc::c_uint,
     ),
-    (descriptor, flags)
+    descriptor,
+    |original, native| original(native, flags)
 );
 
-unsupported_filesystem_hook!(
+unsupported_path_filesystem_hook!(
     sandbox_setxattr,
     agora_sandbox_setxattr,
     original_setxattr,
@@ -1465,10 +2386,12 @@ unsupported_filesystem_hook!(
         position: u32,
         flags: libc::c_int,
     ),
-    (path, name, value, size, position, flags)
+    path,
+    libc::AT_FDCWD,
+    |original, _native_directory, native| original(native, name, value, size, position, flags)
 );
 
-unsupported_filesystem_hook!(
+unsupported_descriptor_filesystem_hook!(
     sandbox_fsetxattr,
     agora_sandbox_fsetxattr,
     original_fsetxattr,
@@ -1480,10 +2403,11 @@ unsupported_filesystem_hook!(
         position: u32,
         flags: libc::c_int,
     ),
-    (descriptor, name, value, size, position, flags)
+    descriptor,
+    |original, native| original(native, name, value, size, position, flags)
 );
 
-unsupported_filesystem_hook!(
+unsupported_path_filesystem_hook!(
     sandbox_removexattr,
     agora_sandbox_removexattr,
     original_removexattr,
@@ -1492,10 +2416,12 @@ unsupported_filesystem_hook!(
         name: *const libc::c_char,
         flags: libc::c_int,
     ),
-    (path, name, flags)
+    path,
+    libc::AT_FDCWD,
+    |original, _native_directory, native| original(native, name, flags)
 );
 
-unsupported_filesystem_hook!(
+unsupported_descriptor_filesystem_hook!(
     sandbox_fremovexattr,
     agora_sandbox_fremovexattr,
     original_fremovexattr,
@@ -1504,7 +2430,8 @@ unsupported_filesystem_hook!(
         name: *const libc::c_char,
         flags: libc::c_int,
     ),
-    (descriptor, name, flags)
+    descriptor,
+    |original, native| original(native, name, flags)
 );
 
 unsafe fn sandbox_chmod(path: *const libc::c_char, mode: libc::mode_t) -> libc::c_int {
@@ -1519,6 +2446,11 @@ unsafe fn sandbox_chmod(path: *const libc::c_char, mode: libc::mode_t) -> libc::
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return unsafe { original(path, mode) };
         };
+        match unsafe { runtime.native_passthrough_c_path(path, libc::AT_FDCWD) } {
+            Ok(Some(native)) => return unsafe { original(native.as_ptr(), mode) },
+            Ok(None) => {}
+            Err(error) => return unsafe { fail(&error, -1) },
+        }
         match runtime.chmod(path, libc::AT_FDCWD, mode, true) {
             Ok(()) => 0,
             Err(error) => unsafe { fail(&error, -1) },
@@ -1546,14 +2478,19 @@ unsafe fn sandbox_fchmod(descriptor: libc::c_int, mode: libc::mode_t) -> libc::c
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return unsafe { original(descriptor, mode) };
         };
+        if runtime.native_passthrough_descriptor(descriptor) {
+            return unsafe { original(descriptor, mode) };
+        }
         let Some(open) = runtime.tracked_open(descriptor) else {
             unsafe { set_errno(libc::EPERM) };
             return -1;
         };
-        match runtime
-            .filesystem
-            .chmod(&open.logical, mode.into(), false, &Credentials::effective())
-        {
+        match runtime.filesystem.chmod(
+            &open.logical(),
+            mode.into(),
+            false,
+            &Credentials::effective(),
+        ) {
             Ok(()) => 0,
             Err(error) => unsafe { fail(&error, -1) },
         }
@@ -1585,6 +2522,13 @@ unsafe fn sandbox_fchmodat(
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return unsafe { original(directory, path, mode, flags) };
         };
+        match unsafe { runtime.native_passthrough_c_path(path, directory) } {
+            Ok(Some(native)) => {
+                return unsafe { original(libc::AT_FDCWD, native.as_ptr(), mode, flags) };
+            }
+            Ok(None) => {}
+            Err(error) => return unsafe { fail(&error, -1) },
+        }
         if flags & !libc::AT_SYMLINK_NOFOLLOW != 0 {
             unsafe { set_errno(libc::EINVAL) };
             return -1;
@@ -1611,7 +2555,7 @@ pub unsafe extern "C" fn agora_sandbox_fchmodat(
     unsafe { sandbox_fchmodat(directory, path, mode, flags) }
 }
 
-unsupported_filesystem_hook!(
+unsupported_path_filesystem_hook!(
     sandbox_chown,
     agora_sandbox_chown,
     original_chown,
@@ -1620,10 +2564,12 @@ unsupported_filesystem_hook!(
         owner: libc::uid_t,
         group: libc::gid_t,
     ),
-    (path, owner, group)
+    path,
+    libc::AT_FDCWD,
+    |original, _native_directory, native| original(native, owner, group)
 );
 
-unsupported_filesystem_hook!(
+unsupported_descriptor_filesystem_hook!(
     sandbox_fchown,
     agora_sandbox_fchown,
     original_fchown,
@@ -1632,10 +2578,11 @@ unsupported_filesystem_hook!(
         owner: libc::uid_t,
         group: libc::gid_t,
     ),
-    (descriptor, owner, group)
+    descriptor,
+    |original, native| original(native, owner, group)
 );
 
-unsupported_filesystem_hook!(
+unsupported_path_filesystem_hook!(
     sandbox_lchown,
     agora_sandbox_lchown,
     original_lchown,
@@ -1644,10 +2591,12 @@ unsupported_filesystem_hook!(
         owner: libc::uid_t,
         group: libc::gid_t,
     ),
-    (path, owner, group)
+    path,
+    libc::AT_FDCWD,
+    |original, _native_directory, native| original(native, owner, group)
 );
 
-unsupported_filesystem_hook!(
+unsupported_path_filesystem_hook!(
     sandbox_fchownat,
     agora_sandbox_fchownat,
     original_fchownat,
@@ -1658,7 +2607,9 @@ unsupported_filesystem_hook!(
         group: libc::gid_t,
         flags: libc::c_int,
     ),
-    (directory, path, owner, group, flags)
+    path,
+    directory,
+    |original, native_directory, native| original(native_directory, native, owner, group, flags)
 );
 
 unsafe fn sandbox_fopen(path: *const libc::c_char, mode: *const libc::c_char) -> *mut libc::FILE {
@@ -1675,6 +2626,13 @@ unsafe fn sandbox_fopen(path: *const libc::c_char, mode: *const libc::c_char) ->
         };
         match runtime.prepare_fopen(path, mode) {
             Ok(request) => {
+                match request.native_path() {
+                    Ok(Some(native)) => return unsafe { original(native.as_ptr(), mode) },
+                    Ok(None) => {}
+                    Err(error) => {
+                        return unsafe { fail(&error, std::ptr::null_mut()) };
+                    }
+                }
                 let flags = request.flags;
                 if let Err(error) = runtime.publish(FileOperation::Open, request.file.clone()) {
                     return unsafe { fail_audit(&error, std::ptr::null_mut()) };
@@ -1761,8 +2719,30 @@ unsafe fn sandbox_freopen(
         let Some(_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(path, mode, stream) };
         };
-        if FilesystemHookRuntime::global().is_none() {
+        let Some(runtime) = FilesystemHookRuntime::global() else {
             return unsafe { original(path, mode, stream) };
+        };
+        match unsafe { runtime.native_passthrough_c_path(path, libc::AT_FDCWD) } {
+            Ok(Some(native)) => {
+                let descriptor = if stream.is_null() {
+                    -1
+                } else {
+                    unsafe { libc::fileno(stream) }
+                };
+                if descriptor >= 0
+                    && let Err(error) = runtime.writeback(descriptor)
+                {
+                    return unsafe { fail(&error, std::ptr::null_mut()) };
+                }
+                let result = unsafe { original(native.as_ptr(), mode, stream) };
+                if descriptor >= 0 {
+                    runtime.take_descriptor(descriptor);
+                    runtime.unregister_directory(descriptor);
+                }
+                return result;
+            }
+            Ok(None) => {}
+            Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
         }
         unsafe { set_errno(libc::ENOTSUP) };
         std::ptr::null_mut()
@@ -1799,6 +2779,13 @@ unsafe fn sandbox_posix_spawn_file_actions_addopen(
             Ok(request) => request,
             Err(error) => return error_errno(&error),
         };
+        match request.native_path() {
+            Ok(Some(native)) => {
+                return unsafe { original(actions, descriptor, native.as_ptr(), flags, mode) };
+            }
+            Ok(None) => {}
+            Err(error) => return error_errno(&error),
+        }
         if let Err(error) = runtime.publish(FileOperation::Open, request.file.clone()) {
             return error.errno();
         }
@@ -1840,7 +2827,7 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn_file_actions_addopen(
     unsafe { sandbox_posix_spawn_file_actions_addopen(actions, descriptor, path, flags, mode) }
 }
 
-unsupported_filesystem_hook!(
+unsupported_pair_filesystem_hook!(
     sandbox_link,
     agora_sandbox_link,
     original_link,
@@ -1848,10 +2835,16 @@ unsupported_filesystem_hook!(
         source: *const libc::c_char,
         destination: *const libc::c_char,
     ),
-    (source, destination)
+    (source, libc::AT_FDCWD),
+    (destination, libc::AT_FDCWD),
+    |original,
+     _native_source_directory,
+     native_source,
+     _native_destination_directory,
+     native_destination| original(native_source, native_destination)
 );
 
-unsupported_filesystem_hook!(
+unsupported_pair_filesystem_hook!(
     sandbox_linkat,
     agora_sandbox_linkat,
     original_linkat,
@@ -1862,39 +2855,81 @@ unsupported_filesystem_hook!(
         destination: *const libc::c_char,
         flags: libc::c_int,
     ),
-    (
-        source_directory,
-        source,
-        destination_directory,
-        destination,
+    (source, source_directory),
+    (destination, destination_directory),
+    |original,
+     native_source_directory,
+     native_source,
+     native_destination_directory,
+     native_destination| original(
+        native_source_directory,
+        native_source,
+        native_destination_directory,
+        native_destination,
         flags,
     )
 );
 
-unsupported_filesystem_hook!(
-    sandbox_symlink,
-    agora_sandbox_symlink,
-    original_symlink,
-    (
-        target: *const libc::c_char,
-        link: *const libc::c_char,
-    ),
-    (target, link)
-);
+unsafe fn sandbox_symlink(target: *const libc::c_char, link: *const libc::c_char) -> libc::c_int {
+    catch_filesystem_panic(-1, || {
+        let Some(original) = original_symlink() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return -1;
+        };
+        let Some(_guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(target, link) };
+        };
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return unsafe { original(target, link) };
+        };
+        match runtime.create_symlink(target, libc::AT_FDCWD, link) {
+            Ok(()) => 0,
+            Err(error) => unsafe { fail(&error, -1) },
+        }
+    })
+}
 
-unsupported_filesystem_hook!(
-    sandbox_symlinkat,
-    agora_sandbox_symlinkat,
-    original_symlinkat,
-    (
-        target: *const libc::c_char,
-        directory: libc::c_int,
-        link: *const libc::c_char,
-    ),
-    (target, directory, link)
-);
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_symlink(
+    target: *const libc::c_char,
+    link: *const libc::c_char,
+) -> libc::c_int {
+    unsafe { sandbox_symlink(target, link) }
+}
 
-unsupported_filesystem_hook!(
+unsafe fn sandbox_symlinkat(
+    target: *const libc::c_char,
+    directory: libc::c_int,
+    link: *const libc::c_char,
+) -> libc::c_int {
+    catch_filesystem_panic(-1, || {
+        let Some(original) = original_symlinkat() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return -1;
+        };
+        let Some(_guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(target, directory, link) };
+        };
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return unsafe { original(target, directory, link) };
+        };
+        match runtime.create_symlink(target, directory, link) {
+            Ok(()) => 0,
+            Err(error) => unsafe { fail(&error, -1) },
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_symlinkat(
+    target: *const libc::c_char,
+    directory: libc::c_int,
+    link: *const libc::c_char,
+) -> libc::c_int {
+    unsafe { sandbox_symlinkat(target, directory, link) }
+}
+
+unsupported_pair_filesystem_hook!(
     sandbox_clonefile,
     agora_sandbox_clonefile,
     original_clonefile,
@@ -1903,10 +2938,20 @@ unsupported_filesystem_hook!(
         destination: *const libc::c_char,
         flags: u32,
     ),
-    (source, destination, flags)
+    (source, libc::AT_FDCWD),
+    (destination, libc::AT_FDCWD),
+    |original,
+     _native_source_directory,
+     native_source,
+     _native_destination_directory,
+     native_destination| original(
+        native_source,
+        native_destination,
+        flags,
+    )
 );
 
-unsupported_filesystem_hook!(
+unsupported_pair_filesystem_hook!(
     sandbox_clonefileat,
     agora_sandbox_clonefileat,
     original_clonefileat,
@@ -1917,16 +2962,22 @@ unsupported_filesystem_hook!(
         destination: *const libc::c_char,
         flags: u32,
     ),
-    (
-        source_directory,
-        source,
-        destination_directory,
-        destination,
+    (source, source_directory),
+    (destination, destination_directory),
+    |original,
+     native_source_directory,
+     native_source,
+     native_destination_directory,
+     native_destination| original(
+        native_source_directory,
+        native_source,
+        native_destination_directory,
+        native_destination,
         flags,
     )
 );
 
-unsupported_filesystem_hook!(
+unsupported_pair_filesystem_hook!(
     sandbox_copyfile,
     agora_sandbox_copyfile,
     original_copyfile,
@@ -1936,7 +2987,18 @@ unsupported_filesystem_hook!(
         state: libc::copyfile_state_t,
         flags: libc::copyfile_flags_t,
     ),
-    (source, destination, state, flags)
+    (source, libc::AT_FDCWD),
+    (destination, libc::AT_FDCWD),
+    |original,
+     _native_source_directory,
+     native_source,
+     _native_destination_directory,
+     native_destination| original(
+        native_source,
+        native_destination,
+        state,
+        flags,
+    )
 );
 
 unsafe fn sandbox_close(descriptor: libc::c_int) -> libc::c_int {
@@ -2310,7 +3372,7 @@ unsafe fn sandbox_fstat(descriptor: libc::c_int, status: *mut libc::stat) -> lib
             && !status.is_null()
             && let Some(open) = runtime.tracked_open(descriptor)
         {
-            let attributes = match runtime.filesystem.attributes(&open.logical) {
+            let attributes = match runtime.filesystem.attributes(&open.logical()) {
                 Ok(attributes) => attributes,
                 Err(error) => return unsafe { fail(&error, -1) },
             };
@@ -2575,6 +3637,13 @@ unsafe fn sandbox_unlinkat(
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return unsafe { original(directory, path, flags) };
         };
+        match unsafe { runtime.native_passthrough_c_path(path, directory) } {
+            Ok(Some(native)) => {
+                return unsafe { original(libc::AT_FDCWD, native.as_ptr(), flags) };
+            }
+            Ok(None) => {}
+            Err(error) => return unsafe { fail(&error, -1) },
+        }
         let supported = flags == 0 || flags == libc::AT_REMOVEDIR;
         if !supported {
             unsafe { set_errno(libc::EINVAL) };
@@ -2644,6 +3713,13 @@ unsafe fn sandbox_renamex_np(
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return unsafe { original(from, to, flags) };
         };
+        match unsafe { runtime.native_passthrough_pair(from, libc::AT_FDCWD, to, libc::AT_FDCWD) } {
+            Ok(Some((from, to))) => {
+                return unsafe { original(from.as_ptr(), to.as_ptr(), flags) };
+            }
+            Ok(None) => {}
+            Err(error) => return unsafe { fail(&error, -1) },
+        }
         if flags != 0 {
             unsafe { set_errno(libc::ENOTSUP) };
             return -1;
@@ -2682,6 +3758,21 @@ unsafe fn sandbox_renameatx_np(
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return unsafe { original(from_directory, from, to_directory, to, flags) };
         };
+        match unsafe { runtime.native_passthrough_pair(from, from_directory, to, to_directory) } {
+            Ok(Some((from, to))) => {
+                return unsafe {
+                    original(
+                        libc::AT_FDCWD,
+                        from.as_ptr(),
+                        libc::AT_FDCWD,
+                        to.as_ptr(),
+                        flags,
+                    )
+                };
+            }
+            Ok(None) => {}
+            Err(error) => return unsafe { fail(&error, -1) },
+        }
         if flags != 0 {
             unsafe { set_errno(libc::ENOTSUP) };
             return -1;
@@ -2743,7 +3834,9 @@ unsafe fn sandbox_chdir(path: *const libc::c_char) -> libc::c_int {
             Ok((mapped, logical)) => {
                 let result = unsafe { original(mapped.as_ptr()) };
                 if result == 0 {
-                    runtime.set_current_directory(logical);
+                    if runtime.synchronize_current_directory().is_err() {
+                        runtime.set_current_directory(logical);
+                    }
                     unsafe { set_errno(caller_errno) };
                 }
                 result
@@ -2771,6 +3864,14 @@ unsafe fn sandbox_fchdir(descriptor: libc::c_int) -> libc::c_int {
             return unsafe { original(descriptor) };
         };
         let caller_errno = unsafe { *libc::__error() };
+        if runtime.native_passthrough_descriptor(descriptor) {
+            let result = unsafe { original(descriptor) };
+            if result == 0 {
+                let _ = runtime.synchronize_current_directory();
+                unsafe { set_errno(caller_errno) };
+            }
+            return result;
+        }
         let logical = match runtime.resolve_descriptor_logical_path(descriptor) {
             Ok(logical) => logical,
             Err(error) => return unsafe { fail(&error, -1) },
@@ -2784,7 +3885,9 @@ unsafe fn sandbox_fchdir(descriptor: libc::c_int) -> libc::c_int {
         }
         let result = unsafe { original(descriptor) };
         if result == 0 {
-            runtime.set_current_directory(logical);
+            if runtime.synchronize_current_directory().is_err() {
+                runtime.set_current_directory(logical);
+            }
             unsafe { set_errno(caller_errno) };
         }
         result
@@ -2844,6 +3947,60 @@ pub unsafe extern "C" fn agora_sandbox_getcwd(
     size: libc::size_t,
 ) -> *mut libc::c_char {
     unsafe { sandbox_getcwd(buffer, size) }
+}
+
+unsafe fn sandbox_realpath(
+    path: *const libc::c_char,
+    resolved: *mut libc::c_char,
+) -> *mut libc::c_char {
+    catch_filesystem_panic(std::ptr::null_mut(), || {
+        let Some(original) = original_realpath() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return std::ptr::null_mut();
+        };
+        let Some(_guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(path, resolved) };
+        };
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return unsafe { original(path, resolved) };
+        };
+        match unsafe { runtime.native_passthrough_c_path(path, libc::AT_FDCWD) } {
+            Ok(Some(native)) => return unsafe { original(native.as_ptr(), resolved) },
+            Ok(None) => {}
+            Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
+        }
+        let canonical = match unsafe { runtime.canonical_path(path) } {
+            Ok(canonical) => canonical,
+            Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
+        };
+        let required = canonical.as_bytes_with_nul().len();
+        if required > libc::PATH_MAX as usize {
+            unsafe { set_errno(libc::ENAMETOOLONG) };
+            return std::ptr::null_mut();
+        }
+        let target = if resolved.is_null() {
+            let allocated = unsafe { libc::malloc(required) }.cast::<libc::c_char>();
+            if allocated.is_null() {
+                unsafe { set_errno(libc::ENOMEM) };
+                return std::ptr::null_mut();
+            }
+            allocated
+        } else {
+            resolved
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(canonical.as_ptr(), target, required);
+        }
+        target
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_realpath(
+    path: *const libc::c_char,
+    resolved: *mut libc::c_char,
+) -> *mut libc::c_char {
+    unsafe { sandbox_realpath(path, resolved) }
 }
 
 unsafe fn sandbox_opendir(path: *const libc::c_char) -> *mut libc::DIR {
@@ -3109,6 +4266,510 @@ pub unsafe extern "C" fn agora_sandbox_closedir(directory: *mut libc::DIR) -> li
     unsafe { sandbox_closedir(directory) }
 }
 
+unsafe fn sandbox_getattrlistbulk(
+    directory: libc::c_int,
+    attributes: *mut libc::c_void,
+    buffer: *mut libc::c_void,
+    size: libc::size_t,
+    options: u64,
+) -> libc::c_int {
+    catch_filesystem_panic(-1, || {
+        let Some(original) = original_getattrlistbulk() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return -1;
+        };
+        if !FtsVirtualBulk::is_active() {
+            return unsafe { original(directory, attributes, buffer, size, options) };
+        }
+        if attributes.is_null() || buffer.is_null() {
+            unsafe { set_errno(libc::EFAULT) };
+            return -1;
+        }
+        let attributes = unsafe { std::ptr::read(attributes.cast::<libc::attrlist>()) };
+        if !fts_attributes_supported(&attributes) {
+            return unsafe {
+                original(
+                    directory,
+                    (&raw const attributes).cast_mut().cast(),
+                    buffer,
+                    size,
+                    options,
+                )
+            };
+        }
+        let Some(_guard) = FilesystemHookGuard::enter() else {
+            return unsafe {
+                original(
+                    directory,
+                    (&raw const attributes).cast_mut().cast(),
+                    buffer,
+                    size,
+                    options,
+                )
+            };
+        };
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return unsafe {
+                original(
+                    directory,
+                    (&raw const attributes).cast_mut().cast(),
+                    buffer,
+                    size,
+                    options,
+                )
+            };
+        };
+        let identity = match fts_descriptor_identity(directory) {
+            Ok(identity) => identity,
+            Err(error) => return unsafe { fail(&error, -1) },
+        };
+        let needs_cursor = FTS_BULK_CURSORS.with(|cursors| {
+            cursors
+                .borrow()
+                .get(&directory)
+                .is_none_or(|cursor| cursor.identity != identity)
+        });
+        if needs_cursor {
+            if let Err(error) = runtime.synchronize_current_directory() {
+                return unsafe { fail(&error, -1) };
+            }
+            let cursor = match FtsBulkCursor::new(runtime, directory, identity) {
+                Ok(Some(cursor)) => cursor,
+                Ok(None) => {
+                    return unsafe {
+                        original(
+                            directory,
+                            (&raw const attributes).cast_mut().cast(),
+                            buffer,
+                            size,
+                            options,
+                        )
+                    };
+                }
+                Err(error) => return unsafe { fail(&error, -1) },
+            };
+            FTS_BULK_CURSORS.with(|cursors| {
+                cursors.borrow_mut().insert(directory, cursor);
+            });
+        }
+
+        let mut written = 0_usize;
+        let mut count = 0_i32;
+        let mut finished = false;
+        let result = FTS_BULK_CURSORS.with(|cursors| -> Result<()> {
+            let mut cursors = cursors.borrow_mut();
+            let cursor = cursors
+                .get_mut(&directory)
+                .context("missing FTS bulk cursor")?;
+            while let Some(entry) = cursor.entries.get(cursor.next) {
+                let record = fts_attr_record(entry, &attributes)?;
+                if record.len() > size.saturating_sub(written) {
+                    if count == 0 {
+                        return Err(io::Error::from_raw_os_error(libc::ERANGE).into());
+                    }
+                    break;
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        record.as_ptr(),
+                        buffer.cast::<u8>().add(written),
+                        record.len(),
+                    );
+                }
+                written += record.len();
+                count += 1;
+                cursor.next += 1;
+            }
+            finished = cursor.next == cursor.entries.len() && count == 0;
+            Ok(())
+        });
+        if let Err(error) = result {
+            FTS_BULK_CURSORS.with(|cursors| {
+                cursors.borrow_mut().remove(&directory);
+            });
+            return unsafe { fail(&error, -1) };
+        }
+        if finished {
+            FTS_BULK_CURSORS.with(|cursors| {
+                cursors.borrow_mut().remove(&directory);
+            });
+        }
+        unsafe { set_errno(0) };
+        count
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_getattrlistbulk(
+    directory: libc::c_int,
+    attributes: *mut libc::c_void,
+    buffer: *mut libc::c_void,
+    size: libc::size_t,
+    options: u64,
+) -> libc::c_int {
+    unsafe { sandbox_getattrlistbulk(directory, attributes, buffer, size, options) }
+}
+
+fn fts_entry_is_visible(runtime: &FilesystemHookRuntime, entry: *mut DarwinFtsEntry) -> bool {
+    let raw_path = unsafe { (*entry).fts_accpath };
+    if raw_path.is_null() {
+        return true;
+    }
+    unsafe { trusted_fts_logical_path(runtime, raw_path) }
+        .and_then(|logical| runtime.filesystem.exists(&logical))
+        .unwrap_or(true)
+}
+
+unsafe fn trusted_fts_logical_path(
+    runtime: &FilesystemHookRuntime,
+    path: *const libc::c_char,
+) -> Result<PathBuf> {
+    let requested = Path::new(OsStr::from_bytes(
+        unsafe { CStr::from_ptr(path) }.to_bytes(),
+    ));
+    if requested.is_absolute() && runtime.filesystem.is_internal(requested) {
+        runtime.filesystem.logical_path(requested)
+    } else {
+        unsafe { runtime.logical_path(path, libc::AT_FDCWD) }
+    }
+}
+
+unsafe fn sandbox_fts_open(
+    paths: *const *mut libc::c_char,
+    options: libc::c_int,
+    compare: Option<FtsCompareFn>,
+) -> *mut libc::c_void {
+    catch_filesystem_panic(std::ptr::null_mut(), || {
+        let Some(original) = original_fts_open() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return std::ptr::null_mut();
+        };
+        if paths.is_null() {
+            unsafe { set_errno(libc::EFAULT) };
+            return std::ptr::null_mut();
+        }
+        let Some(_guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(paths, options, compare) };
+        };
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return unsafe { original(paths, options, compare) };
+        };
+        if let Err(error) = runtime.synchronize_current_directory() {
+            return unsafe { fail(&error, std::ptr::null_mut()) };
+        }
+
+        let mut mapped_paths = Vec::new();
+        let mut mappings = Vec::new();
+        let mut index = 0_usize;
+        loop {
+            let path = unsafe { *paths.add(index) };
+            if path.is_null() {
+                break;
+            }
+            let original_path = unsafe { CStr::from_ptr(path) };
+            let logical = match unsafe { runtime.logical_path(path, libc::AT_FDCWD) } {
+                Ok(logical) => logical,
+                Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
+            };
+            let (mapped, _, _) = match runtime.map_metadata(
+                path,
+                libc::AT_FDCWD,
+                false,
+                &Credentials::effective(),
+            ) {
+                Ok(mapped) => mapped,
+                Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
+            };
+            if mapped.to_bytes() == logical.as_os_str().as_bytes() {
+                match CString::new(original_path.to_bytes()) {
+                    Ok(path) => mapped_paths.push(path),
+                    Err(error) => return unsafe { fail(&error.into(), std::ptr::null_mut()) },
+                }
+            } else {
+                mappings.push(FtsRootMapping {
+                    physical: mapped.to_bytes().to_vec(),
+                    logical: original_path.to_bytes().to_vec(),
+                });
+                mapped_paths.push(mapped);
+            }
+            index += 1;
+        }
+        let mut mapped_argv = mapped_paths
+            .iter_mut()
+            .map(|path| path.as_ptr().cast_mut())
+            .collect::<Vec<_>>();
+        mapped_argv.push(std::ptr::null_mut());
+        let stream = unsafe { original(mapped_argv.as_ptr(), options | FTS_NOCHDIR, compare) };
+        if !stream.is_null() {
+            mappings.sort_by_key(|mapping| std::cmp::Reverse(mapping.physical.len()));
+            lock(fts_streams()).insert(
+                stream as usize,
+                FtsStreamState {
+                    mappings,
+                    presented: Vec::new(),
+                },
+            );
+        }
+        stream
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_fts_open(
+    paths: *const *mut libc::c_char,
+    options: libc::c_int,
+    compare: Option<FtsCompareFn>,
+) -> *mut libc::c_void {
+    unsafe { sandbox_fts_open(paths, options, compare) }
+}
+
+fn repair_virtual_fts_entry(
+    runtime: &FilesystemHookRuntime,
+    entry: *mut DarwinFtsEntry,
+) -> Result<bool> {
+    let info = unsafe { (*entry).fts_info };
+    if info == FTS_NSOK || (info != FTS_NS && unsafe { (*entry).fts_statp.is_null() }) {
+        return Ok(false);
+    }
+    let path = unsafe { (*entry).fts_accpath };
+    if path.is_null() {
+        return Ok(false);
+    }
+    let logical = unsafe { trusted_fts_logical_path(runtime, path) }?;
+    let logical = CString::new(logical.as_os_str().as_bytes())
+        .context("logical FTS metadata path contains NUL")?;
+    let (mapped, plaintext_size, attributes) = runtime.map_metadata(
+        logical.as_ptr(),
+        libc::AT_FDCWD,
+        false,
+        &Credentials::effective(),
+    )?;
+    if info != FTS_NS {
+        unsafe {
+            patch_stat(
+                &mut *(*entry).fts_statp,
+                plaintext_size,
+                attributes.as_ref(),
+            )
+        };
+        return Ok(false);
+    }
+    let original = original_lstat().context("lstat is unavailable")?;
+    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { original(mapped.as_ptr(), &mut status) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    unsafe { patch_stat(&mut status, plaintext_size, attributes.as_ref()) };
+    let name = unsafe { CStr::from_ptr((*entry).fts_name.as_ptr()) }.to_bytes();
+    let repaired = match status.st_mode & libc::S_IFMT {
+        libc::S_IFDIR if matches!(name, b"." | b"..") => FTS_DOT,
+        libc::S_IFDIR => FTS_D,
+        libc::S_IFREG => FTS_F,
+        libc::S_IFLNK => FTS_SL,
+        _ => FTS_DEFAULT,
+    };
+    unsafe {
+        if !(*entry).fts_statp.is_null() {
+            *(*entry).fts_statp = status;
+        }
+        (*entry).fts_errno = 0;
+        (*entry).fts_info = repaired;
+    }
+    Ok(true)
+}
+
+unsafe fn skip_fts_directory(stream: *mut libc::c_void, entry: *mut DarwinFtsEntry) -> libc::c_int {
+    if unsafe { (*entry).fts_info } == FTS_D {
+        unsafe { darwin_fts_set(stream, entry, FTS_SKIP) }
+    } else {
+        0
+    }
+}
+
+unsafe fn sandbox_fts_children(
+    stream: *mut libc::c_void,
+    options: libc::c_int,
+) -> *mut DarwinFtsEntry {
+    catch_filesystem_panic(std::ptr::null_mut(), || {
+        let Some(original) = original_fts_children() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return std::ptr::null_mut();
+        };
+        let Some(guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(stream, options) };
+        };
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return unsafe { original(stream, options) };
+        };
+        restore_fts_stream(stream);
+        drop(guard);
+        unsafe { set_errno(0) };
+        let mut head = {
+            let _bulk = FtsVirtualBulk::enter();
+            unsafe { original(stream, options) }
+        };
+        let original_errno = unsafe { *libc::__error() };
+        let Some(_guard) = FilesystemHookGuard::enter() else {
+            unsafe { set_errno(original_errno) };
+            return head;
+        };
+        if fts_stream_may_change_current_directory(stream) {
+            let _ = runtime.synchronize_current_directory();
+        }
+        let mut current = head;
+        let mut previous: *mut DarwinFtsEntry = std::ptr::null_mut();
+        let mut unresolved_error = false;
+        while !current.is_null() {
+            let next = unsafe { (*current).fts_link };
+            let visible = fts_entry_is_visible(runtime, current);
+            if visible {
+                if let Err(error) = repair_virtual_fts_entry(runtime, current) {
+                    return unsafe { fail(&error, std::ptr::null_mut()) };
+                }
+                unresolved_error |=
+                    matches!(unsafe { (*current).fts_info }, FTS_DNR | FTS_ERR | FTS_NS);
+                previous = current;
+            } else {
+                if unsafe { skip_fts_directory(stream, current) } != 0 {
+                    return std::ptr::null_mut();
+                }
+                if previous.is_null() {
+                    head = next;
+                } else {
+                    unsafe { (*previous).fts_link = next };
+                }
+            }
+            current = next;
+        }
+        let successful = !head.is_null() && !unresolved_error;
+        if successful {
+            let parent = unsafe { (*head).fts_parent };
+            if !parent.is_null() {
+                unsafe { (*parent).fts_errno = 0 };
+            }
+        }
+        unsafe { set_errno(if successful { 0 } else { original_errno }) };
+        if let Err(error) = present_fts_list(stream, head) {
+            return unsafe { fail(&error, std::ptr::null_mut()) };
+        }
+        head
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_fts_children(
+    stream: *mut libc::c_void,
+    options: libc::c_int,
+) -> *mut DarwinFtsEntry {
+    unsafe { sandbox_fts_children(stream, options) }
+}
+
+unsafe fn sandbox_fts_close(stream: *mut libc::c_void) -> libc::c_int {
+    catch_filesystem_panic(-1, || {
+        let Some(original) = original_fts_close() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return -1;
+        };
+        let may_change_current_directory = fts_stream_may_change_current_directory(stream);
+        restore_fts_stream(stream);
+        let Some(guard) = FilesystemHookGuard::enter() else {
+            let result = unsafe { original(stream) };
+            lock(fts_streams()).remove(&(stream as usize));
+            return result;
+        };
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            let result = unsafe { original(stream) };
+            lock(fts_streams()).remove(&(stream as usize));
+            return result;
+        };
+        drop(guard);
+        let result = unsafe { original(stream) };
+        let original_errno = unsafe { *libc::__error() };
+        lock(fts_streams()).remove(&(stream as usize));
+        let Some(_guard) = FilesystemHookGuard::enter() else {
+            unsafe { set_errno(original_errno) };
+            return result;
+        };
+        if may_change_current_directory {
+            let _ = runtime.synchronize_current_directory();
+        }
+        unsafe { set_errno(original_errno) };
+        result
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_fts_close(stream: *mut libc::c_void) -> libc::c_int {
+    unsafe { sandbox_fts_close(stream) }
+}
+
+unsafe fn sandbox_fts_read(stream: *mut libc::c_void) -> *mut DarwinFtsEntry {
+    catch_filesystem_panic(std::ptr::null_mut(), || {
+        let Some(original) = original_fts_read() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return std::ptr::null_mut();
+        };
+        let Some(guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(stream) };
+        };
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return unsafe { original(stream) };
+        };
+        restore_fts_stream(stream);
+        drop(guard);
+        loop {
+            unsafe { set_errno(0) };
+            let entry = {
+                let _bulk = FtsVirtualBulk::enter();
+                unsafe { original(stream) }
+            };
+            let original_errno = unsafe { *libc::__error() };
+            let Some(_guard) = FilesystemHookGuard::enter() else {
+                unsafe { set_errno(original_errno) };
+                return entry;
+            };
+            if fts_stream_may_change_current_directory(stream) {
+                let _ = runtime.synchronize_current_directory();
+            }
+            if entry.is_null() {
+                unsafe { set_errno(original_errno) };
+                return entry;
+            }
+            let visible = fts_entry_is_visible(runtime, entry);
+            if visible {
+                let repaired = match repair_virtual_fts_entry(runtime, entry) {
+                    Ok(repaired) => repaired,
+                    Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
+                };
+                let unresolved_error =
+                    matches!(unsafe { (*entry).fts_info }, FTS_DNR | FTS_ERR | FTS_NS);
+                if !unresolved_error {
+                    unsafe { (*entry).fts_errno = 0 };
+                }
+                unsafe {
+                    set_errno(if repaired || !unresolved_error {
+                        0
+                    } else {
+                        original_errno
+                    })
+                };
+                if let Err(error) = present_fts_entry(stream, entry) {
+                    return unsafe { fail(&error, std::ptr::null_mut()) };
+                }
+                return entry;
+            }
+            if unsafe { skip_fts_directory(stream, entry) } != 0 {
+                return std::ptr::null_mut();
+            }
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_fts_read(stream: *mut libc::c_void) -> *mut DarwinFtsEntry {
+    unsafe { sandbox_fts_read(stream) }
+}
+
 fn original_open() -> Option<OpenFn> {
     (!INTERPOSE_OPEN.replacee.is_null()).then_some(call_original_open)
 }
@@ -3354,6 +5015,10 @@ fn original_getcwd() -> Option<GetcwdFn> {
     function_from_interpose(&INTERPOSE_GETCWD)
 }
 
+fn original_realpath() -> Option<RealpathFn> {
+    function_from_interpose(&INTERPOSE_REALPATH)
+}
+
 fn original_opendir() -> Option<OpendirFn> {
     function_from_interpose(&INTERPOSE_OPENDIR)
 }
@@ -3364,6 +5029,26 @@ fn original_fdopendir() -> Option<FdopendirFn> {
 
 fn original_readdir() -> Option<ReaddirFn> {
     function_from_interpose(&INTERPOSE_READDIR)
+}
+
+fn original_fts_open() -> Option<FtsOpenFn> {
+    function_from_interpose(&INTERPOSE_FTS_OPEN)
+}
+
+fn original_fts_children() -> Option<FtsChildrenFn> {
+    function_from_interpose(&INTERPOSE_FTS_CHILDREN)
+}
+
+fn original_fts_close() -> Option<FtsCloseFn> {
+    function_from_interpose(&INTERPOSE_FTS_CLOSE)
+}
+
+fn original_fts_read() -> Option<FtsReadFn> {
+    function_from_interpose(&INTERPOSE_FTS_READ)
+}
+
+fn original_getattrlistbulk() -> Option<GetattrlistbulkFn> {
+    function_from_interpose(&INTERPOSE_GETATTRLISTBULK)
 }
 
 fn original_rewinddir() -> Option<RewinddirFn> {
@@ -3514,6 +5199,7 @@ dyld_interpose!(INTERPOSE_MKDIRAT, agora_sandbox_mkdirat, libc::mkdirat);
 dyld_interpose!(INTERPOSE_CHDIR, agora_sandbox_chdir, libc::chdir);
 dyld_interpose!(INTERPOSE_FCHDIR, agora_sandbox_fchdir, libc::fchdir);
 dyld_interpose!(INTERPOSE_GETCWD, agora_sandbox_getcwd, libc::getcwd);
+dyld_interpose!(INTERPOSE_REALPATH, agora_sandbox_realpath, libc::realpath);
 dyld_interpose!(INTERPOSE_OPENDIR, agora_sandbox_opendir, libc::opendir);
 dyld_interpose!(
     INTERPOSE_FDOPENDIR,
@@ -3525,6 +5211,23 @@ dyld_interpose!(
     INTERPOSE_READDIR_R,
     agora_sandbox_readdir_r,
     darwin_readdir_r
+);
+dyld_interpose!(INTERPOSE_FTS_OPEN, agora_sandbox_fts_open, darwin_fts_open);
+dyld_interpose!(
+    INTERPOSE_FTS_CHILDREN,
+    agora_sandbox_fts_children,
+    darwin_fts_children
+);
+dyld_interpose!(
+    INTERPOSE_FTS_CLOSE,
+    agora_sandbox_fts_close,
+    darwin_fts_close
+);
+dyld_interpose!(INTERPOSE_FTS_READ, agora_sandbox_fts_read, darwin_fts_read);
+dyld_interpose!(
+    INTERPOSE_GETATTRLISTBULK,
+    agora_sandbox_getattrlistbulk,
+    darwin_getattrlistbulk
 );
 dyld_interpose!(
     INTERPOSE_REWINDDIR,

@@ -1,4 +1,4 @@
-use crate::filesystem::{EntryState, Materializer, OverlayStore};
+use crate::filesystem::{EntryState, FileCipher, Materializer, OverlayStore};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
@@ -65,6 +65,14 @@ pub(super) struct ExecutableStore {
 
 impl ExecutableStore {
     pub(super) fn new(directory: PathBuf) -> Result<Self> {
+        Self::with_cipher(directory, None)
+    }
+
+    pub(super) fn encrypted(directory: PathBuf, cipher: FileCipher) -> Result<Self> {
+        Self::with_cipher(directory, Some(cipher))
+    }
+
+    fn with_cipher(directory: PathBuf, cipher: Option<FileCipher>) -> Result<Self> {
         fs::create_dir_all(&directory).with_context(|| {
             format!(
                 "failed to create sandbox executable directory {}",
@@ -77,7 +85,10 @@ impl ExecutableStore {
                 directory.display()
             )
         })?;
-        let overlay = OverlayStore::new(directory.clone())?;
+        let overlay = match cipher {
+            Some(cipher) => OverlayStore::encrypted(directory.clone(), cipher)?,
+            None => OverlayStore::new(directory.clone())?,
+        };
         Ok(Self { overlay })
     }
 
@@ -279,6 +290,7 @@ impl ExecutableStore {
                 OsStr::new("--sign"),
                 OsStr::new("-"),
                 OsStr::new("--timestamp=none"),
+                OsStr::new("--preserve-metadata=entitlements"),
                 temporary.as_os_str(),
             ],
             "failed to ad-hoc sign executable copy",

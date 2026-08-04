@@ -40,16 +40,9 @@ impl FilesystemWorkspace {
         }
     }
 
-    pub(crate) fn encrypted_key(&self) -> Option<&[u8]> {
+    pub(crate) fn encrypted_cipher_key(&self) -> Option<&[u8; 32]> {
         match self {
-            Self::Encrypted(workspace) => Some(workspace.key()),
-            Self::Plain(_) => None,
-        }
-    }
-
-    pub(crate) fn encrypted_salt(&self) -> Option<&[u8]> {
-        match self {
-            Self::Encrypted(workspace) => Some(workspace.salt()),
+            Self::Encrypted(workspace) => Some(workspace.cipher_key()),
             Self::Plain(_) => None,
         }
     }
