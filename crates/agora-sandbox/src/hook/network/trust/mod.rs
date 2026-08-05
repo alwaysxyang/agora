@@ -1,7 +1,7 @@
 #![cfg(target_os = "macos")]
 
-use super::config;
-use super::dyld::{dyld_interpose, function_from_interpose};
+use super::super::config;
+use super::super::dyld::{dyld_interpose, function_from_interpose};
 use base64::Engine;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};

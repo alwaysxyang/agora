@@ -1,10 +1,17 @@
 #![cfg(target_os = "macos")]
 
+mod socket;
+mod trust;
+
+#[cfg(test)]
+pub(super) use self::socket::{RawSocketAddress, socket_addr_from_raw};
+#[cfg(not(test))]
+use self::socket::{RawSocketAddress, socket_addr_from_raw};
 use super::config;
 #[cfg(test)]
 use super::dyld::DyldInterpose;
 use super::dyld::{dyld_interpose, function_from_interpose};
-use super::socket::{RawSocketAddress, set_errno, socket_addr_from_raw};
+use super::{initialized, set_errno};
 use crate::protocol::{
     ConnectRequest, HookOperation, PROTOCOL_VERSION, ProcessIdentity, encode_connect_request,
 };
@@ -12,8 +19,8 @@ use std::cell::Cell;
 use std::mem;
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Once, OnceLock};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 type ConnectFn =
     unsafe extern "C" fn(libc::c_int, *const libc::sockaddr, libc::socklen_t) -> libc::c_int;
@@ -44,30 +51,6 @@ type ConnectxFn = unsafe extern "C" fn(
 thread_local! {
     static INSIDE_HOOK: Cell<bool> = const { Cell::new(false) };
 }
-
-static HOOK_INITIALIZED: AtomicBool = AtomicBool::new(false);
-static EXIT_FLUSH_REGISTERED: Once = Once::new();
-
-pub(super) fn initialized() -> bool {
-    HOOK_INITIALIZED.load(Ordering::Acquire)
-}
-
-extern "C" fn flush_filesystem_at_exit() {
-    super::filesystem::flush_at_exit();
-}
-
-extern "C" fn initialize_hook() {
-    config::initialize();
-    super::filesystem::initialize_process();
-    EXIT_FLUSH_REGISTERED.call_once(|| unsafe {
-        libc::atexit(flush_filesystem_at_exit);
-    });
-    HOOK_INITIALIZED.store(true, Ordering::Release);
-}
-
-#[used]
-#[unsafe(link_section = "__DATA,__mod_init_func")]
-static HOOK_INITIALIZER: extern "C" fn() = initialize_hook;
 
 struct HookGuard;
 

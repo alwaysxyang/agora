@@ -1,3 +1,4 @@
+use super::super::{HOOK_INITIALIZED, flush_filesystem_at_exit, initialize_hook, initialized};
 use super::*;
 use crate::hook::config::HookConfig;
 use crate::protocol::parse_connect_request_prefix;
@@ -7,6 +8,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -454,7 +456,7 @@ fn configured_hook_runtime_exercises_exported_entry_points() {
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "hook::interpose::tests::configured_hook_runtime_exercises_exported_entry_points",
+            "hook::network::tests::configured_hook_runtime_exercises_exported_entry_points",
             "--nocapture",
         ])
         .env("AGORA_SANDBOX_COVERAGE_CHILD", "1")

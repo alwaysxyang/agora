@@ -2,7 +2,7 @@
 
 use super::config;
 use super::dyld::{dyld_interpose, function_from_interpose};
-use super::socket::set_errno;
+use super::set_errno;
 use crate::audit::{AuditClient, AuditError, AuditEventRequest, FileOperation};
 use crate::callback::{FileAccessMode, FileContext, FileOpenMode, ProcessContext};
 use crate::filesystem::{
@@ -68,7 +68,7 @@ struct FilesystemHookGuard;
 
 impl FilesystemHookGuard {
     fn enter() -> Option<Self> {
-        if !super::interpose::initialized() && !test_runtime_is_set() {
+        if !super::initialized() && !test_runtime_is_set() {
             return None;
         }
         let entered = INSIDE_FILESYSTEM_HOOK.with(|inside| !inside.replace(true));

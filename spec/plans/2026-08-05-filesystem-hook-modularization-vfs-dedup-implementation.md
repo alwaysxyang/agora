@@ -4,7 +4,7 @@
 
 **Goal:** Split the macOS filesystem hook into focused syscall-family modules and remove duplicate VFS final-path and parent-attribute work without changing observable behavior.
 
-**Architecture:** `hook/filesystem.rs` remains the shared runtime and facade. Child modules own complete libc operation families, including their handlers, original-function lookup, and dyld registration. VFS keeps explicit operation APIs but reuses one final-resolution/search helper, distinguishes raw from already-resolved endpoint checks, and reuses parent attributes returned by ancestor search.
+**Architecture:** `hook/filesystem/mod.rs` is the shared runtime and facade. Child modules own complete libc operation families, including their handlers, original-function lookup, and dyld registration. VFS keeps explicit operation APIs but reuses one final-resolution/search helper, distinguishes raw from already-resolved endpoint checks, and reuses parent attributes returned by ancestor search.
 
 **Tech Stack:** Rust 2024, macOS libc interposition, Cargo, `cargo llvm-cov`.
 
@@ -33,7 +33,7 @@
 
 **Modify:**
 
-- `crates/agora-sandbox/src/hook/filesystem.rs`: retain shared runtime/facade code, declare child modules, and remove operation-family implementations.
+- `crates/agora-sandbox/src/hook/filesystem/mod.rs`: retain shared runtime/facade code, declare child modules, and remove operation-family implementations.
 - `crates/agora-sandbox/src/hook/filesystem/tests.rs`: adjust only imports if the root facade no longer privately re-exports every test entry point.
 - `crates/agora-sandbox/src/filesystem/overlay.rs`: add test-only final-resolution instrumentation.
 - `crates/agora-sandbox/src/filesystem/vfs.rs`: consolidate resolution/search and resolved endpoint checks; return reusable parent attributes from ancestor search.
@@ -84,7 +84,7 @@ Expected: PASS with zero warnings.
 Run:
 
 ```bash
-rg -o "agora_sandbox_[a-z0-9_]+" crates/agora-sandbox/src/hook/filesystem.rs | sort -u
+rg -o "agora_sandbox_[a-z0-9_]+" crates/agora-sandbox/src/hook/filesystem/mod.rs | sort -u
 ```
 
 Save the output for comparison after modularization. Every name must remain present in the new parent-plus-child source tree.
@@ -97,7 +97,7 @@ Save the output for comparison after modularization. Every name must remain pres
 
 - Create: `crates/agora-sandbox/src/hook/filesystem/directory/mod.rs`
 - Create: `crates/agora-sandbox/src/hook/filesystem/directory/fts.rs`
-- Modify: `crates/agora-sandbox/src/hook/filesystem.rs`
+- Modify: `crates/agora-sandbox/src/hook/filesystem/mod.rs`
 
 **Interfaces:**
 
@@ -106,7 +106,7 @@ Save the output for comparison after modularization. Every name must remain pres
 
 - [ ] **Step 1: Add the child module declarations**
 
-Add to `hook/filesystem.rs` below the imports:
+Add to `hook/filesystem/mod.rs` below the imports:
 
 ```rust
 mod directory;
@@ -174,7 +174,7 @@ Expected: PASS with zero warnings and unchanged directory/FTS behavior.
 
 - Create: `crates/agora-sandbox/src/hook/filesystem/open.rs`
 - Create: `crates/agora-sandbox/src/hook/filesystem/descriptor.rs`
-- Modify: `crates/agora-sandbox/src/hook/filesystem.rs`
+- Modify: `crates/agora-sandbox/src/hook/filesystem/mod.rs`
 
 **Interfaces:**
 
@@ -226,7 +226,7 @@ pub(super) fn original_close() -> Option<CloseFn>
 Privately import test-facing exports into the parent under `#[cfg(test)]`. Then run:
 
 ```bash
-rg -o "agora_sandbox_[a-z0-9_]+" crates/agora-sandbox/src/hook/filesystem.rs crates/agora-sandbox/src/hook/filesystem -g '*.rs' | sed 's/.*://' | sort -u
+rg -o "agora_sandbox_[a-z0-9_]+" crates/agora-sandbox/src/hook/filesystem/mod.rs crates/agora-sandbox/src/hook/filesystem -g '*.rs' | sed 's/.*://' | sort -u
 ```
 
 Expected: the same symbol-name set recorded in Task 1.
@@ -251,7 +251,7 @@ Expected: PASS with zero warnings.
 - Create: `crates/agora-sandbox/src/hook/filesystem/metadata.rs`
 - Create: `crates/agora-sandbox/src/hook/filesystem/namespace.rs`
 - Create: `crates/agora-sandbox/src/hook/filesystem/unsupported.rs`
-- Modify: `crates/agora-sandbox/src/hook/filesystem.rs`
+- Modify: `crates/agora-sandbox/src/hook/filesystem/mod.rs`
 
 **Interfaces:**
 
@@ -313,7 +313,7 @@ cargo test -p agora-sandbox hook::filesystem::tests --jobs 16
 cargo check -p agora-sandbox --all-targets --jobs 16
 ```
 
-Expected: PASS with zero warnings. `hook/filesystem.rs` contains no `unsafe fn sandbox_*` libc handler and no `dyld_interpose!` registration.
+Expected: PASS with zero warnings. `hook/filesystem/mod.rs` contains no `unsafe fn sandbox_*` libc handler and no `dyld_interpose!` registration.
 
 ---
 
@@ -512,7 +512,7 @@ Expected: PASS with unchanged errno and side-effect behavior.
 Add a concise internal-ownership paragraph stating that:
 
 ```text
-filesystem.rs owns shared hook runtime and process/descriptor coordination;
+filesystem/mod.rs owns shared hook runtime and process/descriptor coordination;
 operation modules own complete libc function families including lookup and registration;
 directory/fts is nested under merged directory enumeration;
 authorized VFS operations reuse one resolved endpoint and searched parent attributes.
@@ -529,7 +529,7 @@ cargo fmt --all
 cargo fmt --all -- --check
 git diff --check
 rg -n "effective_attributes_in" crates/agora-sandbox/src
-rg -n "unsafe fn sandbox_|dyld_interpose!" crates/agora-sandbox/src/hook/filesystem.rs
+rg -n "unsafe fn sandbox_|dyld_interpose!" crates/agora-sandbox/src/hook/filesystem/mod.rs
 ```
 
 Expected: formatting and diff checks pass; both structural searches return no matches.

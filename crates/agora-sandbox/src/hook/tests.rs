@@ -1,6 +1,5 @@
 use super::config::HookConfig;
-use super::interpose::ProcessContext;
-use super::socket::{RawSocketAddress, socket_addr_from_raw};
+use super::network::{ProcessContext, RawSocketAddress, socket_addr_from_raw};
 use crate::filesystem::FileCipher;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};

@@ -1,13 +1,13 @@
 use std::mem::{self, MaybeUninit};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-pub(super) struct RawSocketAddress {
+pub(in crate::hook) struct RawSocketAddress {
     storage: libc::sockaddr_storage,
     length: libc::socklen_t,
 }
 
 impl RawSocketAddress {
-    pub(super) fn new(address: SocketAddr) -> Self {
+    pub(in crate::hook) fn new(address: SocketAddr) -> Self {
         let mut storage = MaybeUninit::<libc::sockaddr_storage>::zeroed();
         let length = unsafe {
             match address {
@@ -47,16 +47,16 @@ impl RawSocketAddress {
         }
     }
 
-    pub(super) fn as_ptr(&self) -> *const libc::sockaddr {
+    pub(in crate::hook) fn as_ptr(&self) -> *const libc::sockaddr {
         std::ptr::addr_of!(self.storage).cast()
     }
 
-    pub(super) fn len(&self) -> libc::socklen_t {
+    pub(in crate::hook) fn len(&self) -> libc::socklen_t {
         self.length
     }
 }
 
-pub(super) unsafe fn socket_addr_from_raw(
+pub(in crate::hook) unsafe fn socket_addr_from_raw(
     address: *const libc::sockaddr,
     length: libc::socklen_t,
 ) -> Option<SocketAddr> {
@@ -83,9 +83,4 @@ pub(super) unsafe fn socket_addr_from_raw(
         }
         _ => None,
     }
-}
-
-#[cfg(target_os = "macos")]
-pub(super) unsafe fn set_errno(value: libc::c_int) {
-    unsafe { *libc::__error() = value };
 }

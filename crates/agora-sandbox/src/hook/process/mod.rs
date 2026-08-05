@@ -2,7 +2,7 @@
 
 use super::config::{self, CHILD_RUNTIME_ENVIRONMENT, HookConfig};
 use super::dyld::{dyld_interpose, function_from_interpose};
-use super::socket::set_errno;
+use super::set_errno;
 use crate::audit::{AuditClient, AuditEventRequest};
 use crate::callback::{CommandContext, ProcessContext, ProcessOperation};
 use crate::execution::{

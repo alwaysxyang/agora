@@ -27,7 +27,8 @@ This change has two parts:
 
 ### Hook structure
 
-`hook/filesystem.rs` currently combines more than 5,000 lines of unrelated concerns:
+Before modularization, the filesystem facade now located at `hook/filesystem/mod.rs` combined more
+than 5,000 lines of unrelated concerns:
 
 - process initialization, recursion protection, and fork synchronization;
 - hook runtime and descriptor state;
@@ -58,9 +59,9 @@ Some callers already resolve the endpoint and then call `require_entry_access_in
 
 ```text
 crates/agora-sandbox/src/hook/
-├── filesystem.rs
-├── filesystem_shim.c
 └── filesystem/
+    ├── mod.rs
+    ├── filesystem_shim.c
     ├── open.rs
     ├── descriptor.rs
     ├── metadata.rs
@@ -72,11 +73,11 @@ crates/agora-sandbox/src/hook/
     └── tests.rs
 ```
 
-`filesystem_shim.c` and the existing test file retain their current locations.
+The C shim and existing test file are colocated with the filesystem module.
 
 ### Parent facade and runtime
 
-`hook/filesystem.rs` remains the parent module and owns only state or behavior shared across multiple operation families:
+`hook/filesystem/mod.rs` is the parent module and owns only state or behavior shared across multiple operation families:
 
 - `FilesystemHookRuntime` and global runtime initialization;
 - recursion guard and fork barrier;
@@ -297,7 +298,7 @@ The earlier VFS permission transaction design remains valid. This design complet
 
 ## Acceptance Criteria
 
-- `hook/filesystem.rs` contains shared runtime/facade behavior and no concrete libc hook handlers.
+- `hook/filesystem/mod.rs` contains shared runtime/facade behavior and no concrete libc hook handlers.
 - Hook operations are grouped by the function-family layout above.
 - Each handler, original-function lookup, and interpose registration are colocated.
 - No exported C symbol, signature, or interpose target changes.

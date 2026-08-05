@@ -120,7 +120,7 @@ This plan implements raw TCP interception and callback policy end to end. It doe
 
 **Files:**
 - Add: `crates/agora-sandbox/src/execution/`
-- Add: `crates/agora-sandbox/src/hook/process.rs`
+- Add: `crates/agora-sandbox/src/hook/process/mod.rs`
 - Modify: `crates/agora-sandbox/src/runner/mod.rs`
 - Modify: `crates/agora-sandbox/tests/runner.rs`
 
@@ -179,7 +179,7 @@ This plan implements raw TCP interception and callback policy end to end. It doe
 
 **Files:**
 - Modify: `crates/agora-sandbox/src/execution/`
-- Modify: `crates/agora-sandbox/src/hook/process.rs`
+- Modify: `crates/agora-sandbox/src/hook/process/mod.rs`
 - Modify: `crates/agora-sandbox/src/trace.rs`
 - Modify: `crates/agora-sandbox/src/main.rs`
 - Add: `spec/architecture/sandbox.md`
