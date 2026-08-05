@@ -131,28 +131,11 @@ fn hook_library() -> PathBuf {
             assert!(library.is_file(), "missing {}", library.display());
             return library;
         }
-        let workspace = workspace_root();
-        let target = std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .map(|path| {
-                if path.is_absolute() {
-                    path
-                } else {
-                    workspace.join(path)
-                }
-            })
-            .unwrap_or_else(|| workspace.join("target"))
-            .join("hook");
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "agora-sandbox", "--lib", "--target-dir"])
-            .arg(&target)
-            .current_dir(&workspace)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let library = target.join("debug/libagora_sandbox.dylib");
-        assert!(library.is_file(), "missing {}", library.display());
-        library
+        let workdir = std::env::temp_dir().join(format!(
+            "agora-sandbox-integration-hook-{}",
+            std::process::id()
+        ));
+        agora_sandbox::hook_library::materialize(&workdir).unwrap()
     })
     .clone()
 }

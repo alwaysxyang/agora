@@ -49,6 +49,8 @@ traffic.
 - `SandboxCommand`: program, arguments, environment, and working-directory configuration.
 - `Sandbox<C: Callback>`: one sandbox run with a caller-provided asynchronous callback.
 - `SandboxOutcome`: child exit status plus generated sandbox and run identifiers.
+- `hook_library::materialize`: publish the embedded hook below a selected work directory and return
+  its verified path for the existing `SandboxConfig::new` API.
 - `generate_tls_ca`: generate or replace a PEM signing CA certificate and matching PKCS#8 private
   key for TLS interception.
 - `NetworkConfig`: enforcement mode, TLS mode, domain-inspection timeout, callback timeout,
@@ -62,15 +64,16 @@ The CLI is a thin adapter:
 
 ```bash
 agora-sandbox \
-  --hook-library ./target/debug/libagora_sandbox.dylib \
   --tls auto \
   --workdir ~/.agora-sandbox \
   --audit-file ./sandbox-audit.jsonl \
   -c './target/debug/my-client --endpoint https://example.com'
 ```
 
-When `--hook-library` is omitted, the CLI looks for `libagora_sandbox.dylib` next to its own
-executable. Packaging must install both artifacts together. `--tls` accepts `off` or `auto`.
+The CLI contains the hook and automatically materializes it below
+`<workdir>/runtime/hook/<md5>/libagora_sandbox.dylib` before constructing `SandboxConfig`. It has no
+`--hook-library` option, sidecar lookup, or runtime Cargo dependency; failure to materialize the
+verified hook is a startup error. `--tls` accepts `off` or `auto`.
 When either explicit CA option is supplied, both `--tls-ca-cert` and `--tls-ca-key` are required; the
 PEM certificate must be a signing CA and its public key must match the private key. When neither is
 supplied, auto mode uses the workdir-relative default CA paths and generates the pair when needed.
@@ -102,11 +105,41 @@ terminate the active run through the shared process lifecycle. Strict network en
 unavailable and is not exposed as a CLI option. Filesystem persistence and destructive-reset
 behavior are specified in [Sandbox Filesystem And Executable Preparation](sandbox.md).
 
+## Embedded Hook Build And Materialization
+
+`agora-sandbox` remains one public Cargo package. Its ordinary Cargo build produces an rlib and a
+standard cdylib; the latter is a build and coverage artifact, not a runtime sidecar dependency. It
+lets injected coverage processes share Cargo's crate identity with their test binaries. The outer
+`build.rs` performs one guarded inner `cargo rustc --crate-type cdylib` build in a separate target
+directory for the bytes embedded into consumers. The inner build uses the same manifest, Cargo
+target, and profile, compiles the existing C shim, and excludes the materializer so embedded bytes
+cannot recurse. A private build marker prevents the inner build script from launching Cargo again.
+
+The outer build resolves the dylib from Cargo's JSON artifact output, verifies that it contains only
+the requested target architecture, and checks the linker's existing ad-hoc signature with
+`codesign --verify --strict` without signing or mutating the artifact. It then computes a full-file
+MD5, stages the dylib in the outer `OUT_DIR`, and includes those exact bytes and their checksum in
+consumers that call `hook_library::materialize`. A packaged standalone executable does not require
+or install a dylib beside itself, even though Cargo's target directory contains its normal cdylib
+build artifact.
+
+At runtime, `hook_library::materialize(workdir)` publishes the bytes under the checksum-addressed
+path while holding `<workdir>/runtime/hook/.lock`. Controller directories and the lock reject
+symlinks, non-directory or non-file substitutions, and foreign ownership. A matching regular file
+is reused; mismatched content is replaced through a same-directory, synced temporary file and an
+atomic rename. The runtime cache and lock are independent of `<workdir>/fs` and its overlay locks.
+SDK callers may instead continue to pass any explicit hook path directly to `SandboxConfig::new`.
+
 ## Runtime Flow
 
 Each run creates independent identifiers, credentials, and listeners:
 
 ```text
+CLI startup
+  -> resolve the configured or default workdir
+  -> materialize and verify the embedded hook in <workdir>/runtime/hook/<md5>
+  -> pass that path to the existing SandboxConfig::new API
+
 Sandbox::run
   -> validate intercept and TLS policy
   -> validate explicit fixed PEM interception CA paths when configured

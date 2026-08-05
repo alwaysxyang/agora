@@ -33,4 +33,7 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 
 [build-dependencies]
+anyhow = { workspace = true }
 cc = { workspace = true }
+md-5 = { workspace = true }
+serde_json = { workspace = true }

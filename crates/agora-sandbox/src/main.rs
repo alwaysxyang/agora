@@ -4,6 +4,7 @@ use agora_core::lifecycle::{
 };
 use agora_sandbox::{
     callback::{Callback, Decision, Event, EventType, FileOpenMode, ProcessOperation},
+    hook_library,
     network::TlsMode,
     runner::{FilesystemMode, Sandbox, SandboxCommand, SandboxConfig},
 };
@@ -33,10 +34,6 @@ struct Arguments {
 
     #[command(subcommand)]
     subcommand: Option<CliCommand>,
-
-    /// Path to the injectable libagora_sandbox.dylib
-    #[arg(long)]
-    hook_library: Option<PathBuf>,
 
     /// Path for JSON Lines audit records; defaults to stdout
     #[arg(long)]
@@ -283,27 +280,25 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
         }
         None => {}
     }
-    let hook_library = match arguments.hook_library {
-        Some(path) => path,
-        None => default_hook_library()?,
-    };
-    let mut config = SandboxConfig::new(hook_library);
-    if let Some(workdir) = arguments.workdir {
-        config = config.with_workdir(workdir);
-    }
-    match (arguments.filesystem, arguments.filesystem_key) {
-        (FilesystemArgument::Encrypted, Some(key)) => {
-            config = config.with_encrypted_workspace(key);
-        }
+    let filesystem_key = match (arguments.filesystem, arguments.filesystem_key) {
+        (FilesystemArgument::Encrypted, Some(key)) => Some(key),
         (FilesystemArgument::Encrypted, None) => {
             anyhow::bail!("--filesystem-key is required with encrypted filesystem mode");
         }
-        (FilesystemArgument::Plain, None) => {
-            config = config.with_plain_workspace();
-        }
+        (FilesystemArgument::Plain, None) => None,
         (FilesystemArgument::Plain, Some(_)) => {
             anyhow::bail!("--filesystem-key cannot be used with plain filesystem mode");
         }
+    };
+    let workdir = arguments
+        .workdir
+        .unwrap_or_else(SandboxConfig::default_workdir);
+    let hook = hook_library::materialize(&workdir)?;
+    let mut config = SandboxConfig::new(hook).with_workdir(&workdir);
+    if let Some(key) = filesystem_key {
+        config = config.with_encrypted_workspace(key);
+    } else {
+        config = config.with_plain_workspace();
     }
     config.network.tls = arguments.tls.into();
     if let (Some(certificate), Some(private_key)) = (arguments.tls_ca_cert, arguments.tls_ca_key) {
@@ -358,14 +353,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn default_hook_library() -> Result<PathBuf> {
-    let executable = std::env::current_exe().context("failed to resolve sandbox executable")?;
-    let directory = executable
-        .parent()
-        .context("sandbox executable has no parent directory")?;
-    Ok(directory.join("libagora_sandbox.dylib"))
 }
 
 fn exit_status_code(status: ExitStatus) -> u8 {

@@ -5,55 +5,7 @@ use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
-
-fn hook_library() -> PathBuf {
-    static HOOK: OnceLock<PathBuf> = OnceLock::new();
-    HOOK.get_or_init(|| {
-        if std::env::var_os("CARGO_LLVM_COV").is_some() {
-            let library = std::env::current_exe()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("libagora_sandbox.dylib");
-            assert!(library.is_file(), "missing {}", library.display());
-            return library;
-        }
-        let workspace = workspace_root();
-        let target = std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .map(|path| {
-                if path.is_absolute() {
-                    path
-                } else {
-                    workspace.join(path)
-                }
-            })
-            .unwrap_or_else(|| workspace.join("target"))
-            .join("hook");
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "agora-sandbox", "--lib", "--target-dir"])
-            .arg(&target)
-            .current_dir(&workspace)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let library = target.join("debug/libagora_sandbox.dylib");
-        assert!(library.is_file(), "missing {}", library.display());
-        library
-    })
-    .clone()
-}
 
 fn cli_workdir() -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -72,7 +24,7 @@ fn sandbox_cli_documents_only_available_options() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("-c, --command <COMMAND>"));
-    assert!(stdout.contains("--hook-library <HOOK_LIBRARY>"));
+    assert!(!stdout.contains("--hook-library"));
     assert!(stdout.contains("--audit-file <AUDIT_FILE>"));
     assert!(stdout.contains("--workdir <WORKDIR>"));
     assert!(stdout.contains("--filesystem <FILESYSTEM>"));
@@ -96,6 +48,21 @@ fn sandbox_cli_documents_only_available_options() {
         .output()
         .unwrap();
     assert!(!removed.status.success());
+}
+
+#[test]
+fn sandbox_cli_rejects_the_removed_hook_library_option() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .args(["--hook-library", "/tmp/hook.dylib", "-c", "/usr/bin/true"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--hook-library'"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -135,8 +102,6 @@ fn sandbox_cli_documents_interactive_key_migration() {
 fn sandbox_cli_runs_with_the_default_plain_filesystem_and_no_key() {
     let workdir = cli_workdir();
     let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
-        .arg("--hook-library")
-        .arg(hook_library())
         .arg("--workdir")
         .arg(&workdir)
         .args(["-c", "/usr/bin/true"])
@@ -151,6 +116,47 @@ fn sandbox_cli_runs_with_the_default_plain_filesystem_and_no_key() {
     );
     assert!(workdir.join("fs").is_dir());
     std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn copied_cli_materializes_its_hook_without_a_sidecar() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    let workdir = root.path().join("workdir");
+    std::fs::create_dir(&bin).unwrap();
+    let executable = bin.join("agora-sandbox");
+    std::fs::copy(env!("CARGO_BIN_EXE_agora-sandbox"), &executable).unwrap();
+    assert!(!bin.join("libagora_sandbox.dylib").exists());
+
+    let output = Command::new(&executable)
+        .arg("--workdir")
+        .arg(&workdir)
+        .args(["-c", "/usr/bin/true"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let versions = std::fs::read_dir(workdir.join("runtime/hook"))
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.path().is_dir())
+        .collect::<Vec<_>>();
+    assert_eq!(versions.len(), 1);
+    let checksum = versions[0].file_name();
+    let checksum = checksum.to_str().unwrap();
+    assert_eq!(checksum.len(), 32);
+    assert!(
+        checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    assert!(versions[0].path().join("libagora_sandbox.dylib").is_file());
 }
 
 #[test]
@@ -175,8 +181,6 @@ fn sandbox_cli_migrates_the_encrypted_filesystem_key_in_place() {
     let workdir = cli_workdir();
     let run = |key: &str| {
         Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
-            .arg("--hook-library")
-            .arg(hook_library())
             .arg("--workdir")
             .arg(&workdir)
             .args(["--filesystem", "encrypted"])
@@ -292,8 +296,6 @@ fn sandbox_cli_auto_generates_reuses_and_replaces_a_configured_tls_ca() {
 
     let run = || {
         Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
-            .arg("--hook-library")
-            .arg(hook_library())
             .arg("--workdir")
             .arg(&workdir)
             .args(["--tls", "auto", "--tls-ca-cert"])
@@ -369,8 +371,6 @@ fn sandbox_cli_runs_an_interactive_bash_in_a_terminal() {
         .arg("-q")
         .arg("/dev/null")
         .arg(env!("CARGO_BIN_EXE_agora-sandbox"))
-        .arg("--hook-library")
-        .arg(hook_library())
         .arg("--workdir")
         .arg(&workdir)
         .arg("-c")
@@ -529,8 +529,6 @@ fn run_audited_cli(audit_file: Option<&Path>) -> (Output, SocketAddr) {
     let workdir = cli_workdir();
     let mut process = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"));
     process
-        .arg("--hook-library")
-        .arg(hook_library())
         .arg("--workdir")
         .arg(&workdir)
         .arg("-c")
