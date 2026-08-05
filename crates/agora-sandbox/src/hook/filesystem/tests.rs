@@ -36,7 +36,8 @@ use super::{
     agora_sandbox_unlink as sandbox_unlink, agora_sandbox_unlinkat as sandbox_unlinkat,
     agora_sandbox_utimensat as sandbox_utimensat, agora_sandbox_utimes as sandbox_utimes,
     catch_filesystem_panic, configure_descriptor, error_errno, flush_at_exit, flush_before_exec,
-    sandbox_descriptor_mutation, sandbox_unsupported_path_mutation, with_test_runtime,
+    intent_from_fopen_mode, sandbox_descriptor_mutation, sandbox_unsupported_path_mutation,
+    with_test_runtime,
 };
 use crate::audit::AuditClient;
 use crate::filesystem::{EntryState, FileAttributes, FileLayer};
@@ -726,8 +727,11 @@ fn open_flags_select_read_create_and_write_intents() {
     assert_eq!(read.file.path, lower.to_string_lossy());
     assert_eq!(read.file.mode.access, crate::callback::FileAccessMode::Read);
     assert!(!read.file.mode.create);
-    assert!(read.native_passthrough);
-    let _read = fixture.runtime.map_open(read).unwrap();
+    assert!(matches!(
+        read.prepared.target(),
+        crate::filesystem::OpenTarget::Path(mapped) if mapped == &lower
+    ));
+    let _read = read.into_prepared();
     assert_eq!(
         fixture.runtime.filesystem.state_for_test(&lower).unwrap(),
         None
@@ -741,8 +745,11 @@ fn open_flags_select_read_create_and_write_intents() {
         write.file.mode.access,
         crate::callback::FileAccessMode::Write
     );
-    assert!(!write.native_passthrough);
-    let mut write = fixture.runtime.map_open(write).unwrap();
+    assert!(matches!(
+        write.prepared.target(),
+        crate::filesystem::OpenTarget::Path(mapped) if mapped != &lower
+    ));
+    let mut write = write.into_prepared();
     assert!(matches!(
         fixture.runtime.filesystem.state_for_test(&lower).unwrap(),
         Some(EntryState::Cached { .. })
@@ -771,8 +778,7 @@ fn open_flags_select_read_create_and_write_intents() {
     assert!(prepared.file.mode.truncate);
     assert!(prepared.file.mode.append);
     assert!(prepared.file.mode.exclusive);
-    assert!(!prepared.native_passthrough);
-    let mut prepared = fixture.runtime.map_open(prepared).unwrap();
+    let mut prepared = prepared.into_prepared();
     assert_eq!(
         fixture.runtime.filesystem.state_for_test(&created).unwrap(),
         None
@@ -782,6 +788,31 @@ fn open_flags_select_read_create_and_write_intents() {
         fixture.runtime.filesystem.state_for_test(&created).unwrap(),
         Some(EntryState::Cow)
     );
+}
+
+#[test]
+fn open_intent_is_shared_by_open_and_fopen_modes() {
+    for (mode, flags) in [
+        (b"r".as_slice(), libc::O_RDONLY),
+        (b"r+".as_slice(), libc::O_RDWR),
+        (
+            b"w".as_slice(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+        ),
+        (
+            b"a+".as_slice(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_APPEND,
+        ),
+        (
+            b"wx".as_slice(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_EXCL,
+        ),
+    ] {
+        assert_eq!(
+            intent_from_fopen_mode(mode).unwrap(),
+            crate::filesystem::OpenIntent::new(flags, 0o666).unwrap(),
+        );
+    }
 }
 
 #[test]

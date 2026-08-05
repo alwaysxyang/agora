@@ -51,6 +51,12 @@ unsafe extern "C" {
         service_port: *mut libc::mach_port_t,
     ) -> libc::kern_return_t;
 
+    fn mach_task_self() -> libc::mach_port_t;
+    fn mach_port_deallocate(
+        task: libc::mach_port_t,
+        name: libc::mach_port_t,
+    ) -> libc::kern_return_t;
+
     fn connectx(
         socket: libc::c_int,
         endpoints: *const TestSocketEndpoints,
@@ -83,7 +89,12 @@ fn keychain_lookup_probe_child_process() {
             &mut port,
         )
     };
-    assert_ne!(result, libc::KERN_SUCCESS);
+    assert_eq!(result, libc::KERN_SUCCESS);
+    assert_ne!(port, libc::MACH_PORT_NULL as libc::mach_port_t);
+    assert_eq!(
+        unsafe { mach_port_deallocate(mach_task_self(), port) },
+        libc::KERN_SUCCESS
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -261,7 +272,7 @@ async fn runner_generates_default_tls_ca_in_the_configured_workdir() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn sandbox_denies_host_keychain_mach_lookup() {
+async fn sandbox_allows_host_keychain_mach_lookup() {
     let directory = std::env::temp_dir().join(format!(
         "agora-sandbox-keychain-boundary-test-{}",
         uuid::Uuid::new_v4()
@@ -802,6 +813,152 @@ async fn system_ls_hides_encrypted_whiteouts() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn external_upper_removal_reveals_lower_in_a_running_child() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-external-upper-file-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    let logical = source.join("value.txt");
+    let release = source.join("release");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(&logical, b"lower").unwrap();
+
+    let created = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(
+            SandboxCommand::new("/bin/sh")
+                .args(["-c", "printf upper > value.txt"])
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+    assert!(created.status().success());
+
+    let backing_directory = workdir
+        .join("fs")
+        .join(source.canonicalize().unwrap().strip_prefix("/").unwrap());
+    let upper = std::fs::read_dir(&backing_directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.as_encoded_bytes().starts_with(b"enc_"))
+        })
+        .unwrap();
+    let first_read = Arc::new(tokio::sync::Notify::new());
+    let callback = {
+        let first_read = Arc::clone(&first_read);
+        move |event| {
+            if matches!(
+                event,
+                Event::File(ref event)
+                    if event.event_type == EventType::FilesystemClose
+                        && Path::new(&event.file.path).ends_with("value.txt")
+                        && event.file.mode.access == FileAccessMode::Read
+            ) {
+                first_read.notify_one();
+            }
+            std::future::ready(Decision::Allow)
+        }
+    };
+    let child = tokio::spawn(
+        Sandbox::new(sandbox_config_in(&workdir), callback).run(
+            SandboxCommand::new("/bin/sh")
+                .args([
+                    "-c",
+                    "test \"$(cat value.txt)\" = upper && until test -e release; do /bin/sleep 0.01; done && test \"$(cat value.txt)\" = lower",
+                ])
+                .current_dir(&source),
+        ),
+    );
+
+    tokio::time::timeout(Duration::from_secs(30), first_read.notified())
+        .await
+        .expect("sandbox child did not finish its first upper read");
+    std::fs::remove_file(&upper).unwrap();
+    std::fs::write(&release, b"continue").unwrap();
+
+    let outcome = child.await.unwrap().unwrap();
+    assert!(outcome.status().success());
+    assert_eq!(std::fs::read(&logical).unwrap(), b"lower");
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn system_ls_observes_external_upper_directory_removal() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-external-upper-directory-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    let logical_directory = source.join("view");
+    let release = source.join("release");
+    std::fs::create_dir_all(&logical_directory).unwrap();
+    std::fs::write(logical_directory.join("lower.txt"), b"lower").unwrap();
+
+    let created = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(
+            SandboxCommand::new("/bin/sh")
+                .args([
+                    "-c",
+                    "/bin/rm -rf view && /bin/mkdir view && printf upper > view/upper.txt",
+                ])
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+    assert!(created.status().success());
+
+    let upper_directory = workdir.join("fs").join(
+        logical_directory
+            .canonicalize()
+            .unwrap()
+            .strip_prefix("/")
+            .unwrap(),
+    );
+    let first_read = Arc::new(tokio::sync::Notify::new());
+    let callback = {
+        let first_read = Arc::clone(&first_read);
+        move |event| {
+            if matches!(
+                event,
+                Event::File(ref event)
+                    if event.event_type == EventType::FilesystemClose
+                        && Path::new(&event.file.path).ends_with("upper.txt")
+                        && event.file.mode.access == FileAccessMode::Read
+            ) {
+                first_read.notify_one();
+            }
+            std::future::ready(Decision::Allow)
+        }
+    };
+    let child = tokio::spawn(
+        Sandbox::new(sandbox_config_in(&workdir), callback).run(
+            SandboxCommand::new("/bin/sh")
+                .args([
+                    "-c",
+                    "test \"$(cat view/upper.txt)\" = upper && until test -e release; do /bin/sleep 0.01; done && /bin/ls -1 view | /usr/bin/grep -qx lower.txt && test -z \"$(/bin/ls -1 view | /usr/bin/grep '^upper\\.txt$')\"",
+                ])
+                .current_dir(&source),
+        ),
+    );
+
+    tokio::time::timeout(Duration::from_secs(30), first_read.notified())
+        .await
+        .expect("sandbox child did not finish its first upper directory read");
+    std::fs::remove_dir_all(&upper_directory).unwrap();
+    std::fs::write(&release, b"continue").unwrap();
+
+    let outcome = child.await.unwrap().unwrap();
+    assert!(outcome.status().success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn symlinks_created_in_an_encrypted_workspace_are_visible() {
     let directory = std::env::temp_dir().join(format!(
         "agora-sandbox-symlink-test-{}",
@@ -1059,6 +1216,104 @@ async fn runner_persists_a_plain_workspace_without_modifying_the_source() {
     assert!(verified.status().success());
     assert!(!source.join("output.txt").exists());
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn logical_permissions_match_in_plain_and_encrypted_workspaces() {
+    for encrypted in [false, true] {
+        let mode = if encrypted { "encrypted" } else { "plain" };
+        let directory = std::env::temp_dir().join(format!(
+            "agora-sandbox-{mode}-permission-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = directory.join("source");
+        let workdir = directory.join("sandbox");
+        std::fs::create_dir_all(&source).unwrap();
+        for name in ["denied.txt", "writable.txt", "removable.txt"] {
+            let path = source.join(name);
+            std::fs::write(&path, format!("host-{name}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let config = SandboxConfig::new(hook_library()).with_workdir(&workdir);
+        let config = if encrypted {
+            config.with_encrypted_workspace(FILESYSTEM_KEY)
+        } else {
+            config.with_plain_workspace()
+        };
+        let exercise = SandboxCommand::new("/bin/sh")
+            .args([
+                "-c",
+                "set -e
+                 if (printf bad > denied.txt) 2>/dev/null; then exit 10; fi
+                 test \"$(cat denied.txt)\" = host-denied.txt
+                 chmod 644 writable.txt
+                 printf sandbox-upper > writable.txt
+                 rm removable.txt
+                 mkdir locked
+                 printf child > locked/child
+                 chmod 000 locked
+                 if cat locked/child >/dev/null 2>&1; then exit 11; fi
+                 if /usr/bin/stat -f %z locked/child >/dev/null 2>&1; then exit 12; fi
+                 if (printf new > locked/new) 2>/dev/null; then exit 13; fi
+                 chmod 700 locked
+                 printf agora-dev-passthrough-7f1a9c2e >/dev/null",
+            ])
+            .current_dir(&source);
+
+        let exercised = Sandbox::new(config.clone(), NoopCallback)
+            .run(exercise)
+            .await
+            .unwrap();
+        assert!(
+            exercised.status().success(),
+            "{mode} permission exercise failed: {}",
+            exercised.status()
+        );
+        assert_eq!(
+            std::fs::read(source.join("denied.txt")).unwrap(),
+            b"host-denied.txt\n"
+        );
+        assert_eq!(
+            std::fs::read(source.join("writable.txt")).unwrap(),
+            b"host-writable.txt\n"
+        );
+        assert_eq!(
+            std::fs::metadata(source.join("writable.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
+        assert!(source.join("removable.txt").is_file());
+        assert!(!workdir.join("fs/dev").exists());
+        assert!(!directory_contains(
+            &workdir,
+            b"agora-dev-passthrough-7f1a9c2e"
+        ));
+
+        let verify = SandboxCommand::new("/bin/sh")
+            .args([
+                "-c",
+                "set -e
+                 test \"$(cat denied.txt)\" = host-denied.txt
+                 test \"$(cat writable.txt)\" = sandbox-upper
+                 test ! -e removable.txt
+                 test \"$(cat locked/child)\" = child",
+            ])
+            .current_dir(&source);
+        let verified = Sandbox::new(config, NoopCallback)
+            .run(verify)
+            .await
+            .unwrap();
+        assert!(
+            verified.status().success(),
+            "{mode} permission verification failed: {}",
+            verified.status()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 #[cfg(target_os = "macos")]

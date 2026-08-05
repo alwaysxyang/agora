@@ -4,7 +4,6 @@ use super::{
 };
 use crate::execution::resolve_executable;
 use crate::filesystem::{EntryState, Materializer};
-use base64::Engine;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -33,27 +32,6 @@ impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
-}
-
-fn convert_metadata_to_version_one(value: &mut serde_json::Value) {
-    let records = std::mem::take(value["entries"].as_object_mut().unwrap());
-    let mut entries = serde_json::Map::new();
-    let mut attributes = serde_json::Map::new();
-    for (name, mut record) in records {
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(name.as_bytes());
-        if let Some(entry) = record.as_object_mut().unwrap().remove("entry") {
-            entries.insert(encoded.clone(), entry);
-        }
-        if let Some(value) = record.as_object_mut().unwrap().remove("attributes") {
-            attributes.insert(encoded, value);
-        }
-    }
-    *value = serde_json::json!({
-        "version": 1,
-        "entries": entries,
-        "attributes": attributes,
-        "backing_names": {}
-    });
 }
 
 #[test]
@@ -127,24 +105,16 @@ fn executable_store_prepares_and_caches_a_native_copy() {
 
     let inode = first.metadata().unwrap().ino();
     let metadata_path = directory.join("bin/.metadata");
-    let mut metadata: serde_json::Value =
-        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
-    convert_metadata_to_version_one(&mut metadata);
-    fs::write(
-        &metadata_path,
-        serde_json::to_vec_pretty(&metadata).unwrap(),
-    )
-    .unwrap();
     drop(store);
 
     let reused_store = ExecutableStore::new(directory).unwrap();
     let reused = reused_store.prepare(Path::new("/bin/sh")).unwrap();
     assert_eq!(reused, first);
     assert_eq!(reused.metadata().unwrap().ino(), inode);
-    let migrated: serde_json::Value =
+    let metadata: serde_json::Value =
         serde_json::from_slice(&fs::read(metadata_path).unwrap()).unwrap();
-    assert_eq!(migrated["version"], 3);
-    assert!(migrated["entries"].get("sh").is_some());
+    assert_eq!(metadata["version"], 3);
+    assert!(metadata["entries"].get("sh").is_some());
 }
 
 #[test]
@@ -185,7 +155,7 @@ fn executable_store_keeps_unrestricted_binaries_and_scripts_at_their_original_pa
     assert_eq!(shebang.argument.as_deref(), Some(OsStr::new("node")));
     assert_eq!(store.prepare(&script).unwrap(), script);
     assert!(!store.destination(&script).unwrap().exists());
-    assert_eq!(fs::read_dir(directory).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(directory).unwrap().count(), 2);
 }
 
 #[test]
@@ -515,7 +485,7 @@ fn executable_store_reports_temporary_directory_creation_failure_without_artifac
             .and_then(std::io::Error::raw_os_error),
         Some(libc::EACCES)
     );
-    assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
 }
 

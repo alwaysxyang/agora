@@ -7,7 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 #[cfg(test)]
@@ -40,6 +40,19 @@ pub(crate) enum EntryState {
     Whiteout,
 }
 
+impl EntryState {
+    pub(crate) fn stored_attributes_are_authoritative(&self, attributes: &FileAttributes) -> bool {
+        match self {
+            Self::Cow => true,
+            Self::Cached {
+                source: Some(source),
+                ..
+            } => !source.matches_materialized_attributes(attributes),
+            Self::Cached { source: None, .. } | Self::Whiteout => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct SourceIdentity {
     device: u64,
@@ -64,6 +77,12 @@ impl SourceIdentity {
             changed_nanoseconds: metadata.ctime_nsec(),
             mode: metadata.mode(),
         }
+    }
+
+    fn matches_materialized_attributes(&self, attributes: &FileAttributes) -> bool {
+        self.mode == attributes.mode
+            && self.modified_seconds == attributes.mtime
+            && self.modified_nanoseconds == attributes.mtime_nsec
     }
 }
 
@@ -203,7 +222,13 @@ pub(super) struct FilenameMigrationPlan {
 
 struct MetadataCache {
     generation: Option<u64>,
-    directories: HashMap<PathBuf, Option<DirectoryMetadata>>,
+    directories: HashMap<PathBuf, CachedDirectoryMetadata>,
+}
+
+#[derive(Clone)]
+struct CachedDirectoryMetadata {
+    identity: Option<SourceIdentity>,
+    metadata: Option<DirectoryMetadata>,
 }
 
 impl MetadataStore {
@@ -245,7 +270,7 @@ impl MetadataStore {
             )
         })?;
         Self::initialize_generation(&generation)?;
-        Ok(Self {
+        let store = Self {
             root: root.to_path_buf(),
             generation,
             cipher,
@@ -257,39 +282,9 @@ impl MetadataStore {
             parse_count: AtomicUsize::new(0),
             #[cfg(test)]
             probe_count: AtomicUsize::new(0),
-        })
-    }
-
-    pub(super) fn migrate_all(&self) -> Result<()> {
-        let mut pending = vec![self.root.clone()];
-        while let Some(backing_directory) = pending.pop() {
-            let entries = fs::read_dir(&backing_directory).with_context(|| {
-                format!(
-                    "failed to inspect filesystem metadata directory {}",
-                    backing_directory.display()
-                )
-            })?;
-            for entry in entries {
-                let entry = entry.with_context(|| {
-                    format!(
-                        "failed to inspect filesystem metadata directory {}",
-                        backing_directory.display()
-                    )
-                })?;
-                if entry.file_type()?.is_dir() {
-                    pending.push(entry.path());
-                }
-            }
-            if !backing_directory.join(METADATA_FILE).try_exists()? {
-                continue;
-            }
-            let logical = namespace::logical_path(&self.root, &backing_directory)?;
-            let metadata = self.load(&logical)?;
-            if metadata.version != METADATA_VERSION {
-                self.migrate_legacy_directory(&logical, &backing_directory, metadata)?;
-            }
-        }
-        Ok(())
+        };
+        store.ensure_marker(Path::new("/"))?;
+        Ok(store)
     }
 
     pub(super) fn prepare_filename_migration(
@@ -355,127 +350,6 @@ impl MetadataStore {
         Ok(plan)
     }
 
-    fn migrate_legacy_directory(
-        &self,
-        logical_directory: &Path,
-        backing_directory: &Path,
-        mut metadata: DirectoryMetadata,
-    ) -> Result<()> {
-        if metadata.encrypted_names.is_empty() {
-            return self.write(logical_directory, &metadata);
-        }
-        let cipher = self.cipher.as_ref().with_context(|| {
-            format!(
-                "legacy encrypted filesystem metadata requires a cipher in {}",
-                backing_directory.display()
-            )
-        })?;
-        let previous = metadata.encrypted_names.clone();
-        let mut created = Vec::new();
-        let migration = (|| {
-            let mut assigned = HashSet::new();
-            for (logical_name, old_name) in &previous {
-                let logical = Self::decode(logical_name)?;
-                let new_name = loop {
-                    let candidate = cipher.encrypt_name(logical.as_bytes())?;
-                    if assigned.insert(candidate.clone())
-                        && !backing_directory.join(&candidate).try_exists()?
-                    {
-                        break candidate;
-                    }
-                };
-                let old_path = backing_directory.join(old_name);
-                let new_path = backing_directory.join(&new_name);
-                let copied_file = Self::duplicate_legacy_entry(&old_path, &new_path)?;
-                let old_lease = Self::lease_path(&old_path)?;
-                let new_lease = Self::lease_path(&new_path)?;
-                let copied_lease =
-                    match Self::duplicate_legacy_lease(&old_lease, &new_lease, &new_path) {
-                        Ok(copied) => copied,
-                        Err(error) => {
-                            if copied_file {
-                                let _ = fs::remove_file(&new_path);
-                            }
-                            return Err(error);
-                        }
-                    };
-                created.push((
-                    old_path,
-                    new_path,
-                    copied_file,
-                    old_lease,
-                    new_lease,
-                    copied_lease,
-                ));
-                metadata
-                    .encrypted_names
-                    .insert(logical_name.clone(), new_name);
-            }
-            File::open(backing_directory)?.sync_all()?;
-            self.write(logical_directory, &metadata)
-        })();
-        if let Err(error) = migration {
-            for (_, new_path, copied_file, _, new_lease, copied_lease) in created.iter().rev() {
-                if *copied_lease {
-                    let _ = fs::remove_file(new_lease);
-                }
-                if *copied_file {
-                    let _ = fs::remove_file(new_path);
-                }
-            }
-            return Err(error);
-        }
-        for (old_path, _, copied_file, old_lease, _, copied_lease) in created {
-            if copied_lease {
-                let _ = fs::remove_file(old_lease);
-            }
-            if copied_file {
-                let _ = fs::remove_file(old_path);
-            }
-        }
-        File::open(backing_directory)?.sync_all()?;
-        Ok(())
-    }
-
-    fn duplicate_legacy_entry(old: &Path, new: &Path) -> Result<bool> {
-        let metadata = match old.symlink_metadata() {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
-        if metadata.is_file() {
-            fs::hard_link(old, new)?;
-        } else if metadata.file_type().is_symlink() {
-            std::os::unix::fs::symlink(fs::read_link(old)?, new)?;
-        } else {
-            bail!(
-                "legacy encrypted filesystem alias is not a file: {}",
-                old.display()
-            );
-        }
-        Ok(true)
-    }
-
-    fn duplicate_legacy_lease(old: &Path, new: &Path, destination: &Path) -> Result<bool> {
-        match old.symlink_metadata() {
-            Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => bail!(
-                "legacy encrypted filesystem write lease is not a file: {}",
-                old.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
-        }
-        let mut lease = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(new)?;
-        lease.write_all(destination.as_os_str().as_bytes())?;
-        lease.sync_all()?;
-        Ok(true)
-    }
-
     fn lease_path(destination: &Path) -> Result<PathBuf> {
         let name = destination
             .file_name()
@@ -491,6 +365,67 @@ impl MetadataStore {
         }
         let (parent, name) = Self::split(path)?;
         Ok(self.load(parent)?.entries.get(&Self::encode(name)).cloned())
+    }
+
+    pub(super) fn records(
+        &self,
+        paths: &[&Path],
+    ) -> Result<Vec<(Option<EntryState>, Option<FileAttributes>)>> {
+        let generation = self.current_generation()?;
+        paths
+            .iter()
+            .map(|path| {
+                let (parent, name) = Self::split(path)?;
+                let metadata = self.load_at_generation(parent, generation)?;
+                let name = Self::encode(name);
+                Ok((
+                    metadata.entries.get(&name).cloned(),
+                    metadata.attributes.get(&name).cloned(),
+                ))
+            })
+            .collect()
+    }
+
+    pub(super) fn ensure_marker(&self, directory: &Path) -> Result<()> {
+        let path = self.path(directory)?;
+        match path.symlink_metadata() {
+            Ok(metadata) if metadata.is_file() => self.load(directory).map(|_| ()),
+            Ok(_) => bail!(
+                "failed to read filesystem metadata {}: marker is not a file",
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.write(directory, &DirectoryMetadata::default())
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!("failed to inspect filesystem metadata {}", path.display())
+            }),
+        }
+    }
+
+    pub(super) fn has_marker(&self, directory: &Path) -> Result<bool> {
+        let path = self.path(directory)?;
+        let identity = Self::marker_identity(&path)?;
+        let generation = self.current_generation()?;
+        let cached_identity = {
+            let mut cache = self.cache();
+            if cache.generation != Some(generation) {
+                cache.generation = Some(generation);
+                cache.directories.clear();
+            }
+            cache.directories.get(&path).map(|cached| cached.identity)
+        };
+        if cached_identity.is_some_and(|cached| cached != identity) {
+            self.advance_generation()?;
+        }
+        if identity.is_some() {
+            self.load(directory)?;
+        }
+        Ok(identity.is_some())
+    }
+
+    pub(super) fn invalidate(&self) -> Result<()> {
+        self.advance_generation()
     }
 
     pub(super) fn set(&self, path: &Path, state: EntryState) -> Result<()> {
@@ -622,8 +557,12 @@ impl MetadataStore {
     }
 
     fn load(&self, directory: &Path) -> Result<DirectoryMetadata> {
-        let path = self.path(directory)?;
         let generation = self.current_generation()?;
+        self.load_at_generation(directory, generation)
+    }
+
+    fn load_at_generation(&self, directory: &Path, generation: u64) -> Result<DirectoryMetadata> {
+        let path = self.path(directory)?;
         {
             let mut cache = self.cache();
             if cache.generation != Some(generation) {
@@ -631,7 +570,7 @@ impl MetadataStore {
                 cache.directories.clear();
             }
             if let Some(cached) = cache.directories.get(&path) {
-                return Ok(cached.clone().unwrap_or_default());
+                return Ok(cached.metadata.clone().unwrap_or_default());
             }
         }
         #[cfg(test)]
@@ -641,7 +580,13 @@ impl MetadataStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mut cache = self.cache();
                 if cache.generation == Some(generation) {
-                    cache.directories.insert(path, None);
+                    cache.directories.insert(
+                        path,
+                        CachedDirectoryMetadata {
+                            identity: None,
+                            metadata: None,
+                        },
+                    );
                 }
                 return Ok(DirectoryMetadata::default());
             }
@@ -651,7 +596,9 @@ impl MetadataStore {
                 });
             }
         };
-        let mut contents = Vec::with_capacity(usize::try_from(file.metadata()?.len()).unwrap_or(0));
+        let file_metadata = file.metadata()?;
+        let identity = Some(SourceIdentity::from_metadata(&file_metadata));
+        let mut contents = Vec::with_capacity(usize::try_from(file_metadata.len()).unwrap_or(0));
         file.read_to_end(&mut contents)
             .with_context(|| format!("failed to read filesystem metadata {}", path.display()))?;
         let metadata = self.decode_metadata(&contents, &path)?;
@@ -666,14 +613,59 @@ impl MetadataStore {
         {
             cache.directories.clear();
         }
-        cache.directories.insert(path, Some(metadata.clone()));
+        cache.directories.insert(
+            path,
+            CachedDirectoryMetadata {
+                identity,
+                metadata: Some(metadata.clone()),
+            },
+        );
         Ok(metadata)
     }
 
+    fn marker_identity(path: &Path) -> Result<Option<SourceIdentity>> {
+        match path.symlink_metadata() {
+            Ok(metadata) if metadata.is_file() => {
+                Ok(Some(SourceIdentity::from_metadata(&metadata)))
+            }
+            Ok(_) => bail!(
+                "failed to read filesystem metadata {}: marker is not a file",
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| {
+                format!("failed to inspect filesystem metadata {}", path.display())
+            }),
+        }
+    }
+
     fn write(&self, directory: &Path, metadata: &DirectoryMetadata) -> Result<()> {
+        let mut ancestors = directory.ancestors().skip(1).collect::<Vec<_>>();
+        ancestors.reverse();
+        for ancestor in ancestors {
+            let marker = self.path(ancestor)?;
+            match Self::marker_identity(&marker)? {
+                Some(_) => {
+                    self.load(ancestor)?;
+                }
+                None => self.write_one(ancestor, &DirectoryMetadata::default())?,
+            }
+        }
+        self.write_one(directory, metadata)
+    }
+
+    fn write_one(&self, directory: &Path, metadata: &DirectoryMetadata) -> Result<()> {
         let path = self.path(directory)?;
         let parent = path.parent().context("metadata path has no parent")?;
+        let parent_exists = match parent.metadata() {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
         fs::create_dir_all(parent)?;
+        if !parent_exists {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
         let temporary = parent.join(format!("{METADATA_FILE}.{}.tmp", Uuid::new_v4().simple()));
         let contents = self.serialize_metadata(metadata)?;
         let result = (|| {

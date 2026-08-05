@@ -1,5 +1,10 @@
 # Overlay Realpath And Export Visibility Design
 
+> **Compatibility update:** Automatic version-1/version-2 startup migration was superseded by
+> [Overlay Reconciliation And Keychain Passthrough Design](2026-08-04-overlay-reconciliation-keychain-passthrough-design.md).
+> The decoder remains available for direct legacy reads, but normal startup does not scan or
+> rewrite legacy trees; deployments use a fresh `<workdir>/fs`.
+
 ## Problem
 
 An encrypted upper-only path is visible through hooked `stat`, directory enumeration, and access checks, but macOS `realpath` still resolves only the host lower filesystem. A caller such as Codex can therefore create or observe a path in the sandbox and immediately receive `ENOENT` from `std::fs::canonicalize`. A persistent Codex workdir contains enough upper-only state to trigger this during TUI startup, while a fresh workdir may not.
@@ -17,7 +22,7 @@ The Lark export reported alongside this bug is stored correctly but was requeste
 - A reserved encrypted filename ciphertext is represented by a record even before COW state commits, so `O_CREAT|O_EXCL` remains atomic across VFS instances.
 - Encrypted file whiteouts retain their ciphertext record key after physical ciphertext removal, so deletion does not re-expose the business filename. Directory entries and controller-managed plaintext executable caches retain mirrored physical names.
 - Plain COW files keep their logical leaf names as both record keys and physical names. Names beginning with reserved metadata prefixes are losslessly escaped rather than encrypted.
-- Metadata versions 1 and 2 remain readable and migrate atomically to version 3 at Overlay startup. Existing version-2 `backing_names` files are renamed to newly encrypted logical-filename ciphertexts, which become both their version-3 record keys and physical leaf names.
+- Metadata versions 1 and 2 remain directly readable, but Overlay startup does not recursively scan or migrate them. Existing deployments start version 3 with a fresh `<workdir>/fs`.
 - A sandbox-visible export never creates the logical plaintext path on the host lower filesystem.
 
 These rules make the metadata record key agree with the physical filename while keeping encrypted business names out of both places.
@@ -67,7 +72,7 @@ Without `cd ~`, `--output-dir .` intentionally writes to the current directory. 
 
 - Hook tests cover `realpath` for lower paths, upper-only directories, caller-owned buffers, allocated buffers, Overlay symlinks, whiteouts, missing paths, and private backing-path non-disclosure.
 - Crypto tests cover authenticated filename encryption, random ciphertext for repeated names, non-UTF-8 byte round trips, wrong-key rejection, and malformed payload rejection.
-- Metadata tests cover version-3 encrypted records, absence of plaintext logical names, `backing_names`, and separate `name` fields, record-key/physical-name equality, plain-mode readable records, pre-commit ciphertext-name reservation, encrypted whiteouts, malformed/duplicate record rejection, and atomic version-1/version-2 migration.
+- Metadata tests cover version-3 encrypted records, absence of plaintext logical names, `backing_names`, and separate `name` fields, record-key/physical-name equality, plain-mode readable records, pre-commit ciphertext-name reservation, encrypted whiteouts, malformed/duplicate record rejection, and direct legacy decoding without startup migration.
 - A runner test creates an upper-only directory, calls `std::fs::canonicalize`, and asserts that the returned path is logical and usable.
 - A runner test verifies `mkdir -p` through existing root-owned prefixes and confirms that the host lower path remains absent.
 - A runner test writes an upper-only file and directory, then verifies `/bin/ls` lists their logical names while lower entries remain present and whiteouts remain hidden.
@@ -77,4 +82,4 @@ Without `cd ~`, `--output-dir .` intentionally writes to the current directory. 
 
 ## Specification Impact
 
-`spec/architecture/sandbox.md` must list `realpath` and scoped synthetic FTS bulk enumeration among supported hooks, document logical canonicalization and allocation semantics, define metadata version 3 and migration from versions 1 and 2, state that existing-directory creation returns `EEXIST` before parent mutation is required, and require FTS enumeration to merge upper-only entries rather than only filtering lower entries.
+`spec/architecture/sandbox.md` must list `realpath` and scoped synthetic FTS bulk enumeration among supported hooks, document logical canonicalization and allocation semantics, define metadata version 3 and the fresh-workspace requirement, state that existing-directory creation returns `EEXIST` before parent mutation is required, and require FTS enumeration to merge upper-only entries rather than only filtering lower entries.

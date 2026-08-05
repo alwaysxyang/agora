@@ -7,6 +7,36 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 #[test]
+fn metadata_store_creates_and_validates_directory_markers() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+
+    assert!(root.join(".metadata").is_file());
+    store.ensure_marker(Path::new("/Users/bytedance")).unwrap();
+    assert!(root.join("Users/bytedance/.metadata").is_file());
+    assert!(store.has_marker(Path::new("/Users/bytedance")).unwrap());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cached_marker_removal_is_observed_without_a_sandbox_publication() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let directory = Path::new("/Users/bytedance");
+    let entry = directory.join("entry");
+    store.ensure_marker(directory).unwrap();
+    store.set(&entry, EntryState::Cow).unwrap();
+
+    assert_eq!(store.state(&entry).unwrap(), Some(EntryState::Cow));
+    std::fs::remove_file(root.join("Users/bytedance/.metadata")).unwrap();
+    assert!(!store.has_marker(directory).unwrap());
+    assert_eq!(store.state(&entry).unwrap(), None);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn metadata_round_trips_cached_cow_and_whiteout_states() {
     let root = tempfile();
     let store = MetadataStore::new(&root).unwrap();
@@ -42,6 +72,31 @@ fn metadata_round_trips_cached_cow_and_whiteout_states() {
 
     store.remove(cached).unwrap();
     assert_eq!(store.state(cached).unwrap(), None);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_reads_multiple_records_from_one_generation_snapshot() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let cow = Path::new("/tmp/cow");
+    let whiteout = Path::new("/tmp/whiteout");
+    let missing = Path::new("/tmp/missing");
+    let attributes = FileAttributes::created_file(0o640);
+    store
+        .set_with_attributes(cow, EntryState::Cow, Some(attributes.clone()))
+        .unwrap();
+    store.set(whiteout, EntryState::Whiteout).unwrap();
+
+    assert_eq!(
+        store.records(&[cow, whiteout, missing]).unwrap(),
+        vec![
+            (Some(EntryState::Cow), Some(attributes)),
+            (Some(EntryState::Whiteout), None),
+            (None, None),
+        ]
+    );
+
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -128,8 +183,9 @@ fn unchanged_metadata_is_parsed_once() {
     store.set(path, EntryState::Cow).unwrap();
 
     assert_eq!(store.state(path).unwrap(), Some(EntryState::Cow));
+    let parsed = store.parse_count();
     assert_eq!(store.state(path).unwrap(), Some(EntryState::Cow));
-    assert_eq!(store.parse_count(), 1);
+    assert_eq!(store.parse_count(), parsed);
 
     std::fs::remove_dir_all(root).unwrap();
 }

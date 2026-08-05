@@ -1,6 +1,7 @@
-#[cfg(test)]
-use super::EntryState;
-use super::{DirectoryView, FileCipher, OverlayStore, StagedWrite};
+use super::overlay::OverlayTransaction;
+use super::{
+    AccessRequest, Credentials, DirectoryView, EntryState, FileCipher, OverlayStore, StagedWrite,
+};
 use anyhow::{Context, Result, bail};
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
@@ -12,10 +13,86 @@ pub(crate) struct VirtualFilesystem {
     overlay: OverlayStore,
 }
 
-pub(crate) struct Credentials {
-    uid: libc::uid_t,
-    gid: libc::gid_t,
-    groups: Vec<libc::gid_t>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OpenIntent {
+    flags: libc::c_int,
+    mode: u32,
+}
+
+pub(crate) struct OpenPlan {
+    logical: PathBuf,
+    prepared: PreparedFile,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum AccessPlan {
+    Allowed,
+    Native(PathBuf),
+}
+
+pub(crate) struct MetadataPlan {
+    logical: PathBuf,
+    mapped: PathBuf,
+    plaintext_size: Option<u64>,
+    attributes: Option<super::FileAttributes>,
+}
+
+enum OpenMapping {
+    Directory(PathBuf),
+    File {
+        mapped: PathBuf,
+        staged: Option<StagedWrite>,
+        existed: bool,
+        lease: Option<File>,
+    },
+}
+
+impl OpenIntent {
+    pub(crate) fn new(flags: libc::c_int, mode: u32) -> Result<Self> {
+        VirtualFilesystem::validate_open_flags(flags)?;
+        Ok(Self { flags, mode })
+    }
+
+    pub(crate) fn flags(self) -> libc::c_int {
+        self.flags
+    }
+
+    pub(crate) fn access(self) -> AccessRequest {
+        AccessRequest::from_open_flags(self.flags)
+    }
+}
+
+impl OpenPlan {
+    pub(crate) fn logical(&self) -> &Path {
+        &self.logical
+    }
+
+    pub(crate) fn into_parts(self) -> (PathBuf, PreparedFile) {
+        (self.logical, self.prepared)
+    }
+}
+
+impl MetadataPlan {
+    #[cfg(test)]
+    pub(crate) fn logical(&self) -> &Path {
+        &self.logical
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mapped(&self) -> &Path {
+        &self.mapped
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (PathBuf, PathBuf, Option<u64>, Option<super::FileAttributes>) {
+        (
+            self.logical,
+            self.mapped,
+            self.plaintext_size,
+            self.attributes,
+        )
+    }
 }
 
 pub(crate) enum OpenTarget {
@@ -67,6 +144,17 @@ impl PlaintextIdentity {
 }
 
 impl PreparedFile {
+    fn for_path(target: PathBuf, staged: Option<StagedWrite>, layer: FileLayer) -> Self {
+        Self {
+            target: OpenTarget::Path(target),
+            staged,
+            writeback: None,
+            publish_on_open: false,
+            created_mode: None,
+            layer,
+        }
+    }
+
     pub(crate) fn target(&self) -> &OpenTarget {
         &self.target
     }
@@ -77,71 +165,6 @@ impl PreparedFile {
 
     pub(crate) fn into_parts(self) -> (OpenTarget, Option<Writeback>, FileLayer) {
         (self.target, self.writeback, self.layer)
-    }
-}
-
-impl Credentials {
-    pub(crate) fn real() -> Self {
-        Self::current(unsafe { libc::getuid() }, unsafe { libc::getgid() })
-    }
-
-    pub(crate) fn effective() -> Self {
-        Self::current(unsafe { libc::geteuid() }, unsafe { libc::getegid() })
-    }
-
-    fn current(uid: libc::uid_t, gid: libc::gid_t) -> Self {
-        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-        let mut groups = if count > 0 {
-            vec![0; count as usize]
-        } else {
-            Vec::new()
-        };
-        if count > 0 {
-            let actual = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
-            if actual >= 0 {
-                groups.truncate(actual as usize);
-            } else {
-                groups.clear();
-            }
-        }
-        Self { uid, gid, groups }
-    }
-
-    #[cfg(test)]
-    fn for_test(uid: libc::uid_t, gid: libc::gid_t, groups: &[libc::gid_t]) -> Self {
-        Self {
-            uid,
-            gid,
-            groups: groups.to_vec(),
-        }
-    }
-
-    pub(crate) fn allows(
-        &self,
-        attributes: &super::FileAttributes,
-        requested: libc::c_int,
-    ) -> bool {
-        if requested == libc::F_OK {
-            return true;
-        }
-        if self.uid == 0 {
-            return requested & libc::X_OK == 0 || attributes.mode & 0o111 != 0;
-        }
-        let shift = if self.uid == attributes.uid {
-            6
-        } else if self.gid == attributes.gid || self.groups.contains(&attributes.gid) {
-            3
-        } else {
-            0
-        };
-        let allowed = (attributes.mode >> shift) & 0o7;
-        (requested & libc::R_OK == 0 || allowed & 0o4 != 0)
-            && (requested & libc::W_OK == 0 || allowed & 0o2 != 0)
-            && (requested & libc::X_OK == 0 || allowed & 0o1 != 0)
-    }
-
-    fn can_chmod(&self, attributes: &super::FileAttributes) -> bool {
-        self.uid == 0 || self.uid == attributes.uid
     }
 }
 
@@ -158,85 +181,315 @@ impl VirtualFilesystem {
         })
     }
 
+    pub(crate) fn prepare_authorized_open(
+        &self,
+        requested: &Path,
+        intent: OpenIntent,
+        credentials: &Credentials,
+    ) -> Result<OpenPlan> {
+        let (logical, mapping) = self.overlay.transaction(|transaction| {
+            if Self::native_read_eligible(intent.flags)
+                && transaction.native_metadata_passthrough(requested, true, |attributes| {
+                    credentials.allows(attributes, AccessRequest::EXECUTE)
+                })?
+            {
+                return Ok((
+                    requested.to_path_buf(),
+                    OpenMapping::File {
+                        mapped: requested.to_path_buf(),
+                        staged: None,
+                        existed: true,
+                        lease: None,
+                    },
+                ));
+            }
+            let endpoint_is_resolved = intent.flags & libc::O_NOFOLLOW == 0
+                && intent.flags & (libc::O_CREAT | libc::O_EXCL) != (libc::O_CREAT | libc::O_EXCL);
+            let (logical, parent_attributes) = if endpoint_is_resolved {
+                Self::resolve_final_with_search_in(
+                    transaction,
+                    requested,
+                    intent.flags & libc::O_CREAT != 0,
+                    credentials,
+                )?
+            } else {
+                (
+                    requested.to_path_buf(),
+                    Self::require_search_in(transaction, requested, credentials)?,
+                )
+            };
+            if transaction.visible_exists(&logical)? {
+                if intent.flags & (libc::O_CREAT | libc::O_EXCL) == (libc::O_CREAT | libc::O_EXCL) {
+                    return Err(std::io::Error::from_raw_os_error(libc::EEXIST).into());
+                }
+                let final_is_symlink = transaction
+                    .prepare_read(&logical)?
+                    .symlink_metadata()?
+                    .file_type()
+                    .is_symlink();
+                if intent.flags & libc::O_NOFOLLOW == 0 || !final_is_symlink {
+                    if endpoint_is_resolved {
+                        Self::require_resolved_entry_access_in(
+                            transaction,
+                            &logical,
+                            intent.access(),
+                            credentials,
+                        )?;
+                    } else {
+                        Self::require_entry_access_in(
+                            transaction,
+                            &logical,
+                            intent.access(),
+                            credentials,
+                        )?;
+                    }
+                }
+            } else if intent.flags & libc::O_CREAT != 0 {
+                Self::require_parent_access(&logical, parent_attributes.as_ref(), credentials)?;
+            }
+            let mapping = Self::stage_open_in(transaction, &logical, intent)?;
+            Ok((logical, mapping))
+        })?;
+        let prepared = self.prepare_mapped_open(&logical, intent, mapping)?;
+        Ok(OpenPlan { logical, prepared })
+    }
+
+    fn native_read_eligible(flags: libc::c_int) -> bool {
+        let mutating_or_special = libc::O_CREAT
+            | libc::O_TRUNC
+            | libc::O_EXCL
+            | libc::O_DIRECTORY
+            | libc::O_NOFOLLOW
+            | libc::O_NOFOLLOW_ANY
+            | libc::O_SYMLINK;
+        flags & libc::O_ACCMODE == libc::O_RDONLY && flags & mutating_or_special == 0
+    }
+
+    fn stage_open_in(
+        transaction: &OverlayTransaction<'_>,
+        logical: &Path,
+        intent: OpenIntent,
+    ) -> Result<OpenMapping> {
+        if intent.flags & libc::O_DIRECTORY != 0 {
+            return transaction
+                .prepare_directory(logical)
+                .map(OpenMapping::Directory);
+        }
+        let writes = intent.flags & libc::O_ACCMODE != libc::O_RDONLY
+            || intent.flags & (libc::O_CREAT | libc::O_TRUNC) != 0;
+        if writes {
+            let (staged, existed, lease) = transaction.stage_file_open(
+                logical,
+                intent.flags & libc::O_CREAT != 0,
+                intent.flags & libc::O_EXCL != 0,
+            )?;
+            return Ok(OpenMapping::File {
+                mapped: staged.destination().to_path_buf(),
+                staged: Some(staged),
+                existed,
+                lease,
+            });
+        }
+        Ok(OpenMapping::File {
+            mapped: transaction.prepare_read(logical)?,
+            staged: None,
+            existed: true,
+            lease: None,
+        })
+    }
+
+    fn entry_attributes_in(
+        transaction: &OverlayTransaction<'_>,
+        path: &Path,
+    ) -> Result<super::FileAttributes> {
+        if let Some(attributes) = transaction.attributes(path)? {
+            return Ok(attributes);
+        }
+        let mapped = transaction.prepare_read(path)?;
+        Ok(super::FileAttributes::from_metadata(
+            &mapped.symlink_metadata()?,
+        ))
+    }
+
+    fn require_entry_access_in(
+        transaction: &OverlayTransaction<'_>,
+        path: &Path,
+        request: AccessRequest,
+        credentials: &Credentials,
+    ) -> Result<()> {
+        let logical = transaction.resolve_final(path, false)?;
+        Self::require_resolved_entry_access_in(transaction, &logical, request, credentials)
+    }
+
+    fn require_resolved_entry_access_in(
+        transaction: &OverlayTransaction<'_>,
+        logical: &Path,
+        request: AccessRequest,
+        credentials: &Credentials,
+    ) -> Result<()> {
+        let attributes = Self::entry_attributes_in(transaction, logical)?;
+        Self::require_attributes_access(&attributes, request, credentials)
+    }
+
+    fn require_attributes_access(
+        attributes: &super::FileAttributes,
+        request: AccessRequest,
+        credentials: &Credentials,
+    ) -> Result<()> {
+        if credentials.allows(attributes, request) {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(libc::EACCES).into())
+        }
+    }
+
+    fn require_search_in(
+        transaction: &OverlayTransaction<'_>,
+        path: &Path,
+        credentials: &Credentials,
+    ) -> Result<Option<super::FileAttributes>> {
+        let Some(parent) = path.parent() else {
+            return Ok(None);
+        };
+        let ancestors = parent.ancestors().collect::<Vec<_>>();
+        let resolved = ancestors
+            .iter()
+            .rev()
+            .map(|ancestor| transaction.resolve_final(ancestor, false))
+            .collect::<Result<Vec<_>>>()?;
+        let records =
+            transaction.records(&resolved.iter().map(PathBuf::as_path).collect::<Vec<_>>())?;
+        let mut parent_attributes = None;
+        for (logical, (state, attributes)) in resolved.into_iter().zip(records) {
+            let attributes = match (state, attributes) {
+                (Some(EntryState::Cow) | None, Some(attributes)) => attributes,
+                _ => {
+                    let mapped = transaction.prepare_read(&logical)?;
+                    super::FileAttributes::from_metadata(&mapped.metadata()?)
+                }
+            };
+            if !credentials.allows(&attributes, AccessRequest::EXECUTE) {
+                return Err(std::io::Error::from_raw_os_error(libc::EACCES).into());
+            }
+            parent_attributes = Some(attributes);
+        }
+        Ok(parent_attributes)
+    }
+
+    fn resolve_final_with_search_in(
+        transaction: &OverlayTransaction<'_>,
+        path: &Path,
+        allow_missing: bool,
+        credentials: &Credentials,
+    ) -> Result<(PathBuf, Option<super::FileAttributes>)> {
+        let mut parent_attributes = Self::require_search_in(transaction, path, credentials)?;
+        let logical = transaction.resolve_final(path, allow_missing)?;
+        if logical != path {
+            parent_attributes = Self::require_search_in(transaction, &logical, credentials)?;
+        }
+        Ok((logical, parent_attributes))
+    }
+
+    fn resolve_access_path_in(
+        transaction: &OverlayTransaction<'_>,
+        path: &Path,
+        follow_final: bool,
+        credentials: &Credentials,
+    ) -> Result<PathBuf> {
+        if follow_final {
+            return Ok(
+                Self::resolve_final_with_search_in(transaction, path, false, credentials)?.0,
+            );
+        }
+        Self::require_search_in(transaction, path, credentials)?;
+        Ok(path.to_path_buf())
+    }
+
+    fn require_parent_mutation_in(
+        transaction: &OverlayTransaction<'_>,
+        path: &Path,
+        credentials: &Credentials,
+    ) -> Result<()> {
+        let parent_attributes = Self::require_search_in(transaction, path, credentials)?;
+        Self::require_parent_access(path, parent_attributes.as_ref(), credentials)
+    }
+
+    fn require_parent_access(
+        path: &Path,
+        parent_attributes: Option<&super::FileAttributes>,
+        credentials: &Credentials,
+    ) -> Result<()> {
+        path.parent()
+            .context("filesystem mutation path has no parent")?;
+        let parent_attributes =
+            parent_attributes.context("filesystem mutation parent attributes are unavailable")?;
+        Self::require_attributes_access(
+            parent_attributes,
+            AccessRequest::WRITE_EXECUTE,
+            credentials,
+        )
+    }
+
+    #[cfg(test)]
+    fn transaction_count_for_test(&self) -> usize {
+        self.overlay.transaction_count_for_test()
+    }
+
+    #[cfg(test)]
+    fn resolution_count_for_test(&self) -> usize {
+        self.overlay.resolution_count_for_test()
+    }
+
+    #[cfg(test)]
     pub(crate) fn prepare_open(
         &self,
         logical: &Path,
         flags: libc::c_int,
         mode: u32,
     ) -> Result<PreparedFile> {
-        Self::validate_open_flags(flags)?;
-        if flags & libc::O_DIRECTORY != 0 {
-            let target = self.overlay.prepare_directory(logical)?;
+        let intent = OpenIntent::new(flags, mode)?;
+        let mapping = self
+            .overlay
+            .transaction(|transaction| Self::stage_open_in(transaction, logical, intent))?;
+        self.prepare_mapped_open(logical, intent, mapping)
+    }
+
+    fn prepare_mapped_open(
+        &self,
+        logical: &Path,
+        intent: OpenIntent,
+        mapping: OpenMapping,
+    ) -> Result<PreparedFile> {
+        let flags = intent.flags;
+        let mode = intent.mode;
+        if let OpenMapping::Directory(target) = mapping {
             let layer = if self.overlay.is_internal(&target) {
                 FileLayer::Upper
             } else {
                 FileLayer::Lower
             };
-            return Ok(PreparedFile {
-                target: OpenTarget::Path(target),
-                staged: None,
-                writeback: None,
-                publish_on_open: false,
-                created_mode: None,
-                layer,
-            });
+            return Ok(PreparedFile::for_path(target, None, layer));
         }
+        let OpenMapping::File {
+            mapped,
+            staged,
+            existed,
+            lease,
+        } = mapping
+        else {
+            unreachable!("directory mapping returned above")
+        };
         let writes = flags & libc::O_ACCMODE != libc::O_RDONLY
             || flags & (libc::O_CREAT | libc::O_TRUNC) != 0;
         let create = flags & libc::O_CREAT != 0;
-        let (mapped, staged, existed, lease) = if writes {
-            let (staged, existed, lease) =
-                self.overlay
-                    .stage_file_open(logical, create, flags & libc::O_EXCL != 0)?;
-            (
-                staged.destination().to_path_buf(),
-                Some(staged),
-                existed,
-                lease,
-            )
-        } else {
-            let mapped = self.overlay.prepare_read(logical)?;
-            if !self.overlay.is_internal(&mapped) {
-                return Ok(PreparedFile {
-                    target: OpenTarget::Path(mapped),
-                    staged: None,
-                    writeback: None,
-                    publish_on_open: false,
-                    created_mode: None,
-                    layer: FileLayer::Lower,
-                });
-            }
-            (mapped, None, true, None)
-        };
         if !self.overlay.is_internal(&mapped) {
-            return Ok(PreparedFile {
-                target: OpenTarget::Path(mapped),
-                staged: None,
-                writeback: None,
-                publish_on_open: false,
-                created_mode: None,
-                layer: FileLayer::Lower,
-            });
+            return Ok(PreparedFile::for_path(mapped, None, FileLayer::Lower));
         }
         let Some(cipher) = self.overlay.cipher().cloned() else {
-            return Ok(PreparedFile {
-                target: OpenTarget::Path(mapped),
-                staged,
-                writeback: None,
-                publish_on_open: false,
-                created_mode: None,
-                layer: FileLayer::Upper,
-            });
+            return Ok(PreparedFile::for_path(mapped, staged, FileLayer::Upper));
         };
         if mapped.exists() && !mapped.symlink_metadata()?.is_file() {
-            return Ok(PreparedFile {
-                target: OpenTarget::Path(mapped),
-                staged,
-                writeback: None,
-                publish_on_open: false,
-                created_mode: None,
-                layer: FileLayer::Upper,
-            });
+            return Ok(PreparedFile::for_path(mapped, staged, FileLayer::Upper));
         }
 
         let created_mode = (create && !existed)
@@ -287,26 +540,7 @@ impl VirtualFilesystem {
     }
 
     pub(crate) fn prepare_native_open(&self, logical: &Path) -> PreparedFile {
-        PreparedFile {
-            target: OpenTarget::Path(logical.to_path_buf()),
-            staged: None,
-            writeback: None,
-            publish_on_open: false,
-            created_mode: None,
-            layer: FileLayer::Lower,
-        }
-    }
-
-    pub(crate) fn resolve_open_path(&self, logical: &Path, flags: libc::c_int) -> Result<PathBuf> {
-        Self::validate_open_flags(flags)?;
-        let no_follow = flags & libc::O_NOFOLLOW != 0
-            || flags & (libc::O_CREAT | libc::O_EXCL) == (libc::O_CREAT | libc::O_EXCL);
-        if no_follow {
-            Ok(logical.to_path_buf())
-        } else {
-            self.overlay
-                .resolve_final(logical, flags & libc::O_CREAT != 0)
-        }
+        PreparedFile::for_path(logical.to_path_buf(), None, FileLayer::Lower)
     }
 
     pub(crate) fn commit_open(&self, prepared: &mut PreparedFile) -> Result<()> {
@@ -371,15 +605,126 @@ impl VirtualFilesystem {
         self.overlay.logical_path(path)
     }
 
-    pub(crate) fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
-        let resolved = self.overlay.resolve_final(path, false)?;
-        let visible = self.overlay.visible_path(&resolved)?;
-        let canonical = visible.canonicalize()?;
-        if self.overlay.is_internal(&canonical) {
-            self.overlay.logical_path(&canonical)
+    pub(crate) fn check_access(
+        &self,
+        path: &Path,
+        follow_final: bool,
+        request: AccessRequest,
+        credentials: &Credentials,
+    ) -> Result<AccessPlan> {
+        self.overlay.transaction(|transaction| {
+            if transaction.native_metadata_passthrough(path, follow_final, |attributes| {
+                credentials.allows(attributes, AccessRequest::EXECUTE)
+            })? {
+                return Ok(AccessPlan::Native(path.to_path_buf()));
+            }
+            let logical =
+                Self::resolve_access_path_in(transaction, path, follow_final, credentials)?;
+            let attributes = Self::entry_attributes_in(transaction, &logical)?;
+            Self::require_attributes_access(&attributes, request, credentials)?;
+            Ok(AccessPlan::Allowed)
+        })
+    }
+
+    pub(crate) fn prepare_authorized_metadata(
+        &self,
+        path: &Path,
+        follow_final: bool,
+        credentials: &Credentials,
+    ) -> Result<MetadataPlan> {
+        let (logical, mapped, attributes) = self.overlay.transaction(|transaction| {
+            if transaction.native_metadata_passthrough(path, follow_final, |attributes| {
+                credentials.allows(attributes, AccessRequest::EXECUTE)
+            })? {
+                return Ok((path.to_path_buf(), path.to_path_buf(), None));
+            }
+            let logical =
+                Self::resolve_access_path_in(transaction, path, follow_final, credentials)?;
+            let mapped = transaction.prepare_read(&logical)?;
+            let attributes = transaction.attributes(&logical)?;
+            Ok((logical, mapped, attributes))
+        })?;
+        let plaintext_size = if let Some(cipher) = self
+            .overlay
+            .cipher()
+            .filter(|_| self.overlay.is_internal(&mapped))
+        {
+            if mapped.symlink_metadata()?.is_file() {
+                let mut plaintext = tempfile::tempfile()?;
+                cipher.decrypt(&mapped, &mut plaintext)?;
+                Some(plaintext.metadata()?.len())
+            } else {
+                None
+            }
         } else {
-            Ok(canonical)
-        }
+            None
+        };
+        Ok(MetadataPlan {
+            logical,
+            mapped,
+            plaintext_size,
+            attributes,
+        })
+    }
+
+    pub(crate) fn canonicalize_authorized(
+        &self,
+        path: &Path,
+        credentials: &Credentials,
+    ) -> Result<PathBuf> {
+        self.overlay.transaction(|transaction| {
+            Self::require_search_in(transaction, path, credentials)?;
+            let resolved = transaction.resolve_final(path, false)?;
+            let visible = transaction.visible_path(&resolved)?;
+            let canonical = visible.canonicalize()?;
+            if self.overlay.is_internal(&canonical) {
+                self.overlay.logical_path(&canonical)
+            } else {
+                Ok(canonical)
+            }
+        })
+    }
+
+    pub(crate) fn prepare_change_directory(
+        &self,
+        path: &Path,
+        credentials: &Credentials,
+    ) -> Result<(PathBuf, PathBuf)> {
+        self.overlay.transaction(|transaction| {
+            let (logical, _) =
+                Self::resolve_final_with_search_in(transaction, path, false, credentials)?;
+            Self::require_resolved_entry_access_in(
+                transaction,
+                &logical,
+                AccessRequest::EXECUTE,
+                credentials,
+            )?;
+            Ok((transaction.prepare_directory(&logical)?, logical))
+        })
+    }
+
+    pub(crate) fn directory_view_authorized(
+        &self,
+        path: &Path,
+        credentials: &Credentials,
+    ) -> Result<DirectoryView> {
+        self.overlay.transaction(|transaction| {
+            Self::require_search_in(transaction, path, credentials)?;
+            Self::require_entry_access_in(transaction, path, AccessRequest::READ, credentials)?;
+            transaction.directory_view(path)
+        })
+    }
+
+    pub(crate) fn require_descriptor_access(
+        &self,
+        path: &Path,
+        request: AccessRequest,
+        credentials: &Credentials,
+    ) -> Result<()> {
+        self.overlay.transaction(|transaction| {
+            let attributes = Self::entry_attributes_in(transaction, path)?;
+            Self::require_attributes_access(&attributes, request, credentials)
+        })
     }
 
     #[cfg(test)]
@@ -387,6 +732,7 @@ impl VirtualFilesystem {
         self.overlay.prepare_read(path)
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_metadata(
         &self,
         path: &Path,
@@ -423,6 +769,7 @@ impl VirtualFilesystem {
         self.overlay.exists(path)
     }
 
+    #[cfg(test)]
     pub(crate) fn native_metadata_passthrough(
         &self,
         path: &Path,
@@ -431,120 +778,81 @@ impl VirtualFilesystem {
     ) -> Result<bool> {
         self.overlay
             .native_metadata_passthrough(path, follow_final, |attributes| {
-                credentials.allows(attributes, libc::X_OK)
+                credentials.allows(attributes, AccessRequest::EXECUTE)
             })
     }
 
-    fn is_symlink(&self, path: &Path) -> Result<bool> {
-        Ok(self
-            .overlay
-            .prepare_read(path)?
-            .symlink_metadata()?
-            .file_type()
-            .is_symlink())
-    }
-
-    fn effective_attributes(&self, path: &Path) -> Result<super::FileAttributes> {
-        let logical = self.overlay.resolve_final(path, false)?;
-        if let Some(attributes) = self.overlay.attributes(&logical)? {
-            return Ok(attributes);
-        }
-        let mapped = self.overlay.prepare_read(&logical)?;
-        Ok(super::FileAttributes::from_metadata(&mapped.metadata()?))
-    }
-
-    pub(crate) fn require_access(
+    pub(crate) fn create_directory_authorized(
         &self,
         path: &Path,
-        requested: libc::c_int,
+        mode: u32,
         credentials: &Credentials,
-    ) -> Result<()> {
-        let attributes = self.effective_attributes(path)?;
-        if credentials.allows(&attributes, requested) {
-            Ok(())
-        } else {
-            Err(std::io::Error::from_raw_os_error(libc::EACCES).into())
-        }
-    }
-
-    pub(crate) fn require_search(&self, path: &Path, credentials: &Credentials) -> Result<()> {
-        let Some(parent) = path.parent() else {
-            return Ok(());
-        };
-        for ancestor in parent.ancestors().collect::<Vec<_>>().into_iter().rev() {
-            self.require_access(ancestor, libc::X_OK, credentials)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn require_parent_mutation(
-        &self,
-        path: &Path,
-        credentials: &Credentials,
-    ) -> Result<()> {
-        let parent = path
-            .parent()
-            .context("filesystem mutation path has no parent")?;
-        self.require_search(parent, credentials)?;
-        self.require_access(parent, libc::W_OK | libc::X_OK, credentials)
-    }
-
-    pub(crate) fn validate_create_directory(
-        &self,
-        path: &Path,
-        credentials: &Credentials,
-    ) -> Result<()> {
-        self.require_search(path, credentials)?;
-        if self.exists(path)? {
-            return Err(std::io::Error::from_raw_os_error(libc::EEXIST).into());
-        }
-        self.require_parent_mutation(path, credentials)
-    }
-
-    pub(crate) fn validate_open_permissions(
-        &self,
-        logical: &Path,
-        flags: libc::c_int,
-        requested: libc::c_int,
-        credentials: &Credentials,
-    ) -> Result<()> {
-        self.require_search(logical, credentials)?;
-        if self.exists(logical)? {
-            if flags & (libc::O_CREAT | libc::O_EXCL) == libc::O_CREAT | libc::O_EXCL {
+    ) -> Result<PathBuf> {
+        let mode = Self::effective_creation_mode(mode)?;
+        self.overlay.transaction(|transaction| {
+            let parent_attributes = Self::require_search_in(transaction, path, credentials)?;
+            if transaction.visible_exists(path)? {
                 return Err(std::io::Error::from_raw_os_error(libc::EEXIST).into());
             }
-            if flags & libc::O_NOFOLLOW == 0 || !self.is_symlink(logical)? {
-                self.require_access(logical, requested, credentials)?;
-            }
-        } else if flags & libc::O_CREAT != 0 {
-            self.require_parent_mutation(logical, credentials)?;
-        }
-        Ok(())
+            Self::require_parent_access(path, parent_attributes.as_ref(), credentials)?;
+            transaction.create_directory(path, mode)
+        })
     }
 
-    pub(crate) fn chmod(
+    pub(crate) fn create_symlink_authorized(
+        &self,
+        path: &Path,
+        target: &Path,
+        credentials: &Credentials,
+    ) -> Result<PathBuf> {
+        self.overlay.transaction(|transaction| {
+            Self::require_parent_mutation_in(transaction, path, credentials)?;
+            transaction.create_symlink(path, target)
+        })
+    }
+
+    pub(crate) fn remove_authorized(
+        &self,
+        path: &Path,
+        directory: bool,
+        credentials: &Credentials,
+    ) -> Result<()> {
+        self.overlay.transaction(|transaction| {
+            Self::require_parent_mutation_in(transaction, path, credentials)?;
+            transaction.remove(path, directory)
+        })
+    }
+
+    pub(crate) fn rename_authorized(
+        &self,
+        from: &Path,
+        to: &Path,
+        credentials: &Credentials,
+    ) -> Result<()> {
+        self.overlay.transaction(|transaction| {
+            Self::require_parent_mutation_in(transaction, from, credentials)?;
+            Self::require_parent_mutation_in(transaction, to, credentials)?;
+            transaction.rename(from, to)
+        })
+    }
+
+    pub(crate) fn chmod_authorized(
         &self,
         path: &Path,
         mode: u32,
         follow_final: bool,
         credentials: &Credentials,
     ) -> Result<()> {
-        self.require_search(path, credentials)?;
-        let logical = if follow_final {
-            self.overlay.resolve_final(path, false)?
-        } else {
-            path.to_path_buf()
-        };
-        let mapped = self.overlay.prepare_read(&logical)?;
-        let mut attributes = match self.overlay.attributes(&logical)? {
-            Some(attributes) => attributes,
-            None => super::FileAttributes::from_metadata(&mapped.symlink_metadata()?),
-        };
-        if !credentials.can_chmod(&attributes) {
-            return Err(std::io::Error::from_raw_os_error(libc::EPERM).into());
-        }
-        attributes.mode = attributes.mode & !0o7777 | mode & 0o7777;
-        self.overlay.set_attributes(&logical, attributes)
+        self.overlay.transaction(|transaction| {
+            let logical =
+                Self::resolve_access_path_in(transaction, path, follow_final, credentials)?;
+            let mut attributes = Self::entry_attributes_in(transaction, &logical)?;
+            if !credentials.can_chmod(&attributes) {
+                return Err(std::io::Error::from_raw_os_error(libc::EPERM).into());
+            }
+            attributes.mode = attributes.mode & !0o7777 | mode & 0o7777;
+            transaction.set_attributes(&logical, attributes)
+        })
     }
 
     pub(crate) fn set_attributes(
@@ -577,6 +885,7 @@ impl VirtualFilesystem {
         self.overlay.commit_write(staged)
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_directory(&self, path: &Path) -> Result<PathBuf> {
         self.overlay.prepare_directory(path)
     }
@@ -585,19 +894,18 @@ impl VirtualFilesystem {
         self.overlay.directory_view(path)
     }
 
+    #[cfg(test)]
     pub(crate) fn create_directory(&self, path: &Path, mode: u32) -> Result<PathBuf> {
         self.overlay
             .create_directory(path, Self::effective_creation_mode(mode)?)
     }
 
-    pub(crate) fn create_symlink(&self, path: &Path, target: &Path) -> Result<PathBuf> {
-        self.overlay.create_symlink(path, target)
-    }
-
+    #[cfg(test)]
     pub(crate) fn remove(&self, path: &Path, directory: bool) -> Result<()> {
         self.overlay.remove(path, directory)
     }
 
+    #[cfg(test)]
     pub(crate) fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         self.overlay.rename(from, to)
     }

@@ -1,10 +1,16 @@
 # Overlay Realpath And FTS Visibility Implementation Plan
 
+> **Compatibility update:** The automatic version-1/version-2 migration steps in the original
+> plan were superseded by
+> [Overlay Reconciliation And Keychain Passthrough Design](2026-08-04-overlay-reconciliation-keychain-passthrough-design.md).
+> Normal startup now requires a fresh `<workdir>/fs` and does not recursively scan or rewrite a
+> legacy tree.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Project policy requires inline execution with the current agent and leaves changes uncommitted unless the user explicitly requests a commit.
 
 **Goal:** Hide encrypted business filenames from both metadata and physical storage, make upper-only Overlay paths canonicalizable and visible to macOS system directory tools, and restore POSIX `mkdir -p` behavior.
 
-**Architecture:** Metadata version 3 directly encrypts each encrypted logical leaf into the ciphertext token used as both its record key and physical filename, while plain entries remain literal and versions 1/2 migrate on startup. The existing VFS and macOS filesystem hook then gain logical canonicalization, correct directory-create ordering, and scoped synthetic `getattrlistbulk` records sourced from the merged directory view.
+**Architecture:** Metadata version 3 directly encrypts each encrypted logical leaf into the ciphertext token used as both its record key and physical filename, while plain entries remain literal. The decoder can read versions 1/2 directly, but startup does not migrate them. The existing VFS and macOS filesystem hook then gain logical canonicalization, correct directory-create ordering, and scoped synthetic `getattrlistbulk` records sourced from the merged directory view.
 
 **Tech Stack:** Rust, macOS dyld interposition, libc FTS/getattrlistbulk/realpath APIs, Tokio integration tests, cargo-llvm-cov.
 
@@ -16,8 +22,8 @@
 - Modify `crates/agora-sandbox/src/hook/filesystem/tests.rs`: add direct hook tests for `realpath`, existing-directory `mkdir`, and scoped FTS virtual-bulk state.
 - Modify `crates/agora-sandbox/src/filesystem/crypto.rs`: add authenticated encryption for logical filename bytes under a distinct domain.
 - Modify `crates/agora-sandbox/src/filesystem/crypto/tests.rs`: verify filename encryption round trips and authentication failures.
-- Modify `crates/agora-sandbox/src/filesystem/metadata.rs`: implement version-3 record persistence and v1/v2 migration without a persisted `backing_names` map.
-- Modify `crates/agora-sandbox/src/filesystem/metadata/tests.rs`: verify encrypted and plain schemas, migration, validation, and ciphertext-name reservation.
+- Modify `crates/agora-sandbox/src/filesystem/metadata.rs`: implement version-3 record persistence and direct v1/v2 decoding without a persisted `backing_names` map.
+- Modify `crates/agora-sandbox/src/filesystem/metadata/tests.rs`: verify encrypted and plain schemas, direct legacy decoding, validation, and ciphertext-name reservation.
 - Modify `crates/agora-sandbox/src/filesystem/overlay.rs`: pass the optional cipher to metadata and retain opaque ciphertext names for encrypted file whiteouts.
 - Modify `crates/agora-sandbox/src/filesystem/overlay/tests.rs`: verify metadata-key/physical-name equality and reopen behavior.
 - Modify `crates/agora-sandbox/src/filesystem/vfs.rs`: expose visible logical canonicalization and POSIX directory-create validation.
@@ -47,9 +53,9 @@ assert!(!contents.windows(b"secret.docx".len()).any(|part| part == b"secret.docx
 assert_eq!(record_key, physical_name);
 ```
 
-- [ ] **Step 3: Add plain schema and migration tests**
+- [ ] **Step 3: Add plain schema and direct legacy-decoding tests**
 
-Require a plain store to use the literal key, losslessly escaping reserved `base64:` and `enc_` prefixes. Seed version-1 and version-2 files, including a version-2 alias, open the corresponding Overlay store, and require atomic version-3 output after renaming the old physical file to a direct encrypted-filename ciphertext.
+Require a plain store to use the literal key, losslessly escaping reserved `base64:` and `enc_` prefixes. Seed version-1 and version-2 files and verify direct decoding. Require normal Overlay startup to stay lazy rather than recursively scanning or rewriting an unrelated legacy subtree.
 
 - [ ] **Step 4: Add an end-to-end physical-name test**
 
@@ -91,9 +97,9 @@ Keep `DirectoryMetadata` as canonical in-memory logical maps, but serialize the 
 
 Inspect `version` before decoding. Keep version-1/2 readers, add a version-3 reader that decrypts encrypted record keys, rejects missing ciphers, malformed ciphertext, invalid logical leaves, duplicate logical names, and duplicate physical keys, and reconstructs the canonical logical maps used by Overlay. Plain names beginning with the reserved `enc_` prefix must be Base64-escaped so they cannot be misclassified.
 
-- [ ] **Step 4: Migrate old metadata at startup**
+- [ ] **Step 4: Keep startup lazy and require a fresh workspace**
 
-Change recursive migration to rewrite both version 1 and version 2 under the VFS lock. For each existing version-2 alias, encrypt the corresponding logical key, duplicate the old physical file under that ciphertext name, atomically publish version-3 metadata keyed by the same ciphertext, and then remove the old alias. Preserve cached executable and directory records as literal non-encrypted physical names.
+Do not recursively scan or rewrite version-1/version-2 trees at Overlay startup. Keep the direct decoders for targeted reads and key-migration internals, but require deployments to remove the old `<workdir>/fs` and start with version 3.
 
 - [ ] **Step 5: Preserve encrypted ciphertext names through file whiteout**
 
@@ -265,7 +271,7 @@ Run the virtual-bulk hook test, `upper_only_entries_are_visible_to_system_ls`, `
 
 - [ ] **Step 1: Update architecture behavior**
 
-Document metadata version 3 and v1/v2 migration, direct encrypted record-key/physical-name equality without `backing_names` or an encrypted `name` field, `realpath` logical output and allocation forms, `mkdir`'s existing-entry ordering, and FTS's scoped synthetic `getattrlistbulk` merged view.
+Document metadata version 3, direct legacy decoding without startup migration, the fresh-workspace requirement, direct encrypted record-key/physical-name equality without `backing_names` or an encrypted `name` field, `realpath` logical output and allocation forms, `mkdir`'s existing-entry ordering, and FTS's scoped synthetic `getattrlistbulk` merged view.
 
 - [ ] **Step 2: Build release artifacts and run manual sandbox acceptance**
 

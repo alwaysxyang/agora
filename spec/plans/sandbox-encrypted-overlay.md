@@ -12,6 +12,8 @@ Provide one rootless filesystem view for injectable macOS process trees. Reads f
 - Encrypted mode stores upper files as chunked AES-256-GCM data and exposes their plaintext only through anonymous descriptors.
 - VFS overlay, logical mode authorization, and cryptography are independent from libc interposition.
 - Control files live beside mirrored data but are hidden and physically unreachable from the sandbox.
+- Every physical upper directory has a valid `.metadata` marker, with a continuous marker chain
+  from the backing root.
 - Logical business files may use control-like names through physical name encoding.
 - Copy-on-write and whiteouts operate at whole-file granularity.
 - SIP-restricted executable copies are persistent controller-managed cache entries at exact mirrored paths below `<workdir>/fs`.
@@ -25,6 +27,7 @@ Provide one rootless filesystem view for injectable macOS process trees. Reads f
 └── fs/
     ├── .fs.lock
     ├── .key.json          # encrypted mode only
+    ├── .metadata          # managed-directory root marker
     ├── .vfs.lock
     ├── .rekey.json        # present only during recoverable key migration
     └── <mirrored path>/
@@ -38,8 +41,8 @@ Provide one rootless filesystem view for injectable macOS process trees. Reads f
 
 1. Normalize the logical absolute path, resolve existing path components without following a path into the private work directory, and reject physical work-directory aliases.
 2. Keep directory paths mirrored. Resolve control-like logical names to encoded physical names. In encrypted mode, authenticate-encrypt each business-file leaf directly into an `enc_` token used as both the metadata key and physical filename; do not generate a separate random alias.
-3. Consult the parent directory's `.metadata`.
-4. Prefer authoritative `cow` upper data, reject `whiteout`, and otherwise return the lower host path directly. A non-authoritative `cached` entry does not shadow lower for normal reads.
+3. Validate the continuous upper-directory marker chain and consult the parent directory's `.metadata`.
+4. Reconcile externally changed upper state under `.vfs.lock`: clear a `cow` or `cached` record whose backing object is missing, preserve `whiteout`, remove an unexpected object at a whiteout path, preserve an attribute-only lower override, and remove unrecorded files, symlinks, or unmarked directory subtrees. Then prefer authoritative `cow` upper data, reject `whiteout`, and otherwise return the lower host path directly. A non-authoritative `cached` entry does not shadow lower for normal reads.
 5. On write intent, copy lower data into upper before opening it. Newly created files start in upper. Encrypted exclusive creation reserves its filename ciphertext under `.vfs.lock` until the staged open commits or is dropped. Read-only lower traversal creates no upper directory or metadata.
 6. In encrypted mode, open an empty staging descriptor, unlink its temporary name, and only then verify and decrypt upper regular data into the anonymous inode.
 7. Duplicate descriptors, including `fcntl(F_DUPFD*)`, share one open-file record and writeback state. Anonymous encrypted descriptors remain close-on-exec even after duplication or `F_SETFD`.
@@ -51,9 +54,9 @@ At no point does encrypted mode publish a named plaintext business file beneath 
 
 ## Directory And Metadata Flow
 
-Directories are ordinary owner-accessible backing directories so the controller can maintain them. Their requested mode is retained where possible, with owner management bits forced on physically. Directory enumeration merges lower and upper entries, applies whiteouts, decrypts encrypted logical leaves, and filters controls. Managed macOS FTS traversal receives the same merged view through scoped synthetic `getattrlistbulk` records, forces `FTS_NOCHDIR`, and presents logical paths rather than private backing paths.
+Directories are ordinary owner-accessible backing directories so the controller can maintain them. Their requested mode is retained where possible, with owner management bits forced on physically. Every creation and metadata-publication path writes an empty-or-populated marker before publishing child state. Marker identity is retained with cached metadata, so external marker deletion invalidates cached descendants and advances the shared generation. A present directory without its own marker is untrusted and is removed recursively; descendant metadata cannot restore trust. Startup does not scan the whole upper tree, and deployments use a fresh `<workdir>/fs` rather than a compatibility migration. Directory enumeration merges lower and upper entries, applies whiteouts, reconciles orphans, decrypts encrypted logical leaves, and filters controls. Managed macOS FTS traversal receives the same merged view through scoped synthetic `getattrlistbulk` records, forces `FTS_NOCHDIR`, and presents logical paths rather than private backing paths.
 
-Cached entries carry lower MD5, source identity, materializer type, and logical file attributes, but remain non-authoritative for normal reads. COW entries remain authoritative and retain logical mode and timestamps independently from the physical `0600` ciphertext container. Explicit materializers reuse an unchanged source identity without recomputing the MD5 and refresh their cached entries when lower changes. Logical permission overrides are also stored in metadata and are enforced by VFS authorization methods without changing lower permissions; path traversal checks ancestor search permission, parent mutations check write plus search permission, and chmod requires the effective owner or UID 0. The hook selects real credentials for `access`/ordinary `faccessat` and effective credentials for opens and mutations. Rename validates the operation before materialization, preserves ordinary symlinks, and then updates only upper state; rename and removal never mutate lower data. Intercepted `readlink`/`readlinkat`, `realpath`, and `faccessat` observe the logical view. Intercepted `opendir`/`fdopendir` plus `readdir`/`readdir_r` merge the visible lower and upper view, `rewinddir` resets both physical cursors, and the covered macOS `fts_*`/`getattrlistbulk` path supplies that same view to system tools.
+Cached entries carry lower MD5, source identity, materializer type, and logical file attributes, but remain non-authoritative for normal reads. Source-derived cached attributes refresh with a changed lower snapshot; attributes that differ from the recorded source identity are explicit logical overrides and survive copy-up or an uncommitted native open. COW entries remain authoritative and retain logical mode and timestamps independently from the physical `0600` ciphertext container. Explicit materializers reuse an unchanged source identity without recomputing the MD5 and refresh their cached entries when lower changes. Logical permission overrides are enforced by credential-requiring VFS operations without changing lower permissions; each operation resolves, authorizes, and stages or mutates against one scoped overlay transaction. Path traversal checks ancestor search permission, parent mutations check write plus search permission, and chmod requires the effective owner or UID 0. The hook selects real credentials for `access`/ordinary `faccessat` and effective credentials for opens and mutations. Rename validates the operation before materialization, preserves ordinary symlinks, and then updates only upper state; rename and removal never mutate lower data. Intercepted `readlink`/`readlinkat`, `realpath`, and `faccessat` observe the logical view. Intercepted `opendir`/`fdopendir` plus `readdir`/`readdir_r` merge the visible lower and upper view, `rewinddir` resets both physical cursors, and the covered macOS `fts_*`/`getattrlistbulk` path supplies that same view to system tools.
 
 ## Key Lifecycle
 
@@ -63,7 +66,7 @@ The first encrypted run creates `.key.json`. A later run derives the cipher and 
 
 ## Security Boundary
 
-The design is rootless and requires no mount permission. Its boundary is only as strong as hook coverage. Non-injectable processes, direct syscalls, and uncatchable termination are explicit limitations. The host user can inspect control metadata and ciphertext but not a named plaintext backing file during normal operation.
+The design is rootless and requires no mount permission. Its boundary is only as strong as hook coverage. Non-injectable processes, direct syscalls, and uncatchable termination are explicit limitations. The host user can inspect control metadata and ciphertext but not a named plaintext backing file during normal operation. Keychain is not virtualized; descendants use and may mutate the current user's host Keychain directly.
 
 The runtime fails closed when key validation, metadata parsing, decryption authentication, audit delivery, executable preparation, or supported VFS mapping fails.
 

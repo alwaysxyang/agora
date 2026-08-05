@@ -32,9 +32,6 @@ use std::time::Duration;
 use tokio::process::Command;
 use uuid::Uuid;
 
-#[cfg(target_os = "macos")]
-mod native_sandbox;
-
 const TOKEN: &str = "AGORA_SANDBOX_TOKEN";
 const PROXY_IPV4: &str = "AGORA_SANDBOX_PROXY_IPV4";
 const PROXY_IPV6: &str = "AGORA_SANDBOX_PROXY_IPV6";
@@ -631,7 +628,6 @@ where
             }
         }
         child.as_std_mut().process_group(0);
-        native_sandbox::configure(&mut child);
         let mut terminal = ForegroundTerminal::capture()?;
 
         let mut child = match child.spawn() {

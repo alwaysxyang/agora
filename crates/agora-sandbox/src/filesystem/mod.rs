@@ -9,6 +9,8 @@ mod namespace;
 #[cfg(target_os = "macos")]
 mod overlay;
 #[cfg(target_os = "macos")]
+mod permissions;
+#[cfg(target_os = "macos")]
 mod vfs;
 #[cfg(target_os = "macos")]
 mod workspace;
@@ -29,8 +31,11 @@ pub(crate) use metadata::{EntryState, FileAttributes, Materializer};
 #[cfg(target_os = "macos")]
 pub(crate) use overlay::{DirectoryView, OverlayStore, StagedWrite};
 #[cfg(target_os = "macos")]
+pub(crate) use permissions::{AccessRequest, Credentials};
+#[cfg(target_os = "macos")]
 pub(crate) use vfs::{
-    Credentials, FileLayer, OpenTarget, PreparedFile, VirtualFilesystem, Writeback,
+    AccessPlan, FileLayer, MetadataPlan, OpenIntent, OpenTarget, PreparedFile, VirtualFilesystem,
+    Writeback,
 };
 #[cfg(target_os = "macos")]
 pub(crate) use workspace::FilesystemWorkspace;

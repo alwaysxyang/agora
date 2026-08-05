@@ -1,8 +1,9 @@
-use super::{Credentials, OpenTarget, VirtualFilesystem};
-use crate::filesystem::FileAttributes;
+use super::{AccessPlan, OpenIntent, OpenTarget, VirtualFilesystem};
 use crate::filesystem::crypto::FileCipher;
+use crate::filesystem::{AccessRequest, Credentials, FileAttributes};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -21,34 +22,404 @@ fn fixture(name: &str) -> (std::path::PathBuf, VirtualFilesystem) {
     (root, filesystem)
 }
 
+fn attributes_with_mode(path: &Path, mode: u32) -> FileAttributes {
+    let mut attributes = FileAttributes::from_metadata(&path.symlink_metadata().unwrap());
+    attributes.mode = (attributes.mode & u32::from(libc::S_IFMT)) | mode;
+    attributes
+}
+
 #[test]
-fn credentials_apply_owner_group_other_and_root_rules() {
-    let attributes = FileAttributes {
-        mode: u32::from(libc::S_IFREG) | 0o640,
-        uid: 100,
-        gid: 200,
-        atime: 0,
-        atime_nsec: 0,
-        mtime: 0,
-        mtime_nsec: 0,
+fn authorized_open_denies_before_staging_in_one_transaction() {
+    let (root, filesystem) = fixture("authorized-open-denied");
+    let logical = root.parent().unwrap().join(format!(
+        "agora-vfs-authorized-open-denied-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&logical, b"lower").unwrap();
+    let mut attributes = FileAttributes::from_metadata(&logical.metadata().unwrap());
+    attributes.mode = u32::from(libc::S_IFREG) | 0o444;
+    filesystem.set_attributes(&logical, attributes).unwrap();
+    let before = filesystem.transaction_count_for_test();
+
+    let error = filesystem
+        .prepare_authorized_open(
+            &logical,
+            OpenIntent::new(libc::O_WRONLY | libc::O_TRUNC, 0o666).unwrap(),
+            &Credentials::effective(),
+        )
+        .err()
+        .expect("write open should be denied");
+
+    assert_eq!(errno(&error), Some(libc::EACCES));
+    assert_eq!(filesystem.transaction_count_for_test() - before, 1);
+    assert_eq!(filesystem.state_for_test(&logical).unwrap(), None);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_file(logical).unwrap();
+}
+
+#[test]
+fn authorized_open_stages_from_the_authorized_transaction() {
+    let (root, filesystem) = fixture("authorized-open-staged");
+    let logical = root.parent().unwrap().join(format!(
+        "agora-vfs-authorized-open-staged-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&logical, b"lower").unwrap();
+    let before = filesystem.transaction_count_for_test();
+
+    let plan = filesystem
+        .prepare_authorized_open(
+            &logical,
+            OpenIntent::new(libc::O_WRONLY, 0o666).unwrap(),
+            &Credentials::effective(),
+        )
+        .unwrap();
+
+    assert_eq!(plan.logical(), logical);
+    assert_eq!(filesystem.transaction_count_for_test() - before, 1);
+    let (_logical, _prepared) = plan.into_parts();
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_file(logical).unwrap();
+}
+
+#[test]
+fn authorized_open_resolves_an_existing_endpoint_once() {
+    let (root, filesystem) = fixture("authorized-open-single-resolution");
+    let logical = root.parent().unwrap().join(format!(
+        "agora-vfs-authorized-open-single-resolution-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&logical, b"lower").unwrap();
+    filesystem
+        .set_attributes(
+            &logical,
+            FileAttributes::from_metadata(&logical.metadata().unwrap()),
+        )
+        .unwrap();
+    let before = filesystem.resolution_count_for_test();
+
+    let plan = filesystem
+        .prepare_authorized_open(
+            &logical,
+            OpenIntent::new(libc::O_RDONLY, 0).unwrap(),
+            &Credentials::effective(),
+        )
+        .unwrap();
+
+    let expected = logical.parent().unwrap().ancestors().count() + 1;
+    assert_eq!(filesystem.resolution_count_for_test() - before, expected);
+    drop(plan);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_file(logical).unwrap();
+}
+
+#[test]
+fn change_directory_resolves_the_endpoint_once() {
+    let (root, filesystem) = fixture("chdir-single-resolution");
+    let logical = root.parent().unwrap().join(format!(
+        "agora-vfs-chdir-single-resolution-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&logical).unwrap();
+    let before = filesystem.resolution_count_for_test();
+
+    let (mapped, resolved) = filesystem
+        .prepare_change_directory(&logical, &Credentials::effective())
+        .unwrap();
+
+    assert_eq!(mapped, logical);
+    assert_eq!(resolved, logical);
+    let expected = logical.parent().unwrap().ancestors().count() + 1;
+    assert_eq!(filesystem.resolution_count_for_test() - before, expected);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(logical).unwrap();
+}
+
+#[test]
+fn directory_creation_reuses_the_parent_resolution_from_search() {
+    let (root, filesystem) = fixture("mkdir-parent-single-resolution");
+    let parent = root.parent().unwrap().join(format!(
+        "agora-vfs-mkdir-parent-single-resolution-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&parent).unwrap();
+    let logical = parent.join("child");
+    let before = filesystem.resolution_count_for_test();
+
+    filesystem
+        .create_directory_authorized(&logical, 0o755, &Credentials::effective())
+        .unwrap();
+
+    let expected = logical.parent().unwrap().ancestors().count();
+    assert_eq!(filesystem.resolution_count_for_test() - before, expected);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn authorized_open_delegates_untouched_lower_permissions_to_native_open() {
+    let (root, filesystem) = fixture("authorized-open-native-lower");
+    let logical = root.parent().unwrap().join(format!(
+        "agora-vfs-authorized-open-native-lower-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&logical, b"lower").unwrap();
+    let original_mode = logical.metadata().unwrap().permissions().mode();
+    std::fs::set_permissions(&logical, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let before = filesystem.transaction_count_for_test();
+
+    let plan = filesystem
+        .prepare_authorized_open(
+            &logical,
+            OpenIntent::new(libc::O_RDONLY, 0).unwrap(),
+            &Credentials::effective(),
+        )
+        .unwrap();
+
+    assert_eq!(filesystem.transaction_count_for_test() - before, 1);
+    let (_, prepared) = plan.into_parts();
+    assert!(matches!(
+        prepared.target(),
+        OpenTarget::Path(mapped) if mapped == &logical
+    ));
+    std::fs::set_permissions(&logical, std::fs::Permissions::from_mode(original_mode)).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_file(logical).unwrap();
+}
+
+#[test]
+fn authorized_open_preserves_logical_chmod_during_plain_copy_up() {
+    let root = std::env::temp_dir().join(format!(
+        "agora-vfs-authorized-open-plain-chmod-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let filesystem = VirtualFilesystem::plain(&root).unwrap();
+    let logical = root.parent().unwrap().join(format!(
+        "agora-vfs-authorized-open-plain-chmod-lower-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&logical, b"lower").unwrap();
+    std::fs::set_permissions(&logical, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let credentials = Credentials::effective();
+    filesystem
+        .chmod_authorized(&logical, 0o644, true, &credentials)
+        .unwrap();
+
+    let plan = filesystem
+        .prepare_authorized_open(
+            &logical,
+            OpenIntent::new(libc::O_WRONLY, 0).unwrap(),
+            &credentials,
+        )
+        .unwrap();
+    let (_, prepared) = plan.into_parts();
+    let OpenTarget::Path(mapped) = prepared.target() else {
+        panic!("plain copy-up should return an upper path");
     };
 
-    let owner = Credentials::for_test(100, 300, &[]);
-    assert!(owner.allows(&attributes, libc::R_OK | libc::W_OK));
-    assert!(owner.can_chmod(&attributes));
+    assert_eq!(
+        mapped.metadata().unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert_eq!(
+        filesystem.attributes(&logical).unwrap().unwrap().mode & 0o777,
+        0o644
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(mapped)
+        .unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_file(logical).unwrap();
+}
 
-    let group = Credentials::for_test(101, 300, &[200]);
-    assert!(group.allows(&attributes, libc::R_OK));
-    assert!(!group.allows(&attributes, libc::W_OK));
-    assert!(!group.can_chmod(&attributes));
+#[test]
+fn authorized_mutations_deny_without_publishing_and_use_one_transaction() {
+    let (root, filesystem) = fixture("authorized-mutations-denied");
+    let parent = root.parent().unwrap().join(format!(
+        "agora-vfs-authorized-mutations-denied-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&parent).unwrap();
+    filesystem
+        .set_attributes(&parent, attributes_with_mode(&parent, 0o555))
+        .unwrap();
+    let credentials = Credentials::effective();
 
-    let other = Credentials::for_test(101, 300, &[]);
-    assert!(!other.allows(&attributes, libc::R_OK));
+    let directory = parent.join("directory");
+    let before = filesystem.transaction_count_for_test();
+    let error = filesystem
+        .create_directory_authorized(&directory, 0o755, &credentials)
+        .unwrap_err();
+    assert_eq!(errno(&error), Some(libc::EACCES));
+    assert_eq!(filesystem.transaction_count_for_test() - before, 1);
+    assert_eq!(filesystem.state_for_test(&directory).unwrap(), None);
 
-    let root = Credentials::for_test(0, 0, &[]);
-    assert!(root.allows(&attributes, libc::R_OK | libc::W_OK));
-    assert!(!root.allows(&attributes, libc::X_OK));
-    assert!(root.can_chmod(&attributes));
+    let link = parent.join("link");
+    let before = filesystem.transaction_count_for_test();
+    let error = filesystem
+        .create_symlink_authorized(&link, Path::new("target"), &credentials)
+        .unwrap_err();
+    assert_eq!(errno(&error), Some(libc::EACCES));
+    assert_eq!(filesystem.transaction_count_for_test() - before, 1);
+    assert_eq!(filesystem.state_for_test(&link).unwrap(), None);
+
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn authorized_remove_uses_parent_permissions_not_entry_write_permission() {
+    let (root, filesystem) = fixture("authorized-remove");
+    let parent = root.parent().unwrap().join(format!(
+        "agora-vfs-authorized-remove-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let logical = parent.join("read-only");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::write(&logical, b"lower").unwrap();
+    filesystem
+        .set_attributes(&logical, attributes_with_mode(&logical, 0o444))
+        .unwrap();
+    let before = filesystem.transaction_count_for_test();
+
+    filesystem
+        .remove_authorized(&logical, false, &Credentials::effective())
+        .unwrap();
+
+    assert_eq!(filesystem.transaction_count_for_test() - before, 1);
+    assert_eq!(
+        filesystem.state_for_test(&logical).unwrap(),
+        Some(super::EntryState::Whiteout)
+    );
+    assert!(logical.is_file());
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn authorized_rename_and_chmod_leave_state_unchanged_on_denial() {
+    let (root, filesystem) = fixture("authorized-rename-chmod-denied");
+    let parent = root.parent().unwrap().join(format!(
+        "agora-vfs-authorized-rename-chmod-denied-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source_parent = parent.join("source-parent");
+    let target_parent = parent.join("target-parent");
+    let source = source_parent.join("source");
+    let target = target_parent.join("target");
+    std::fs::create_dir_all(&source_parent).unwrap();
+    std::fs::create_dir(&target_parent).unwrap();
+    std::fs::write(&source, b"lower").unwrap();
+    filesystem
+        .set_attributes(&target_parent, attributes_with_mode(&target_parent, 0o555))
+        .unwrap();
+    let credentials = Credentials::effective();
+    let before = filesystem.transaction_count_for_test();
+
+    let error = filesystem
+        .rename_authorized(&source, &target, &credentials)
+        .unwrap_err();
+
+    assert_eq!(errno(&error), Some(libc::EACCES));
+    assert_eq!(filesystem.transaction_count_for_test() - before, 1);
+    assert_eq!(filesystem.state_for_test(&source).unwrap(), None);
+    assert_eq!(filesystem.state_for_test(&target).unwrap(), None);
+    assert!(source.is_file());
+    assert!(!target.exists());
+
+    let mut foreign = attributes_with_mode(&source, 0o644);
+    foreign.uid = foreign.uid.wrapping_add(1);
+    filesystem.set_attributes(&source, foreign.clone()).unwrap();
+    let before = filesystem.transaction_count_for_test();
+    let error = filesystem
+        .chmod_authorized(&source, 0o600, true, &credentials)
+        .unwrap_err();
+    assert_eq!(errno(&error), Some(libc::EPERM));
+    assert_eq!(filesystem.transaction_count_for_test() - before, 1);
+    assert_eq!(filesystem.attributes(&source).unwrap(), Some(foreign));
+
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn authorized_query_returns_native_for_untouched_lower_and_denies_logical_mode() {
+    let (root, filesystem) = fixture("authorized-query-access");
+    let logical = root.parent().unwrap().join(format!(
+        "agora-vfs-authorized-query-access-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&logical, b"lower").unwrap();
+    let credentials = Credentials::effective();
+    let before = filesystem.transaction_count_for_test();
+
+    assert!(matches!(
+        filesystem
+            .check_access(&logical, true, AccessRequest::READ, &credentials)
+            .unwrap(),
+        AccessPlan::Native(path) if path == logical
+    ));
+    assert_eq!(filesystem.transaction_count_for_test() - before, 1);
+
+    filesystem
+        .set_attributes(&logical, attributes_with_mode(&logical, 0o000))
+        .unwrap();
+    let before = filesystem.transaction_count_for_test();
+    let error = filesystem
+        .check_access(&logical, true, AccessRequest::READ, &credentials)
+        .unwrap_err();
+    assert_eq!(errno(&error), Some(libc::EACCES));
+    assert_eq!(filesystem.transaction_count_for_test() - before, 1);
+
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_file(logical).unwrap();
+}
+
+#[test]
+fn authorized_query_plans_metadata_directory_and_canonical_paths_in_one_transaction() {
+    let (root, filesystem) = fixture("authorized-query-plans");
+    let parent = root.parent().unwrap().join(format!(
+        "agora-vfs-authorized-query-plans-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let logical = parent.join("file");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::write(&logical, b"lower").unwrap();
+    let credentials = Credentials::effective();
+
+    let before = filesystem.transaction_count_for_test();
+    let plan = filesystem
+        .prepare_authorized_metadata(&logical, true, &credentials)
+        .unwrap();
+    assert_eq!(plan.logical(), logical);
+    assert_eq!(plan.mapped(), logical);
+    assert_eq!(filesystem.transaction_count_for_test() - before, 1);
+
+    let before = filesystem.transaction_count_for_test();
+    let canonical = filesystem
+        .canonicalize_authorized(&logical, &credentials)
+        .unwrap();
+    assert_eq!(canonical, logical.canonicalize().unwrap());
+    assert_eq!(filesystem.transaction_count_for_test() - before, 1);
+
+    let before = filesystem.transaction_count_for_test();
+    let (mapped, resolved) = filesystem
+        .prepare_change_directory(&parent, &credentials)
+        .unwrap();
+    assert_eq!(mapped, parent);
+    assert_eq!(resolved, parent);
+    assert_eq!(filesystem.transaction_count_for_test() - before, 1);
+
+    let before = filesystem.transaction_count_for_test();
+    let view = filesystem
+        .directory_view_authorized(&parent, &credentials)
+        .unwrap();
+    assert_eq!(view.logical(), parent);
+    assert_eq!(filesystem.transaction_count_for_test() - before, 1);
+
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(parent).unwrap();
 }
 
 #[test]

@@ -113,6 +113,151 @@ fn sequential_overlay_transactions_reuse_the_lock_descriptor() {
 }
 
 #[test]
+fn overlay_transaction_batches_queries_under_one_lock_entry() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("transaction-file");
+    std::fs::write(&logical, b"lower").unwrap();
+    let before = fixture.store.transaction_count_for_test();
+
+    fixture
+        .store
+        .transaction(|transaction| {
+            assert!(transaction.visible_exists(&logical)?);
+            assert_eq!(transaction.resolve_final(&logical, false)?, logical);
+            assert_eq!(transaction.attributes(&logical)?, None);
+            assert_eq!(
+                transaction.records(&[logical.as_path()])?,
+                vec![(None, None)]
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(fixture.store.transaction_count_for_test() - before, 1);
+}
+
+#[test]
+fn overlay_transaction_records_treat_the_logical_root_as_unmodified() {
+    let fixture = Fixture::new();
+
+    let records = fixture
+        .store
+        .transaction(|transaction| transaction.records(&[Path::new("/")]))
+        .unwrap();
+
+    assert_eq!(records, vec![(None, None)]);
+}
+
+#[test]
+fn overlay_transaction_records_reconcile_each_unique_path_once() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("deep/ancestor/transaction-file");
+    std::fs::create_dir_all(logical.parent().unwrap()).unwrap();
+    std::fs::write(&logical, b"lower").unwrap();
+    fixture.store.prepare_write(&logical, false).unwrap();
+    let paths = logical
+        .ancestors()
+        .take_while(|path| *path != Path::new("/"))
+        .collect::<Vec<_>>();
+    let before = fixture.store.reconciliation_count_for_test();
+
+    fixture
+        .store
+        .transaction(|transaction| transaction.records(&paths))
+        .unwrap();
+
+    assert_eq!(
+        fixture.store.reconciliation_count_for_test() - before,
+        paths.len()
+    );
+}
+
+#[test]
+fn overlay_transaction_records_stop_at_a_missing_upper_ancestor() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("deep/ancestor/transaction-file");
+    std::fs::create_dir_all(logical.parent().unwrap()).unwrap();
+    std::fs::write(&logical, b"lower").unwrap();
+    let paths = logical
+        .ancestors()
+        .take_while(|path| *path != Path::new("/"))
+        .collect::<Vec<_>>();
+    let before = fixture.store.reconciliation_count_for_test();
+
+    let records = fixture
+        .store
+        .transaction(|transaction| transaction.records(&paths))
+        .unwrap();
+
+    assert_eq!(records, vec![(None, None); paths.len()]);
+    assert_eq!(fixture.store.reconciliation_count_for_test() - before, 1);
+}
+
+#[test]
+fn overlay_transaction_records_reject_descendants_of_a_whiteout() {
+    let fixture = Fixture::new();
+    let directory = fixture.lower.join("removed-tree");
+    std::fs::create_dir(&directory).unwrap();
+    fixture.store.remove(&directory, true).unwrap();
+    let child = directory.join("created-after-removal");
+    std::fs::write(&child, b"lower").unwrap();
+
+    let error = fixture
+        .store
+        .transaction(|transaction| transaction.records(&[child.as_path()]))
+        .unwrap_err();
+
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn overlay_transactions_serialize_distinct_stores_for_one_workspace() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-overlay-transaction-lock-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let root = directory.join("fs");
+    let first_store = Arc::new(OverlayStore::new(&root).unwrap());
+    let second_store = Arc::new(OverlayStore::new(&root).unwrap());
+    let (first_entered_tx, first_entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let first = std::thread::spawn(move || {
+        first_store
+            .transaction(|_| {
+                first_entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+    });
+    first_entered_rx.recv().unwrap();
+
+    let (second_entered_tx, second_entered_rx) = mpsc::channel();
+    let second = std::thread::spawn(move || {
+        second_store
+            .transaction(|_| {
+                second_entered_tx.send(()).unwrap();
+                Ok(())
+            })
+            .unwrap();
+    });
+
+    assert!(
+        second_entered_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err()
+    );
+    release_tx.send(()).unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    second_entered_rx.recv().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn read_uses_lower_without_materializing_host_files() {
     let fixture = Fixture::new();
     let source = fixture.lower.join("file");
@@ -127,6 +272,332 @@ fn read_uses_lower_without_materializing_host_files() {
     std::fs::write(&source, b"second").unwrap();
     assert_eq!(fixture.store.prepare_read(&source).unwrap(), mapped);
     assert_eq!(std::fs::read(mapped).unwrap(), b"second");
+}
+
+#[test]
+fn creating_upper_data_builds_a_continuous_marker_chain() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("one/two/file");
+    std::fs::create_dir_all(logical.parent().unwrap()).unwrap();
+
+    let upper = fixture.store.prepare_write(&logical, true).unwrap();
+    std::fs::write(upper, b"upper").unwrap();
+
+    let root = fixture.store.root();
+    assert!(root.join(".metadata").is_file());
+    for ancestor in logical
+        .parent()
+        .unwrap()
+        .ancestors()
+        .take_while(|ancestor| *ancestor != Path::new("/"))
+    {
+        let marker = root
+            .join(ancestor.strip_prefix("/").unwrap())
+            .join(".metadata");
+        assert!(marker.is_file(), "missing {}", marker.display());
+    }
+}
+
+#[test]
+fn creating_an_upper_directory_adds_its_own_marker() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("created");
+
+    let upper = fixture.store.create_directory(&logical, 0o700).unwrap();
+
+    assert!(upper.join(".metadata").is_file());
+}
+
+#[test]
+fn externally_removed_cow_backing_clears_metadata_and_reveals_lower() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("cow-file");
+    std::fs::write(&logical, b"lower").unwrap();
+    let upper = fixture.store.prepare_write(&logical, false).unwrap();
+    std::fs::write(&upper, b"upper").unwrap();
+    std::fs::remove_file(&upper).unwrap();
+
+    assert_eq!(fixture.store.prepare_read(&logical).unwrap(), logical);
+    assert_eq!(fixture.store.state(&logical).unwrap(), None);
+}
+
+#[test]
+fn externally_removed_cached_backing_clears_cache_and_reveals_lower() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("cached-file");
+    std::fs::write(&logical, b"lower").unwrap();
+    let upper = fixture
+        .store
+        .prepare_executable(&logical, |temporary| {
+            std::fs::write(temporary, b"cached")?;
+            std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        })
+        .unwrap();
+    std::fs::remove_file(upper).unwrap();
+
+    assert_eq!(fixture.store.prepare_read(&logical).unwrap(), logical);
+    assert_eq!(fixture.store.state(&logical).unwrap(), None);
+}
+
+#[test]
+fn whiteout_without_backing_remains_authoritative() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("whiteout");
+    std::fs::write(&logical, b"lower").unwrap();
+    fixture.store.remove(&logical, false).unwrap();
+
+    assert!(fixture.store.prepare_read(&logical).is_err());
+    assert!(
+        fixture
+            .store
+            .plain_destination(logical.parent().unwrap())
+            .unwrap()
+            .join(".metadata")
+            .is_file()
+    );
+    assert_eq!(
+        fixture.store.state(&logical).unwrap(),
+        Some(EntryState::Whiteout)
+    );
+}
+
+#[test]
+fn whiteout_removes_an_unexpected_upper_object_without_revealing_lower() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("whiteout-orphan");
+    std::fs::write(&logical, b"lower").unwrap();
+    fixture.store.remove(&logical, false).unwrap();
+    let upper = fixture.store.plain_destination(&logical).unwrap();
+    std::fs::write(&upper, b"orphan").unwrap();
+
+    assert!(fixture.store.prepare_read(&logical).is_err());
+    assert!(!upper.exists());
+    assert_eq!(
+        fixture.store.state(&logical).unwrap(),
+        Some(EntryState::Whiteout)
+    );
+}
+
+#[test]
+fn whiteout_ancestor_hides_lower_children_created_later() {
+    let fixture = Fixture::new();
+    let logical_directory = fixture.lower.join("removed-tree");
+    std::fs::create_dir(&logical_directory).unwrap();
+    fixture.store.remove(&logical_directory, true).unwrap();
+    let late_child = logical_directory.join("late-child");
+    std::fs::write(&late_child, b"lower").unwrap();
+
+    assert!(fixture.store.prepare_read(&late_child).is_err());
+}
+
+#[test]
+fn unrecorded_upper_file_is_removed_and_lower_is_visible() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("orphan");
+    std::fs::write(&logical, b"lower").unwrap();
+    fixture.store.ensure_parent_locked(&logical).unwrap();
+    let upper = fixture.store.plain_destination(&logical).unwrap();
+    std::fs::write(&upper, b"orphan").unwrap();
+
+    assert_eq!(fixture.store.prepare_read(&logical).unwrap(), logical);
+    assert!(!upper.exists());
+}
+
+#[test]
+fn attribute_only_lower_override_survives_reconciliation() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("attribute-only");
+    std::fs::write(&logical, b"lower").unwrap();
+    let attributes = FileAttributes::created_file(0o600);
+    fixture
+        .store
+        .set_attributes(&logical, attributes.clone())
+        .unwrap();
+
+    assert_eq!(fixture.store.prepare_read(&logical).unwrap(), logical);
+    assert_eq!(
+        fixture.store.attributes(&logical).unwrap(),
+        Some(attributes)
+    );
+    assert!(
+        fixture
+            .store
+            .plain_destination(logical.parent().unwrap())
+            .unwrap()
+            .join(".metadata")
+            .is_file()
+    );
+}
+
+#[test]
+fn unmarked_parent_invalidates_descendant_metadata_and_reveals_lower() {
+    let fixture = Fixture::new();
+    let directory = fixture.lower.join("untrusted-parent");
+    let logical = directory.join("child");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(&logical, b"lower").unwrap();
+    let upper = fixture.store.prepare_write(&logical, false).unwrap();
+    std::fs::write(&upper, b"upper").unwrap();
+    assert_eq!(
+        fixture.store.state(&logical).unwrap(),
+        Some(EntryState::Cow)
+    );
+    let upper_directory = fixture.store.plain_destination(&directory).unwrap();
+    std::fs::remove_file(upper_directory.join(".metadata")).unwrap();
+
+    assert_eq!(fixture.store.prepare_read(&logical).unwrap(), logical);
+    assert!(!upper_directory.exists());
+    assert_eq!(fixture.store.state(&logical).unwrap(), None);
+}
+
+#[test]
+fn externally_removed_upper_directory_reveals_lower_in_the_same_store() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("cow-directory");
+    let upper = fixture.store.create_directory(&logical, 0o700).unwrap();
+    std::fs::create_dir(&logical).unwrap();
+    std::fs::remove_dir_all(upper).unwrap();
+
+    assert_eq!(fixture.store.prepare_directory(&logical).unwrap(), logical);
+    assert_eq!(fixture.store.state(&logical).unwrap(), None);
+}
+
+#[test]
+fn externally_removed_merge_directory_invalidates_cached_child_metadata() {
+    for fixture in [Fixture::new(), Fixture::encrypted().0] {
+        let logical_directory = fixture.lower.join("merge-directory");
+        let first = logical_directory.join("first");
+        let second = logical_directory.join("second");
+        std::fs::create_dir(&logical_directory).unwrap();
+        std::fs::write(&first, b"lower first").unwrap();
+        std::fs::write(&second, b"lower second").unwrap();
+        for path in [&first, &second] {
+            let upper = fixture.store.prepare_write(path, false).unwrap();
+            std::fs::write(upper, b"upper").unwrap();
+            fixture.store.prepare_read(path).unwrap();
+        }
+        let upper_directory = fixture.store.plain_destination(&logical_directory).unwrap();
+        std::fs::remove_dir_all(&upper_directory).unwrap();
+
+        assert_eq!(fixture.store.prepare_read(&first).unwrap(), first);
+        assert!(!upper_directory.exists());
+        assert_eq!(fixture.store.prepare_read(&second).unwrap(), second);
+        assert!(!upper_directory.exists());
+    }
+}
+
+#[test]
+fn unrecorded_upper_symlink_is_removed_and_lower_is_visible() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("orphan-symlink");
+    std::fs::write(&logical, b"lower").unwrap();
+    fixture.store.ensure_parent_locked(&logical).unwrap();
+    let upper = fixture.store.plain_destination(&logical).unwrap();
+    symlink("somewhere", &upper).unwrap();
+
+    assert_eq!(fixture.store.prepare_read(&logical).unwrap(), logical);
+    assert!(upper.symlink_metadata().is_err());
+}
+
+#[test]
+fn encrypted_orphan_is_removed_during_directory_reconciliation() {
+    let (fixture, cipher) = Fixture::encrypted();
+    let logical_directory = fixture.lower.join("encrypted-orphans");
+    std::fs::create_dir(&logical_directory).unwrap();
+    let upper_directory = fixture
+        .store
+        .ensure_directory_locked(&logical_directory)
+        .unwrap();
+    let encrypted_name = cipher.encrypt_name(b"orphan").unwrap();
+    let orphan = upper_directory.join(encrypted_name);
+    std::fs::write(&orphan, b"orphan").unwrap();
+
+    fixture.store.directory_view(&logical_directory).unwrap();
+
+    assert!(!orphan.exists());
+}
+
+#[test]
+fn stale_encrypted_writer_cannot_recreate_a_reconciled_cow_file() {
+    let (fixture, _) = Fixture::encrypted();
+    let logical = fixture.lower.join("stale-writer");
+    std::fs::write(&logical, b"lower").unwrap();
+    let (staged, _, lease) = fixture
+        .store
+        .stage_file_open(&logical, false, false)
+        .unwrap();
+    let destination = staged.destination().to_path_buf();
+    let lease = lease.unwrap();
+    fixture.store.commit_write(staged).unwrap();
+    std::fs::remove_file(&destination).unwrap();
+
+    assert_eq!(fixture.store.prepare_read(&logical).unwrap(), logical);
+    let mut late_plaintext = tempfile::tempfile().unwrap();
+    use std::io::Write as _;
+    late_plaintext.write_all(b"late upper").unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .publish_encrypted(&mut late_plaintext, &lease)
+            .unwrap(),
+        None
+    );
+    assert!(!destination.exists());
+}
+
+#[test]
+fn pending_encrypted_exclusive_create_is_not_reconciled_as_an_orphan() {
+    let (fixture, _) = Fixture::encrypted();
+    let logical = fixture.lower.join("pending-create");
+    let (staged, existed, lease) = fixture.store.stage_file_open(&logical, true, true).unwrap();
+    let destination = staged.destination().to_path_buf();
+    assert!(!existed);
+    assert!(lease.is_some());
+
+    assert!(fixture.store.prepare_read(&logical).is_err());
+    assert!(destination.is_file());
+    fixture.store.commit_created_file(staged, 0o600).unwrap();
+    assert_eq!(
+        fixture.store.state(&logical).unwrap(),
+        Some(EntryState::Cow)
+    );
+}
+
+#[test]
+fn externally_removed_root_marker_discards_all_upper_data() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("root-reset");
+    std::fs::write(&logical, b"lower").unwrap();
+    let upper = fixture.store.prepare_write(&logical, false).unwrap();
+    std::fs::write(&upper, b"upper").unwrap();
+    std::fs::remove_file(fixture.store.root().join(".metadata")).unwrap();
+
+    assert_eq!(fixture.store.prepare_read(&logical).unwrap(), logical);
+    assert!(!upper.exists());
+    assert!(fixture.store.root().join(".metadata").is_file());
+}
+
+#[test]
+fn reopening_after_root_marker_removal_discards_all_upper_data() {
+    let directory = tempfile::tempdir().unwrap();
+    let lower = directory.path().join("lower");
+    let root = directory.path().join("fs");
+    let logical = lower.join("root-reopen");
+    std::fs::create_dir(&lower).unwrap();
+    std::fs::write(&logical, b"lower").unwrap();
+    let upper = {
+        let store = OverlayStore::new(&root).unwrap();
+        let upper = store.prepare_write(&logical, false).unwrap();
+        std::fs::write(&upper, b"upper").unwrap();
+        upper
+    };
+    std::fs::remove_file(root.join(".metadata")).unwrap();
+
+    let reopened = OverlayStore::new(&root).unwrap();
+
+    assert_eq!(reopened.prepare_read(&logical).unwrap(), logical);
+    assert!(!upper.exists());
 }
 
 #[test]
@@ -172,116 +643,22 @@ fn encrypted_metadata_key_matches_the_encrypted_physical_name_without_plaintext(
 }
 
 #[test]
-fn opening_an_overlay_recursively_migrates_version_one_metadata() {
+fn opening_an_overlay_does_not_scan_unrelated_nested_metadata() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("fs");
-    let nested = root.join("usr/bin");
-    std::fs::create_dir_all(&nested).unwrap();
-    let attributes = FileAttributes::created_file(0o755);
+    let unrelated = root.join("unrelated");
+    std::fs::create_dir_all(&unrelated).unwrap();
     std::fs::write(
         root.join(".metadata"),
-        serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "entries": {"Y2F0": {"state": "whiteout"}},
-            "attributes": {},
-            "backing_names": {}
-        }))
-        .unwrap(),
+        serde_json::to_vec(&serde_json::json!({"version": 3, "entries": {}})).unwrap(),
     )
     .unwrap();
-    std::fs::write(
-        nested.join(".metadata"),
-        serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "entries": {"YmFzaA": {"state": "cow"}},
-            "attributes": {"YmFzaA": serde_json::to_value(&attributes).unwrap()},
-            "backing_names": {}
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    std::fs::write(unrelated.join(".metadata"), b"not-json").unwrap();
 
     let store = OverlayStore::new(&root).unwrap();
 
-    assert_eq!(
-        store.state(Path::new("/cat")).unwrap(),
-        Some(EntryState::Whiteout)
-    );
-    assert_eq!(
-        store.state(Path::new("/usr/bin/bash")).unwrap(),
-        Some(EntryState::Cow)
-    );
-    assert_eq!(
-        store.attributes(Path::new("/usr/bin/bash")).unwrap(),
-        Some(attributes)
-    );
-    let root_metadata: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.join(".metadata")).unwrap()).unwrap();
-    let nested_metadata: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(nested.join(".metadata")).unwrap()).unwrap();
-    assert_eq!(root_metadata["version"], 3);
-    assert!(root_metadata["entries"].get("cat").is_some());
-    assert_eq!(nested_metadata["version"], 3);
-    assert!(nested_metadata["entries"].get("bash").is_some());
-    assert!(
-        nested_metadata["entries"]["bash"]
-            .get("attributes")
-            .is_some()
-    );
-}
-
-#[test]
-fn encrypted_overlay_migrates_version_two_aliases_to_encrypted_filenames() {
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().join("fs");
-    let backing = root.join("tmp");
-    std::fs::create_dir_all(&backing).unwrap();
-    let old_name = "c1ed24271f7440a19b1b85076d21d0ae";
-    std::fs::write(backing.join(old_name), b"ciphertext").unwrap();
-    std::fs::write(
-        backing.join(".metadata"),
-        serde_json::to_vec(&serde_json::json!({
-            "version": 2,
-            "entries": {"安全方案.docx": {"state": "cow"}},
-            "attributes": {},
-            "backing_names": {"安全方案.docx": old_name}
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
-
-    let store = OverlayStore::encrypted(&root, cipher.clone()).unwrap();
-
-    assert_eq!(
-        store.state(Path::new("/tmp/安全方案.docx")).unwrap(),
-        Some(EntryState::Cow)
-    );
-    let contents = std::fs::read(backing.join(".metadata")).unwrap();
-    assert!(
-        !contents
-            .windows("安全方案.docx".len())
-            .any(|part| { part == "安全方案.docx".as_bytes() })
-    );
-    let metadata: serde_json::Value = serde_json::from_slice(&contents).unwrap();
-    assert_eq!(metadata["version"], 3);
-    assert!(metadata.get("backing_names").is_none());
-    let encrypted_name = metadata["entries"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .next()
-        .unwrap();
-    assert_eq!(
-        cipher.decrypt_name(encrypted_name).unwrap(),
-        "安全方案.docx".as_bytes()
-    );
-    assert!(backing.join(encrypted_name).is_file());
-    assert!(!backing.join(old_name).exists());
-    assert_eq!(
-        store.prepare_read(Path::new("/tmp/安全方案.docx")).unwrap(),
-        backing.join(encrypted_name)
-    );
+    assert_eq!(store.prepare_read(Path::new("/")).unwrap(), Path::new("/"));
+    assert!(store.state(Path::new("/unrelated/entry")).is_err());
 }
 
 #[test]
@@ -976,14 +1353,15 @@ fn special_files_root_children_and_upper_directories_remain_overlay_local() {
 }
 
 #[test]
-fn missing_cow_whiteout_and_directory_paths_remain_unavailable() {
+fn missing_cow_falls_back_while_whiteout_and_missing_paths_remain_unavailable() {
     let fixture = Fixture::new();
 
     let cow_file = fixture.lower.join("cow-file");
     std::fs::write(&cow_file, b"host").unwrap();
     let mapped_cow_file = fixture.store.prepare_write(&cow_file, false).unwrap();
     std::fs::remove_file(mapped_cow_file).unwrap();
-    assert!(fixture.store.prepare_write(&cow_file, false).is_err());
+    let recreated_cow_file = fixture.store.prepare_write(&cow_file, false).unwrap();
+    assert_eq!(std::fs::read(recreated_cow_file).unwrap(), b"host");
 
     let removed_file = fixture.lower.join("removed-file");
     std::fs::write(&removed_file, b"host").unwrap();
