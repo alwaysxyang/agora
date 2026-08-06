@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 const INNER_BUILD: &str = "AGORA_SANDBOX_INNER_HOOK_BUILD";
 const HOOK_CFG: &str = "agora_sandbox_hook_build";
 const HOOK_FILE_NAME: &str = "libagora_sandbox.dylib";
+const HOOK_TARGET_DIRECTORY: &str = "agora-sandbox-hook";
 
 fn main() {
     if let Err(error) = run() {
@@ -20,6 +21,7 @@ fn main() {
 fn run() -> Result<()> {
     println!("cargo:rustc-check-cfg=cfg({HOOK_CFG})");
     println!("cargo:rerun-if-env-changed={INNER_BUILD}");
+    println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
     let inner_build = env::var_os(INNER_BUILD).is_some();
     for input in [
         "build.rs",
@@ -46,7 +48,7 @@ fn run() -> Result<()> {
     let artifact = build_hook_dylib()?;
     validate_target_architecture(&artifact)?;
     verify_linker_signature(&artifact)?;
-    publish_embedded_artifact(&artifact)
+    configure_embedded_artifact(&artifact)
 }
 
 fn compile_filesystem_shim() {
@@ -81,7 +83,7 @@ fn build_hook_dylib() -> Result<PathBuf> {
         .arg("--profile")
         .arg(profile)
         .arg("--target-dir")
-        .arg(out_directory.join("hook-target"))
+        .arg(hook_target_directory(&manifest_directory)?)
         .args([
             "--message-format",
             "json-render-diagnostics",
@@ -135,7 +137,15 @@ fn build_hook_dylib() -> Result<PathBuf> {
             .map(PathBuf::from)
             .find(|path| path.extension().and_then(|value| value.to_str()) == Some("dylib"))
         {
-            artifact = Some(path);
+            let destination = out_directory.join(format!("embedded-{HOOK_FILE_NAME}"));
+            fs::copy(&path, &destination).with_context(|| {
+                format!(
+                    "failed to snapshot hook artifact {} to {}",
+                    path.display(),
+                    destination.display()
+                )
+            })?;
+            artifact = Some(destination);
         }
     }
     let status = child
@@ -149,6 +159,25 @@ fn build_hook_dylib() -> Result<PathBuf> {
     artifact
         .canonicalize()
         .with_context(|| format!("failed to resolve hook artifact {}", artifact.display()))
+}
+
+fn hook_target_directory(manifest_directory: &Path) -> Result<PathBuf> {
+    let workspace = manifest_directory
+        .parent()
+        .and_then(Path::parent)
+        .context("agora-sandbox manifest is not inside the workspace")?;
+    let target = match env::var_os("CARGO_TARGET_DIR") {
+        Some(directory) => {
+            let directory = PathBuf::from(directory);
+            if directory.is_absolute() {
+                directory
+            } else {
+                workspace.join(directory)
+            }
+        }
+        None => workspace.join("target"),
+    };
+    Ok(target.join(HOOK_TARGET_DIRECTORY))
 }
 
 fn validate_target_architecture(artifact: &Path) -> Result<()> {
@@ -196,22 +225,12 @@ fn verify_linker_signature(artifact: &Path) -> Result<()> {
     Ok(())
 }
 
-fn publish_embedded_artifact(artifact: &Path) -> Result<()> {
-    let out_directory =
-        PathBuf::from(env::var_os("OUT_DIR").context("Cargo did not provide OUT_DIR")?);
-    let destination = out_directory.join(format!("embedded-{HOOK_FILE_NAME}"));
-    fs::copy(artifact, &destination).with_context(|| {
-        format!(
-            "failed to copy hook artifact {} to {}",
-            artifact.display(),
-            destination.display()
-        )
-    })?;
-    let checksum = checksum(&destination)?;
-    let destination = destination
+fn configure_embedded_artifact(artifact: &Path) -> Result<()> {
+    let checksum = checksum(artifact)?;
+    let artifact = artifact
         .to_str()
         .context("embedded hook artifact path is not valid UTF-8")?;
-    println!("cargo:rustc-env=AGORA_SANDBOX_EMBEDDED_HOOK_PATH={destination}");
+    println!("cargo:rustc-env=AGORA_SANDBOX_EMBEDDED_HOOK_PATH={artifact}");
     println!("cargo:rustc-env=AGORA_SANDBOX_EMBEDDED_HOOK_MD5={checksum}");
     Ok(())
 }

@@ -1273,7 +1273,7 @@ fn unchanged_executable_identity_reuses_cache_without_rehashing_contents() {
         .set_state_for_test(
             &source,
             EntryState::Cached {
-                checksum: "intentionally-invalid".to_string(),
+                checksum: Some("intentionally-invalid".to_string()),
                 materializer,
                 source: Some(source_identity),
             },

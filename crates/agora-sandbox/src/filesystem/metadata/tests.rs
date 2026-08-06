@@ -48,7 +48,7 @@ fn metadata_round_trips_cached_cow_and_whiteout_states() {
         .set(
             cached,
             EntryState::Cached {
-                checksum: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+                checksum: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
                 materializer: Materializer::Copy,
                 source: None,
             },

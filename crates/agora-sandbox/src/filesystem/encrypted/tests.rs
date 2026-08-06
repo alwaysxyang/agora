@@ -120,7 +120,7 @@ fn key_migration_ignores_persistent_executable_caches() {
         .set(
             std::path::Path::new("/usr/bin/tool"),
             EntryState::Cached {
-                checksum: "checksum".to_string(),
+                checksum: None,
                 materializer: Materializer::Executable,
                 source: None,
             },

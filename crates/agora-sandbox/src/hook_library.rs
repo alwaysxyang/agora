@@ -188,7 +188,29 @@ fn checksum(path: &Path) -> Result<String> {
 #[cfg(target_os = "macos")]
 fn is_matching_regular_file(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(checksum(path)? == EMBEDDED_HOOK_MD5),
+        Ok(metadata) if metadata.is_file() => {
+            anyhow::ensure!(
+                metadata.uid() == unsafe { libc::geteuid() },
+                "embedded sandbox hook is not owned by the current user: {}",
+                path.display()
+            );
+            if metadata.len() != EMBEDDED_HOOK.len() as u64 {
+                return Ok(false);
+            }
+            match checksum(path) {
+                Ok(checksum) => Ok(checksum == EMBEDDED_HOOK_MD5),
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                            error.kind() == std::io::ErrorKind::PermissionDenied
+                        })
+                    }) =>
+                {
+                    Ok(false)
+                }
+                Err(error) => Err(error),
+            }
+        }
         Ok(_) => Ok(false),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error)

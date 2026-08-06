@@ -332,11 +332,6 @@ impl ExecutableStore {
         Ok(self.overlay.root().join(relative))
     }
 
-    #[cfg(test)]
-    fn checksum(source: &Path) -> Result<String> {
-        OverlayStore::checksum(source)
-    }
-
     fn architectures(source: &Path) -> Result<Vec<String>> {
         let output = Command::new("/usr/bin/lipo")
             .arg("-archs")

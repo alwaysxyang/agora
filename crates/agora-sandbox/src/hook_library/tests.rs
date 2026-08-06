@@ -91,6 +91,23 @@ fn restores_a_corrupt_materialized_hook_atomically() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn restores_an_unreadable_materialized_hook_atomically() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = super::materialize(root.path()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    assert_eq!(super::materialize(root.path()).unwrap(), path);
+    assert_eq!(std::fs::read(&path).unwrap(), super::EMBEDDED_HOOK);
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o500
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn replaces_a_destination_symlink_without_touching_its_target() {
     use std::os::unix::fs::symlink;
 

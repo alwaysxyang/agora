@@ -133,7 +133,7 @@ Current status:
 - The hook also interposes the supported `posix_spawn` and `exec` family so an explicit shell and
   its descendants remain injected recursively. Restricted dynamic Mach-O executables are mirrored
   by canonical source path under `<workdir>/fs`, processed for the sandbox build architecture,
-  ad-hoc signed, and reused across runs when their MD5 manifest entry still matches. Process launch
+  ad-hoc signed, and reused across runs when their recorded source identity still matches. Process launch
   attempts and intercepted file opens and closes are published through an authenticated audit
   controller, then delivered through the same callback as network events with the shared trace
   chain. File events retain the logical pre-overlay path and structured open mode from open through

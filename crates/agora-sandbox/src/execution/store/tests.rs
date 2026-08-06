@@ -85,7 +85,7 @@ fn executable_store_prepares_and_caches_a_native_copy() {
     else {
         panic!("missing executable cache metadata");
     };
-    assert_eq!(checksum, ExecutableStore::checksum(&source).unwrap());
+    assert_eq!(checksum, None);
     assert_eq!(materializer, Materializer::Executable);
     assert!(source_identity.is_some());
     assert!(!first.with_extension("md5").exists());
@@ -115,6 +115,7 @@ fn executable_store_prepares_and_caches_a_native_copy() {
         serde_json::from_slice(&fs::read(metadata_path).unwrap()).unwrap();
     assert_eq!(metadata["version"], 3);
     assert!(metadata["entries"].get("sh").is_some());
+    assert!(metadata["entries"]["sh"]["entry"].get("checksum").is_none());
 }
 
 #[test]
@@ -717,7 +718,7 @@ fn executable_store_rebuilds_when_the_copy_or_metadata_is_missing() {
 }
 
 #[test]
-fn executable_store_rebuilds_when_the_source_checksum_changes() {
+fn executable_store_rebuilds_when_the_source_identity_changes() {
     let root = TestDirectory::new();
     let source = root.path().join("tool");
     fs::copy("/bin/sh", &source).unwrap();
@@ -725,13 +726,16 @@ fn executable_store_rebuilds_when_the_source_checksum_changes() {
     let store = ExecutableStore::new(root.path().join("prepared")).unwrap();
     let destination = store.prepare_copy_for_test(&source).unwrap();
     let canonical_source = source.canonicalize().unwrap();
-    let first_checksum = match store
+    let first_identity = match store
         .overlay
         .state_for_test(&canonical_source)
         .unwrap()
         .unwrap()
     {
-        EntryState::Cached { checksum, .. } => checksum,
+        EntryState::Cached {
+            source: Some(source),
+            ..
+        } => source,
         state => panic!("unexpected state: {state:?}"),
     };
     let first_copy = fs::read(&destination).unwrap();
@@ -747,16 +751,19 @@ fn executable_store_rebuilds_when_the_source_checksum_changes() {
             .unwrap()
             .unwrap()
         {
-            EntryState::Cached { checksum, .. } => checksum,
+            EntryState::Cached {
+                source: Some(source),
+                ..
+            } => source,
             state => panic!("unexpected state: {state:?}"),
         },
-        first_checksum
+        first_identity
     );
     assert_ne!(fs::read(destination).unwrap(), first_copy);
 }
 
 #[test]
-fn executable_store_reuses_the_copy_when_the_source_checksum_matches() {
+fn executable_store_reuses_the_copy_when_the_source_identity_matches() {
     let root = TestDirectory::new();
     let store = ExecutableStore::new(root.path().join("prepared")).unwrap();
     let destination = store.prepare(Path::new("/bin/sh")).unwrap();

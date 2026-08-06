@@ -31,7 +31,8 @@ pub(crate) enum Materializer {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum EntryState {
     Cached {
-        checksum: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checksum: Option<String>,
         materializer: Materializer,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<SourceIdentity>,

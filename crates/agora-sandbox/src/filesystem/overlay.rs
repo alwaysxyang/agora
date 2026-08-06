@@ -704,27 +704,6 @@ impl OverlayStore {
             {
                 return Ok(destination);
             }
-            let checksum = Self::checksum(&source)?;
-            if reusable_destination
-                && matches!(
-                    cached,
-                    Some(EntryState::Cached {
-                        checksum: ref cached,
-                        materializer: Materializer::Executable,
-                        ..
-                    }) if cached == &checksum
-                )
-            {
-                self.metadata.set(
-                    &source,
-                    EntryState::Cached {
-                        checksum,
-                        materializer: Materializer::Executable,
-                        source: Some(source_identity),
-                    },
-                )?;
-                return Ok(destination);
-            }
             let parent = destination
                 .parent()
                 .context("executable destination has no parent")?;
@@ -738,7 +717,7 @@ impl OverlayStore {
                 self.metadata.set(
                     &source,
                     EntryState::Cached {
-                        checksum,
+                        checksum: None,
                         materializer: Materializer::Executable,
                         source: Some(source_identity),
                     },
@@ -921,7 +900,9 @@ impl OverlayStore {
                     let destination = self.destination(path)?;
                     let reusable = destination.exists()
                         && materializer == Materializer::Copy
-                        && Self::checksum(path).is_ok_and(|current| current == checksum);
+                        && checksum.as_ref().is_some_and(|checksum| {
+                            Self::checksum(path).is_ok_and(|current| &current == checksum)
+                        });
                     if !reusable {
                         return self.materialize_file_locked(path, Materializer::Copy);
                     }
@@ -1238,7 +1219,7 @@ impl OverlayStore {
             self.metadata.set_with_attributes(
                 source,
                 EntryState::Cached {
-                    checksum: Self::hex_digest(digest.finalize().as_slice()),
+                    checksum: Some(Self::hex_digest(digest.finalize().as_slice())),
                     materializer,
                     source: Some(SourceIdentity::from_metadata(&source_metadata)),
                 },

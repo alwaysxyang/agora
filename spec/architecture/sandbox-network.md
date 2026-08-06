@@ -110,8 +110,10 @@ behavior are specified in [Sandbox Filesystem And Executable Preparation](sandbo
 `agora-sandbox` remains one public Cargo package. Its ordinary Cargo build produces an rlib and a
 standard cdylib; the latter is a build and coverage artifact, not a runtime sidecar dependency. It
 lets injected coverage processes share Cargo's crate identity with their test binaries. The outer
-`build.rs` performs one guarded inner `cargo rustc --crate-type cdylib` build in a separate target
-directory for the bytes embedded into consumers. The inner build uses the same manifest, Cargo
+`build.rs` performs one guarded inner `cargo rustc --crate-type cdylib` build in a shared nested
+target directory beneath the active Cargo target directory for the bytes embedded into consumers.
+Different outer build-script instances reuse that dependency cache while each stages its reported
+dylib into its own `OUT_DIR`. The inner build uses the same manifest, Cargo
 target, and profile, compiles the existing C shim, and excludes the materializer so embedded bytes
 cannot recurse. A private build marker prevents the inner build script from launching Cargo again.
 
@@ -126,8 +128,9 @@ build artifact.
 At runtime, `hook_library::materialize(workdir)` publishes the bytes under the checksum-addressed
 path while holding `<workdir>/runtime/hook/.lock`. Controller directories and the lock reject
 symlinks, non-directory or non-file substitutions, and foreign ownership. A matching regular file
-is reused; mismatched content is replaced through a same-directory, synced temporary file and an
-atomic rename. The runtime cache and lock are independent of `<workdir>/fs` and its overlay locks.
+is reused; a same-user regular file with the wrong size, unreadable content, or mismatched content
+is replaced through a same-directory, synced temporary file and an atomic rename. The runtime cache
+and lock are independent of `<workdir>/fs` and its overlay locks.
 SDK callers may instead continue to pass any explicit hook path directly to `SandboxConfig::new`.
 
 ## Runtime Flow
@@ -305,7 +308,8 @@ binaries are thinned to that selected architecture before the original signature
 an ad-hoc signature. Executables without dyld restrictions and scripts remain at their canonical
 original paths. Shebang scripts are launched through their declared interpreter, and that interpreter
 is independently prepared when required. Prepared copies are reused across runs only when the
-executable exists and its directory metadata entry matches the source MD5. The original
+executable exists and its directory metadata entry matches the source device, inode, size,
+timestamps, and mode. Executable preparation does not hash the complete source. The original
 executable is never modified.
 
 Remaining coverage gaps exist outside code that successfully enters the hook:
