@@ -75,13 +75,12 @@ unsafe fn sandbox_open_with_mode(
                     }
                     return unsafe { fail(&error, -1) };
                 }
-                let (target, file, logical, writeback, layer, close_on_exec) =
-                    prepared.into_parts();
+                let (target, open) = prepared.into_parts();
                 let descriptor = match target {
                     OpenTarget::Path(_) => descriptor,
                     OpenTarget::Descriptor(file) => file.into_raw_fd(),
                 };
-                runtime.register(descriptor, file, logical, writeback, layer, close_on_exec);
+                runtime.register(descriptor, open);
                 descriptor
             }
             Err(error) => unsafe { fail(&error, -1) },
@@ -154,13 +153,12 @@ unsafe fn sandbox_openat_with_mode(
                     }
                     return unsafe { fail(&error, -1) };
                 }
-                let (target, file, logical, writeback, layer, close_on_exec) =
-                    prepared.into_parts();
+                let (target, open) = prepared.into_parts();
                 let descriptor = match target {
                     OpenTarget::Path(_) => descriptor,
                     OpenTarget::Descriptor(file) => file.into_raw_fd(),
                 };
-                runtime.register(descriptor, file, logical, writeback, layer, close_on_exec);
+                runtime.register(descriptor, open);
                 descriptor
             }
             Err(error) => unsafe { fail(&error, -1) },
@@ -255,12 +253,11 @@ unsafe fn sandbox_fopen(path: *const libc::c_char, mode: *const libc::c_char) ->
                     }
                     return unsafe { fail(&error, std::ptr::null_mut()) };
                 }
-                let (target, file, logical, writeback, layer, close_on_exec) =
-                    prepared.into_parts();
+                let (target, open) = prepared.into_parts();
                 drop(target);
                 let descriptor = unsafe { libc::fileno(stream) };
                 if descriptor >= 0 {
-                    runtime.register(descriptor, file, logical, writeback, layer, close_on_exec);
+                    runtime.register(descriptor, open);
                 }
                 stream
             }

@@ -84,6 +84,7 @@ fn build_hook_dylib() -> Result<PathBuf> {
         .arg(profile)
         .arg("--target-dir")
         .arg(hook_target_directory(&manifest_directory)?)
+        .arg("--no-default-features")
         .args([
             "--message-format",
             "json-render-diagnostics",

@@ -162,7 +162,7 @@ fn child_environment_restores_runtime_values_after_the_caller_clears_them() {
     let values = [path.as_ptr(), std::ptr::null()];
 
     let environment =
-        unsafe { ChildEnvironment::new(values.as_ptr(), &config(), &child_trace()) }.unwrap();
+        unsafe { ChildEnvironment::new(values.as_ptr(), &config(), &child_trace(), None) }.unwrap();
     let entries = environment
         .values
         .iter()
@@ -184,7 +184,8 @@ fn child_environment_restores_runtime_values_after_the_caller_clears_them() {
 #[test]
 fn child_environment_accepts_a_null_source_environment() {
     let environment =
-        unsafe { ChildEnvironment::new(std::ptr::null(), &config(), &child_trace()) }.unwrap();
+        unsafe { ChildEnvironment::new(std::ptr::null(), &config(), &child_trace(), None) }
+            .unwrap();
 
     assert!(!environment.as_exec_ptr().is_null());
     assert_eq!(environment.values.len(), 12);
@@ -245,7 +246,8 @@ fn child_environment_replaces_untrusted_runtime_values() {
     let pointers = [stale[0].as_ptr(), stale[1].as_ptr(), std::ptr::null()];
 
     let environment =
-        unsafe { ChildEnvironment::new(pointers.as_ptr(), &config(), &child_trace()) }.unwrap();
+        unsafe { ChildEnvironment::new(pointers.as_ptr(), &config(), &child_trace(), None) }
+            .unwrap();
     let entries = unsafe {
         let mut current = environment.as_exec_ptr();
         let mut entries = Vec::new();
@@ -263,12 +265,49 @@ fn child_environment_replaces_untrusted_runtime_values() {
 }
 
 #[test]
+fn child_environment_propagates_only_the_tracked_remote_current_directory() {
+    let stale = CString::new("AGORA_SANDBOX_REMOTE_CURRENT_DIRECTORY=/remote/stale").unwrap();
+    let values = [stale.as_ptr(), std::ptr::null()];
+
+    let environment = unsafe {
+        ChildEnvironment::new(
+            values.as_ptr(),
+            &config(),
+            &child_trace(),
+            Some(Path::new("/remote/team/docs")),
+        )
+    }
+    .unwrap();
+    let entries = environment
+        .values
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert!(!entries.contains(&"AGORA_SANDBOX_REMOTE_CURRENT_DIRECTORY=/remote/stale"));
+    assert!(entries.contains(&"AGORA_SANDBOX_REMOTE_CURRENT_DIRECTORY=/remote/team/docs"));
+
+    let environment =
+        unsafe { ChildEnvironment::new(values.as_ptr(), &config(), &child_trace(), None) }.unwrap();
+    assert!(environment.values.iter().all(|value| {
+        !value
+            .to_bytes()
+            .starts_with(b"AGORA_SANDBOX_REMOTE_CURRENT_DIRECTORY=")
+    }));
+}
+
+#[test]
 fn child_environment_restores_tls_trust_after_the_caller_clears_it() {
     let stale = CString::new("SSL_CERT_FILE=/tmp/untrusted.pem").unwrap();
     let values = [stale.as_ptr(), std::ptr::null()];
 
     let environment = unsafe {
-        ChildEnvironment::new(values.as_ptr(), &config_with_tls_bundle(), &child_trace())
+        ChildEnvironment::new(
+            values.as_ptr(),
+            &config_with_tls_bundle(),
+            &child_trace(),
+            None,
+        )
     }
     .unwrap();
     let entries = environment

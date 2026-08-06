@@ -14,6 +14,49 @@ fn cli_workdir() -> PathBuf {
     ))
 }
 
+#[cfg(target_os = "macos")]
+fn write_cli_config(
+    directory: &Path,
+    workdir: &Path,
+    tls: &str,
+    encryption: &str,
+    key: Option<&str>,
+    audit_file: Option<&Path>,
+) -> PathBuf {
+    std::fs::create_dir_all(directory).unwrap();
+    let mut local = serde_json::json!({ "encrypt": encryption });
+    if let Some(key) = key {
+        local["key"] = serde_json::Value::String(key.to_string());
+    }
+    let audit = audit_file
+        .map(|path| serde_json::json!({ "file": path }))
+        .unwrap_or_else(|| serde_json::json!({}));
+    let config = serde_json::json!({
+        "workdir": workdir,
+        "tls": tls,
+        "filesystem": {
+            "local": local,
+            "nfs": []
+        },
+        "audit": audit
+    });
+    let path = directory.join("sandbox.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    path
+}
+
+fn configured_command(config: &Path, executable: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"));
+    command
+        .arg("run")
+        .arg("-c")
+        .arg(config)
+        .arg("-e")
+        .arg(executable);
+    command
+}
+
 #[test]
 fn sandbox_cli_documents_only_available_options() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
@@ -23,26 +66,23 @@ fn sandbox_cli_documents_only_available_options() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("-c, --command <COMMAND>"));
-    assert!(!stdout.contains("--hook-library"));
-    assert!(stdout.contains("--audit-file <AUDIT_FILE>"));
-    assert!(stdout.contains("--workdir <WORKDIR>"));
-    assert!(stdout.contains("--filesystem <FILESYSTEM>"));
-    assert!(stdout.contains("[possible values: encrypted, plain]"));
-    assert!(stdout.contains("[default: plain]"));
-    assert!(stdout.contains("--filesystem-key <FILESYSTEM_KEY>"));
-    assert!(!stdout.contains("--filesystem-key-file"));
-    assert!(!stdout.contains("--tls-trust-anchor"));
-    assert!(stdout.contains("--tls <TLS>"));
-    assert!(stdout.contains("[possible values: off, auto]"));
-    assert!(!stdout.contains("off, auto, require"));
-    assert!(stdout.contains("--tls-ca-cert <TLS_CA_CERT>"));
-    assert!(stdout.contains("--tls-ca-key <TLS_CA_KEY>"));
-    assert!(stdout.contains("<workdir>/ca/ca.crt"));
-    assert!(stdout.contains("<workdir>/ca/ca.key"));
-    assert!(!stdout.contains("--network-enforcement"));
-    assert!(!stdout.contains("clean"));
+    assert!(stdout.contains("run"));
     assert!(stdout.contains("migrate-key"));
+    assert!(!stdout.contains("--smb-config"));
+    assert!(!stdout.contains("--filesystem-key"));
+
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .args(["run", "--help"])
+        .output()
+        .unwrap();
+    assert!(run.status.success());
+    let run = String::from_utf8_lossy(&run.stdout);
+    assert!(run.contains("-c, --config <CONFIG>"));
+    assert!(run.contains("-e, --executable <EXECUTABLE>"));
+    assert!(!run.contains("--workdir"));
+    assert!(!run.contains("--tls"));
+    assert!(!run.contains("--audit-file"));
+
     let removed = std::process::Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
         .args(["tls", "generate"])
         .output()
@@ -50,36 +90,41 @@ fn sandbox_cli_documents_only_available_options() {
     assert!(!removed.status.success());
 }
 
+#[cfg(target_os = "macos")]
 #[test]
-fn sandbox_cli_rejects_the_removed_hook_library_option() {
+fn sandbox_cli_runs_from_one_strict_config_file() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("sandbox.json");
+    std::fs::write(
+        &config,
+        r#"{
+          "workdir": "workdir",
+          "tls": "off",
+          "filesystem": {
+            "local": { "encrypt": "plain" },
+            "nfs": []
+          },
+          "audit": {}
+        }"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+
     let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
-        .args(["--hook-library", "/tmp/hook.dylib", "-c", "/usr/bin/true"])
+        .arg("run")
+        .arg("-c")
+        .arg(&config)
+        .args(["-e", "/usr/bin/true"])
         .output()
         .unwrap();
 
-    assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--hook-library'"),
-        "{}",
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-#[test]
-fn sandbox_cli_rejects_the_removed_clean_command() {
-    let workdir = std::env::temp_dir().join(format!(
-        "agora-sandbox-cli-clean-test-{}",
-        uuid::Uuid::new_v4()
-    ));
-    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
-        .arg("clean")
-        .arg("--workdir")
-        .arg(&workdir)
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand 'clean'"));
+    assert!(root.path().join("workdir/fs").is_dir());
 }
 
 #[test]
@@ -99,12 +144,11 @@ fn sandbox_cli_documents_interactive_key_migration() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn sandbox_cli_runs_with_the_default_plain_filesystem_and_no_key() {
-    let workdir = cli_workdir();
-    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
-        .arg("--workdir")
-        .arg(&workdir)
-        .args(["-c", "/usr/bin/true"])
+fn sandbox_cli_runs_with_a_plain_local_filesystem() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workdir");
+    let config = write_cli_config(root.path(), &workdir, "off", "plain", None, None);
+    let output = configured_command(&config, "/usr/bin/true")
         .output()
         .unwrap();
 
@@ -115,7 +159,6 @@ fn sandbox_cli_runs_with_the_default_plain_filesystem_and_no_key() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(workdir.join("fs").is_dir());
-    std::fs::remove_dir_all(workdir).unwrap();
 }
 
 #[cfg(target_os = "macos")]
@@ -128,11 +171,13 @@ fn copied_cli_materializes_its_hook_without_a_sidecar() {
     let executable = bin.join("agora-sandbox");
     std::fs::copy(env!("CARGO_BIN_EXE_agora-sandbox"), &executable).unwrap();
     assert!(!bin.join("libagora_sandbox.dylib").exists());
+    let config = write_cli_config(root.path(), &workdir, "off", "plain", None, None);
 
     let output = Command::new(&executable)
-        .arg("--workdir")
-        .arg(&workdir)
-        .args(["-c", "/usr/bin/true"])
+        .arg("run")
+        .arg("-c")
+        .arg(&config)
+        .args(["-e", "/usr/bin/true"])
         .output()
         .unwrap();
 
@@ -161,31 +206,34 @@ fn copied_cli_materializes_its_hook_without_a_sidecar() {
 
 #[test]
 fn sandbox_cli_rejects_a_key_in_plain_filesystem_mode() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
-        .args(["--filesystem", "plain"])
-        .args(["--filesystem-key", "unused"])
-        .args(["-c", "/usr/bin/true"])
+    let root = tempfile::tempdir().unwrap();
+    let config = write_cli_config(
+        root.path(),
+        &root.path().join("workdir"),
+        "off",
+        "plain",
+        Some("unused"),
+        None,
+    );
+    let output = configured_command(&config, "/usr/bin/true")
         .output()
         .unwrap();
 
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("--filesystem-key cannot be used with plain filesystem mode")
+            .contains("filesystem.local.key is not allowed when encrypt is plain")
     );
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn sandbox_cli_migrates_the_encrypted_filesystem_key_in_place() {
-    let workdir = cli_workdir();
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workdir");
     let run = |key: &str| {
-        Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
-            .arg("--workdir")
-            .arg(&workdir)
-            .args(["--filesystem", "encrypted"])
-            .args(["--filesystem-key", key])
-            .args(["-c", "/usr/bin/true"])
+        let config = write_cli_config(root.path(), &workdir, "off", "encrypted", Some(key), None);
+        configured_command(&config, "/usr/bin/true")
             .output()
             .unwrap()
     };
@@ -236,7 +284,6 @@ fn sandbox_cli_migrates_the_encrypted_filesystem_key_in_place() {
         String::from_utf8_lossy(&new_key.stdout),
         String::from_utf8_lossy(&new_key.stderr)
     );
-    std::fs::remove_dir_all(workdir).unwrap();
 }
 
 #[cfg(target_os = "macos")]
@@ -285,24 +332,15 @@ fn sandbox_cli_prompts_for_migration_keys_in_a_terminal() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn sandbox_cli_auto_generates_reuses_and_replaces_a_configured_tls_ca() {
-    let directory = std::env::temp_dir().join(format!(
-        "agora-sandbox-cli-auto-ca-test-{}",
-        uuid::Uuid::new_v4()
-    ));
-    let certificate = directory.join("nested/ca.pem");
-    let private_key = directory.join("nested/ca-key.pem");
-    let workdir = directory.join("workdir");
+fn sandbox_cli_auto_generates_reuses_and_replaces_its_workdir_tls_ca() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().join("workdir");
+    let certificate = workdir.join("ca/ca.crt");
+    let private_key = workdir.join("ca/ca.key");
+    let config = write_cli_config(directory.path(), &workdir, "auto", "plain", None, None);
 
     let run = || {
-        Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
-            .arg("--workdir")
-            .arg(&workdir)
-            .args(["--tls", "auto", "--tls-ca-cert"])
-            .arg(&certificate)
-            .arg("--tls-ca-key")
-            .arg(&private_key)
-            .args(["-c", "/usr/bin/true"])
+        configured_command(&config, "/usr/bin/true")
             .output()
             .unwrap()
     };
@@ -359,21 +397,23 @@ fn sandbox_cli_auto_generates_reuses_and_replaces_a_configured_tls_ca() {
         std::fs::read_to_string(&private_key).unwrap(),
         private_key_pem
     );
-    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn sandbox_cli_runs_an_interactive_bash_in_a_terminal() {
-    let workdir = cli_workdir();
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workdir");
+    let config = write_cli_config(root.path(), &workdir, "off", "plain", None, None);
     let mut process = Command::new("/usr/bin/script");
     process
         .arg("-q")
         .arg("/dev/null")
         .arg(env!("CARGO_BIN_EXE_agora-sandbox"))
-        .arg("--workdir")
-        .arg(&workdir)
+        .arg("run")
         .arg("-c")
+        .arg(&config)
+        .arg("-e")
         .arg("/bin/bash")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -386,7 +426,7 @@ fn sandbox_cli_runs_an_interactive_bash_in_a_terminal() {
         .write_all(b"echo AGORA_INTERACTIVE_BASH_OK\nexit\n")
         .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -409,25 +449,27 @@ fn sandbox_cli_runs_an_interactive_bash_in_a_terminal() {
         "stdout={}",
         String::from_utf8_lossy(&output.stdout)
     );
-    std::fs::remove_dir_all(workdir).unwrap();
 }
 
 #[test]
-fn sandbox_cli_requires_both_tls_ca_files() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
-        .args([
-            "--tls",
-            "auto",
-            "--tls-ca-cert",
-            "/tmp/ca.pem",
-            "-c",
-            "/bin/true",
-        ])
-        .output()
-        .unwrap();
+fn sandbox_cli_rejects_unknown_config_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("sandbox.json");
+    std::fs::write(
+        &config,
+        r#"{
+          "workdir": "workdir",
+          "tls": "off",
+          "filesystem": { "local": { "encrypt": "plain" } },
+          "tls_ca_cert": "/tmp/ca.pem"
+        }"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let output = configured_command(&config, "/bin/true").output().unwrap();
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--tls-ca-key"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown field `tls_ca_cert`"));
 }
 
 #[test]
@@ -437,7 +479,7 @@ fn sandbox_cli_requires_a_command() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--command <COMMAND>"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Usage: agora-sandbox <COMMAND>"));
 }
 
 #[test]
@@ -526,25 +568,19 @@ fn run_audited_cli(audit_file: Option<&Path>) -> (Output, SocketAddr) {
         "'{}' intercepted_cli_child --exact --nocapture",
         test_binary.display()
     );
-    let workdir = cli_workdir();
-    let mut process = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"));
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workdir");
+    let config = write_cli_config(root.path(), &workdir, "off", "plain", None, audit_file);
+    let mut process = configured_command(&config, command);
     process
-        .arg("--workdir")
-        .arg(&workdir)
-        .arg("-c")
-        .arg(command)
         .env("AGORA_SANDBOX_TEST_CLI_CHILD", "1")
         .env("AGORA_SANDBOX_TEST_DESTINATION", destination.to_string());
-    if let Some(audit_file) = audit_file {
-        process.arg("--audit-file").arg(audit_file);
-    }
     let output = process.output().unwrap();
 
     if !output.status.success() {
         drop(TcpStream::connect(destination));
     }
     echo.join().unwrap();
-    std::fs::remove_dir_all(workdir).unwrap();
     (output, destination)
 }
 

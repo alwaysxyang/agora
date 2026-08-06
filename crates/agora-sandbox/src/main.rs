@@ -5,11 +5,10 @@ use agora_core::lifecycle::{
 use agora_sandbox::{
     callback::{Callback, Decision, Event, EventType, FileOpenMode, ProcessOperation},
     hook_library,
-    network::TlsMode,
-    runner::{FilesystemMode, Sandbox, SandboxCommand, SandboxConfig},
+    runner::{Sandbox, SandboxCommand},
 };
 use anyhow::{Context, Result};
-use clap::{ColorChoice, Parser, Subcommand, ValueEnum};
+use clap::{ColorChoice, Parser, Subcommand};
 use serde::Serialize;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -17,93 +16,39 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+mod config;
 mod key_migration;
 
 #[derive(Parser)]
 #[command(
     name = "agora-sandbox",
     about = "Run a command with Agora sandbox network interception and auditing",
-    color = ColorChoice::Auto,
-    subcommand_negates_reqs = true,
-    args_conflicts_with_subcommands = true
+    color = ColorChoice::Auto
 )]
 struct Arguments {
-    /// Command line to run; shell operators are not interpreted
-    #[arg(short = 'c', long, required = true)]
-    command: Option<String>,
-
     #[command(subcommand)]
-    subcommand: Option<CliCommand>,
-
-    /// Path for JSON Lines audit records; defaults to stdout
-    #[arg(long)]
-    audit_file: Option<PathBuf>,
-
-    /// Sandbox work directory; defaults to ~/.agora-sandbox
-    #[arg(long)]
-    workdir: Option<PathBuf>,
-
-    /// Passphrase for the persistent encrypted filesystem; visible in process arguments
-    #[arg(long)]
-    filesystem_key: Option<String>,
-
-    /// Filesystem storage mode
-    #[arg(long, value_enum, default_value_t = FilesystemArgument::Plain)]
-    filesystem: FilesystemArgument,
-
-    /// TLS interception mode
-    #[arg(long, value_enum, default_value_t = TlsArgument::Off)]
-    tls: TlsArgument,
-
-    /// PEM CA certificate; TLS auto defaults to <workdir>/ca/ca.crt
-    #[arg(long, requires = "tls_ca_key")]
-    tls_ca_cert: Option<PathBuf>,
-
-    /// PEM CA private key; TLS auto defaults to <workdir>/ca/ca.key
-    #[arg(long, requires = "tls_ca_cert")]
-    tls_ca_key: Option<PathBuf>,
+    command: CliCommand,
 }
 
 #[derive(Subcommand)]
 enum CliCommand {
+    /// Run an executable inside the configured sandbox
+    Run {
+        /// Owner-only sandbox JSON configuration file
+        #[arg(short = 'c', long)]
+        config: PathBuf,
+
+        /// Executable command line; shell operators are not interpreted
+        #[arg(short = 'e', long)]
+        executable: String,
+    },
+
     /// Interactively change the passphrase of an existing encrypted filesystem
     MigrateKey {
         /// Sandbox work directory; defaults to ~/.agora-sandbox
         #[arg(long)]
         workdir: Option<PathBuf>,
     },
-}
-
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
-enum TlsArgument {
-    #[default]
-    Off,
-    Auto,
-}
-
-impl From<TlsArgument> for TlsMode {
-    fn from(value: TlsArgument) -> Self {
-        match value {
-            TlsArgument::Off => Self::Off,
-            TlsArgument::Auto => Self::Auto,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
-enum FilesystemArgument {
-    Encrypted,
-    #[default]
-    Plain,
-}
-
-impl From<FilesystemArgument> for FilesystemMode {
-    fn from(value: FilesystemArgument) -> Self {
-        match value {
-            FilesystemArgument::Encrypted => Self::Encrypted,
-            FilesystemArgument::Plain => Self::Plain,
-        }
-    }
 }
 
 struct JsonCallback {
@@ -273,44 +218,21 @@ enum FileOperation {
 }
 
 async fn async_main(arguments: Arguments) -> Result<u8> {
-    match arguments.subcommand {
-        Some(CliCommand::MigrateKey { workdir }) => {
+    match arguments.command {
+        CliCommand::MigrateKey { workdir } => {
             key_migration::run(workdir).await?;
-            return Ok(0);
+            Ok(0)
         }
-        None => {}
+        CliCommand::Run { config, executable } => run(config, executable).await,
     }
-    let filesystem_key = match (arguments.filesystem, arguments.filesystem_key) {
-        (FilesystemArgument::Encrypted, Some(key)) => Some(key),
-        (FilesystemArgument::Encrypted, None) => {
-            anyhow::bail!("--filesystem-key is required with encrypted filesystem mode");
-        }
-        (FilesystemArgument::Plain, None) => None,
-        (FilesystemArgument::Plain, Some(_)) => {
-            anyhow::bail!("--filesystem-key cannot be used with plain filesystem mode");
-        }
-    };
-    let workdir = arguments
-        .workdir
-        .unwrap_or_else(SandboxConfig::default_workdir);
-    let hook = hook_library::materialize(&workdir)?;
-    let mut config = SandboxConfig::new(hook).with_workdir(&workdir);
-    if let Some(key) = filesystem_key {
-        config = config.with_encrypted_workspace(key);
-    } else {
-        config = config.with_plain_workspace();
-    }
-    config.network.tls = arguments.tls.into();
-    if let (Some(certificate), Some(private_key)) = (arguments.tls_ca_cert, arguments.tls_ca_key) {
-        config = config.with_tls_ca(certificate, private_key);
-    }
-    let command = parse_command(
-        arguments
-            .command
-            .as_deref()
-            .context("missing sandbox command")?,
-    )?;
-    let callback = JsonCallback::new(arguments.audit_file.as_deref())?;
+}
+
+async fn run(config_path: PathBuf, executable: String) -> Result<u8> {
+    let config = config::RunConfig::load(&config_path)?;
+    let command = parse_command(&executable)?;
+    let hook = hook_library::materialize(config.workdir())?;
+    let (config, audit_file) = config.into_runtime(hook);
+    let callback = JsonCallback::new(audit_file.as_deref())?;
 
     let status = Arc::new(Mutex::new(None::<ExitStatus>));
     let reason = Arc::new(Mutex::new(None::<ShutdownReason>));

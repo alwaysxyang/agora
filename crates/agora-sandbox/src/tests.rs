@@ -1,6 +1,6 @@
 use super::{
-    Arguments, AuditOutput, AuditState, FilesystemArgument, JsonCallback, TlsArgument, async_main,
-    exit_status_code, parse_command, shutdown_signals, signal_exit_code,
+    AuditOutput, AuditState, JsonCallback, exit_status_code, parse_command, shutdown_signals,
+    signal_exit_code,
 };
 use agora_core::lifecycle::shutdown::ShutdownGuard;
 use agora_sandbox::callback::{
@@ -8,8 +8,6 @@ use agora_sandbox::callback::{
     EventType, FileAccessMode, FileContext, FileEvent, FileOpenMode, NetworkContext, NetworkEvent,
     NetworkProtocol, ProcessContext, ProcessEvent, ProcessOperation, Subsystem,
 };
-use agora_sandbox::network::TlsMode;
-use agora_sandbox::runner::FilesystemMode;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Command;
 use uuid::Uuid;
@@ -49,22 +47,6 @@ fn event(event_type: EventType, connection_id: Option<&str>, network: bool) -> N
         },
         metrics: None,
     }
-}
-
-#[test]
-fn filesystem_arguments_map_to_their_runtime_modes() {
-    assert!(matches!(
-        FilesystemArgument::default(),
-        FilesystemArgument::Plain
-    ));
-    assert_eq!(
-        FilesystemMode::from(FilesystemArgument::Encrypted),
-        FilesystemMode::Encrypted
-    );
-    assert_eq!(
-        FilesystemMode::from(FilesystemArgument::Plain),
-        FilesystemMode::Plain
-    );
 }
 
 fn process_event() -> ProcessEvent {
@@ -250,7 +232,7 @@ fn audit_state_reports_an_unusable_output_directory() {
 }
 
 #[tokio::test]
-async fn exit_codes_and_tls_arguments_are_stable() {
+async fn exit_codes_and_shutdown_signals_are_stable() {
     let status = Command::new("/bin/sh")
         .args(["-c", "exit 7"])
         .status()
@@ -258,8 +240,6 @@ async fn exit_codes_and_tls_arguments_are_stable() {
     assert_eq!(exit_status_code(status), 7);
     assert_eq!(signal_exit_code(15), 143);
     assert_eq!(signal_exit_code(i32::MAX), u8::MAX);
-    assert!(matches!(TlsMode::from(TlsArgument::Off), TlsMode::Off));
-    assert!(matches!(TlsMode::from(TlsArgument::Auto), TlsMode::Auto));
     shutdown_signals(&ShutdownGuard::get()).unwrap();
 }
 
@@ -298,50 +278,4 @@ async fn json_callback_allows_events_when_audit_output_fails() {
     ));
 
     std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
-async fn async_main_rejects_an_empty_encrypted_workspace_key() {
-    let root = std::env::temp_dir().join(format!("agora-empty-key-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&root).unwrap();
-    let arguments = Arguments {
-        command: Some("/bin/true".to_string()),
-        subcommand: None,
-        audit_file: None,
-        workdir: Some(root.clone()),
-        filesystem_key: Some(String::new()),
-        filesystem: FilesystemArgument::Encrypted,
-        tls: super::TlsArgument::Off,
-        tls_ca_cert: None,
-        tls_ca_key: None,
-    };
-
-    let error = async_main(arguments).await.unwrap_err();
-    assert!(error.to_string().contains("key is empty"));
-
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
-async fn async_main_requires_a_key_for_explicit_encrypted_mode() {
-    let root = std::env::temp_dir().join(format!("agora-missing-key-{}", Uuid::new_v4()));
-    let arguments = Arguments {
-        command: Some("/bin/true".to_string()),
-        subcommand: None,
-        audit_file: None,
-        workdir: Some(root.clone()),
-        filesystem_key: None,
-        filesystem: FilesystemArgument::Encrypted,
-        tls: super::TlsArgument::Off,
-        tls_ca_cert: None,
-        tls_ca_key: None,
-    };
-
-    let error = async_main(arguments).await.unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("--filesystem-key is required with encrypted filesystem mode")
-    );
-    assert!(!root.join("runtime/hook").exists());
 }

@@ -1,6 +1,7 @@
 use super::{
     FilesystemMode, Sandbox, SandboxCommand, SandboxConfig, SandboxOutcome, SecretBytes,
-    process_group_exists, signal_process_group, terminate_process_group, wait_for_child_or_service,
+    SmbRemoteConfig, process_group_exists, signal_process_group, terminate_process_group,
+    wait_for_child_or_service,
 };
 use crate::audit::AuditController;
 use crate::callback::{Decision, Event, EventType, NoopCallback, TlsOutcome};
@@ -8,6 +9,11 @@ use crate::execution::ExecutionController;
 #[cfg(target_os = "macos")]
 use crate::filesystem::EncryptedWorkspace;
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
+#[cfg(feature = "remote-smb")]
+use crate::nfs::{
+    controller::{RemoteConnectionStatus, RemoteController},
+    testing::MemoryStorage,
+};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
@@ -433,6 +439,174 @@ fn sandbox_config_and_command_builders_preserve_runtime_inputs() {
     );
 }
 
+#[test]
+fn smb_remote_config_normalizes_paths_and_redacts_credentials() {
+    let remote = SmbRemoteConfig::new("/remote/./team", "files.example.com", "documents")
+        .unwrap()
+        .with_remote_path("/projects/./current/")
+        .unwrap()
+        .with_domain("CORP")
+        .with_credentials("alice", "top secret");
+
+    assert_eq!(remote.logical_root(), Path::new("/remote/team"));
+    assert_eq!(remote.server(), "files.example.com:445");
+    assert_eq!(remote.share(), "documents");
+    assert_eq!(remote.remote_path(), "projects/current");
+    assert_eq!(remote.domain(), "CORP");
+    assert_eq!(remote.username(), "alice");
+    assert!(!format!("{remote:?}").contains("top secret"));
+    assert_eq!(
+        SmbRemoteConfig::new("/ipv6", "2001:db8::1", "documents")
+            .unwrap()
+            .server(),
+        "[2001:db8::1]:445"
+    );
+}
+
+#[test]
+fn smb_remote_config_rejects_unsafe_roots_and_remote_paths() {
+    assert!(SmbRemoteConfig::new("relative", "server", "share").is_err());
+    assert!(SmbRemoteConfig::new("/", "server", "share").is_err());
+    assert!(SmbRemoteConfig::new("/remote", "", "share").is_err());
+    assert!(SmbRemoteConfig::new("/remote", "server:invalid", "share").is_err());
+    assert!(SmbRemoteConfig::new("/remote", "server", "bad/share").is_err());
+    assert!(
+        SmbRemoteConfig::new("/remote", "server", "share")
+            .unwrap()
+            .with_remote_path("../escape")
+            .is_err()
+    );
+}
+
+#[cfg(feature = "remote-smb")]
+#[test]
+fn nfs_connection_status_output_is_clear_and_redacts_credentials() {
+    let remote = SmbRemoteConfig::new("/smb", "files.example.com", "documents")
+        .unwrap()
+        .with_remote_path("projects/current")
+        .unwrap()
+        .with_credentials("alice", "top secret");
+    let remotes = [remote];
+    let mut output = Vec::new();
+
+    super::write_remote_connection_status(
+        &mut output,
+        &remotes,
+        RemoteConnectionStatus::Connected { root: 0 },
+    )
+    .unwrap();
+    super::write_remote_connection_status(
+        &mut output,
+        &remotes,
+        RemoteConnectionStatus::Unavailable {
+            root: 0,
+            errno: libc::EACCES,
+        },
+    )
+    .unwrap();
+
+    let output = String::from_utf8(output).unwrap();
+    assert_eq!(
+        output,
+        "[agora-sandbox] NFS /smb connected: smb://files.example.com:445/documents/projects/current\n\
+[agora-sandbox] NFS /smb unavailable: Permission denied (os error 13)\n"
+    );
+    assert!(!output.contains("alice"));
+    assert!(!output.contains("top secret"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_config_rejects_remote_root_collisions() {
+    let root = std::env::temp_dir().join(format!("agora-remote-config-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let hook = root.join("hook.dylib");
+    std::fs::write(&hook, b"hook").unwrap();
+
+    let duplicate = SandboxConfig::new(&hook)
+        .with_workdir(root.join("workspace"))
+        .with_smb_remote(SmbRemoteConfig::new("/remote", "one", "share").unwrap())
+        .with_smb_remote(SmbRemoteConfig::new("/remote", "two", "share").unwrap());
+    assert!(
+        duplicate
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("overlap")
+    );
+
+    let nested = SandboxConfig::new(&hook)
+        .with_workdir(root.join("workspace"))
+        .with_smb_remote(SmbRemoteConfig::new("/remote", "one", "share").unwrap())
+        .with_smb_remote(SmbRemoteConfig::new("/remote/team", "two", "share").unwrap());
+    assert!(
+        nested
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("overlap")
+    );
+
+    let native = SandboxConfig::new(&hook)
+        .with_workdir(root.join("workspace"))
+        .with_smb_remote(SmbRemoteConfig::new("/dev/remote", "one", "share").unwrap());
+    assert!(native.validate().unwrap_err().to_string().contains("/dev"));
+
+    let private = SandboxConfig::new(&hook)
+        .with_workdir(root.join("workspace"))
+        .with_smb_remote(SmbRemoteConfig::new(root.join("workspace/fs"), "one", "share").unwrap());
+    assert!(
+        private
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("work directory")
+    );
+
+    let sibling = SandboxConfig::new(&hook)
+        .with_workdir(root.join("workspace"))
+        .with_smb_remote(
+            SmbRemoteConfig::new(root.join("workspace/remote"), "one", "share").unwrap(),
+        );
+    assert!(
+        sibling
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("work directory")
+    );
+
+    let dotted = SandboxConfig::new(&hook)
+        .with_workdir(root.join("state/../workspace"))
+        .with_smb_remote(
+            SmbRemoteConfig::new(root.join("workspace/remote"), "one", "share").unwrap(),
+        );
+    assert!(
+        dotted
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("work directory")
+    );
+
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let alias = root.join("workspace-alias");
+    std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+    let aliased = SandboxConfig::new(&hook)
+        .with_workdir(&workspace)
+        .with_smb_remote(SmbRemoteConfig::new(alias.join("remote"), "one", "share").unwrap());
+    assert!(
+        aliased
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("work directory")
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn sandbox_config_defaults_to_plain_without_a_filesystem_key() {
@@ -739,6 +913,8 @@ async fn proxy_failure_terminates_the_child_process() {
     .unwrap();
     controller.abort_listener_for_test();
     let process_group = child.id().unwrap() as libc::pid_t;
+    #[cfg(feature = "remote-smb")]
+    let mut remote = None;
 
     let result = tokio::time::timeout(
         Duration::from_secs(1),
@@ -748,6 +924,10 @@ async fn proxy_failure_terminates_the_child_process() {
             &mut controller,
             &mut execution,
             &mut audit,
+            #[cfg(feature = "remote-smb")]
+            &mut remote,
+            #[cfg(feature = "remote-smb")]
+            |_| {},
         ),
     )
     .await
@@ -791,6 +971,8 @@ async fn execution_controller_failure_terminates_the_child_process() {
     .unwrap();
     execution.abort_server_for_test();
     let process_group = child.id().unwrap() as libc::pid_t;
+    #[cfg(feature = "remote-smb")]
+    let mut remote = None;
 
     let result = tokio::time::timeout(
         Duration::from_secs(1),
@@ -800,6 +982,10 @@ async fn execution_controller_failure_terminates_the_child_process() {
             &mut controller,
             &mut execution,
             &mut audit,
+            #[cfg(feature = "remote-smb")]
+            &mut remote,
+            #[cfg(feature = "remote-smb")]
+            |_| {},
         ),
     )
     .await
@@ -843,6 +1029,8 @@ async fn audit_controller_failure_terminates_the_child_process() {
     .unwrap();
     audit.abort_server_for_test();
     let process_group = child.id().unwrap() as libc::pid_t;
+    #[cfg(feature = "remote-smb")]
+    let mut remote = None;
 
     let result = tokio::time::timeout(
         Duration::from_secs(1),
@@ -852,6 +1040,10 @@ async fn audit_controller_failure_terminates_the_child_process() {
             &mut controller,
             &mut execution,
             &mut audit,
+            #[cfg(feature = "remote-smb")]
+            &mut remote,
+            #[cfg(feature = "remote-smb")]
+            |_| {},
         ),
     )
     .await
@@ -867,6 +1059,69 @@ async fn audit_controller_failure_terminates_the_child_process() {
     controller.shutdown().await.unwrap();
     execution.shutdown().await.unwrap();
     assert!(audit.shutdown().await.is_ok());
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[cfg(all(target_os = "macos", feature = "remote-smb"))]
+#[tokio::test]
+async fn nfs_broker_failure_terminates_the_child_process() {
+    let workdir =
+        std::env::temp_dir().join(format!("agora-nfs-failure-cache-{}", uuid::Uuid::new_v4()));
+    let runtime = tempfile::Builder::new()
+        .prefix("agora-nfs-runner-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let mut controller = NetworkController::start(
+        NetworkConfig::default(),
+        NetworkRunContext::new("sandbox", "run"),
+        NoopCallback,
+    )
+    .await
+    .unwrap();
+    let mut child = sleeping_child();
+    let mut execution = ExecutionController::start(workdir.clone()).await.unwrap();
+    let mut audit = AuditController::start(
+        "sandbox".to_string(),
+        "run".to_string(),
+        NoopCallback,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    let mut remote = Some(
+        RemoteController::start_with_storage(Arc::new(MemoryStorage::default()), runtime.path())
+            .await
+            .unwrap(),
+    );
+    remote.as_mut().unwrap().abort_server_for_test();
+    let process_group = child.id().unwrap() as libc::pid_t;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_for_child_or_service(
+            &mut child,
+            process_group,
+            &mut controller,
+            &mut execution,
+            &mut audit,
+            &mut remote,
+            |_| {},
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("sandbox remote filesystem failed")
+    );
+    assert!(child.try_wait().unwrap().is_some());
+    controller.shutdown().await.unwrap();
+    execution.shutdown().await.unwrap();
+    audit.shutdown().await.unwrap();
+    remote.take().unwrap().shutdown().await.unwrap();
     std::fs::remove_dir_all(workdir).unwrap();
 }
 

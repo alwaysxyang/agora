@@ -5,3 +5,4 @@
 !.gitignore
 Cargo.lock
 config.json
+sandbox.json

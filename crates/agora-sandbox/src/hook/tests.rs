@@ -140,6 +140,87 @@ fn encrypted_hook_configuration_reuses_derived_cipher_key_material() {
 }
 
 #[test]
+fn hook_configuration_validates_and_propagates_remote_broker_values() {
+    let routes = r#"[{"root":0,"logical_root":"/remote"}]"#;
+    let values = HashMap::from([
+        ("AGORA_SANDBOX_TOKEN", "token"),
+        ("AGORA_SANDBOX_PROXY_IPV4", "127.0.0.1:41000"),
+        ("AGORA_SANDBOX_PROXY_IPV6", "[::1]:41001"),
+        ("AGORA_SANDBOX_EXECUTION_CONTROL", "127.0.0.1:41002"),
+        ("AGORA_SANDBOX_EXECUTION_TOKEN", "execution-token"),
+        ("AGORA_SANDBOX_AUDIT_CONTROL", "127.0.0.1:41003"),
+        ("AGORA_SANDBOX_AUDIT_TOKEN", "audit-token"),
+        ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
+        ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs"),
+        ("AGORA_SANDBOX_FILESYSTEM_MODE", "plain"),
+        ("AGORA_SANDBOX_REMOTE_CONTROL", "/tmp/remote.sock"),
+        ("AGORA_SANDBOX_REMOTE_TOKEN", "remote-token"),
+        ("AGORA_SANDBOX_REMOTE_ROOTS", routes),
+        ("AGORA_SANDBOX_REMOTE_CURRENT_DIRECTORY", "/remote/docs"),
+        ("AGORA_SANDBOX_TRACE_ID", "trace-root"),
+    ]);
+
+    let config = HookConfig::from_getter(|key| values.get(key).map(ToString::to_string)).unwrap();
+
+    assert_eq!(
+        config.remote_filesystem(),
+        Some(("/tmp/remote.sock", "remote-token", routes))
+    );
+    assert_eq!(
+        config.remote_current_directory(),
+        Some(std::path::Path::new("/remote/docs"))
+    );
+    for (key, value) in [
+        ("AGORA_SANDBOX_REMOTE_CONTROL", "/tmp/remote.sock"),
+        ("AGORA_SANDBOX_REMOTE_TOKEN", "remote-token"),
+        ("AGORA_SANDBOX_REMOTE_ROOTS", routes),
+    ] {
+        assert!(
+            config
+                .child_environment()
+                .contains(&(key, value.to_string()))
+        );
+    }
+
+    let partial = HookConfig::from_getter(|key| {
+        (key != "AGORA_SANDBOX_REMOTE_TOKEN")
+            .then(|| values.get(key).map(ToString::to_string))
+            .flatten()
+    });
+    assert!(partial.unwrap_err().contains("remote filesystem"));
+
+    let without_remote = HookConfig::from_getter(|key| {
+        if key == "AGORA_SANDBOX_REMOTE_CURRENT_DIRECTORY" {
+            Some("/remote/docs".to_string())
+        } else if [
+            "AGORA_SANDBOX_REMOTE_CONTROL",
+            "AGORA_SANDBOX_REMOTE_TOKEN",
+            "AGORA_SANDBOX_REMOTE_ROOTS",
+        ]
+        .contains(&key)
+        {
+            None
+        } else {
+            values.get(key).map(ToString::to_string)
+        }
+    });
+    assert!(
+        without_remote
+            .unwrap_err()
+            .contains("requires a remote filesystem")
+    );
+
+    let relative = HookConfig::from_getter(|key| {
+        if key == "AGORA_SANDBOX_REMOTE_CURRENT_DIRECTORY" {
+            Some("relative".to_string())
+        } else {
+            values.get(key).map(ToString::to_string)
+        }
+    });
+    assert!(relative.unwrap_err().contains("must be an absolute path"));
+}
+
+#[test]
 fn process_context_uses_the_current_process_for_each_connection() {
     let context = ProcessContext::new("/tmp/client".to_string());
 

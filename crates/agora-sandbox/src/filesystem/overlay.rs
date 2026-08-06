@@ -1,6 +1,7 @@
 use super::crypto::FileCipher;
 use super::metadata::{EntryState, FileAttributes, Materializer, MetadataStore, SourceIdentity};
 use super::namespace;
+use super::{normalize_path, resolve_existing_ancestor};
 use anyhow::{Context, Result};
 use md5::{Digest, Md5};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -122,14 +123,17 @@ impl OverlayTransaction<'_> {
         if self.store.is_internal(&path) {
             return Ok(false);
         }
+        if path == Path::new("/") {
+            return Ok(true);
+        }
         let native_resolved = if follow_final {
-            OverlayStore::resolve_existing_ancestor(&path)?
+            resolve_existing_ancestor(&path)?
         } else {
             let parent = path.parent().context("filesystem path has no parent")?;
             let name = path
                 .file_name()
                 .context("filesystem path has no file name")?;
-            OverlayStore::resolve_existing_ancestor(parent)?.join(name)
+            resolve_existing_ancestor(parent)?.join(name)
         };
         let overlay_resolved = if follow_final {
             match path.symlink_metadata() {
@@ -300,7 +304,7 @@ impl Drop for StagedWrite {
 }
 
 fn is_private_path_with_roots(root: &Path, canonical_root: &Path, path: &Path) -> Result<bool> {
-    let path = namespace::normalize(path)?;
+    let path = normalize_path(path)?;
     if root
         .parent()
         .is_some_and(|workdir| path.starts_with(workdir))
@@ -310,7 +314,7 @@ fn is_private_path_with_roots(root: &Path, canonical_root: &Path, path: &Path) -
     {
         return Ok(true);
     }
-    let resolved = OverlayStore::resolve_existing_ancestor(&path)?;
+    let resolved = resolve_existing_ancestor(&path)?;
     Ok(canonical_root
         .parent()
         .is_some_and(|workdir| resolved.starts_with(workdir)))
@@ -1732,39 +1736,7 @@ impl OverlayStore {
     }
 
     fn normalize(&self, path: &Path) -> Result<PathBuf> {
-        namespace::normalize(path)
-    }
-
-    fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf> {
-        let mut existing = path.to_path_buf();
-        let mut suffix = Vec::new();
-        loop {
-            match existing.canonicalize() {
-                Ok(mut resolved) => {
-                    for component in suffix.iter().rev() {
-                        resolved.push(component);
-                    }
-                    return Ok(resolved);
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) =>
-                {
-                    let name = existing.file_name().with_context(|| {
-                        format!("failed to resolve filesystem path {}", path.display())
-                    })?;
-                    suffix.push(name.to_os_string());
-                    existing.pop();
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to resolve filesystem path {}", path.display())
-                    });
-                }
-            }
-        }
+        normalize_path(path)
     }
 
     fn remove_existing(path: &Path) -> Result<()> {

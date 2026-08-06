@@ -1,3 +1,7 @@
+use super::directory::{
+    fts_bulk_entry_names_for_test, fts_directory_descent_path_for_test,
+    fts_read_returns_virtual_entry_for_test,
+};
 use super::{
     DirectoryCursor, FilesystemHookGuard, FilesystemHookRuntime,
     agora_sandbox_access as sandbox_access, agora_sandbox_chdir as sandbox_chdir,
@@ -6,20 +10,20 @@ use super::{
     agora_sandbox_clonefileat as sandbox_clonefileat, agora_sandbox_close as sandbox_close,
     agora_sandbox_closedir as sandbox_closedir, agora_sandbox_copyfile as sandbox_copyfile,
     agora_sandbox_creat as sandbox_creat, agora_sandbox_dup as sandbox_dup,
-    agora_sandbox_faccessat as sandbox_faccessat, agora_sandbox_fchdir as sandbox_fchdir,
-    agora_sandbox_fchflags as sandbox_fchflags, agora_sandbox_fchmod as sandbox_fchmod,
-    agora_sandbox_fchmodat as sandbox_fchmodat, agora_sandbox_fchown as sandbox_fchown,
-    agora_sandbox_fchownat as sandbox_fchownat, agora_sandbox_fclose as sandbox_fclose,
-    agora_sandbox_fdopendir as sandbox_fdopendir, agora_sandbox_fopen as sandbox_fopen,
-    agora_sandbox_fremovexattr as sandbox_fremovexattr, agora_sandbox_freopen as sandbox_freopen,
-    agora_sandbox_fsetxattr as sandbox_fsetxattr, agora_sandbox_fstat as sandbox_fstat,
-    agora_sandbox_fstatat as sandbox_fstatat, agora_sandbox_fsync as sandbox_fsync,
-    agora_sandbox_ftruncate as sandbox_ftruncate, agora_sandbox_futimens as sandbox_futimens,
-    agora_sandbox_futimes as sandbox_futimes, agora_sandbox_getcwd as sandbox_getcwd,
-    agora_sandbox_lchown as sandbox_lchown, agora_sandbox_link as sandbox_link,
-    agora_sandbox_linkat as sandbox_linkat, agora_sandbox_lstat as sandbox_lstat,
-    agora_sandbox_lutimes as sandbox_lutimes, agora_sandbox_mkdir as sandbox_mkdir,
-    agora_sandbox_mkdirat as sandbox_mkdirat,
+    agora_sandbox_dup2 as sandbox_dup2, agora_sandbox_faccessat as sandbox_faccessat,
+    agora_sandbox_fchdir as sandbox_fchdir, agora_sandbox_fchflags as sandbox_fchflags,
+    agora_sandbox_fchmod as sandbox_fchmod, agora_sandbox_fchmodat as sandbox_fchmodat,
+    agora_sandbox_fchown as sandbox_fchown, agora_sandbox_fchownat as sandbox_fchownat,
+    agora_sandbox_fclose as sandbox_fclose, agora_sandbox_fdopendir as sandbox_fdopendir,
+    agora_sandbox_fopen as sandbox_fopen, agora_sandbox_fremovexattr as sandbox_fremovexattr,
+    agora_sandbox_freopen as sandbox_freopen, agora_sandbox_fsetxattr as sandbox_fsetxattr,
+    agora_sandbox_fstat as sandbox_fstat, agora_sandbox_fstatat as sandbox_fstatat,
+    agora_sandbox_fsync as sandbox_fsync, agora_sandbox_ftruncate as sandbox_ftruncate,
+    agora_sandbox_futimens as sandbox_futimens, agora_sandbox_futimes as sandbox_futimes,
+    agora_sandbox_getcwd as sandbox_getcwd, agora_sandbox_lchown as sandbox_lchown,
+    agora_sandbox_link as sandbox_link, agora_sandbox_linkat as sandbox_linkat,
+    agora_sandbox_lstat as sandbox_lstat, agora_sandbox_lutimes as sandbox_lutimes,
+    agora_sandbox_mkdir as sandbox_mkdir, agora_sandbox_mkdirat as sandbox_mkdirat,
     agora_sandbox_open_with_mode as sandbox_open_with_mode,
     agora_sandbox_openat_with_mode as sandbox_openat_with_mode,
     agora_sandbox_opendir as sandbox_opendir,
@@ -41,6 +45,9 @@ use super::{
 };
 use crate::audit::AuditClient;
 use crate::filesystem::{EntryState, FileAttributes, FileLayer};
+use crate::nfs::controller::RemoteController;
+use crate::nfs::protocol::RemoteRoute;
+use crate::nfs::testing::MemoryStorage;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
@@ -48,6 +55,7 @@ use std::net::TcpListener;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -75,12 +83,733 @@ impl Fixture {
         use std::os::unix::ffi::OsStrExt;
         CString::new(path.as_os_str().as_bytes()).unwrap()
     }
+
+    fn attach_nfs(&mut self) -> NfsTestServer {
+        let logical_root = self.lower.join("network");
+        let storage = Arc::new(MemoryStorage::default());
+        storage.insert_directory(0, "");
+        let runtime_directory = tempfile::Builder::new()
+            .prefix("agora-nfs-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let (socket, token, shutdown, thread) =
+            NfsTestServer::start(Arc::clone(&storage), runtime_directory.path().to_path_buf());
+        self.runtime.remote = Some(
+            super::nfs::RemoteFilesystem::new(
+                socket,
+                token,
+                vec![RemoteRoute {
+                    root: 0,
+                    logical_root: logical_root.to_string_lossy().into_owned(),
+                }],
+            )
+            .unwrap(),
+        );
+        NfsTestServer {
+            logical_root,
+            storage,
+            shutdown: Some(shutdown),
+            thread: Some(thread),
+            _runtime_directory: runtime_directory,
+        }
+    }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.directory).unwrap();
     }
+}
+
+struct NfsTestServer {
+    logical_root: PathBuf,
+    storage: Arc<MemoryStorage>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+    _runtime_directory: tempfile::TempDir,
+}
+
+impl NfsTestServer {
+    fn start(
+        storage: Arc<MemoryStorage>,
+        runtime_directory: PathBuf,
+    ) -> (
+        PathBuf,
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let (ready, started) = std::sync::mpsc::sync_channel(1);
+        let (shutdown, stopping) = tokio::sync::oneshot::channel();
+        let thread = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let controller = RemoteController::start_with_storage(storage, &runtime_directory)
+                    .await
+                    .unwrap();
+                ready
+                    .send((
+                        controller.runtime().socket().to_path_buf(),
+                        controller.runtime().token().to_string(),
+                    ))
+                    .unwrap();
+                let _ = stopping.await;
+                controller.shutdown().await.unwrap();
+            });
+        });
+        let (socket, token) = started.recv().unwrap();
+        (socket, token, shutdown, thread)
+    }
+}
+
+impl Drop for NfsTestServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[test]
+fn nfs_files_use_anonymous_descriptors_without_overlay_state() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_directory(0, "docs");
+    nfs.storage
+        .insert_file(0, "docs/file.txt", b"remote content");
+    let logical = nfs.logical_root.join("docs/file.txt");
+    let path = Fixture::c_path(&logical);
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR, 0);
+        assert!(descriptor >= 0);
+        let mut content = [0_u8; 14];
+        assert_eq!(
+            libc::read(descriptor, content.as_mut_ptr().cast(), content.len()),
+            14
+        );
+        assert_eq!(&content, b"remote content");
+
+        let mut status = std::mem::zeroed();
+        assert_eq!(sandbox_fstat(descriptor, &mut status), 0);
+        assert_eq!(status.st_size, 14);
+        assert_eq!(sandbox_stat(path.as_ptr(), &mut status), 0);
+        assert_eq!(status.st_size, 14);
+        assert_eq!(sandbox_access(path.as_ptr(), libc::R_OK | libc::W_OK), 0);
+        assert_eq!(sandbox_access(path.as_ptr(), libc::X_OK), -1);
+        assert_eq!(*libc::__error(), libc::EACCES);
+
+        assert_eq!(sandbox_ftruncate(descriptor, 0), 0);
+        assert_eq!(libc::lseek(descriptor, 0, libc::SEEK_SET), 0);
+        assert_eq!(libc::write(descriptor, b"sandbox".as_ptr().cast(), 7), 7);
+        assert_eq!(sandbox_stat(path.as_ptr(), &mut status), 0);
+        assert_eq!(status.st_size, 7);
+        assert_eq!(
+            nfs.storage.data(0, "docs/file.txt"),
+            Some(b"sandbox".to_vec())
+        );
+        assert_eq!(sandbox_fsync(descriptor), 0);
+        assert_eq!(
+            nfs.storage.data(0, "docs/file.txt"),
+            Some(b"sandbox".to_vec())
+        );
+
+        let duplicate = sandbox_dup(descriptor);
+        assert!(duplicate >= 0);
+        assert_eq!(sandbox_close(descriptor), 0);
+        assert_eq!(sandbox_close(duplicate), 0);
+
+        assert_eq!(sandbox_truncate(path.as_ptr(), -1), -1);
+        assert_eq!(*libc::__error(), libc::EINVAL);
+        assert_eq!(
+            nfs.storage.data(0, "docs/file.txt"),
+            Some(b"sandbox".to_vec())
+        );
+
+        let stream = sandbox_fopen(path.as_ptr(), c"r".as_ptr());
+        assert!(!stream.is_null());
+        let mut reopened = [0_u8; 7];
+        assert_eq!(
+            libc::fread(reopened.as_mut_ptr().cast(), 1, reopened.len(), stream),
+            7
+        );
+        assert_eq!(&reopened, b"sandbox");
+        assert_eq!(sandbox_fclose(stream), 0);
+
+        let created_path = Fixture::c_path(&nfs.logical_root.join("created.txt"));
+        let created =
+            sandbox_open_with_mode(created_path.as_ptr(), libc::O_RDONLY | libc::O_CREAT, 0o600);
+        assert!(created >= 0);
+        assert_eq!(nfs.storage.data(0, "created.txt"), Some(Vec::new()));
+        assert_eq!(sandbox_close(created), 0);
+    });
+
+    assert!(!nfs.logical_root.exists());
+    assert_eq!(
+        fixture.runtime.filesystem.state_for_test(&logical).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn nfs_existing_open_uses_one_remote_lookup() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_file(0, "file.txt", b"remote content");
+    let path = Fixture::c_path(&nfs.logical_root.join("file.txt"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(descriptor >= 0);
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+
+    assert_eq!(nfs.storage.stat_operations(), 1);
+}
+
+#[test]
+fn nfs_root_is_visible_in_its_parent_directory() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    let parent = Fixture::c_path(nfs.logical_root.parent().unwrap());
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let directory = sandbox_opendir(parent.as_ptr());
+        assert!(!directory.is_null());
+        let mut names = Vec::new();
+        loop {
+            let entry = sandbox_readdir(directory);
+            if entry.is_null() {
+                break;
+            }
+            names.push(CStr::from_ptr((*entry).d_name.as_ptr()).to_bytes().to_vec());
+        }
+        assert_eq!(sandbox_closedir(directory), 0);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_slice() == b"network")
+                .count(),
+            1
+        );
+    });
+
+    assert!(!nfs.logical_root.exists());
+}
+
+#[test]
+fn nfs_root_is_visible_to_fts_in_its_parent_directory() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    let parent = nfs.logical_root.parent().unwrap();
+    let parent = Fixture::c_path(parent);
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor =
+            sandbox_open_with_mode(parent.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY, 0);
+        assert!(descriptor >= 0);
+        let names = fts_bulk_entry_names_for_test(&fixture.runtime, descriptor).unwrap();
+        assert_eq!(sandbox_close(descriptor), 0);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_slice() == b"network")
+                .count(),
+            1
+        );
+    });
+    assert!(!nfs.logical_root.exists());
+}
+
+#[test]
+fn nfs_child_from_fts_read_is_not_filtered() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_directory(0, "test");
+    nfs.storage.insert_file(0, "test/file.txt", b"content");
+    let child = nfs.logical_root.join("test/file.txt");
+
+    with_test_runtime(&fixture.runtime, || {
+        assert!(fts_read_returns_virtual_entry_for_test(&child).unwrap());
+    });
+}
+
+#[test]
+fn nfs_directory_from_fts_read_uses_its_remote_anchor_for_descent() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_directory(0, "test");
+    nfs.storage.insert_directory(0, "test/nested");
+    let directory = nfs.logical_root.join("test/nested");
+    let path = Fixture::c_path(&directory);
+
+    with_test_runtime(&fixture.runtime, || {
+        let (expected, _, _) = fixture
+            .runtime
+            .map_metadata(
+                path.as_ptr(),
+                libc::AT_FDCWD,
+                false,
+                &crate::filesystem::Credentials::effective(),
+            )
+            .unwrap();
+        assert_eq!(
+            fts_directory_descent_path_for_test(&directory).unwrap(),
+            expected.as_bytes()
+        );
+    });
+}
+
+#[test]
+fn nfs_entries_override_overlay_entries_and_missing_entries_fall_back() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    let local_directory = nfs.logical_root.join("docs");
+    std::fs::create_dir_all(&local_directory).unwrap();
+    std::fs::write(local_directory.join("shared.txt"), b"lower shared").unwrap();
+    std::fs::write(local_directory.join("lower.txt"), b"lower only").unwrap();
+    std::fs::write(local_directory.join("upper.txt"), b"lower baseline").unwrap();
+    let whiteouted_logical = local_directory.join("whiteouted.txt");
+    std::fs::write(&whiteouted_logical, b"hidden lower").unwrap();
+    fixture
+        .runtime
+        .filesystem
+        .remove(&whiteouted_logical, false)
+        .unwrap();
+    std::fs::create_dir(local_directory.join("local-dir")).unwrap();
+    nfs.storage.insert_directory(0, "docs");
+    nfs.storage
+        .insert_file(0, "docs/shared.txt", b"remote shared");
+    nfs.storage
+        .insert_file(0, "docs/remote.txt", b"remote only");
+    nfs.storage
+        .insert_file(0, "docs/whiteouted.txt", b"remote over whiteout");
+
+    let shared = Fixture::c_path(&local_directory.join("shared.txt"));
+    let lower = Fixture::c_path(&local_directory.join("lower.txt"));
+    let upper = Fixture::c_path(&local_directory.join("upper.txt"));
+    let whiteouted = Fixture::c_path(&whiteouted_logical);
+    let local_dir = Fixture::c_path(&local_directory.join("local-dir"));
+    let docs = Fixture::c_path(&local_directory);
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let read = |path: &CString, expected: &[u8]| {
+            let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
+            assert!(descriptor >= 0);
+            let mut content = vec![0_u8; expected.len()];
+            assert_eq!(
+                libc::read(descriptor, content.as_mut_ptr().cast(), content.len()),
+                expected.len() as isize
+            );
+            assert_eq!(content, expected);
+            assert_eq!(sandbox_close(descriptor), 0);
+        };
+
+        read(&shared, b"remote shared");
+        read(&lower, b"lower only");
+        read(&whiteouted, b"remote over whiteout");
+        let mut status = std::mem::zeroed();
+        assert_eq!(sandbox_stat(shared.as_ptr(), &mut status), 0);
+        assert_eq!(status.st_size, 13);
+        assert_eq!(sandbox_stat(lower.as_ptr(), &mut status), 0);
+        assert_eq!(status.st_size, 10);
+        assert_eq!(sandbox_access(lower.as_ptr(), libc::R_OK), 0);
+        assert_eq!(sandbox_chmod(lower.as_ptr(), 0o600), 0);
+        assert_eq!(sandbox_mkdir(local_dir.as_ptr(), 0o755), -1);
+        assert_eq!(*libc::__error(), libc::EEXIST);
+        assert!(!nfs.storage.exists(0, "docs/local-dir"));
+
+        let descriptor = sandbox_open_with_mode(upper.as_ptr(), libc::O_RDWR | libc::O_TRUNC, 0);
+        assert!(descriptor >= 0);
+        assert_eq!(
+            libc::write(descriptor, b"upper only".as_ptr().cast(), 10),
+            10
+        );
+        assert_eq!(sandbox_close(descriptor), 0);
+        assert_eq!(nfs.storage.data(0, "docs/upper.txt"), None);
+        assert_eq!(
+            fixture
+                .runtime
+                .filesystem
+                .state_for_test(&local_directory.join("upper.txt"))
+                .unwrap(),
+            Some(EntryState::Cow)
+        );
+        read(&upper, b"upper only");
+
+        nfs.storage
+            .insert_file(0, "docs/upper.txt", b"remote upper");
+        read(&upper, b"remote upper");
+
+        let directory = sandbox_opendir(docs.as_ptr());
+        assert!(!directory.is_null());
+        let mut names = HashSet::new();
+        loop {
+            let entry = sandbox_readdir(directory);
+            if entry.is_null() {
+                break;
+            }
+            names.insert(
+                CStr::from_ptr((*entry).d_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        assert_eq!(
+            names,
+            HashSet::from([
+                ".".into(),
+                "..".into(),
+                "shared.txt".into(),
+                "local-dir".into(),
+                "lower.txt".into(),
+                "upper.txt".into(),
+                "whiteouted.txt".into(),
+                "remote.txt".into(),
+            ])
+        );
+        assert_eq!(sandbox_closedir(directory), 0);
+
+        let descriptor =
+            sandbox_open_with_mode(docs.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY, 0);
+        assert!(descriptor >= 0);
+        let child = sandbox_openat_with_mode(descriptor, c"lower.txt".as_ptr(), libc::O_RDONLY, 0);
+        assert!(child >= 0);
+        let mut content = [0_u8; 10];
+        assert_eq!(libc::read(child, content.as_mut_ptr().cast(), 10), 10);
+        assert_eq!(&content, b"lower only");
+        assert_eq!(sandbox_close(child), 0);
+        let child = sandbox_openat_with_mode(descriptor, c"shared.txt".as_ptr(), libc::O_RDONLY, 0);
+        assert!(child >= 0);
+        let mut content = [0_u8; 13];
+        assert_eq!(libc::read(child, content.as_mut_ptr().cast(), 13), 13);
+        assert_eq!(&content, b"remote shared");
+        assert_eq!(sandbox_close(child), 0);
+        let directory = sandbox_fdopendir(descriptor);
+        assert!(!directory.is_null());
+        let mut names = HashSet::new();
+        loop {
+            let entry = sandbox_readdir(directory);
+            if entry.is_null() {
+                break;
+            }
+            names.insert(
+                CStr::from_ptr((*entry).d_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        assert!(names.contains("remote.txt"));
+        assert!(names.contains("lower.txt"));
+        assert_eq!(sandbox_closedir(directory), 0);
+
+        assert_eq!(sandbox_unlink(shared.as_ptr()), 0);
+        read(&shared, b"lower shared");
+        assert_eq!(sandbox_stat(shared.as_ptr(), &mut status), 0);
+        assert_eq!(status.st_size, 12);
+
+        assert_eq!(sandbox_unlink(upper.as_ptr()), 0);
+        read(&upper, b"upper only");
+
+        assert_eq!(sandbox_unlink(whiteouted.as_ptr()), 0);
+        assert_eq!(
+            sandbox_open_with_mode(whiteouted.as_ptr(), libc::O_RDONLY, 0),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOENT);
+    });
+}
+
+#[test]
+fn nfs_fclose_keeps_the_stream_open_when_writeback_conflicts() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_file(0, "shared.txt", b"original");
+    let path = Fixture::c_path(&nfs.logical_root.join("shared.txt"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let stream = sandbox_fopen(path.as_ptr(), c"r+".as_ptr());
+        assert!(!stream.is_null());
+        let descriptor = libc::fileno(stream);
+        assert!(descriptor >= 0);
+        assert_eq!(libc::fwrite(b"sandbox".as_ptr().cast(), 1, 7, stream), 7);
+        nfs.storage.replace(0, "shared.txt", b"outside");
+
+        assert_eq!(sandbox_fclose(stream), -1);
+        assert_eq!(*libc::__error(), libc::ESTALE);
+        assert!(fixture.runtime.tracked_open(descriptor).is_some());
+        assert_ne!(libc::fcntl(descriptor, libc::F_GETFD), -1);
+
+        fixture.runtime.take_descriptor(descriptor);
+        assert_eq!(libc::fclose(stream), 0);
+    });
+    assert_eq!(nfs.storage.data(0, "shared.txt"), Some(b"outside".to_vec()));
+}
+
+#[test]
+fn nfs_dup2_closes_the_replaced_remote_handle() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_file(0, "destination.txt", b"original");
+    let destination_path = Fixture::c_path(&nfs.logical_root.join("destination.txt"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let destination = sandbox_open_with_mode(destination_path.as_ptr(), libc::O_RDWR, 0);
+        assert!(destination >= 0);
+        assert_eq!(sandbox_ftruncate(destination, 0), 0);
+        assert_eq!(libc::write(destination, b"saved".as_ptr().cast(), 5), 5);
+        let old_handle = fixture
+            .runtime
+            .tracked_open(destination)
+            .unwrap()
+            .remote
+            .as_ref()
+            .unwrap()
+            .handle
+            .clone();
+        let source = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+        assert!(source >= 0);
+
+        assert_eq!(sandbox_dup2(source, destination), destination);
+        assert_eq!(
+            nfs.storage.data(0, "destination.txt"),
+            Some(b"saved".to_vec())
+        );
+        let error = fixture
+            .runtime
+            .remote
+            .as_ref()
+            .unwrap()
+            .close(&old_handle)
+            .unwrap_err();
+        assert_eq!(error_errno(&error), libc::EBADF);
+
+        assert_eq!(sandbox_close(destination), 0);
+        assert_eq!(sandbox_close(source), 0);
+    });
+}
+
+#[test]
+fn nfs_unlink_discards_an_open_snapshot_without_recreating_the_path() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_file(0, "open.txt", b"original");
+    let path = Fixture::c_path(&nfs.logical_root.join("open.txt"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR | libc::O_TRUNC, 0);
+        assert!(descriptor >= 0);
+        assert_eq!(libc::write(descriptor, b"discarded".as_ptr().cast(), 9), 9);
+        assert_eq!(sandbox_unlink(path.as_ptr()), 0);
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+
+    assert!(!nfs.storage.exists(0, "open.txt"));
+}
+
+#[test]
+fn nfs_failed_open_audit_aborts_a_staged_remote_create() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    fixture.runtime.audit = Some(AuditClient::new(address, "audit-token"));
+    let path = Fixture::c_path(&nfs.logical_root.join("denied.txt"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        assert_eq!(
+            sandbox_open_with_mode(
+                path.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                0o600,
+            ),
+            -1
+        );
+    });
+
+    assert!(!nfs.storage.exists(0, "denied.txt"));
+}
+
+#[test]
+fn nfs_directories_and_namespace_operations_use_remote_entries() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_directory(0, "docs");
+    nfs.storage.insert_file(0, "docs/a.txt", b"a");
+    nfs.storage.insert_file(0, "cross.txt", b"cross");
+    let docs = Fixture::c_path(&nfs.logical_root.join("docs"));
+    let source = Fixture::c_path(&nfs.logical_root.join("docs/a.txt"));
+    let renamed = Fixture::c_path(&nfs.logical_root.join("docs/b.txt"));
+    let created = Fixture::c_path(&nfs.logical_root.join("empty"));
+    let cross = Fixture::c_path(&nfs.logical_root.join("cross.txt"));
+    let local = Fixture::c_path(&fixture.lower.join("local.txt"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let directory = sandbox_opendir(docs.as_ptr());
+        assert!(!directory.is_null());
+        let mut names = HashSet::new();
+        loop {
+            let entry = sandbox_readdir(directory);
+            if entry.is_null() {
+                break;
+            }
+            names.insert(
+                CStr::from_ptr((*entry).d_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        assert_eq!(
+            names,
+            HashSet::from([".".into(), "..".into(), "a.txt".into()])
+        );
+        sandbox_rewinddir(directory);
+        assert!(!sandbox_readdir(directory).is_null());
+        assert_eq!(sandbox_closedir(directory), 0);
+
+        let descriptor =
+            sandbox_open_with_mode(docs.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY, 0);
+        assert!(descriptor >= 0);
+        let directory = sandbox_fdopendir(descriptor);
+        assert!(!directory.is_null());
+        assert!(!sandbox_readdir(directory).is_null());
+        assert_eq!(sandbox_closedir(directory), 0);
+
+        assert_eq!(sandbox_mkdir(created.as_ptr(), 0o755), 0);
+        assert!(nfs.storage.exists(0, "empty"));
+        assert_eq!(sandbox_rmdir(created.as_ptr()), 0);
+        assert!(!nfs.storage.exists(0, "empty"));
+
+        assert_eq!(sandbox_rename(source.as_ptr(), renamed.as_ptr()), 0);
+        assert!(!nfs.storage.exists(0, "docs/a.txt"));
+        assert!(nfs.storage.exists(0, "docs/b.txt"));
+        assert_eq!(sandbox_unlink(renamed.as_ptr()), 0);
+        assert!(!nfs.storage.exists(0, "docs/b.txt"));
+
+        assert_eq!(sandbox_chmod(cross.as_ptr(), 0o600), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(sandbox_symlink(c"target".as_ptr(), cross.as_ptr()), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(sandbox_rename(cross.as_ptr(), local.as_ptr()), -1);
+        assert_eq!(*libc::__error(), libc::EXDEV);
+        assert!(nfs.storage.exists(0, "cross.txt"));
+    });
+
+    assert!(!nfs.logical_root.exists());
+    assert_eq!(
+        fixture
+            .runtime
+            .filesystem
+            .state_for_test(&nfs.logical_root.join("docs"))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn nfs_opendir_descriptors_support_fchdir() {
+    struct RestoreDirectory(PathBuf);
+
+    impl Drop for RestoreDirectory {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).unwrap();
+        }
+    }
+
+    let original = std::env::current_dir().unwrap();
+    let _restore = RestoreDirectory(original.clone());
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_directory(0, "docs");
+    let logical = nfs.logical_root.join("docs");
+    let local = nfs.logical_root.join("local");
+    std::fs::create_dir_all(&local).unwrap();
+    let path = Fixture::c_path(&logical);
+    let local_path = Fixture::c_path(&local);
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let directory = sandbox_opendir(path.as_ptr());
+        assert!(!directory.is_null());
+
+        assert_eq!(sandbox_fchdir(libc::dirfd(directory)), 0);
+        let current = sandbox_getcwd(std::ptr::null_mut(), 0);
+        assert!(!current.is_null());
+        assert_eq!(
+            CStr::from_ptr(current).to_bytes(),
+            logical.as_os_str().as_encoded_bytes()
+        );
+        libc::free(current.cast());
+
+        assert_eq!(sandbox_closedir(directory), 0);
+        std::env::set_current_dir(&original).unwrap();
+        fixture.runtime.set_current_directory(original.clone());
+
+        let descriptor =
+            sandbox_open_with_mode(local_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY, 0);
+        assert!(descriptor >= 0);
+        assert_eq!(sandbox_fchdir(descriptor), 0);
+        let current = sandbox_getcwd(std::ptr::null_mut(), 0);
+        assert!(!current.is_null());
+        assert_eq!(
+            CStr::from_ptr(current).to_bytes(),
+            local.as_os_str().as_encoded_bytes()
+        );
+        libc::free(current.cast());
+        assert_eq!(sandbox_close(descriptor), 0);
+        std::env::set_current_dir(&original).unwrap();
+        fixture.runtime.set_current_directory(original.clone());
+    });
+}
+
+#[test]
+fn nfs_fts_setup_preserves_a_remote_logical_current_directory() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_directory(0, "docs");
+    let logical = nfs.logical_root.join("docs");
+    fixture.runtime.set_current_directory(logical.clone());
+
+    fixture
+        .runtime
+        .synchronize_current_directory_for_fts()
+        .unwrap();
+
+    let current = fixture.runtime.current_directory.lock().unwrap();
+    assert_eq!(current.logical, logical);
+    assert!(current.remote);
+}
+
+#[test]
+fn nfs_directory_rename_retargets_open_descendants() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_directory(0, "tree");
+    nfs.storage.insert_file(0, "tree/open.txt", b"old");
+    let source_directory = Fixture::c_path(&nfs.logical_root.join("tree"));
+    let destination_directory = Fixture::c_path(&nfs.logical_root.join("moved"));
+    let file = Fixture::c_path(&nfs.logical_root.join("tree/open.txt"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(file.as_ptr(), libc::O_RDWR | libc::O_TRUNC, 0);
+        assert!(descriptor >= 0);
+        assert_eq!(libc::write(descriptor, b"new".as_ptr().cast(), 3), 3);
+        assert_eq!(
+            sandbox_rename(source_directory.as_ptr(), destination_directory.as_ptr()),
+            0
+        );
+        assert_eq!(sandbox_fsync(descriptor), 0);
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+
+    assert_eq!(nfs.storage.data(0, "moved/open.txt"), Some(b"new".to_vec()));
+    assert!(!nfs.storage.exists(0, "tree/open.txt"));
 }
 
 #[test]
@@ -145,6 +874,25 @@ fn allowlisted_device_opens_bypass_audit_and_tracking() {
         );
         assert_eq!(libc::posix_spawn_file_actions_destroy(&mut actions), 0);
     });
+}
+
+#[test]
+fn root_no_follow_metadata_uses_the_native_root() {
+    let fixture = Fixture::new();
+
+    let (mapped, plaintext_size, attributes) = fixture
+        .runtime
+        .map_metadata(
+            c"/".as_ptr(),
+            libc::AT_FDCWD,
+            false,
+            &crate::filesystem::Credentials::effective(),
+        )
+        .unwrap();
+
+    assert_eq!(mapped.as_c_str(), c"/");
+    assert_eq!(plaintext_size, None);
+    assert_eq!(attributes, None);
 }
 
 #[test]
@@ -333,6 +1081,7 @@ fn managed_fts_streams_do_not_require_current_directory_resynchronization() {
         super::FtsStreamState {
             mappings: Vec::new(),
             presented: Vec::new(),
+            traversal_paths: Vec::new(),
         },
     );
     assert!(!super::fts_stream_may_change_current_directory(stream));
@@ -1308,7 +2057,7 @@ fn directory_descriptor_duplicates_keep_logical_paths_and_close_clears_tracking(
         assert!(descriptor >= 0);
         fixture
             .runtime
-            .register_directory(descriptor, logical.clone());
+            .register_directory(descriptor, logical.clone(), false);
 
         let duplicate = sandbox_dup(descriptor);
         assert!(duplicate >= 0);
@@ -1641,7 +2390,7 @@ fn directory_cursor_prefers_upper_entries_and_hides_whiteouts() {
         .remove(&lower.join("removed"), false)
         .unwrap();
     let view = fixture.runtime.filesystem.directory_view(&lower).unwrap();
-    let mut cursor = DirectoryCursor::new(None, FileLayer::Upper, &view);
+    let mut cursor = DirectoryCursor::filter(&view);
 
     assert_eq!(cursor.include(b"same", false).unwrap(), b"same");
     assert!(cursor.include(b"same", true).is_none());
@@ -1691,12 +2440,12 @@ fn logical_current_directory_drives_relative_path_resolution() {
     std::fs::write(&file, b"content").unwrap();
     let directory_path = Fixture::c_path(&directory);
 
-    let (mapped, logical) = fixture
+    let (mapped, logical, remote) = fixture
         .runtime
         .prepare_change_directory(directory_path.as_ptr())
         .unwrap();
     assert_eq!(Path::new(mapped.to_str().unwrap()), directory);
-    fixture.runtime.set_current_directory(logical);
+    fixture.runtime.set_current_directory_state(logical, remote);
 
     with_test_runtime(&fixture.runtime, || unsafe {
         let mut cwd = vec![0_i8; libc::PATH_MAX as usize];

@@ -7,6 +7,12 @@ pub use crate::filesystem::FilesystemMode;
 #[cfg(target_os = "macos")]
 use crate::filesystem::{EncryptedWorkspace, FilesystemWorkspace, KeyMigrationStage};
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
+pub use crate::nfs::SmbRemoteConfig;
+#[cfg(all(target_os = "macos", feature = "remote-smb"))]
+use crate::nfs::{
+    controller::{RemoteConnectionStatus, RemoteController, RemoteControllerEvent},
+    protocol::RemoteRoute,
+};
 use crate::trace::{TRACE_ID_ENVIRONMENT, TraceContext};
 use anyhow::{Context, Result, bail};
 #[cfg(target_os = "macos")]
@@ -52,6 +58,14 @@ const FILESYSTEM_MODE: &str = "AGORA_SANDBOX_FILESYSTEM_MODE";
 #[cfg(target_os = "macos")]
 const FILESYSTEM_CIPHER_KEY: &str = "AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY";
 #[cfg(target_os = "macos")]
+const REMOTE_CONTROL: &str = "AGORA_SANDBOX_REMOTE_CONTROL";
+#[cfg(target_os = "macos")]
+const REMOTE_TOKEN: &str = "AGORA_SANDBOX_REMOTE_TOKEN";
+#[cfg(target_os = "macos")]
+const REMOTE_ROOTS: &str = "AGORA_SANDBOX_REMOTE_ROOTS";
+#[cfg(target_os = "macos")]
+const REMOTE_CURRENT_DIRECTORY: &str = "AGORA_SANDBOX_REMOTE_CURRENT_DIRECTORY";
+#[cfg(target_os = "macos")]
 const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
 #[cfg(target_os = "macos")]
 const TLS_TRUST_BUNDLE: &str = "AGORA_SANDBOX_TLS_TRUST_BUNDLE";
@@ -86,6 +100,7 @@ pub struct SandboxConfig {
     filesystem_mode: FilesystemMode,
     encrypted_workspace_key: Option<SecretBytes>,
     tls_ca: Option<TlsCaFiles>,
+    smb_remotes: Vec<SmbRemoteConfig>,
     #[cfg(test)]
     upstream_tls_roots: Option<Vec<rustls::pki_types::CertificateDer<'static>>>,
 }
@@ -124,6 +139,7 @@ impl SandboxConfig {
             filesystem_mode: FilesystemMode::default(),
             encrypted_workspace_key: None,
             tls_ca: None,
+            smb_remotes: Vec::new(),
             #[cfg(test)]
             upstream_tls_roots: None,
         }
@@ -189,6 +205,15 @@ impl SandboxConfig {
             .map(|ca| (ca.certificate.as_path(), ca.private_key.as_path()))
     }
 
+    pub fn with_smb_remote(mut self, remote: SmbRemoteConfig) -> Self {
+        self.smb_remotes.push(remote);
+        self
+    }
+
+    pub fn smb_remotes(&self) -> &[SmbRemoteConfig] {
+        &self.smb_remotes
+    }
+
     #[cfg(test)]
     fn with_upstream_tls_roots(
         mut self,
@@ -200,6 +225,11 @@ impl SandboxConfig {
 
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
+        self.validate_smb_remotes()?;
+        #[cfg(not(feature = "remote-smb"))]
+        if !self.smb_remotes.is_empty() {
+            bail!("this build does not include SMB remote filesystem support");
+        }
         #[cfg(not(target_os = "macos"))]
         bail!("the network hook is currently supported only on macOS");
         if !self.hook_library.is_file() {
@@ -217,6 +247,51 @@ impl SandboxConfig {
             (FilesystemMode::Plain, None) => {}
             (FilesystemMode::Plain, Some(_)) => {
                 bail!("encrypted filesystem key cannot be used with plain filesystem mode")
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_smb_remotes(&self) -> Result<()> {
+        let workdir = if self.workdir.is_absolute() {
+            self.workdir.clone()
+        } else {
+            std::env::current_dir()
+                .context("failed to resolve current directory")?
+                .join(&self.workdir)
+        };
+        let workdir = crate::filesystem::normalize_path(&workdir)?;
+        let resolved_workdir = crate::filesystem::resolve_existing_ancestor(&workdir)?;
+        let roots = self
+            .smb_remotes
+            .iter()
+            .map(|remote| {
+                let logical = remote.logical_root();
+                let resolved = crate::filesystem::resolve_existing_ancestor(logical)?;
+                Ok((logical, resolved))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (index, (root, resolved_root)) in roots.iter().enumerate() {
+            if root.starts_with("/dev") || resolved_root.starts_with("/dev") {
+                bail!(
+                    "SMB logical root overlaps native passthrough root /dev: {}",
+                    root.display()
+                );
+            }
+            if path_aliases_overlap(root, resolved_root, &workdir, &resolved_workdir) {
+                bail!(
+                    "SMB logical root overlaps sandbox work directory: {}",
+                    root.display()
+                );
+            }
+            for (other, resolved_other) in &roots[..index] {
+                if path_aliases_overlap(root, resolved_root, other, resolved_other) {
+                    bail!(
+                        "SMB logical roots overlap: {} and {}",
+                        other.display(),
+                        root.display()
+                    );
+                }
             }
         }
         Ok(())
@@ -296,6 +371,23 @@ impl SandboxConfig {
         path.canonicalize()
             .context("failed to resolve TLS client trust bundle")
     }
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn path_aliases_overlap(
+    left: &Path,
+    resolved_left: &Path,
+    right: &Path,
+    resolved_right: &Path,
+) -> bool {
+    [left, resolved_left].into_iter().any(|left| {
+        [right, resolved_right]
+            .into_iter()
+            .any(|right| paths_overlap(left, right))
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -436,7 +528,7 @@ where
         .await?;
         let runtime_directory = tempfile::Builder::new()
             .prefix("agora-sandbox-run-")
-            .tempdir()
+            .tempdir_in("/tmp")
             .context("failed to create sandbox runtime directory")?;
         let tls_ca_files = self.config.tls_ca_for_workdir()?;
         let hook_library = self.config.hook_library.canonicalize().with_context(|| {
@@ -581,6 +673,25 @@ where
                 return Err(error);
             }
         };
+        #[cfg(feature = "remote-smb")]
+        let mut remote = if self.config.smb_remotes.is_empty() {
+            None
+        } else {
+            match crate::nfs::start_controller(
+                &self.config.smb_remotes,
+                &runtime_directory.path().join("nfs"),
+            )
+            .await
+            {
+                Ok(remote) => Some(remote),
+                Err(error) => {
+                    let _ = controller.shutdown().await;
+                    let _ = execution.shutdown().await;
+                    let _ = audit.shutdown().await;
+                    return Err(error);
+                }
+            }
+        };
         let runtime = controller.runtime();
         let execution_runtime = execution.runtime();
         let audit_runtime = audit.runtime();
@@ -609,6 +720,30 @@ where
             )
             .env(TRACE_ID_ENVIRONMENT, trace.encode())
             .env("DYLD_INSERT_LIBRARIES", injected_libraries);
+        child
+            .env_remove(REMOTE_CONTROL)
+            .env_remove(REMOTE_TOKEN)
+            .env_remove(REMOTE_ROOTS)
+            .env_remove(REMOTE_CURRENT_DIRECTORY);
+        #[cfg(feature = "remote-smb")]
+        if let Some(remote) = &remote {
+            let routes = self
+                .config
+                .smb_remotes
+                .iter()
+                .enumerate()
+                .map(|(root, remote)| {
+                    Ok(RemoteRoute {
+                        root: u32::try_from(root).context("too many SMB remote roots")?,
+                        logical_root: remote.logical_root().to_string_lossy().into_owned(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            child
+                .env(REMOTE_CONTROL, remote.runtime().socket())
+                .env(REMOTE_TOKEN, remote.runtime().token())
+                .env(REMOTE_ROOTS, serde_json::to_string(&routes)?);
+        }
         if let Some(key) = filesystem.encrypted_cipher_key() {
             child.env(
                 FILESYSTEM_CIPHER_KEY,
@@ -633,6 +768,10 @@ where
         let mut child = match child.spawn() {
             Ok(child) => child,
             Err(error) => {
+                #[cfg(feature = "remote-smb")]
+                if let Some(remote) = remote.take() {
+                    let _ = remote.shutdown().await;
+                }
                 let _ = controller.shutdown().await;
                 let _ = execution.shutdown().await;
                 let _ = audit.shutdown().await;
@@ -647,6 +786,10 @@ where
             && let Err(error) = terminal.handoff(process_group)
         {
             let _ = terminate_process_group(&mut child, process_group).await;
+            #[cfg(feature = "remote-smb")]
+            if let Some(remote) = remote.take() {
+                let _ = remote.shutdown().await;
+            }
             let _ = controller.shutdown().await;
             let _ = execution.shutdown().await;
             let _ = audit.shutdown().await;
@@ -658,6 +801,16 @@ where
             &mut controller,
             &mut execution,
             &mut audit,
+            #[cfg(feature = "remote-smb")]
+            &mut remote,
+            #[cfg(feature = "remote-smb")]
+            |status| {
+                let stdout = std::io::stdout();
+                let mut stdout = stdout.lock();
+                let _ =
+                    write_remote_connection_status(&mut stdout, &self.config.smb_remotes, status);
+                let _ = stdout.flush();
+            },
         )
         .await;
         let terminal_restore = terminal
@@ -667,11 +820,18 @@ where
         let shutdown = controller.shutdown().await;
         let execution_shutdown = execution.shutdown().await;
         let audit_shutdown = audit.shutdown().await;
+        #[cfg(feature = "remote-smb")]
+        let remote_shutdown = match remote.take() {
+            Some(remote) => remote.shutdown().await,
+            None => Ok(()),
+        };
         let status = status?;
         terminal_restore?;
         shutdown?;
         execution_shutdown?;
         audit_shutdown?;
+        #[cfg(feature = "remote-smb")]
+        remote_shutdown?;
 
         Ok(SandboxOutcome {
             status,
@@ -879,25 +1039,35 @@ async fn wait_for_child_or_service(
     controller: &mut NetworkController,
     execution: &mut ExecutionController,
     audit: &mut AuditController,
+    #[cfg(feature = "remote-smb")] remote: &mut Option<RemoteController>,
+    #[cfg(feature = "remote-smb")] mut remote_status: impl FnMut(RemoteConnectionStatus),
 ) -> Result<ExitStatus> {
     enum Completion {
         Child(std::io::Result<ExitStatus>),
         Proxy(anyhow::Error),
         Execution(anyhow::Error),
         Audit(anyhow::Error),
+        Remote(anyhow::Error),
     }
 
+    #[cfg(feature = "remote-smb")]
+    let remote_failure = wait_for_remote_failure(remote, &mut remote_status);
+    #[cfg(not(feature = "remote-smb"))]
+    let remote_failure = std::future::pending::<anyhow::Error>();
+    tokio::pin!(remote_failure);
     let completion = tokio::select! {
         status = child.wait() => Completion::Child(status),
         error = controller.wait_failure() => Completion::Proxy(error),
         error = execution.wait_failure() => Completion::Execution(error),
         error = audit.wait_failure() => Completion::Audit(error),
+        error = &mut remote_failure => Completion::Remote(error),
     };
     let result = match completion {
         Completion::Child(status) => status.context("sandbox child wait failed"),
         Completion::Proxy(error) => Err(error).context("sandbox network proxy failed"),
         Completion::Execution(error) => Err(error).context("sandbox execution controller failed"),
         Completion::Audit(error) => Err(error).context("sandbox audit controller failed"),
+        Completion::Remote(error) => Err(error).context("sandbox remote filesystem failed"),
     };
     let termination = terminate_process_group(child, process_group).await;
     match result {
@@ -909,6 +1079,55 @@ async fn wait_for_child_or_service(
             let _ = termination;
             Err(error)
         }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "remote-smb"))]
+async fn wait_for_remote_failure(
+    remote: &mut Option<RemoteController>,
+    status: &mut impl FnMut(RemoteConnectionStatus),
+) -> anyhow::Error {
+    match remote {
+        Some(remote) => loop {
+            match remote.wait_event().await {
+                RemoteControllerEvent::Connection(connection) => status(connection),
+                RemoteControllerEvent::Failure(error) => return error,
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "remote-smb"))]
+fn write_remote_connection_status(
+    output: &mut impl Write,
+    remotes: &[SmbRemoteConfig],
+    status: RemoteConnectionStatus,
+) -> std::io::Result<()> {
+    let root = status.root();
+    let Some(remote) = remotes.get(root as usize) else {
+        return writeln!(
+            output,
+            "[agora-sandbox] NFS route {root} has unknown status"
+        );
+    };
+    let mut endpoint = format!("smb://{}/{}", remote.server(), remote.share());
+    if !remote.remote_path().is_empty() {
+        endpoint.push('/');
+        endpoint.push_str(remote.remote_path());
+    }
+    match status {
+        RemoteConnectionStatus::Connected { .. } => writeln!(
+            output,
+            "[agora-sandbox] NFS {} connected: {endpoint}",
+            remote.logical_root().display(),
+        ),
+        RemoteConnectionStatus::Unavailable { errno, .. } => writeln!(
+            output,
+            "[agora-sandbox] NFS {} unavailable: {}",
+            remote.logical_root().display(),
+            std::io::Error::from_raw_os_error(errno),
+        ),
     }
 }
 

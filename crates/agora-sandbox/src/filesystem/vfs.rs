@@ -57,6 +57,10 @@ impl OpenIntent {
         self.flags
     }
 
+    pub(crate) fn mode(self) -> u32 {
+        self.mode
+    }
+
     pub(crate) fn access(self) -> AccessRequest {
         AccessRequest::from_open_flags(self.flags)
     }

@@ -3,6 +3,10 @@ name = "agora-sandbox"
 version = { workspace = true }
 edition = { workspace = true }
 
+[features]
+default = ["remote-smb"]
+remote-smb = ["dep:smb2"]
+
 [lib]
 crate-type = ["rlib", "cdylib"]
 
@@ -19,6 +23,7 @@ md-5 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 shell-words = { workspace = true }
+smb2 = { workspace = true, optional = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-pemfile = { workspace = true }

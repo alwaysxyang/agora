@@ -1,3 +1,4 @@
+use super::normalize_path as normalize;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use std::ffi::{OsStr, OsString};
@@ -73,24 +74,6 @@ pub(super) fn is_control_name(name: &OsStr) -> bool {
 
 pub(super) fn is_file_backing_name(name: &[u8]) -> bool {
     name.len() == 32 && name.iter().all(u8::is_ascii_hexdigit)
-}
-
-pub(super) fn normalize(path: &Path) -> Result<PathBuf> {
-    if !path.is_absolute() {
-        bail!("filesystem path is not absolute: {}", path.display());
-    }
-    let mut normalized = PathBuf::from("/");
-    for component in path.components() {
-        match component {
-            Component::RootDir | Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(value) => normalized.push(value),
-            Component::Prefix(_) => bail!("unsupported filesystem path: {}", path.display()),
-        }
-    }
-    Ok(normalized)
 }
 
 fn is_reserved(name: &[u8]) -> bool {

@@ -57,6 +57,7 @@ const FTS_SL: libc::c_ushort = 12;
 const FTS_DEFAULT: libc::c_ushort = 3;
 const FTS_SKIP: libc::c_int = 4;
 const FTS_NOCHDIR: libc::c_int = 0x004;
+const DARWIN_VNODE_TYPE_DIRECTORY: u32 = 2;
 
 unsafe extern "C" {
     #[link_name = "fts_children"]
@@ -93,26 +94,38 @@ unsafe extern "C" {
 }
 
 thread_local! {
-    static FTS_VIRTUAL_BULK_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static ACTIVE_FTS_STREAM: Cell<usize> = const { Cell::new(0) };
     static FTS_BULK_CURSORS: RefCell<HashMap<libc::c_int, FtsBulkCursor>> = RefCell::new(HashMap::new());
 }
 
-struct FtsVirtualBulk;
+#[cfg(test)]
+thread_local! {
+    static TEST_FTS_READ_ENTRY: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+struct FtsVirtualBulk {
+    previous: usize,
+}
 
 impl FtsVirtualBulk {
-    fn enter() -> Self {
-        FTS_VIRTUAL_BULK_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
-        Self
+    fn enter(stream: *mut libc::c_void) -> Self {
+        let previous = ACTIVE_FTS_STREAM.with(|active| active.replace(stream as usize));
+        Self { previous }
     }
 
     fn is_active() -> bool {
-        FTS_VIRTUAL_BULK_DEPTH.with(|depth| depth.get() != 0)
+        Self::active_stream().is_some()
+    }
+
+    fn active_stream() -> Option<usize> {
+        let stream = ACTIVE_FTS_STREAM.with(Cell::get);
+        (stream != 0).then_some(stream)
     }
 }
 
 impl Drop for FtsVirtualBulk {
     fn drop(&mut self) {
-        FTS_VIRTUAL_BULK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        ACTIVE_FTS_STREAM.with(|active| active.set(self.previous));
     }
 }
 
@@ -136,6 +149,7 @@ struct FtsBulkCursor {
 pub(in crate::hook::filesystem) struct FtsRootMapping {
     physical: Vec<u8>,
     logical: Vec<u8>,
+    resolved: Vec<u8>,
 }
 
 pub(in crate::hook::filesystem) struct PresentedFtsEntry {
@@ -152,6 +166,7 @@ pub(in crate::hook::filesystem) struct PresentedFtsEntry {
 pub(in crate::hook::filesystem) struct FtsStreamState {
     pub(in crate::hook::filesystem) mappings: Vec<FtsRootMapping>,
     pub(in crate::hook::filesystem) presented: Vec<PresentedFtsEntry>,
+    pub(in crate::hook::filesystem) traversal_paths: Vec<CString>,
 }
 
 impl FtsStreamState {
@@ -251,17 +266,111 @@ impl FtsStreamState {
         Ok(())
     }
 
+    fn retarget_directory(
+        &mut self,
+        entry: *mut DarwinFtsEntry,
+        mapped: CString,
+        resolved: &Path,
+    ) -> Result<()> {
+        let path = unsafe { CStr::from_ptr((*entry).fts_path) }.to_bytes();
+        let access_path = unsafe { CStr::from_ptr((*entry).fts_accpath) }.to_bytes();
+        if access_path == mapped.as_bytes() {
+            return Ok(());
+        }
+        let logical = self
+            .translate(path)
+            .or_else(|| self.translate(access_path))
+            .unwrap_or_else(|| resolved.as_os_str().as_bytes().to_vec());
+        let physical = mapped.as_bytes().to_vec();
+        if !self
+            .mappings
+            .iter()
+            .any(|mapping| mapping.physical == physical)
+        {
+            self.mappings.push(FtsRootMapping {
+                physical,
+                logical,
+                resolved: resolved.as_os_str().as_bytes().to_vec(),
+            });
+            self.mappings
+                .sort_by_key(|mapping| std::cmp::Reverse(mapping.physical.len()));
+        }
+        let pointer = if let Some(path) = self
+            .traversal_paths
+            .iter()
+            .find(|path| path.as_bytes() == mapped.as_bytes())
+        {
+            path.as_ptr()
+        } else {
+            self.traversal_paths.push(mapped);
+            self.traversal_paths
+                .last()
+                .context("missing FTS traversal path")?
+                .as_ptr()
+        };
+        unsafe { (*entry).fts_accpath = pointer.cast_mut() };
+        Ok(())
+    }
+
     fn translate(&self, path: &[u8]) -> Option<Vec<u8>> {
+        self.translate_with(path, |mapping| &mapping.logical)
+    }
+
+    fn resolve(&self, path: &[u8]) -> Option<Vec<u8>> {
+        self.translate_with(path, |mapping| &mapping.resolved)
+    }
+
+    fn translate_with<'a>(
+        &'a self,
+        path: &[u8],
+        destination: impl Fn(&'a FtsRootMapping) -> &'a Vec<u8>,
+    ) -> Option<Vec<u8>> {
         self.mappings.iter().find_map(|mapping| {
             let suffix = path.strip_prefix(mapping.physical.as_slice())?;
             if !suffix.is_empty() && !suffix.starts_with(b"/") {
                 return None;
             }
-            let mut logical = mapping.logical.clone();
+            let mut logical = destination(mapping).clone();
             logical.extend_from_slice(suffix);
             Some(logical)
         })
     }
+}
+
+pub(in crate::hook::filesystem) fn active_fts_logical_path(path: &Path) -> Option<PathBuf> {
+    let stream = FtsVirtualBulk::active_stream()?;
+    let path = path.as_os_str().as_bytes();
+    lock(fts_streams())
+        .get(&stream)?
+        .resolve(path)
+        .map(|path| PathBuf::from(OsStr::from_bytes(&path)))
+}
+
+pub(in crate::hook::filesystem) fn register_active_fts_mapping(physical: &Path, logical: &Path) {
+    let Some(stream) = FtsVirtualBulk::active_stream() else {
+        return;
+    };
+    let physical = physical.as_os_str().as_bytes().to_vec();
+    let logical = logical.as_os_str().as_bytes().to_vec();
+    let mut streams = lock(fts_streams());
+    let Some(state) = streams.get_mut(&stream) else {
+        return;
+    };
+    if state
+        .mappings
+        .iter()
+        .any(|mapping| mapping.physical == physical)
+    {
+        return;
+    }
+    state.mappings.push(FtsRootMapping {
+        physical,
+        logical: logical.clone(),
+        resolved: logical,
+    });
+    state
+        .mappings
+        .sort_by_key(|mapping| std::cmp::Reverse(mapping.physical.len()));
 }
 
 fn logical_basename(path: &[u8]) -> &[u8] {
@@ -306,12 +415,29 @@ impl FtsBulkCursor {
         descriptor: libc::c_int,
         identity: FtsDescriptorIdentity,
     ) -> Result<Option<Self>> {
+        if let Some(view) = runtime.descriptor_remote_directory_view(descriptor)? {
+            return Self::layered_remote(runtime, identity, view).map(Some);
+        }
+        let descriptor_path = FilesystemHookRuntime::descriptor_path(descriptor)?;
+        if let Some(logical) = active_fts_logical_path(&descriptor_path)
+            && let Some(view) = runtime.remote_directory_view_for_logical(&logical)?
+        {
+            return Self::layered_remote(runtime, identity, view).map(Some);
+        }
         let (view, _) = runtime.descriptor_directory_view(descriptor)?;
-        if view.is_passthrough() {
+        let remote_roots = runtime.remote_route_root_names(view.logical())?;
+        if view.is_passthrough() && remote_roots.is_empty() {
             return Ok(None);
         }
-        let mut filter = DirectoryCursor::new(None, FileLayer::Upper, &view);
-        let mut entries = Vec::new();
+        let mut filter = DirectoryCursor::filter(&view);
+        filter.remote_names.extend(remote_roots.iter().cloned());
+        let mut entries = remote_roots
+            .into_iter()
+            .map(|name| FtsBulkEntry {
+                name,
+                object_type: DARWIN_VNODE_TYPE_DIRECTORY,
+            })
+            .collect();
         let primary_is_upper = runtime.filesystem.is_internal(view.primary());
         Self::extend_entries(&mut entries, &mut filter, view.primary(), !primary_is_upper)?;
         if let Some(lower) = view.lower() {
@@ -322,6 +448,43 @@ impl FtsBulkCursor {
             entries,
             next: 0,
         }))
+    }
+
+    fn layered_remote(
+        runtime: &FilesystemHookRuntime,
+        identity: FtsDescriptorIdentity,
+        view: RemoteDirectoryView,
+    ) -> Result<Self> {
+        let logical = view.logical().to_path_buf();
+        let remote_entries = view.into_entries();
+        let mut entries = remote_entries
+            .iter()
+            .map(|entry| FtsBulkEntry {
+                name: entry.name.as_bytes().to_vec(),
+                object_type: match entry.metadata.file_type {
+                    crate::nfs::protocol::RemoteFileType::File => 1,
+                    crate::nfs::protocol::RemoteFileType::Directory => DARWIN_VNODE_TYPE_DIRECTORY,
+                },
+            })
+            .collect::<Vec<_>>();
+        if let Some(local) = runtime.local_directory_view_for_remote(&logical)? {
+            let mut filter = DirectoryCursor::layered_filter(&local, &remote_entries);
+            let primary_is_upper = runtime.filesystem.is_internal(local.primary());
+            Self::extend_entries(
+                &mut entries,
+                &mut filter,
+                local.primary(),
+                !primary_is_upper,
+            )?;
+            if let Some(lower) = local.lower() {
+                Self::extend_entries(&mut entries, &mut filter, lower, true)?;
+            }
+        }
+        Ok(Self {
+            identity,
+            entries,
+            next: 0,
+        })
     }
 
     fn extend_entries(
@@ -345,11 +508,84 @@ impl FtsBulkCursor {
     }
 }
 
+#[cfg(test)]
+pub(in crate::hook::filesystem) fn fts_bulk_entry_names_for_test(
+    runtime: &FilesystemHookRuntime,
+    descriptor: libc::c_int,
+) -> Result<Vec<Vec<u8>>> {
+    let identity = fts_descriptor_identity(descriptor)?;
+    Ok(FtsBulkCursor::new(runtime, descriptor, identity)?
+        .map(|cursor| cursor.entries.into_iter().map(|entry| entry.name).collect())
+        .unwrap_or_default())
+}
+
+#[cfg(test)]
+pub(in crate::hook::filesystem) fn fts_read_returns_virtual_entry_for_test(
+    logical: &Path,
+) -> Result<bool> {
+    Ok(fts_read_virtual_entry_for_test(logical, FTS_NSOK)?.is_some())
+}
+
+#[cfg(test)]
+pub(in crate::hook::filesystem) fn fts_directory_descent_path_for_test(
+    logical: &Path,
+) -> Result<Vec<u8>> {
+    fts_read_virtual_entry_for_test(logical, FTS_D)?
+        .context("virtual FTS test directory was filtered")
+}
+
+#[cfg(test)]
+fn fts_read_virtual_entry_for_test(
+    logical: &Path,
+    info: libc::c_ushort,
+) -> Result<Option<Vec<u8>>> {
+    let logical_root = logical
+        .parent()
+        .context("virtual FTS test entry has no parent")?;
+    let physical_root = std::env::temp_dir().join(format!("agora-fts-{}", uuid::Uuid::new_v4()));
+    let physical = CString::new(
+        physical_root
+            .join(
+                logical
+                    .file_name()
+                    .context("virtual FTS test entry has no name")?,
+            )
+            .as_os_str()
+            .as_bytes(),
+    )?;
+    let mut entry = unsafe { std::mem::zeroed::<DarwinFtsEntry>() };
+    entry.fts_accpath = physical.as_ptr().cast_mut();
+    entry.fts_path = physical.as_ptr().cast_mut();
+    entry.fts_pathlen = u16::try_from(physical.as_bytes().len())?;
+    entry.fts_info = info;
+    let stream = (&mut entry as *mut DarwinFtsEntry).cast::<libc::c_void>();
+    lock(fts_streams()).insert(
+        stream as usize,
+        FtsStreamState {
+            mappings: vec![FtsRootMapping {
+                physical: physical_root.as_os_str().as_bytes().to_vec(),
+                logical: logical_root.as_os_str().as_bytes().to_vec(),
+                resolved: logical_root.as_os_str().as_bytes().to_vec(),
+            }],
+            presented: Vec::new(),
+            traversal_paths: Vec::new(),
+        },
+    );
+    TEST_FTS_READ_ENTRY.with(|slot| slot.set(&mut entry as *mut DarwinFtsEntry as usize));
+    let returned = unsafe { sandbox_fts_read(stream) };
+    TEST_FTS_READ_ENTRY.with(|slot| slot.set(usize::MAX));
+    restore_fts_stream(stream);
+    let access_path = (!returned.is_null())
+        .then(|| unsafe { CStr::from_ptr(entry.fts_accpath).to_bytes().to_vec() });
+    lock(fts_streams()).remove(&(stream as usize));
+    Ok(access_path)
+}
+
 fn darwin_object_type(file_type: &std::fs::FileType) -> u32 {
     if file_type.is_file() {
         1 // VREG
     } else if file_type.is_dir() {
-        2 // VDIR
+        DARWIN_VNODE_TYPE_DIRECTORY
     } else if file_type.is_block_device() {
         3 // VBLK
     } else if file_type.is_char_device() {
@@ -487,7 +723,9 @@ unsafe fn sandbox_getattrlistbulk(
                 .is_none_or(|cursor| cursor.identity != identity)
         });
         if needs_cursor {
-            if let Err(error) = runtime.synchronize_current_directory() {
+            if FtsVirtualBulk::active_stream().is_none()
+                && let Err(error) = runtime.synchronize_current_directory()
+            {
                 return unsafe { fail(&error, -1) };
             }
             let cursor = match FtsBulkCursor::new(runtime, directory, identity) {
@@ -567,14 +805,16 @@ pub unsafe extern "C" fn agora_sandbox_getattrlistbulk(
     unsafe { sandbox_getattrlistbulk(directory, attributes, buffer, size, options) }
 }
 
-fn fts_entry_is_visible(runtime: &FilesystemHookRuntime, entry: *mut DarwinFtsEntry) -> bool {
+fn fts_entry_is_visible(
+    runtime: &FilesystemHookRuntime,
+    entry: *mut DarwinFtsEntry,
+) -> Result<bool> {
     let raw_path = unsafe { (*entry).fts_accpath };
     if raw_path.is_null() {
-        return true;
+        return Ok(true);
     }
     unsafe { trusted_fts_logical_path(runtime, raw_path) }
-        .and_then(|logical| runtime.filesystem.exists(&logical))
-        .unwrap_or(true)
+        .and_then(|logical| runtime.path_exists(&logical))
 }
 
 unsafe fn trusted_fts_logical_path(
@@ -584,6 +824,9 @@ unsafe fn trusted_fts_logical_path(
     let requested = Path::new(OsStr::from_bytes(
         unsafe { CStr::from_ptr(path) }.to_bytes(),
     ));
+    if let Some(logical) = active_fts_logical_path(requested) {
+        return Ok(logical);
+    }
     if requested.is_absolute() && runtime.filesystem.is_internal(requested) {
         runtime.filesystem.logical_path(requested)
     } else {
@@ -611,7 +854,7 @@ unsafe fn sandbox_fts_open(
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return unsafe { original(paths, options, compare) };
         };
-        if let Err(error) = runtime.synchronize_current_directory() {
+        if let Err(error) = runtime.synchronize_current_directory_for_fts() {
             return unsafe { fail(&error, std::ptr::null_mut()) };
         }
 
@@ -646,6 +889,7 @@ unsafe fn sandbox_fts_open(
                 mappings.push(FtsRootMapping {
                     physical: mapped.to_bytes().to_vec(),
                     logical: original_path.to_bytes().to_vec(),
+                    resolved: logical.as_os_str().as_bytes().to_vec(),
                 });
                 mapped_paths.push(mapped);
             }
@@ -664,6 +908,7 @@ unsafe fn sandbox_fts_open(
                 FtsStreamState {
                     mappings,
                     presented: Vec::new(),
+                    traversal_paths: Vec::new(),
                 },
             );
         }
@@ -682,18 +927,21 @@ pub unsafe extern "C" fn agora_sandbox_fts_open(
 
 fn repair_virtual_fts_entry(
     runtime: &FilesystemHookRuntime,
+    stream: *mut libc::c_void,
     entry: *mut DarwinFtsEntry,
 ) -> Result<bool> {
     let info = unsafe { (*entry).fts_info };
-    if info == FTS_NSOK || (info != FTS_NS && unsafe { (*entry).fts_statp.is_null() }) {
+    if info == FTS_NSOK
+        || (info != FTS_NS && info != FTS_D && unsafe { (*entry).fts_statp.is_null() })
+    {
         return Ok(false);
     }
     let path = unsafe { (*entry).fts_accpath };
     if path.is_null() {
         return Ok(false);
     }
-    let logical = unsafe { trusted_fts_logical_path(runtime, path) }?;
-    let logical = CString::new(logical.as_os_str().as_bytes())
+    let logical_path = unsafe { trusted_fts_logical_path(runtime, path) }?;
+    let logical = CString::new(logical_path.as_os_str().as_bytes())
         .context("logical FTS metadata path contains NUL")?;
     let (mapped, plaintext_size, attributes) = runtime.map_metadata(
         logical.as_ptr(),
@@ -702,13 +950,20 @@ fn repair_virtual_fts_entry(
         &Credentials::effective(),
     )?;
     if info != FTS_NS {
-        unsafe {
-            patch_stat(
-                &mut *(*entry).fts_statp,
-                plaintext_size,
-                attributes.as_ref(),
-            )
-        };
+        if unsafe { !(*entry).fts_statp.is_null() } {
+            unsafe {
+                patch_stat(
+                    &mut *(*entry).fts_statp,
+                    plaintext_size,
+                    attributes.as_ref(),
+                )
+            };
+        }
+        if info == FTS_D
+            && let Some(state) = lock(fts_streams()).get_mut(&(stream as usize))
+        {
+            state.retarget_directory(entry, mapped, &logical_path)?;
+        }
         return Ok(false);
     }
     let original = original_lstat().context("lstat is unavailable")?;
@@ -731,6 +986,11 @@ fn repair_virtual_fts_entry(
         }
         (*entry).fts_errno = 0;
         (*entry).fts_info = repaired;
+    }
+    if repaired == FTS_D
+        && let Some(state) = lock(fts_streams()).get_mut(&(stream as usize))
+    {
+        state.retarget_directory(entry, mapped, &logical_path)?;
     }
     Ok(true)
 }
@@ -762,7 +1022,7 @@ unsafe fn sandbox_fts_children(
         drop(guard);
         unsafe { set_errno(0) };
         let mut head = {
-            let _bulk = FtsVirtualBulk::enter();
+            let _bulk = FtsVirtualBulk::enter(stream);
             unsafe { original(stream, options) }
         };
         let original_errno = unsafe { *libc::__error() };
@@ -778,9 +1038,12 @@ unsafe fn sandbox_fts_children(
         let mut unresolved_error = false;
         while !current.is_null() {
             let next = unsafe { (*current).fts_link };
-            let visible = fts_entry_is_visible(runtime, current);
+            let visible = match fts_entry_is_visible(runtime, current) {
+                Ok(visible) => visible,
+                Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
+            };
             if visible {
-                if let Err(error) = repair_virtual_fts_entry(runtime, current) {
+                if let Err(error) = repair_virtual_fts_entry(runtime, stream, current) {
                     return unsafe { fail(&error, std::ptr::null_mut()) };
                 }
                 unresolved_error |=
@@ -876,10 +1139,8 @@ unsafe fn sandbox_fts_read(stream: *mut libc::c_void) -> *mut DarwinFtsEntry {
         drop(guard);
         loop {
             unsafe { set_errno(0) };
-            let entry = {
-                let _bulk = FtsVirtualBulk::enter();
-                unsafe { original(stream) }
-            };
+            let _bulk = FtsVirtualBulk::enter(stream);
+            let entry = unsafe { original(stream) };
             let original_errno = unsafe { *libc::__error() };
             let Some(_guard) = FilesystemHookGuard::enter() else {
                 unsafe { set_errno(original_errno) };
@@ -892,9 +1153,12 @@ unsafe fn sandbox_fts_read(stream: *mut libc::c_void) -> *mut DarwinFtsEntry {
                 unsafe { set_errno(original_errno) };
                 return entry;
             }
-            let visible = fts_entry_is_visible(runtime, entry);
+            let visible = match fts_entry_is_visible(runtime, entry) {
+                Ok(visible) => visible,
+                Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
+            };
             if visible {
-                let repaired = match repair_virtual_fts_entry(runtime, entry) {
+                let repaired = match repair_virtual_fts_entry(runtime, stream, entry) {
                     Ok(repaired) => repaired,
                     Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
                 };
@@ -940,7 +1204,18 @@ fn original_fts_close() -> Option<FtsCloseFn> {
 }
 
 fn original_fts_read() -> Option<FtsReadFn> {
+    #[cfg(test)]
+    if TEST_FTS_READ_ENTRY.with(|entry| entry.get() != usize::MAX) {
+        return Some(test_fts_read);
+    }
     function_from_interpose(&INTERPOSE_FTS_READ)
+}
+
+#[cfg(test)]
+unsafe extern "C" fn test_fts_read(_stream: *mut libc::c_void) -> *mut DarwinFtsEntry {
+    let entry = TEST_FTS_READ_ENTRY.with(|entry| entry.replace(0));
+    unsafe { set_errno(0) };
+    entry as *mut DarwinFtsEntry
 }
 
 fn original_getattrlistbulk() -> Option<GetattrlistbulkFn> {

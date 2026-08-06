@@ -1,7 +1,12 @@
 mod fts;
 
+pub(in crate::hook::filesystem) use fts::{active_fts_logical_path, register_active_fts_mapping};
+
 #[cfg(test)]
-pub(super) use fts::{FtsStreamState, fts_stream_may_change_current_directory, fts_streams};
+pub(super) use fts::{
+    FtsStreamState, fts_bulk_entry_names_for_test, fts_directory_descent_path_for_test,
+    fts_read_returns_virtual_entry_for_test, fts_stream_may_change_current_directory, fts_streams,
+};
 
 use super::*;
 
@@ -25,24 +30,57 @@ unsafe extern "C" {
 }
 
 pub(super) struct DirectoryCursor {
-    auxiliary: Option<usize>,
-    primary_layer: FileLayer,
-    reading_lower: bool,
+    sources: Vec<DirectorySource>,
+    source_index: usize,
     hidden: HashSet<Vec<u8>>,
     aliases: HashMap<Vec<u8>, Vec<u8>>,
     seen: HashSet<Vec<u8>>,
+    remote_names: HashSet<Vec<u8>>,
+    remote: Option<RemoteDirectoryCursor>,
+}
+
+struct DirectorySource {
+    directory: usize,
+    lower: bool,
+    owned: bool,
+}
+
+struct RemoteDirectoryCursor {
+    entries: Vec<(Vec<u8>, u8)>,
+    index: usize,
+    current: Box<libc::dirent>,
 }
 
 impl DirectoryCursor {
     pub(super) fn new(
+        primary: *mut libc::DIR,
         auxiliary: Option<*mut libc::DIR>,
         primary_layer: FileLayer,
         view: &DirectoryView,
+        remote_roots: Vec<Vec<u8>>,
     ) -> Self {
+        let primary = DirectorySource {
+            directory: primary as usize,
+            lower: primary_layer == FileLayer::Lower,
+            owned: false,
+        };
+        let auxiliary = auxiliary.map(|directory| DirectorySource {
+            directory: directory as usize,
+            lower: primary_layer == FileLayer::Upper,
+            owned: true,
+        });
+        let sources = match (primary_layer, auxiliary) {
+            (FileLayer::Upper, auxiliary) => std::iter::once(primary).chain(auxiliary).collect(),
+            (FileLayer::Lower, Some(auxiliary)) => vec![auxiliary, primary],
+            (FileLayer::Lower, None) => vec![primary],
+        };
+        Self::from_sources(sources, view).with_remote_roots(remote_roots)
+    }
+
+    fn from_sources(sources: Vec<DirectorySource>, view: &DirectoryView) -> Self {
         Self {
-            auxiliary: auxiliary.map(|directory| directory as usize),
-            primary_layer,
-            reading_lower: false,
+            sources,
+            source_index: 0,
             hidden: view
                 .hidden()
                 .iter()
@@ -56,16 +94,92 @@ impl DirectoryCursor {
                 })
                 .collect(),
             seen: HashSet::new(),
+            remote_names: HashSet::new(),
+            remote: None,
         }
     }
 
-    fn source(&self, primary: *mut libc::DIR) -> Option<*mut libc::DIR> {
-        match (self.reading_lower, self.primary_layer) {
-            (false, FileLayer::Upper) | (true, FileLayer::Lower) => Some(primary),
-            (false, FileLayer::Lower) | (true, FileLayer::Upper) => {
-                self.auxiliary.map(|directory| directory as *mut libc::DIR)
+    pub(super) fn filter(view: &DirectoryView) -> Self {
+        Self::from_sources(Vec::new(), view)
+    }
+
+    pub(super) fn layered_filter(
+        view: &DirectoryView,
+        entries: &[crate::nfs::protocol::RemoteEntry],
+    ) -> Self {
+        let mut cursor = Self::filter(view);
+        cursor.remote_names = entries
+            .iter()
+            .map(|entry| entry.name.as_bytes().to_vec())
+            .collect();
+        cursor
+    }
+
+    fn remote(entries: Vec<crate::nfs::protocol::RemoteEntry>) -> Self {
+        Self::from_remote_and_sources(entries, Vec::new(), None)
+    }
+
+    fn layered_remote(
+        entries: Vec<crate::nfs::protocol::RemoteEntry>,
+        sources: Vec<DirectorySource>,
+        view: &DirectoryView,
+    ) -> Self {
+        Self::from_remote_and_sources(entries, sources, Some(view))
+    }
+
+    fn from_remote_and_sources(
+        entries: Vec<crate::nfs::protocol::RemoteEntry>,
+        sources: Vec<DirectorySource>,
+        view: Option<&DirectoryView>,
+    ) -> Self {
+        let mut visible = Vec::with_capacity(entries.len() + 2);
+        visible.push((b".".to_vec(), libc::DT_DIR));
+        visible.push((b"..".to_vec(), libc::DT_DIR));
+        visible.extend(entries.into_iter().map(|entry| {
+            let file_type = match entry.metadata.file_type {
+                crate::nfs::protocol::RemoteFileType::File => libc::DT_REG,
+                crate::nfs::protocol::RemoteFileType::Directory => libc::DT_DIR,
+            };
+            (entry.name.into_bytes(), file_type)
+        }));
+        let remote_names = visible.iter().map(|(name, _)| name.clone()).collect();
+        let mut cursor = if let Some(view) = view {
+            Self::from_sources(sources, view)
+        } else {
+            Self {
+                sources,
+                source_index: 0,
+                hidden: HashSet::new(),
+                aliases: HashMap::new(),
+                seen: HashSet::new(),
+                remote_names: HashSet::new(),
+                remote: None,
             }
+        };
+        cursor.remote_names = remote_names;
+        cursor.remote = Some(RemoteDirectoryCursor {
+            entries: visible,
+            index: 0,
+            current: Box::new(unsafe { std::mem::zeroed() }),
+        });
+        cursor
+    }
+
+    fn with_remote_roots(mut self, names: Vec<Vec<u8>>) -> Self {
+        if names.is_empty() {
+            return self;
         }
+        self.remote_names.extend(names.iter().cloned());
+        self.remote = Some(RemoteDirectoryCursor {
+            entries: names.into_iter().map(|name| (name, libc::DT_DIR)).collect(),
+            index: 0,
+            current: Box::new(unsafe { std::mem::zeroed() }),
+        });
+        self
+    }
+
+    fn source(&self) -> Option<&DirectorySource> {
+        self.sources.get(self.source_index)
     }
 
     pub(super) fn include(&mut self, name: &[u8], lower: bool) -> Option<Vec<u8>> {
@@ -77,6 +191,7 @@ impl DirectoryCursor {
             .to_vec();
         if self.hidden.contains(name)
             || self.hidden.contains(&visible)
+            || self.remote_names.contains(&visible)
             || lower && self.seen.contains(&visible)
         {
             return None;
@@ -86,8 +201,44 @@ impl DirectoryCursor {
     }
 
     fn reset(&mut self) {
-        self.reading_lower = false;
+        if let Some(remote) = &mut self.remote {
+            remote.index = 0;
+        }
+        self.source_index = 0;
         self.seen.clear();
+    }
+
+    fn owned_sources(&self) -> impl Iterator<Item = *mut libc::DIR> + '_ {
+        self.sources
+            .iter()
+            .filter(|source| source.owned)
+            .map(|source| source.directory as *mut libc::DIR)
+    }
+
+    fn next_remote(&mut self) -> Result<Option<*mut libc::dirent>> {
+        let Some(remote) = &mut self.remote else {
+            return Ok(None);
+        };
+        let Some((name, file_type)) = remote.entries.get(remote.index) else {
+            return Ok(None);
+        };
+        if name.len() >= remote.current.d_name.len() {
+            return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG).into());
+        }
+        remote.index += 1;
+        *remote.current = unsafe { std::mem::zeroed() };
+        remote.current.d_seekoff = remote.index as _;
+        remote.current.d_reclen = std::mem::size_of::<libc::dirent>() as _;
+        remote.current.d_namlen = name.len() as _;
+        remote.current.d_type = *file_type;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr().cast::<libc::c_char>(),
+                remote.current.d_name.as_mut_ptr(),
+                name.len(),
+            );
+        }
+        Ok(Some(remote.current.as_mut()))
     }
 }
 
@@ -110,11 +261,11 @@ unsafe fn sandbox_chdir(path: *const libc::c_char) -> libc::c_int {
         };
         let caller_errno = unsafe { *libc::__error() };
         match runtime.prepare_change_directory(path) {
-            Ok((mapped, logical)) => {
+            Ok((mapped, logical, remote)) => {
                 let result = unsafe { original(mapped.as_ptr()) };
                 if result == 0 {
-                    if runtime.synchronize_current_directory().is_err() {
-                        runtime.set_current_directory(logical);
+                    if remote || runtime.synchronize_current_directory().is_err() {
+                        runtime.set_current_directory_state(logical, remote);
                     }
                     unsafe { set_errno(caller_errno) };
                 }
@@ -155,7 +306,26 @@ unsafe fn sandbox_fchdir(descriptor: libc::c_int) -> libc::c_int {
             Ok(logical) => logical,
             Err(error) => return unsafe { fail(&error, -1) },
         };
-        if let Err(error) = runtime.filesystem.require_descriptor_access(
+        let tracked_open = runtime.tracked_open(descriptor);
+        let directory_registration = lock(&runtime.directory_descriptors)
+            .get(&descriptor)
+            .cloned();
+        let managed_descriptor = tracked_open.is_some() || directory_registration.is_some();
+        let remote_descriptor = tracked_open.is_some_and(|open| open.remote.is_some())
+            || directory_registration.is_some_and(|registration| registration.remote);
+        if remote_descriptor {
+            let is_directory = lock(&runtime.directory_descriptors).contains_key(&descriptor)
+                || runtime.tracked_open(descriptor).is_some_and(|open| {
+                    open.remote.as_ref().is_some_and(|remote| {
+                        lock(&remote.metadata).file_type
+                            == crate::nfs::protocol::RemoteFileType::Directory
+                    })
+                });
+            if !is_directory {
+                unsafe { set_errno(libc::ENOTDIR) };
+                return -1;
+            }
+        } else if let Err(error) = runtime.filesystem.require_descriptor_access(
             &logical,
             AccessRequest::EXECUTE,
             &Credentials::effective(),
@@ -164,8 +334,8 @@ unsafe fn sandbox_fchdir(descriptor: libc::c_int) -> libc::c_int {
         }
         let result = unsafe { original(descriptor) };
         if result == 0 {
-            if runtime.synchronize_current_directory().is_err() {
-                runtime.set_current_directory(logical);
+            if managed_descriptor || runtime.synchronize_current_directory().is_err() {
+                runtime.set_current_directory_state(logical, remote_descriptor);
             }
             unsafe { set_errno(caller_errno) };
         }
@@ -294,8 +464,31 @@ unsafe fn sandbox_opendir(path: *const libc::c_char) -> *mut libc::DIR {
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return unsafe { original(path) };
         };
+        match runtime.remote_directory_view(path) {
+            Ok(Some(view)) => {
+                let directory = unsafe { original(view.anchor().as_ptr()) };
+                if directory.is_null() {
+                    return directory;
+                }
+                let prepared = match unsafe { prepare_remote_directory_cursor(runtime, view) } {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        unsafe { original_closedir().map(|close| close(directory)) };
+                        return unsafe { fail(&error, std::ptr::null_mut()) };
+                    }
+                };
+                unsafe { register_remote_directory_cursor(runtime, directory, prepared) };
+                return directory;
+            }
+            Ok(None) => {}
+            Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
+        }
         match runtime.directory_view(path) {
             Ok(view) => {
+                let remote_roots = match runtime.remote_route_root_names(view.logical()) {
+                    Ok(remote_roots) => remote_roots,
+                    Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
+                };
                 let primary = match CString::new(view.primary().as_os_str().as_bytes()) {
                     Ok(path) => path,
                     Err(error) => return unsafe { fail(&error.into(), std::ptr::null_mut()) },
@@ -304,7 +497,7 @@ unsafe fn sandbox_opendir(path: *const libc::c_char) -> *mut libc::DIR {
                 if directory.is_null() {
                     return directory;
                 }
-                if view.is_passthrough() {
+                if view.is_passthrough() && remote_roots.is_empty() {
                     return directory;
                 }
                 let layer = if runtime.filesystem.is_internal(view.primary()) {
@@ -319,12 +512,59 @@ unsafe fn sandbox_opendir(path: *const libc::c_char) -> *mut libc::DIR {
                         return unsafe { fail(&error, std::ptr::null_mut()) };
                     }
                 };
-                unsafe { register_directory_cursor(runtime, directory, auxiliary, layer, &view) };
+                unsafe {
+                    register_directory_cursor(
+                        runtime,
+                        directory,
+                        auxiliary,
+                        layer,
+                        &view,
+                        remote_roots,
+                    )
+                };
                 directory
             }
             Err(error) => unsafe { fail(&error, std::ptr::null_mut()) },
         }
     })
+}
+
+struct PreparedRemoteDirectoryCursor {
+    logical: PathBuf,
+    physical: PathBuf,
+    cursor: DirectoryCursor,
+}
+
+unsafe fn prepare_remote_directory_cursor(
+    runtime: &FilesystemHookRuntime,
+    view: RemoteDirectoryView,
+) -> Result<PreparedRemoteDirectoryCursor> {
+    let logical = view.logical().to_path_buf();
+    let physical = PathBuf::from(OsStr::from_bytes(view.anchor().to_bytes()));
+    let entries = view.into_entries();
+    let cursor = match runtime.local_directory_view_for_remote(&logical)? {
+        Some(local) => DirectoryCursor::layered_remote(
+            entries,
+            unsafe { open_owned_directory_sources(runtime, &local)? },
+            &local,
+        ),
+        None => DirectoryCursor::remote(entries),
+    };
+    Ok(PreparedRemoteDirectoryCursor {
+        logical,
+        physical,
+        cursor,
+    })
+}
+
+unsafe fn register_remote_directory_cursor(
+    runtime: &FilesystemHookRuntime,
+    directory: *mut libc::DIR,
+    prepared: PreparedRemoteDirectoryCursor,
+) {
+    register_active_fts_mapping(&prepared.physical, &prepared.logical);
+    lock(directory_cursors()).insert(directory as usize, prepared.cursor);
+    runtime.register_directory(unsafe { libc::dirfd(directory) }, prepared.logical, true);
 }
 
 #[unsafe(no_mangle)]
@@ -354,18 +594,53 @@ unsafe fn open_auxiliary_directory(
     Ok(Some(directory))
 }
 
+unsafe fn open_owned_directory_sources(
+    runtime: &FilesystemHookRuntime,
+    view: &DirectoryView,
+) -> Result<Vec<DirectorySource>> {
+    let primary_is_upper = runtime.filesystem.is_internal(view.primary());
+    let paths = std::iter::once((view.primary(), !primary_is_upper))
+        .chain(view.lower().map(|path| (path, true)));
+    let original = original_opendir().context("opendir is unavailable")?;
+    let close = original_closedir().context("closedir is unavailable")?;
+    let mut sources: Vec<DirectorySource> = Vec::new();
+    for (path, lower) in paths {
+        let path =
+            CString::new(path.as_os_str().as_bytes()).context("directory path contains NUL")?;
+        let directory = unsafe { original(path.as_ptr()) };
+        if directory.is_null() {
+            let error = io::Error::last_os_error();
+            for source in sources {
+                unsafe { close(source.directory as *mut libc::DIR) };
+            }
+            return Err(error.into());
+        }
+        sources.push(DirectorySource {
+            directory: directory as usize,
+            lower,
+            owned: true,
+        });
+    }
+    Ok(sources)
+}
+
 unsafe fn register_directory_cursor(
     runtime: &FilesystemHookRuntime,
     directory: *mut libc::DIR,
     auxiliary: Option<*mut libc::DIR>,
     primary_layer: FileLayer,
     view: &DirectoryView,
+    remote_roots: Vec<Vec<u8>>,
 ) {
     lock(directory_cursors()).insert(
         directory as usize,
-        DirectoryCursor::new(auxiliary, primary_layer, view),
+        DirectoryCursor::new(directory, auxiliary, primary_layer, view, remote_roots),
     );
-    runtime.register_directory(unsafe { libc::dirfd(directory) }, view.logical().into());
+    runtime.register_directory(
+        unsafe { libc::dirfd(directory) },
+        view.logical().into(),
+        false,
+    );
 }
 
 unsafe fn sandbox_fdopendir(descriptor: libc::c_int) -> *mut libc::DIR {
@@ -380,11 +655,36 @@ unsafe fn sandbox_fdopendir(descriptor: libc::c_int) -> *mut libc::DIR {
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return unsafe { original(descriptor) };
         };
+        match runtime.descriptor_remote_directory_view(descriptor) {
+            Ok(Some(view)) => {
+                let prepared = match unsafe { prepare_remote_directory_cursor(runtime, view) } {
+                    Ok(prepared) => prepared,
+                    Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
+                };
+                let directory = unsafe { original(descriptor) };
+                if directory.is_null() {
+                    if let Some(close) = original_closedir() {
+                        for source in prepared.cursor.owned_sources() {
+                            unsafe { close(source) };
+                        }
+                    }
+                    return directory;
+                }
+                unsafe { register_remote_directory_cursor(runtime, directory, prepared) };
+                return directory;
+            }
+            Ok(None) => {}
+            Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
+        }
         let (view, layer) = match runtime.descriptor_directory_view(descriptor) {
             Ok(view) => view,
             Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
         };
-        if view.is_passthrough() && layer == FileLayer::Lower {
+        let remote_roots = match runtime.remote_route_root_names(view.logical()) {
+            Ok(remote_roots) => remote_roots,
+            Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
+        };
+        if view.is_passthrough() && layer == FileLayer::Lower && remote_roots.is_empty() {
             return unsafe { original(descriptor) };
         }
         let auxiliary = match unsafe { open_auxiliary_directory(&view, layer) } {
@@ -400,7 +700,9 @@ unsafe fn sandbox_fdopendir(descriptor: libc::c_int) -> *mut libc::DIR {
             unsafe { set_errno(error) };
             return directory;
         }
-        unsafe { register_directory_cursor(runtime, directory, auxiliary, layer, &view) };
+        unsafe {
+            register_directory_cursor(runtime, directory, auxiliary, layer, &view, remote_roots)
+        };
         directory
     })
 }
@@ -421,28 +723,31 @@ unsafe fn sandbox_readdir(directory: *mut libc::DIR) -> *mut libc::dirent {
             unsafe { set_errno(0) };
             return unsafe { original(directory) };
         };
-        loop {
-            let source = match cursor.source(directory) {
-                Some(source) => source,
-                None if cursor.reading_lower => {
-                    return std::ptr::null_mut();
-                }
-                None => {
-                    cursor.reading_lower = true;
-                    continue;
-                }
-            };
+        if cursor.remote.is_some() {
             unsafe { set_errno(0) };
-            let entry = unsafe { original(source) };
+            match cursor.next_remote() {
+                Ok(Some(entry)) => return entry,
+                Ok(None) => {}
+                Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
+            }
+        }
+        loop {
+            let Some(source) = cursor.source() else {
+                return std::ptr::null_mut();
+            };
+            let source_directory = source.directory as *mut libc::DIR;
+            let lower = source.lower;
+            unsafe { set_errno(0) };
+            let entry = unsafe { original(source_directory) };
             if entry.is_null() {
-                if !cursor.reading_lower && unsafe { *libc::__error() } == 0 {
-                    cursor.reading_lower = true;
+                if unsafe { *libc::__error() } == 0 {
+                    cursor.source_index += 1;
                     continue;
                 }
                 return std::ptr::null_mut();
             }
             let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-            if let Some(visible) = cursor.include(name.to_bytes(), cursor.reading_lower) {
+            if let Some(visible) = cursor.include(name.to_bytes(), lower) {
                 if visible != name.to_bytes() {
                     if visible.len() >= unsafe { (*entry).d_name.len() } {
                         unsafe { set_errno(libc::ENAMETOOLONG) };
@@ -506,8 +811,8 @@ unsafe fn sandbox_rewinddir(directory: *mut libc::DIR) {
             return;
         };
         unsafe { original(directory) };
-        if let Some(auxiliary) = cursor.auxiliary {
-            unsafe { original(auxiliary as *mut libc::DIR) };
+        for source in cursor.owned_sources() {
+            unsafe { original(source) };
         }
         cursor.reset();
     });
@@ -526,15 +831,31 @@ unsafe fn sandbox_closedir(directory: *mut libc::DIR) -> libc::c_int {
         };
         let cursor = lock(directory_cursors()).remove(&(directory as usize));
         let descriptor = unsafe { libc::dirfd(directory) };
+        let tracked =
+            FilesystemHookRuntime::global().and_then(|runtime| runtime.take_descriptor(descriptor));
+        if let Some((open, true)) = &tracked
+            && let Some(runtime) = FilesystemHookRuntime::global()
+            && let Err(error) = runtime.finish_open_file(descriptor, open)
+        {
+            runtime.restore_descriptor(descriptor, Arc::clone(open));
+            lock(directory_cursors()).extend(cursor.map(|cursor| (directory as usize, cursor)));
+            return unsafe { fail(&error, -1) };
+        }
         let result = unsafe { original(directory) };
-        if let Some(auxiliary) = cursor.and_then(|cursor| cursor.auxiliary) {
-            unsafe { original(auxiliary as *mut libc::DIR) };
+        if let Some(cursor) = cursor {
+            for source in cursor.owned_sources() {
+                unsafe { original(source) };
+            }
         }
         if result == 0
             && let Some(runtime) = FilesystemHookRuntime::global()
         {
-            runtime.take_descriptor(descriptor);
             runtime.unregister_directory(descriptor);
+        } else if result != 0
+            && let Some((open, _)) = tracked
+            && let Some(runtime) = FilesystemHookRuntime::global()
+        {
+            runtime.restore_descriptor(descriptor, open);
         }
         result
     })

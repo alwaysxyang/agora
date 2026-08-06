@@ -19,6 +19,10 @@ unsafe fn sandbox_truncate(path: *const libc::c_char, length: libc::off_t) -> li
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return unsafe { original(path, length) };
         };
+        if length < 0 {
+            unsafe { set_errno(libc::EINVAL) };
+            return -1;
+        }
         let request =
             match runtime.prepare_open(path, libc::AT_FDCWD, libc::O_WRONLY | libc::O_TRUNC, 0) {
                 Ok(request) => request,
@@ -178,7 +182,7 @@ unsafe fn sandbox_close(descriptor: libc::c_int) -> libc::c_int {
         }
         let tracked = runtime.take_descriptor(descriptor);
         if let Some((open, true)) = &tracked
-            && let Err(error) = runtime.commit_open_file(descriptor, open)
+            && let Err(error) = runtime.finish_open_file(descriptor, open)
         {
             runtime.restore_descriptor(descriptor, Arc::clone(open));
             return unsafe { fail(&error, -1) };
@@ -229,14 +233,13 @@ unsafe fn sandbox_fclose(stream: *mut libc::FILE) -> libc::c_int {
         };
         let flush_errno = (flush_result != 0).then(|| unsafe { *libc::__error() });
         let tracked = runtime.take_descriptor(descriptor);
-        let commit_error = tracked
-            .as_ref()
-            .filter(|(_, last_alias)| *last_alias)
-            .and_then(|(open, _)| runtime.commit_open_file(descriptor, open).err());
-        let result = unsafe { original(stream) };
-        if let Some(error) = commit_error {
+        if let Some((open, true)) = &tracked
+            && let Err(error) = runtime.finish_open_file(descriptor, open)
+        {
+            runtime.restore_descriptor(descriptor, Arc::clone(open));
             return unsafe { fail(&error, -1) };
         }
+        let result = unsafe { original(stream) };
         if result != 0 {
             return result;
         }
@@ -344,8 +347,14 @@ pub unsafe extern "C" fn agora_sandbox_dup2(
         }
         let result = unsafe { original(source, destination) };
         if result >= 0 {
-            runtime.take_descriptor(destination);
+            let replaced = runtime.take_descriptor(destination);
             runtime.duplicate_descriptor(source, destination);
+            if let Some((open, true)) = replaced
+                && open.remote.is_some()
+                && let Err(error) = runtime.finish_open_file(destination, &open)
+            {
+                return unsafe { fail(&error, -1) };
+            }
         }
         result
     })

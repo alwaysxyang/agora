@@ -103,7 +103,7 @@ Responsibility:
 - Typed local sandbox startup API.
 - Per-run network interception controller and raw TCP proxy.
 - Versioned, caller-owned asynchronous policy and event callback contract.
-- Thin command-line delivery using `agora-sandbox -c '<command>'`.
+- Thin command-line delivery using `agora-sandbox run -c <config> -e '<command>'`.
 - Rootless TLS termination with an explicit or workdir-local fixed CA.
 - Future workspace, file, and native policy enforcement.
 
@@ -143,9 +143,22 @@ Current status:
   selects real or effective credentials for each operation and adapts results without duplicating
   the permission policy. Synchronous workspace and key-migration storage work runs on blocking
   workers behind the public asynchronous runner API.
+- The `nfs` module owns protocol-backed network filesystem roots. Its generic storage trait and
+  authenticated per-run Broker are independent of the hook; SMB2/3 is the first backend under
+  `nfs/backend/smb`. `nfs/backend/mod.rs` exposes only the protocol-neutral storage boundary to
+  the rest of `nfs`; SMB storage, sessions, path mapping, and error adaptation remain private to
+  that backend. The existing `SmbRemoteConfig` public API is re-exported without exposing its
+  implementation module. Each configured NFS root has an independent backend session holder and a
+  non-blocking startup connection probe. The controller exposes sanitized connection results as
+  status events, while the runner owns stdout presentation; a failed probe does not stop the run.
+  An NFS root is the highest-priority namespace layer ahead of overlay
+  upper and lower state, while remote objects still bypass COW storage without creating a host
+  mount. The parent owns backend credentials and sessions, while the hook receives only route ids,
+  a socket path, and a per-run token and operates through anonymous regular-file descriptors and
+  opaque empty directory anchors. A Broker failure is monitored alongside the other run services.
 - The CLI renders one compact JSON Lines record per network connection attempt, intercepted
   descendant process execution attempt, and intercepted file open or close to stdout by default,
-  or appends it to `--audit-file`; its callback always allows requests.
+  or appends it to the configured `audit.file`; its callback always allows requests.
 - The interception CA is trusted by covered macOS `SecTrust` SSL evaluations and by common
   environment-aware clients through a CA-keyed trust bundle containing the interception CA and
   current native roots. TLS stacks that ignore both mechanisms require their own trust
@@ -164,6 +177,9 @@ Rules:
   mismatched protocol versions or credentials.
 - Keep the wire protocol and Mach-O hook as private `protocol` and `hook` source modules inside
   `agora-sandbox`; do not expose them as workspace crates or public integration APIs.
+- Keep backend credentials, endpoints, and protocol clients in the parent-side `nfs` module. New
+  remote protocols implement the `nfs` storage trait; they must not add mounts, protocol code, or
+  credentials to the injected hook.
 - Keep executable preparation and its authenticated loopback control protocol private to the
   `execution` source module. Never modify the original executable. Keep persistent prepared copies
   under `<workdir>/fs` and validate them through the directory-local versioned `.metadata` state.

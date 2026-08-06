@@ -60,23 +60,59 @@ traffic.
 - Versioned network, process, and file callback events, `Decision`, proxy route types, and explicit
   `Redact` views under `callback`.
 
-The CLI is a thin adapter:
+The CLI is a thin adapter with two subcommands. `run` accepts one configuration file and one
+executable command line:
 
 ```bash
-agora-sandbox \
-  --tls auto \
-  --workdir ~/.agora-sandbox \
-  --audit-file ./sandbox-audit.jsonl \
-  -c './target/debug/my-client --endpoint https://example.com'
+agora-sandbox run -c sandbox.json \
+  -e './target/debug/my-client --endpoint https://example.com'
 ```
+
+```json
+{
+  "workdir": "~/.agora-sandbox",
+  "tls": "auto",
+  "filesystem": {
+    "local": {
+      "encrypt": "encrypted",
+      "key": "filesystem-key"
+    },
+    "nfs": [
+      {
+        "type": "smb",
+        "dir": "/smb",
+        "server": "smb://127.0.0.1:10445/workspace",
+        "username": "openclaw",
+        "password": "secret"
+      }
+    ]
+  },
+  "audit": {
+    "file": "./sandbox-audit.jsonl"
+  }
+}
+```
+
+The configuration rejects unknown fields. Omitted settings retain the previous runtime defaults:
+`workdir` is `~/.agora-sandbox`, `tls` is `off`, the local filesystem is `plain`, NFS roots are
+empty, and audit records go to stdout. A relative `workdir` or `audit.file` is resolved from the
+configuration file's directory, while a leading `~` uses `HOME`. The configuration must be a
+regular non-symlink file owned by the effective user with permissions no broader than `0600`.
+`tls` accepts `off` or `auto`. The CLI supports `filesystem.local.encrypt` values `plain` and
+`encrypted`; plain mode rejects a key, while encrypted mode requires a non-empty
+`filesystem.local.key`. An empty JSON object therefore selects all defaults.
+
+Configured NFS roots are probed asynchronously after their Broker starts, so remote readiness never
+delays child startup. The CLI writes one sanitized connected or unavailable status line per root to
+stdout when each probe completes. A failed probe does not stop the run, and later access retries the
+backend connection.
 
 The CLI contains the hook and automatically materializes it below
 `<workdir>/runtime/hook/<md5>/libagora_sandbox.dylib` before constructing `SandboxConfig`. It has no
 `--hook-library` option, sidecar lookup, or runtime Cargo dependency; failure to materialize the
-verified hook is a startup error. `--tls` accepts `off` or `auto`.
-When either explicit CA option is supplied, both `--tls-ca-cert` and `--tls-ca-key` are required; the
-PEM certificate must be a signing CA and its public key must match the private key. When neither is
-supplied, auto mode uses the workdir-relative default CA paths and generates the pair when needed.
+verified hook is a startup error. CLI auto mode uses the workdir-relative default CA paths and
+generates the pair when needed. SDK callers may supply explicit CA paths; the PEM certificate must
+be a signing CA and its public key must match the private key.
 The library-level `generate_tls_ca` function creates missing parent directories and writes a new
 ten-year signing CA and matching PKCS#8 private key in PEM format. Certificate and key destinations
 must differ. Existing destination files are replaced, and both generated files use mode `0600` on
@@ -87,19 +123,19 @@ the interception CA and current native roots under `<workdir>/ca`, then points `
 `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, and `GIT_SSL_CAINFO` at that bundle.
 Covered descendant launches restore these protected values even if the caller clears or replaces
 its environment. The child inherits stdin, stdout, and stderr. The
-`-c` value is tokenized into a program and arguments but is not
+`-e` value is tokenized into a program and arguments but is not
 implicitly run through a system shell; pipes, redirections, substitutions, and other shell
 operators require an explicit shell command. The CLI audit adapter writes one compact JSON record
 for each validated network connection attempt, intercepted descendant process execution attempt,
 and intercepted file open or close attempt. It writes JSON Lines to stdout by default;
-`--audit-file <path>` instead appends to that
+`audit.file` instead appends to that
 file and creates missing parent directories. Network records contain `access_time`, `trace_id`,
 `pid`, destination IP and port, and the observed domain. Process records contain `access_time`,
 `trace_id`, PID, PPID, current and requested executables, arguments, current directory, and launch
 operation. The root command is started directly by the runner and therefore does not emit a
 `process.exec.attempt` record. File records contain `access_time`, `trace_id`, PID, operation,
 logical path, and structured open mode. The child still inherits stdout and stderr, so callers that require a
-pure audit stream should use `--audit-file`. CLI startup and audit-write errors are written directly
+pure audit stream should configure `audit.file`. CLI startup and audit-write errors are written directly
 to stderr without the project logger. The CLI returns the child's exit code. SIGINT and SIGTERM
 terminate the active run through the shared process lifecycle. Strict network enforcement remains
 unavailable and is not exposed as a CLI option. Filesystem persistence and destructive-reset
@@ -217,10 +253,11 @@ observed by the application through subsequent I/O. Audit events still report th
 attempt and result.
 
 Normal shutdown terminates residual processes in the run's process group, drains active relays for
-up to one second, and stops the proxy listeners, execution controller, and audit controller. Prepared
+up to one second, and stops the proxy listeners, execution controller, audit controller, and optional
+NFS Broker. Prepared
 executables, directory metadata, CA material, and CA-keyed trust bundles remain under the configured
-work directory for reuse. The runner monitors the network listeners, execution controller, and audit
-controller while the child is active. An unexpected service exit terminates the process group
+work directory for reuse. The runner monitors the network listeners, execution controller, audit
+controller, and optional NFS Broker while the child is active. An unexpected service exit terminates the process group
 instead of allowing descendants to continue after their interception path has failed. A descendant
 that deliberately creates a new session or process group can leave this lifecycle boundary;
 preventing that requires the future native sandbox.

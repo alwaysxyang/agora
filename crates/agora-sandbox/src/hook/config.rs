@@ -1,6 +1,7 @@
 use crate::trace::{TRACE_ID_ENVIRONMENT, TraceContext};
 use base64::Engine;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const TOKEN: &str = "AGORA_SANDBOX_TOKEN";
@@ -14,6 +15,10 @@ const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
 const FILESYSTEM_ROOT: &str = "AGORA_SANDBOX_FILESYSTEM_ROOT";
 const FILESYSTEM_MODE: &str = "AGORA_SANDBOX_FILESYSTEM_MODE";
 const FILESYSTEM_CIPHER_KEY: &str = "AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY";
+const REMOTE_CONTROL: &str = "AGORA_SANDBOX_REMOTE_CONTROL";
+const REMOTE_TOKEN: &str = "AGORA_SANDBOX_REMOTE_TOKEN";
+const REMOTE_ROOTS: &str = "AGORA_SANDBOX_REMOTE_ROOTS";
+pub(super) const REMOTE_CURRENT_DIRECTORY: &str = "AGORA_SANDBOX_REMOTE_CURRENT_DIRECTORY";
 const TLS_TRUST_ANCHOR_DER: &str = "AGORA_SANDBOX_TLS_TRUST_ANCHOR_DER";
 const TLS_TRUST_BUNDLE: &str = "AGORA_SANDBOX_TLS_TRUST_BUNDLE";
 
@@ -25,7 +30,7 @@ const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
     "GIT_SSL_CAINFO",
 ];
 
-pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 19] = [
+pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 23] = [
     TOKEN,
     PROXY_IPV4,
     PROXY_IPV6,
@@ -37,6 +42,10 @@ pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 19] = [
     FILESYSTEM_ROOT,
     FILESYSTEM_MODE,
     FILESYSTEM_CIPHER_KEY,
+    REMOTE_CONTROL,
+    REMOTE_TOKEN,
+    REMOTE_ROOTS,
+    REMOTE_CURRENT_DIRECTORY,
     TLS_TRUST_ANCHOR_DER,
     TLS_TRUST_BUNDLE,
     TRACE_ID_ENVIRONMENT,
@@ -61,9 +70,18 @@ pub(super) struct HookConfig {
     filesystem_mode: String,
     filesystem_cipher_key: Option<String>,
     filesystem_cipher: Option<crate::filesystem::FileCipher>,
+    remote_filesystem: Option<RemoteHookConfig>,
+    remote_current_directory: Option<PathBuf>,
     tls_trust_anchor_der: Option<String>,
     tls_trust_bundle: Option<String>,
     trace: TraceContext,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteHookConfig {
+    control: String,
+    token: String,
+    roots: String,
 }
 
 impl HookConfig {
@@ -100,6 +118,48 @@ impl HookConfig {
         }
         let filesystem_cipher =
             Self::decode_filesystem_cipher(&filesystem_mode, filesystem_cipher_key.as_deref())?;
+        let remote_control = get(REMOTE_CONTROL).filter(|value| !value.is_empty());
+        let remote_token = get(REMOTE_TOKEN).filter(|value| !value.is_empty());
+        let remote_roots = get(REMOTE_ROOTS).filter(|value| !value.is_empty());
+        let remote_filesystem = match (remote_control, remote_token, remote_roots) {
+            (None, None, None) => None,
+            (Some(control), Some(token), Some(roots)) => {
+                if !Path::new(&control).is_absolute() {
+                    return Err(format!("{REMOTE_CONTROL} must be an absolute path"));
+                }
+                let parsed: Vec<crate::nfs::protocol::RemoteRoute> =
+                    serde_json::from_str(&roots)
+                        .map_err(|error| format!("invalid {REMOTE_ROOTS}: {error}"))?;
+                if parsed.is_empty() {
+                    return Err(format!("{REMOTE_ROOTS} cannot be empty"));
+                }
+                Some(RemoteHookConfig {
+                    control,
+                    token,
+                    roots,
+                })
+            }
+            _ => {
+                return Err(
+                    "remote filesystem requires control, token, and roots together".to_string(),
+                );
+            }
+        };
+        let remote_current_directory = get(REMOTE_CURRENT_DIRECTORY)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        if let Some(directory) = &remote_current_directory {
+            if remote_filesystem.is_none() {
+                return Err(format!(
+                    "{REMOTE_CURRENT_DIRECTORY} requires a remote filesystem"
+                ));
+            }
+            if !directory.is_absolute() {
+                return Err(format!(
+                    "{REMOTE_CURRENT_DIRECTORY} must be an absolute path"
+                ));
+            }
+        }
         let tls_trust_anchor_der = get(TLS_TRUST_ANCHOR_DER).filter(|value| !value.is_empty());
         let tls_trust_bundle = get(TLS_TRUST_BUNDLE).filter(|value| !value.is_empty());
         let trace = TraceContext::parse(&Self::required(&mut get, TRACE_ID_ENVIRONMENT)?)
@@ -132,6 +192,8 @@ impl HookConfig {
             filesystem_mode,
             filesystem_cipher_key,
             filesystem_cipher,
+            remote_filesystem,
+            remote_current_directory,
             tls_trust_anchor_der,
             tls_trust_bundle,
             trace,
@@ -175,6 +237,20 @@ impl HookConfig {
 
     pub(super) fn filesystem_cipher(&self) -> Option<crate::filesystem::FileCipher> {
         self.filesystem_cipher.clone()
+    }
+
+    pub(super) fn remote_filesystem(&self) -> Option<(&str, &str, &str)> {
+        self.remote_filesystem.as_ref().map(|remote| {
+            (
+                remote.control.as_str(),
+                remote.token.as_str(),
+                remote.roots.as_str(),
+            )
+        })
+    }
+
+    pub(super) fn remote_current_directory(&self) -> Option<&Path> {
+        self.remote_current_directory.as_deref()
     }
 
     fn decode_filesystem_cipher(
@@ -230,6 +306,13 @@ impl HookConfig {
         if let Some(key) = &self.filesystem_cipher_key {
             environment.push((FILESYSTEM_CIPHER_KEY, key.clone()));
         }
+        if let Some(remote) = &self.remote_filesystem {
+            environment.extend([
+                (REMOTE_CONTROL, remote.control.clone()),
+                (REMOTE_TOKEN, remote.token.clone()),
+                (REMOTE_ROOTS, remote.roots.clone()),
+            ]);
+        }
         if let Some(anchor) = &self.tls_trust_anchor_der {
             environment.push((TLS_TRUST_ANCHOR_DER, anchor.clone()));
         }
@@ -260,7 +343,15 @@ impl HookConfig {
 
 pub(super) fn initialize() {
     if global().is_some() {
-        for key in [FILESYSTEM_ROOT, FILESYSTEM_MODE, FILESYSTEM_CIPHER_KEY] {
+        for key in [
+            FILESYSTEM_ROOT,
+            FILESYSTEM_MODE,
+            FILESYSTEM_CIPHER_KEY,
+            REMOTE_CONTROL,
+            REMOTE_TOKEN,
+            REMOTE_ROOTS,
+            REMOTE_CURRENT_DIRECTORY,
+        ] {
             unsafe { std::env::remove_var(key) };
         }
     }

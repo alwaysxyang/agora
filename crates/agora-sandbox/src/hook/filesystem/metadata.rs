@@ -79,6 +79,10 @@ unsafe fn sandbox_fchmod(descriptor: libc::c_int, mode: libc::mode_t) -> libc::c
             unsafe { set_errno(libc::EPERM) };
             return -1;
         };
+        if open.remote.is_some() {
+            unsafe { set_errno(libc::ENOTSUP) };
+            return -1;
+        }
         match runtime.filesystem.chmod_authorized(
             &open.logical(),
             mode.into(),
@@ -290,9 +294,21 @@ unsafe fn sandbox_fstat(descriptor: libc::c_int, status: *mut libc::stat) -> lib
             && !status.is_null()
             && let Some(open) = runtime.tracked_open(descriptor)
         {
-            let attributes = match runtime.filesystem.attributes(&open.logical()) {
-                Ok(attributes) => attributes,
-                Err(error) => return unsafe { fail(&error, -1) },
+            let attributes = if let Some(remote) = &open.remote {
+                let metadata = lock(&remote.metadata);
+                let remote = match runtime.remote.as_ref() {
+                    Some(remote) => remote,
+                    None => {
+                        unsafe { set_errno(libc::EIO) };
+                        return -1;
+                    }
+                };
+                Some(remote.attributes(&metadata))
+            } else {
+                match runtime.filesystem.attributes(&open.logical()) {
+                    Ok(attributes) => attributes,
+                    Err(error) => return unsafe { fail(&error, -1) },
+                }
             };
             unsafe { patch_stat(&mut *status, None, attributes.as_ref()) };
         }

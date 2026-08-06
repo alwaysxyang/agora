@@ -1,6 +1,6 @@
 #![cfg(target_os = "macos")]
 
-use super::config::{self, CHILD_RUNTIME_ENVIRONMENT, HookConfig};
+use super::config::{self, CHILD_RUNTIME_ENVIRONMENT, HookConfig, REMOTE_CURRENT_DIRECTORY};
 use super::dyld::{dyld_interpose, function_from_interpose};
 use super::set_errno;
 use crate::audit::{AuditClient, AuditEventRequest};
@@ -177,6 +177,7 @@ impl ChildEnvironment {
         environment: *const *const libc::c_char,
         config: &HookConfig,
         trace: &TraceContext,
+        remote_current_directory: Option<&Path>,
     ) -> Option<Self> {
         let mut values = Vec::new();
         if !environment.is_null() {
@@ -198,6 +199,15 @@ impl ChildEnvironment {
             entry.extend_from_slice(key.as_bytes());
             entry.push(b'=');
             entry.extend_from_slice(value.as_bytes());
+            values.push(CString::new(entry).ok()?);
+        }
+        if let Some(directory) = remote_current_directory {
+            let mut entry = Vec::with_capacity(
+                REMOTE_CURRENT_DIRECTORY.len() + 1 + directory.as_os_str().as_bytes().len(),
+            );
+            entry.extend_from_slice(REMOTE_CURRENT_DIRECTORY.as_bytes());
+            entry.push(b'=');
+            entry.extend_from_slice(directory.as_os_str().as_bytes());
             values.push(CString::new(entry).ok()?);
         }
         values
@@ -483,11 +493,13 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
     let Some(runtime) = ProcessHookRuntime::global() else {
         return libc::EACCES;
     };
+    let remote_current_directory = super::filesystem::tracked_remote_current_directory();
     let Some(environment) = (unsafe {
         ChildEnvironment::new(
             environment.cast::<*const libc::c_char>(),
             &runtime.config,
             &trace,
+            remote_current_directory.as_deref(),
         )
     }) else {
         return libc::EACCES;
@@ -538,11 +550,13 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
     let Some(runtime) = ProcessHookRuntime::global() else {
         return libc::EACCES;
     };
+    let remote_current_directory = super::filesystem::tracked_remote_current_directory();
     let Some(environment) = (unsafe {
         ChildEnvironment::new(
             environment.cast::<*const libc::c_char>(),
             &runtime.config,
             &trace,
+            remote_current_directory.as_deref(),
         )
     }) else {
         return libc::EACCES;
@@ -640,9 +654,15 @@ unsafe fn execute(
         unsafe { set_errno(libc::EACCES) };
         return -1;
     };
-    let Some(environment) =
-        (unsafe { ChildEnvironment::new(environment, &runtime.config, &trace) })
-    else {
+    let remote_current_directory = super::filesystem::tracked_remote_current_directory();
+    let Some(environment) = (unsafe {
+        ChildEnvironment::new(
+            environment,
+            &runtime.config,
+            &trace,
+            remote_current_directory.as_deref(),
+        )
+    }) else {
         unsafe { set_errno(libc::EACCES) };
         return -1;
     };

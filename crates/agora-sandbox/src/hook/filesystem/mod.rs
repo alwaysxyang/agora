@@ -8,9 +8,11 @@ use crate::callback::{FileAccessMode, FileContext, FileOpenMode, ProcessContext}
 use crate::filesystem::{
     AccessPlan, AccessRequest, Credentials, DirectoryView, FileAttributes, FileLayer, MetadataPlan,
     OpenIntent, OpenTarget, PreparedFile, StagedWrite, VirtualFilesystem, Writeback,
+    normalize_path,
 };
 use crate::trace::TraceContext;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use nfs::{RemoteDirectoryView, RemoteFilesystem, RemoteOpen};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
@@ -18,7 +20,7 @@ use std::io;
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock};
 
 const NATIVE_PASSTHROUGH_ROOTS: &[&str] = &["/dev"];
@@ -104,16 +106,28 @@ impl Drop for FilesystemHookGuard {
 
 struct FilesystemHookRuntime {
     filesystem: VirtualFilesystem,
+    remote: Option<RemoteFilesystem>,
     audit: Option<AuditClient>,
     trace: TraceContext,
     prepared_executable: Option<PathBuf>,
-    current_directory: Mutex<PathBuf>,
+    current_directory: Mutex<CurrentDirectory>,
     open_files: Mutex<HashMap<libc::c_int, Arc<OpenFile>>>,
-    directory_descriptors: Mutex<HashMap<libc::c_int, PathBuf>>,
+    directory_descriptors: Mutex<HashMap<libc::c_int, DirectoryDescriptor>>,
+}
+
+#[derive(Clone)]
+struct DirectoryDescriptor {
+    logical: PathBuf,
+    remote: bool,
+}
+
+struct CurrentDirectory {
+    logical: PathBuf,
+    remote: bool,
 }
 
 struct PreparedOpen {
-    prepared: PreparedFile,
+    prepared: PreparedOpenFile,
     file: FileContext,
     logical: PathBuf,
 }
@@ -122,40 +136,91 @@ struct OpenFile {
     file: FileContext,
     logical: Mutex<PathBuf>,
     writeback: Option<Writeback>,
+    remote: Option<RemoteRegistration>,
     layer: FileLayer,
     close_on_exec: bool,
+}
+
+enum PreparedOpenFile {
+    Local(PreparedFile),
+    Remote(RemoteOpen),
+}
+
+struct RemoteRegistration {
+    handle: String,
+    metadata: Mutex<crate::nfs::protocol::RemoteMetadata>,
+    writable: bool,
 }
 
 static FILESYSTEM_RUNTIME: OnceLock<Option<FilesystemHookRuntime>> = OnceLock::new();
 
 impl PreparedOpen {
+    fn into_parts(self) -> (OpenTarget, OpenFile) {
+        let (target, writeback, remote, layer) = self.prepared.into_parts();
+        let close_on_exec = matches!(target, OpenTarget::Descriptor(_));
+        (
+            target,
+            OpenFile {
+                file: self.file,
+                logical: Mutex::new(self.logical),
+                writeback,
+                remote,
+                layer,
+                close_on_exec,
+            },
+        )
+    }
+}
+
+impl PreparedOpenFile {
+    fn target(&self) -> &OpenTarget {
+        match self {
+            Self::Local(prepared) => prepared.target(),
+            Self::Remote(prepared) => prepared.target(),
+        }
+    }
+
+    fn target_mut(&mut self) -> &mut OpenTarget {
+        match self {
+            Self::Local(prepared) => prepared.target_mut(),
+            Self::Remote(prepared) => prepared.target_mut(),
+        }
+    }
+
     fn into_parts(
         self,
     ) -> (
         OpenTarget,
-        FileContext,
-        PathBuf,
         Option<Writeback>,
+        Option<RemoteRegistration>,
         FileLayer,
-        bool,
     ) {
-        let (target, writeback, layer) = self.prepared.into_parts();
-        let close_on_exec = matches!(target, OpenTarget::Descriptor(_));
-        (
-            target,
-            self.file,
-            self.logical,
-            writeback,
-            layer,
-            close_on_exec,
-        )
+        match self {
+            Self::Local(prepared) => {
+                let (target, writeback, layer) = prepared.into_parts();
+                (target, writeback, None, layer)
+            }
+            Self::Remote(prepared) => {
+                let (target, handle, metadata, writable) = prepared.into_parts();
+                (
+                    target,
+                    None,
+                    Some(RemoteRegistration {
+                        handle,
+                        metadata: Mutex::new(metadata),
+                        writable,
+                    }),
+                    FileLayer::Upper,
+                )
+            }
+        }
     }
 }
 
 struct OpenRequest {
     logical: PathBuf,
     intent: OpenIntent,
-    prepared: PreparedFile,
+    prepared: PreparedOpenFile,
     file: FileContext,
     allowlisted_passthrough: bool,
 }
@@ -201,8 +266,8 @@ impl OpenFile {
 
     fn retarget(&self, from: &Path, to: &Path) {
         let mut logical = lock(&self.logical);
-        if *logical == from {
-            *logical = to.to_path_buf();
+        if let Ok(suffix) = logical.strip_prefix(from) {
+            *logical = to.join(suffix);
         }
     }
 }
@@ -232,10 +297,23 @@ impl FilesystemHookRuntime {
                         None => VirtualFilesystem::plain(config.filesystem_root()),
                     };
                     filesystem.ok().and_then(|filesystem| {
-                        let current_directory = Self::native_current_directory(&filesystem).ok()?;
                         let prepared_executable = Self::prepared_executable(&filesystem);
+                        let remote = config
+                            .remote_filesystem()
+                            .map(|(control, token, routes)| {
+                                RemoteFilesystem::from_json(control, token, routes)
+                            })
+                            .transpose()
+                            .ok()?;
+                        let current_directory = Self::initial_current_directory(
+                            &filesystem,
+                            remote.as_ref(),
+                            config.remote_current_directory(),
+                        )
+                        .ok()?;
                         Some(Self {
                             filesystem,
+                            remote,
                             audit: Some(AuditClient::new(
                                 config.audit_control(),
                                 config.audit_token(),
@@ -260,10 +338,14 @@ impl FilesystemHookRuntime {
         let current_directory = Self::native_current_directory(&filesystem)?;
         Ok(Self {
             filesystem,
+            remote: None,
             audit: None,
             trace: TraceContext::parse("test-trace").map_err(anyhow::Error::msg)?,
             prepared_executable: None,
-            current_directory: Mutex::new(current_directory),
+            current_directory: Mutex::new(CurrentDirectory {
+                logical: current_directory,
+                remote: false,
+            }),
             open_files: Mutex::new(HashMap::new()),
             directory_descriptors: Mutex::new(HashMap::new()),
         })
@@ -276,10 +358,14 @@ impl FilesystemHookRuntime {
         let current_directory = Self::native_current_directory(&filesystem)?;
         Ok(Self {
             filesystem,
+            remote: None,
             audit: None,
             trace: TraceContext::parse("test-trace").map_err(anyhow::Error::msg)?,
             prepared_executable: None,
-            current_directory: Mutex::new(current_directory),
+            current_directory: Mutex::new(CurrentDirectory {
+                logical: current_directory,
+                remote: false,
+            }),
             open_files: Mutex::new(HashMap::new()),
             directory_descriptors: Mutex::new(HashMap::new()),
         })
@@ -294,6 +380,34 @@ impl FilesystemHookRuntime {
         }
     }
 
+    fn initial_current_directory(
+        filesystem: &VirtualFilesystem,
+        remote: Option<&RemoteFilesystem>,
+        inherited_remote: Option<&Path>,
+    ) -> Result<CurrentDirectory> {
+        let native = Self::native_current_directory(filesystem)?;
+        Self::current_directory_from_native(native, remote, inherited_remote)
+    }
+
+    fn current_directory_from_native(
+        native: PathBuf,
+        remote: Option<&RemoteFilesystem>,
+        inherited_remote: Option<&Path>,
+    ) -> Result<CurrentDirectory> {
+        if let (Some(remote), Some(logical)) = (remote, inherited_remote)
+            && let Some(logical) = remote.restore_current_directory(&native, logical)?
+        {
+            return Ok(CurrentDirectory {
+                logical,
+                remote: true,
+            });
+        }
+        Ok(CurrentDirectory {
+            logical: native,
+            remote: false,
+        })
+    }
+
     fn prepared_executable(filesystem: &VirtualFilesystem) -> Option<PathBuf> {
         std::env::current_exe()
             .ok()
@@ -301,7 +415,7 @@ impl FilesystemHookRuntime {
     }
 
     fn native_passthrough_path(&self, path: &Path) -> Result<Option<PathBuf>> {
-        let normalized = normalize_absolute(path)?;
+        let normalized = normalize_path(path)?;
         Ok(NATIVE_PASSTHROUGH_ROOTS
             .iter()
             .map(Path::new)
@@ -367,6 +481,18 @@ impl FilesystemHookRuntime {
                 .context("native passthrough path contains NUL")?;
             return Ok((mapped, None, None));
         }
+        if let Some(remote) = &self.remote
+            && let Some(routed) = remote.route_result(&logical)?
+        {
+            self.publish_open_writers(routed.logical())?;
+            match remote.stat_plan(&routed) {
+                Ok((mapped, plaintext_size, attributes, _)) => {
+                    return Ok((mapped, plaintext_size, Some(attributes)));
+                }
+                Err(error) if error_errno(&error) == libc::ENOENT => {}
+                Err(error) => return Err(error),
+            }
+        }
         let plan: MetadataPlan =
             self.filesystem
                 .prepare_authorized_metadata(&logical, follow_final, credentials)?;
@@ -393,6 +519,18 @@ impl FilesystemHookRuntime {
         if let Some(native) = self.native_passthrough_path(&logical)? {
             return Ok(AccessPlan::Native(native));
         }
+        if let Some(remote) = &self.remote
+            && let Some(routed) = remote.route_result(&logical)?
+        {
+            let mode = ((request.read as libc::c_int) * libc::R_OK)
+                | ((request.write as libc::c_int) * libc::W_OK)
+                | ((request.execute as libc::c_int) * libc::X_OK);
+            match remote.access(&routed, mode) {
+                Ok(()) => return Ok(AccessPlan::Allowed),
+                Err(error) if error_errno(&error) == libc::ENOENT => {}
+                Err(error) => return Err(error),
+            }
+        }
         self.filesystem
             .check_access(&logical, follow_final, request, credentials)
     }
@@ -405,6 +543,9 @@ impl FilesystemHookRuntime {
         follow_final: bool,
     ) -> Result<()> {
         let requested = unsafe { self.logical_path(path, directory) }?;
+        if self.remote_entry_exists(&requested)? {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into());
+        }
         let credentials = Credentials::effective();
         self.filesystem
             .chmod_authorized(&requested, mode.into(), follow_final, &credentials)
@@ -422,16 +563,19 @@ impl FilesystemHookRuntime {
             unsafe { CStr::from_ptr(path) }.to_bytes(),
         ));
         if requested.is_absolute() {
-            return self.logical_or_host(requested);
+            let requested = directory::active_fts_logical_path(requested)
+                .unwrap_or_else(|| requested.to_path_buf());
+            return self.logical_or_host(&requested);
         }
         let base = if directory == libc::AT_FDCWD {
-            lock(&self.current_directory).clone()
+            lock(&self.current_directory).logical.clone()
         } else {
             self.descriptor_logical_path(directory)
                 .map(Ok)
                 .unwrap_or_else(|| self.resolve_descriptor_logical_path(directory))?
         };
         let candidate = self.logical_or_host(&base)?.join(requested);
+        let candidate = directory::active_fts_logical_path(&candidate).unwrap_or(candidate);
         self.logical_or_host(&candidate)
     }
 
@@ -479,9 +623,43 @@ impl FilesystemHookRuntime {
         let (logical, prepared) = match allowlisted {
             Some(path) => {
                 let prepared = self.filesystem.prepare_native_open(&path);
-                (path, prepared)
+                (path, PreparedOpenFile::Local(prepared))
             }
             None => {
+                if let Some(remote) = &self.remote
+                    && let Some(routed) = remote.route_result(&requested)?
+                {
+                    let logical = routed.logical().to_path_buf();
+                    self.publish_open_writers(&logical)?;
+                    let prepared = if flags & libc::O_CREAT == 0 {
+                        match remote.open(&routed, flags, intent.mode()) {
+                            Ok(prepared) => Some(prepared),
+                            Err(error) if error_errno(&error) == libc::ENOENT => None,
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        let remote_exists = match remote.stat(&routed) {
+                            Ok(_) => true,
+                            Err(error) if error_errno(&error) == libc::ENOENT => false,
+                            Err(error) => return Err(error),
+                        };
+                        let local_exists = !remote_exists && self.filesystem.exists(&requested)?;
+                        if remote_exists || !local_exists {
+                            Some(remote.open(&routed, flags, intent.mode())?)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(prepared) = prepared {
+                        return Ok(Self::open_request(
+                            requested,
+                            logical,
+                            intent,
+                            PreparedOpenFile::Remote(prepared),
+                            false,
+                        ));
+                    }
+                }
                 self.publish_open_writers(&requested)?;
                 let credentials = Credentials::effective();
                 let mut plan_path = requested.clone();
@@ -509,12 +687,29 @@ impl FilesystemHookRuntime {
                         continue;
                     }
                     let (logical, prepared) = plan.into_parts();
-                    break (logical, prepared);
+                    break (logical, PreparedOpenFile::Local(prepared));
                 }
             }
         };
+        Ok(Self::open_request(
+            requested,
+            logical,
+            intent,
+            prepared,
+            allowlisted_passthrough,
+        ))
+    }
+
+    fn open_request(
+        requested: PathBuf,
+        logical: PathBuf,
+        intent: OpenIntent,
+        prepared: PreparedOpenFile,
+        allowlisted_passthrough: bool,
+    ) -> OpenRequest {
+        let flags = intent.flags();
         let access = intent.access();
-        Ok(OpenRequest {
+        OpenRequest {
             logical,
             intent,
             prepared,
@@ -533,7 +728,7 @@ impl FilesystemHookRuntime {
                 },
             },
             allowlisted_passthrough,
-        })
+        }
     }
 
     fn prepare_fopen(
@@ -550,13 +745,17 @@ impl FilesystemHookRuntime {
     }
 
     fn commit_open(&self, prepared: &mut PreparedOpen) -> Result<()> {
-        self.filesystem.commit_open(&mut prepared.prepared)
+        match &mut prepared.prepared {
+            PreparedOpenFile::Local(prepared) => self.filesystem.commit_open(prepared),
+            PreparedOpenFile::Remote(prepared) => prepared.commit(),
+        }
     }
 
     fn has_open_writer(&self, logical: &Path) -> bool {
-        lock(&self.open_files)
-            .values()
-            .any(|open| open.writeback.is_some() && open.logical() == logical)
+        lock(&self.open_files).values().any(|open| {
+            (open.writeback.is_some() || open.remote.as_ref().is_some_and(|remote| remote.writable))
+                && open.logical() == logical
+        })
     }
 
     fn publish_open_writers(&self, logical: &Path) -> Result<()> {
@@ -566,7 +765,8 @@ impl FilesystemHookRuntime {
             .collect::<Vec<_>>();
         let mut seen = HashSet::new();
         for (descriptor, open) in files {
-            if open.writeback.is_some()
+            if (open.writeback.is_some()
+                || open.remote.as_ref().is_some_and(|remote| remote.writable))
                 && open.logical() == logical
                 && seen.insert(Arc::as_ptr(&open))
             {
@@ -610,25 +810,8 @@ impl FilesystemHookRuntime {
         })
     }
 
-    fn register(
-        &self,
-        descriptor: libc::c_int,
-        file: FileContext,
-        logical: PathBuf,
-        writeback: Option<Writeback>,
-        layer: FileLayer,
-        close_on_exec: bool,
-    ) {
-        lock(&self.open_files).insert(
-            descriptor,
-            Arc::new(OpenFile {
-                file,
-                logical: Mutex::new(logical),
-                writeback,
-                layer,
-                close_on_exec,
-            }),
-        );
+    fn register(&self, descriptor: libc::c_int, open: OpenFile) {
+        lock(&self.open_files).insert(descriptor, Arc::new(open));
     }
 
     fn tracked(&self, descriptor: libc::c_int) -> Option<FileContext> {
@@ -694,6 +877,17 @@ impl FilesystemHookRuntime {
     }
 
     fn commit_open_file(&self, descriptor: libc::c_int, open: &OpenFile) -> Result<()> {
+        if let Some(registration) = &open.remote {
+            let remote = self
+                .remote
+                .as_ref()
+                .context("remote filesystem runtime is unavailable")?;
+            remote.sync(&registration.handle)?;
+            if let Some(path) = remote.route_result(&open.logical())? {
+                *lock(&registration.metadata) = remote.stat(&path)?;
+            }
+            return Ok(());
+        }
         let Some(writeback) = &open.writeback else {
             return Ok(());
         };
@@ -705,6 +899,17 @@ impl FilesystemHookRuntime {
             return Err(io::Error::last_os_error().into());
         }
         self.filesystem.refresh_timestamps(&logical, &status)
+    }
+
+    fn finish_open_file(&self, descriptor: libc::c_int, open: &OpenFile) -> Result<()> {
+        if let Some(registration) = &open.remote {
+            return self
+                .remote
+                .as_ref()
+                .context("remote filesystem runtime is unavailable")?
+                .close(&registration.handle);
+        }
+        self.commit_open_file(descriptor, open)
     }
 
     fn commit_all_open_files(&self) -> Result<()> {
@@ -724,6 +929,12 @@ impl FilesystemHookRuntime {
     }
 
     fn refresh_attributes(&self, descriptor: libc::c_int, path: &str) -> Result<()> {
+        if self
+            .tracked_open(descriptor)
+            .is_some_and(|open| open.remote.is_some())
+        {
+            return Ok(());
+        }
         let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
         if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
             return Err(io::Error::last_os_error().into());
@@ -746,6 +957,19 @@ impl FilesystemHookRuntime {
                 original_mkdir().ok_or_else(|| io::Error::from_raw_os_error(libc::ENOSYS))?;
             return native_operation_result(unsafe { original(native.as_ptr(), mode) });
         }
+        if let Some(remote) = &self.remote
+            && let Some(routed) = remote.route_result(&logical)?
+        {
+            match remote.stat(&routed) {
+                Ok(_) => return remote.create_directory(&routed, mode),
+                Err(error) if error_errno(&error) == libc::ENOENT => {
+                    if !self.filesystem.exists(&logical)? {
+                        return remote.create_directory(&routed, mode);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
         self.filesystem
             .create_directory_authorized(&logical, u32::from(mode), &Credentials::effective())
             .map(|_| ())
@@ -767,6 +991,20 @@ impl FilesystemHookRuntime {
             let original =
                 original_symlink().ok_or_else(|| io::Error::from_raw_os_error(libc::ENOSYS))?;
             return native_operation_result(unsafe { original(target, native.as_ptr()) });
+        }
+        if let Some(remote) = &self.remote
+            && let Some(routed) = remote.route_result(&link)?
+        {
+            self.publish_open_writers(routed.logical())?;
+            match remote.stat(&routed) {
+                Ok(_) => return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into()),
+                Err(error) if error_errno(&error) == libc::ENOENT => {
+                    if !self.filesystem.exists(&link)? {
+                        return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into());
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
         let requested = Path::new(OsStr::from_bytes(unsafe {
             CStr::from_ptr(target).to_bytes()
@@ -801,6 +1039,15 @@ impl FilesystemHookRuntime {
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOSYS))?;
             return native_operation_result(unsafe { original(native.as_ptr()) });
         }
+        if let Some(remote) = &self.remote
+            && let Some(routed) = remote.route_result(&logical)?
+        {
+            match remote.remove(&routed, remove_directory) {
+                Ok(()) => return Ok(()),
+                Err(error) if error_errno(&error) == libc::ENOENT => {}
+                Err(error) => return Err(error),
+            }
+        }
         self.filesystem
             .remove_authorized(&logical, remove_directory, &Credentials::effective())
     }
@@ -829,26 +1076,67 @@ impl FilesystemHookRuntime {
             (None, None) => {}
             _ => return Err(io::Error::from_raw_os_error(libc::EXDEV).into()),
         }
+        if let Some(remote) = &self.remote {
+            let remote_from = remote.route_result(&from)?;
+            let remote_to = remote.route_result(&to)?;
+            match (remote_from, remote_to) {
+                (Some(remote_from), Some(remote_to)) => {
+                    self.publish_open_writers(remote_from.logical())?;
+                    match remote.stat(&remote_from) {
+                        Ok(_) => {
+                            remote.rename(&remote_from, &remote_to)?;
+                            self.retarget_open_files(&from, &to);
+                            return Ok(());
+                        }
+                        Err(error) if error_errno(&error) == libc::ENOENT => {
+                            if self.filesystem.exists(&from)? && self.remote_entry_exists(&to)? {
+                                return Err(io::Error::from_raw_os_error(libc::EXDEV).into());
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                (None, None) => {}
+                _ => return Err(io::Error::from_raw_os_error(libc::EXDEV).into()),
+            }
+        }
         let credentials = Credentials::effective();
         self.filesystem
             .rename_authorized(&from, &to, &credentials)?;
-        let open_files = lock(&self.open_files).values().cloned().collect::<Vec<_>>();
-        let open_files = open_files
-            .into_iter()
-            .filter(|open| open.logical() == from)
-            .collect::<Vec<_>>();
-        for open in open_files {
-            open.retarget(&from, &to);
-        }
+        self.retarget_open_files(&from, &to);
         Ok(())
     }
 
-    fn prepare_change_directory(&self, path: *const libc::c_char) -> Result<(CString, PathBuf)> {
+    fn retarget_open_files(&self, from: &Path, to: &Path) {
+        let open_files = lock(&self.open_files).values().cloned().collect::<Vec<_>>();
+        for open in open_files {
+            open.retarget(from, to);
+        }
+    }
+
+    fn prepare_change_directory(
+        &self,
+        path: *const libc::c_char,
+    ) -> Result<(CString, PathBuf, bool)> {
         let requested = unsafe { self.logical_path(path, libc::AT_FDCWD) }?;
         if let Some(native) = self.native_passthrough_path(&requested)? {
             let mapped = CString::new(native.as_os_str().as_bytes())
                 .context("native passthrough path contains NUL")?;
-            return Ok((mapped, native));
+            return Ok((mapped, native, false));
+        }
+        if let Some(remote) = &self.remote
+            && let Some(routed) = remote.route_result(&requested)?
+        {
+            match remote.stat_plan(&routed) {
+                Ok((mapped, _, _, metadata)) => {
+                    if metadata.file_type != crate::nfs::protocol::RemoteFileType::Directory {
+                        return Err(io::Error::from_raw_os_error(libc::ENOTDIR).into());
+                    }
+                    return Ok((mapped, requested, true));
+                }
+                Err(error) if error_errno(&error) == libc::ENOENT => {}
+                Err(error) => return Err(error),
+            }
         }
         let credentials = Credentials::effective();
         let (mapped, logical) = self
@@ -857,23 +1145,112 @@ impl FilesystemHookRuntime {
         self.logical_or_host(&logical)?;
         let mapped = CString::new(mapped.as_os_str().as_bytes())
             .context("mapped filesystem path contains NUL")?;
-        Ok((mapped, logical))
+        Ok((mapped, logical, false))
     }
 
+    fn remote_directory_view(
+        &self,
+        path: *const libc::c_char,
+    ) -> Result<Option<RemoteDirectoryView>> {
+        let logical = unsafe { self.logical_path(path, libc::AT_FDCWD) }?;
+        self.remote_directory_view_for_logical(&logical)
+    }
+
+    fn remote_directory_view_for_logical(
+        &self,
+        logical: &Path,
+    ) -> Result<Option<RemoteDirectoryView>> {
+        let Some(remote) = &self.remote else {
+            return Ok(None);
+        };
+        let Some(routed) = remote.route_result(logical)? else {
+            return Ok(None);
+        };
+        match remote.directory_view(&routed) {
+            Ok(view) => Ok(Some(view)),
+            Err(error) if error_errno(&error) == libc::ENOENT => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn remote_route_root_names(&self, parent: &Path) -> Result<Vec<Vec<u8>>> {
+        self.remote
+            .as_ref()
+            .map_or_else(|| Ok(Vec::new()), |remote| remote.route_root_names(parent))
+    }
+
+    fn descriptor_remote_directory_view(
+        &self,
+        descriptor: libc::c_int,
+    ) -> Result<Option<RemoteDirectoryView>> {
+        let Some(open) = self.tracked_open(descriptor) else {
+            return Ok(None);
+        };
+        let Some(registration) = &open.remote else {
+            return Ok(None);
+        };
+        if lock(&registration.metadata).file_type != crate::nfs::protocol::RemoteFileType::Directory
+        {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR).into());
+        }
+        let remote = self
+            .remote
+            .as_ref()
+            .context("remote filesystem runtime is unavailable")?;
+        let routed = remote
+            .route_result(&open.logical())?
+            .context("remote descriptor is outside configured routes")?;
+        remote.directory_view(&routed).map(Some)
+    }
+
+    #[cfg(test)]
+    fn is_nfs_route(&self, path: &Path) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|remote| remote.route(path).is_some())
+    }
+
+    fn path_exists(&self, path: &Path) -> Result<bool> {
+        if self.remote_entry_exists(path)? {
+            return Ok(true);
+        }
+        self.filesystem.exists(path)
+    }
+
+    #[cfg(test)]
     fn set_current_directory(&self, directory: PathBuf) {
-        *lock(&self.current_directory) = directory;
+        let remote = self.is_nfs_route(&directory);
+        self.set_current_directory_state(directory, remote);
+    }
+
+    fn set_current_directory_state(&self, directory: PathBuf, remote: bool) {
+        *lock(&self.current_directory) = CurrentDirectory {
+            logical: directory,
+            remote,
+        };
     }
 
     fn synchronize_current_directory(&self) -> Result<()> {
         let directory = Self::native_current_directory(&self.filesystem)?;
-        self.set_current_directory(directory);
+        self.set_current_directory_state(directory, false);
         Ok(())
+    }
+
+    fn synchronize_current_directory_for_fts(&self) -> Result<()> {
+        if lock(&self.current_directory).remote {
+            return Ok(());
+        }
+        self.synchronize_current_directory()
     }
 
     fn descriptor_logical_path(&self, descriptor: libc::c_int) -> Option<PathBuf> {
         self.tracked_open(descriptor)
             .map(|open| open.logical())
-            .or_else(|| lock(&self.directory_descriptors).get(&descriptor).cloned())
+            .or_else(|| {
+                lock(&self.directory_descriptors)
+                    .get(&descriptor)
+                    .map(|registration| registration.logical.clone())
+            })
     }
 
     fn resolve_descriptor_logical_path(&self, descriptor: libc::c_int) -> Result<PathBuf> {
@@ -888,8 +1265,9 @@ impl FilesystemHookRuntime {
         }
     }
 
-    fn register_directory(&self, descriptor: libc::c_int, logical: PathBuf) {
-        lock(&self.directory_descriptors).insert(descriptor, logical);
+    fn register_directory(&self, descriptor: libc::c_int, logical: PathBuf, remote: bool) {
+        lock(&self.directory_descriptors)
+            .insert(descriptor, DirectoryDescriptor { logical, remote });
     }
 
     fn unregister_directory(&self, descriptor: libc::c_int) {
@@ -897,12 +1275,25 @@ impl FilesystemHookRuntime {
     }
 
     fn logical_current_directory(&self) -> Result<CString> {
-        let logical = lock(&self.current_directory);
-        CString::new(logical.as_os_str().as_bytes()).context("current directory contains NUL")
+        let current = lock(&self.current_directory);
+        CString::new(current.logical.as_os_str().as_bytes())
+            .context("current directory contains NUL")
     }
 
     unsafe fn canonical_path(&self, path: *const libc::c_char) -> Result<CString> {
         let logical = unsafe { self.logical_path(path, libc::AT_FDCWD) }?;
+        if let Some(remote) = &self.remote
+            && let Some(routed) = remote.route_result(&logical)?
+        {
+            match remote.stat(&routed) {
+                Ok(_) => {
+                    return CString::new(logical.as_os_str().as_bytes())
+                        .context("canonical remote filesystem path contains NUL");
+                }
+                Err(error) if error_errno(&error) == libc::ENOENT => {}
+                Err(error) => return Err(error),
+            }
+        }
         let canonical = self
             .filesystem
             .canonicalize_authorized(&logical, &Credentials::effective())?;
@@ -919,6 +1310,14 @@ impl FilesystemHookRuntime {
         let credentials = Credentials::effective();
         self.filesystem
             .directory_view_authorized(&logical, &credentials)
+    }
+
+    fn local_directory_view_for_remote(&self, logical: &Path) -> Result<Option<DirectoryView>> {
+        match self.filesystem.directory_view(logical) {
+            Ok(view) => Ok(Some(view)),
+            Err(error) if matches!(error_errno(&error), libc::ENOENT | libc::ENOTDIR) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn descriptor_directory_view(
@@ -946,24 +1345,21 @@ impl FilesystemHookRuntime {
         }
         Ok((self.filesystem.directory_view(&logical)?, layer))
     }
-}
 
-fn normalize_absolute(path: &Path) -> Result<PathBuf> {
-    if !path.is_absolute() {
-        bail!("filesystem path is not absolute: {}", path.display());
-    }
-    let mut normalized = PathBuf::from("/");
-    for component in path.components() {
-        match component {
-            Component::RootDir | Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(value) => normalized.push(value),
-            Component::Prefix(_) => bail!("unsupported filesystem path: {}", path.display()),
+    fn remote_entry_exists(&self, logical: &Path) -> Result<bool> {
+        let Some(remote) = &self.remote else {
+            return Ok(false);
+        };
+        let Some(routed) = remote.route_result(logical)? else {
+            return Ok(false);
+        };
+        self.publish_open_writers(routed.logical())?;
+        match remote.stat(&routed) {
+            Ok(_) => Ok(true),
+            Err(error) if error_errno(&error) == libc::ENOENT => Ok(false),
+            Err(error) => Err(error),
         }
     }
-    Ok(normalized)
 }
 
 fn native_operation_result(result: libc::c_int) -> Result<()> {
@@ -975,7 +1371,14 @@ fn native_operation_result(result: libc::c_int) -> Result<()> {
 }
 
 pub(super) fn tracked_current_directory() -> Option<PathBuf> {
-    FilesystemHookRuntime::global().map(|runtime| lock(&runtime.current_directory).clone())
+    FilesystemHookRuntime::global().map(|runtime| lock(&runtime.current_directory).logical.clone())
+}
+
+pub(super) fn tracked_remote_current_directory() -> Option<PathBuf> {
+    FilesystemHookRuntime::global().and_then(|runtime| {
+        let current = lock(&runtime.current_directory);
+        current.remote.then(|| current.logical.clone())
+    })
 }
 
 pub(super) fn flush_before_exec() -> Result<()> {
@@ -1085,6 +1488,7 @@ mod descriptor;
 mod directory;
 mod metadata;
 mod namespace;
+mod nfs;
 mod open;
 mod unsupported;
 
