@@ -85,6 +85,12 @@ After editing:
 - Report commands run and any failures honestly.
 - Report spec consistency status in the final response.
 
+## Explicit Verification Override
+
+- If the user explicitly requests that checks or verification be skipped for the current task, do not run formatting, tests, Clippy, coverage, `spec-check`, or other verification commands.
+- Still inspect changes for secrets and unsafe artifacts before committing, do not bypass Git hooks, and report that verification was skipped at the user's request.
+- For commit requests, perform only the necessary Git operations to inspect changes for safety, stage, commit, and push when authorized. Do not run formatting, builds, tests, Clippy, coverage, benchmarks, reproductions, cleanup, or other unrelated actions unless the user explicitly requests them.
+
 ## Test Coverage
 
 - Maintain at least 90% line coverage across the Rust workspace.
