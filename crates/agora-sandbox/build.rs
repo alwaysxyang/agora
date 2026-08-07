@@ -93,6 +93,7 @@ fn build_hook_dylib() -> Result<PathBuf> {
             "--",
             "--cfg",
             HOOK_CFG,
+            "-Clink-arg=-Wl,-adhoc_codesign",
         ])
         .env(INNER_BUILD, "1")
         .current_dir(&manifest_directory)
