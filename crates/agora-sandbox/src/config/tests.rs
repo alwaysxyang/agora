@@ -1,5 +1,6 @@
 use super::*;
 use agora_sandbox::runner::FilesystemMode;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 fn write_config(root: &Path, contents: &str) -> PathBuf {
@@ -152,7 +153,7 @@ fn config_rejects_malformed_smb_uris() {
 }
 
 #[test]
-fn config_file_must_be_owner_only_and_not_a_symlink() {
+fn config_file_accepts_normal_permissions_but_not_a_symlink() {
     let root = tempfile::tempdir().unwrap();
     let path = write_config(
         root.path(),
@@ -163,13 +164,21 @@ fn config_file_must_be_owner_only_and_not_a_symlink() {
         }"#,
     );
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(load_error(&path).contains("permissions"));
+    assert!(RunConfig::load(&path).is_ok());
 
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(load_error(&path).contains("permissions"));
+    assert!(RunConfig::load(&path).is_ok());
 
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let link = root.path().join("sandbox-link.json");
     symlink(&path, &link).unwrap();
-    assert!(load_error(&link).contains("symbolic link"));
+    assert!(load_error(&link).contains("failed to open sandbox config"));
+
+    assert!(load_error(root.path()).contains("not a regular file"));
+    let fifo = root.path().join("sandbox.fifo");
+    let fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    assert!(
+        load_error(Path::new(std::ffi::OsStr::from_bytes(fifo.as_bytes())))
+            .contains("not a regular file")
+    );
 }

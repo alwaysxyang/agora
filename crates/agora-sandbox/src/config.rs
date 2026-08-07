@@ -225,41 +225,18 @@ fn resolve_path(directory: &Path, path: &Path) -> Result<PathBuf> {
 }
 
 fn open_config(path: &Path) -> Result<File> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
 
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect sandbox config {}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        bail!(
-            "sandbox config cannot be a symbolic link: {}",
-            path.display()
-        );
-    }
-    if !metadata.is_file() {
-        bail!("sandbox config is not a regular file: {}", path.display());
-    }
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
-            "sandbox config is not owned by the current user: {}",
-            path.display()
-        );
-    }
-    if metadata.permissions().mode() & 0o7177 != 0 {
-        bail!(
-            "sandbox config permissions must be no broader than 0600: {}",
-            path.display()
-        );
-    }
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .with_context(|| format!("failed to open sandbox config {}", path.display()))?;
-    let opened = file
+    let metadata = file
         .metadata()
         .with_context(|| format!("failed to verify sandbox config {}", path.display()))?;
-    if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
-        bail!("sandbox config changed while opening: {}", path.display());
+    if !metadata.is_file() {
+        bail!("sandbox config is not a regular file: {}", path.display());
     }
     Ok(file)
 }
