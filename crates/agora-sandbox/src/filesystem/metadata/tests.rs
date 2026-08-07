@@ -46,7 +46,7 @@ fn metadata_store_reports_an_unreadable_marker() {
     let directory = Path::new("/restricted");
     store.ensure_marker(directory).unwrap();
     let marker = store.path(directory).unwrap();
-    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o0)).unwrap();
     store.invalidate().unwrap();
 
     let error = store.state(&directory.join("entry")).unwrap_err();
@@ -70,7 +70,7 @@ fn metadata_store_reports_an_inaccessible_marker_ancestor() {
     let store = MetadataStore::new(&root).unwrap();
     let blocked = root.join("blocked");
     std::fs::create_dir(&blocked).unwrap();
-    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o0)).unwrap();
     let directory = Path::new("/blocked/child");
 
     let ensure_error = store.ensure_marker(directory).unwrap_err();

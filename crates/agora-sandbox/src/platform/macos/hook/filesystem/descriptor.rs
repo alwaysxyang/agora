@@ -1,3 +1,4 @@
+use super::super::abi::{darwin_close, darwin_close_nocancel};
 use super::*;
 
 type CloseFn = unsafe extern "C" fn(libc::c_int) -> libc::c_int;
@@ -162,9 +163,9 @@ descriptor_filesystem_hook!(
     (descriptor, length)
 );
 
-unsafe fn sandbox_close(descriptor: libc::c_int) -> libc::c_int {
+unsafe fn sandbox_close(descriptor: libc::c_int, original: Option<CloseFn>) -> libc::c_int {
     catch_filesystem_panic(-1, || {
-        let Some(original) = original_close() else {
+        let Some(original) = original else {
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
@@ -205,7 +206,12 @@ unsafe fn sandbox_close(descriptor: libc::c_int) -> libc::c_int {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn agora_sandbox_close(descriptor: libc::c_int) -> libc::c_int {
-    unsafe { sandbox_close(descriptor) }
+    unsafe { sandbox_close(descriptor, original_close()) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_close_nocancel(descriptor: libc::c_int) -> libc::c_int {
+    unsafe { sandbox_close(descriptor, original_close_nocancel()) }
 }
 
 unsafe fn sandbox_fclose(stream: *mut libc::FILE) -> libc::c_int {
@@ -419,6 +425,10 @@ pub(super) fn original_close() -> Option<CloseFn> {
     function_from_interpose(&INTERPOSE_CLOSE)
 }
 
+fn original_close_nocancel() -> Option<CloseFn> {
+    function_from_interpose(&INTERPOSE_CLOSE_NOCANCEL)
+}
+
 pub(super) fn original_fclose() -> Option<FcloseFn> {
     function_from_interpose(&INTERPOSE_FCLOSE)
 }
@@ -451,7 +461,13 @@ dyld_interpose!(
     libc::ftruncate
 );
 
-dyld_interpose!(INTERPOSE_CLOSE, agora_sandbox_close, libc::close);
+dyld_interpose!(INTERPOSE_CLOSE, agora_sandbox_close, darwin_close);
+
+dyld_interpose!(
+    INTERPOSE_CLOSE_NOCANCEL,
+    agora_sandbox_close_nocancel,
+    darwin_close_nocancel
+);
 
 dyld_interpose!(INTERPOSE_FCLOSE, agora_sandbox_fclose, libc::fclose);
 

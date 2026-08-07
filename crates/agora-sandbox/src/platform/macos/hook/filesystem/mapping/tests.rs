@@ -160,15 +160,10 @@ fn mapping_hooks_report_overflow_before_touching_native_memory() {
         assert_eq!(agora_sandbox_mprotect(address, 2, libc::PROT_READ), -1);
         assert_eq!(*libc::__error(), libc::EOVERFLOW);
 
-        assert_eq!(
-            agora_sandbox_msync(1_usize as *mut _, 4096, libc::MS_SYNC),
-            -1
-        );
-        assert_eq!(agora_sandbox_munmap(1_usize as *mut _, 4096), -1);
-        assert_eq!(
-            agora_sandbox_mprotect(1_usize as *mut _, 4096, libc::PROT_READ),
-            -1
-        );
+        let dangling = std::ptr::dangling_mut::<libc::c_void>();
+        assert_eq!(agora_sandbox_msync(dangling, 4096, libc::MS_SYNC), -1);
+        assert_eq!(agora_sandbox_munmap(dangling, 4096), -1);
+        assert_eq!(agora_sandbox_mprotect(dangling, 4096, libc::PROT_READ), -1);
     });
 }
 

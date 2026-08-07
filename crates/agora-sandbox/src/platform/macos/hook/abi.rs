@@ -26,6 +26,12 @@ pub(super) type FtsCompareFn =
     unsafe extern "C" fn(*const *const DarwinFtsEntry, *const *const DarwinFtsEntry) -> libc::c_int;
 
 unsafe extern "C" {
+    #[link_name = "close"]
+    pub(super) fn darwin_close(descriptor: libc::c_int) -> libc::c_int;
+
+    #[link_name = "close$NOCANCEL"]
+    pub(super) fn darwin_close_nocancel(descriptor: libc::c_int) -> libc::c_int;
+
     #[cfg_attr(target_arch = "x86_64", link_name = "fts_children$INODE64")]
     #[cfg_attr(not(target_arch = "x86_64"), link_name = "fts_children")]
     pub(super) fn darwin_fts_children(

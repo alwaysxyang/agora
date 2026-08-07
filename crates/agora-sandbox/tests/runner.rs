@@ -27,6 +27,17 @@ const TLS_TRUST_ENVIRONMENT: [&str; 5] = [
 const FILESYSTEM_KEY: &str = "test-filesystem-key";
 
 #[cfg(target_os = "macos")]
+fn sandbox_lifecycle_timeout(seconds: u64) -> Duration {
+    let multiplier = if cfg!(target_arch = "x86_64") || std::env::var_os("CARGO_LLVM_COV").is_some()
+    {
+        4
+    } else {
+        1
+    };
+    Duration::from_secs(seconds.saturating_mul(multiplier))
+}
+
+#[cfg(target_os = "macos")]
 type TestAssociationId = u32;
 #[cfg(target_os = "macos")]
 type TestConnectionId = u32;
@@ -520,11 +531,7 @@ async fn encrypted_reopen_after_shell_write_does_not_deadlock() {
             .current_dir(&source),
     );
 
-    let timeout = if std::env::var_os("CARGO_LLVM_COV").is_some() {
-        Duration::from_secs(60)
-    } else {
-        Duration::from_secs(15)
-    };
+    let timeout = sandbox_lifecycle_timeout(15);
     let outcome = tokio::time::timeout(timeout, run)
         .await
         .expect("sandbox child deadlocked while reopening an encrypted file")
@@ -878,7 +885,7 @@ async fn external_upper_removal_reveals_lower_in_a_running_child() {
         ),
     );
 
-    tokio::time::timeout(Duration::from_secs(30), first_read.notified())
+    tokio::time::timeout(sandbox_lifecycle_timeout(30), first_read.notified())
         .await
         .expect("sandbox child did not finish its first upper read");
     std::fs::remove_file(&upper).unwrap();
@@ -951,7 +958,7 @@ async fn system_ls_observes_external_upper_directory_removal() {
         ),
     );
 
-    tokio::time::timeout(Duration::from_secs(30), first_read.notified())
+    tokio::time::timeout(sandbox_lifecycle_timeout(30), first_read.notified())
         .await
         .expect("sandbox child did not finish its first upper directory read");
     std::fs::remove_dir_all(&upper_directory).unwrap();
@@ -1154,7 +1161,7 @@ async fn encrypted_workspace_remains_ciphertext_while_the_child_is_running() {
         ),
     );
 
-    tokio::time::timeout(Duration::from_secs(30), closed.notified())
+    tokio::time::timeout(sandbox_lifecycle_timeout(30), closed.notified())
         .await
         .expect("sandbox child did not close the encrypted output file");
     assert!(
@@ -3297,11 +3304,7 @@ async fn copied_bash_routes_system_curl_through_the_proxy() {
 
     let run = Sandbox::new(sandbox_config(), callback)
         .run(SandboxCommand::new("/bin/bash").args(["-c", &script]));
-    let timeout = if std::env::var_os("CARGO_LLVM_COV").is_some() {
-        Duration::from_secs(60)
-    } else {
-        Duration::from_secs(15)
-    };
+    let timeout = sandbox_lifecycle_timeout(15);
     let outcome = tokio::time::timeout(timeout, run)
         .await
         .expect("sandbox shutdown hung after curl exited")

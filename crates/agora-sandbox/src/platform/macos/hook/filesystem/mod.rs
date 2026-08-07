@@ -35,6 +35,7 @@ const MAX_INHERITED_LOCAL_DESCRIPTORS: usize = 256;
 thread_local! {
     static INSIDE_FILESYSTEM_HOOK: Cell<bool> = const { Cell::new(false) };
     static INITIALIZING_FILESYSTEM_RUNTIME: Cell<bool> = const { Cell::new(false) };
+    static FORK_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
     #[cfg(test)]
     static TEST_FILESYSTEM_RUNTIME: Cell<*const FilesystemHookRuntime> = const { Cell::new(std::ptr::null()) };
 }
@@ -53,6 +54,7 @@ pub(super) fn initialize_process() {
 }
 
 unsafe extern "C" fn lock_filesystem_before_fork() {
+    FORK_IN_PROGRESS.with(|forking| forking.set(true));
     unsafe {
         libc::pthread_rwlock_wrlock(&raw mut FILESYSTEM_FORK_BARRIER);
     }
@@ -62,6 +64,7 @@ unsafe extern "C" fn unlock_filesystem_after_fork() {
     unsafe {
         libc::pthread_rwlock_unlock(&raw mut FILESYSTEM_FORK_BARRIER);
     }
+    FORK_IN_PROGRESS.with(|forking| forking.set(false));
 }
 
 unsafe extern "C" fn reset_filesystem_after_fork() {
@@ -71,6 +74,7 @@ unsafe extern "C" fn reset_filesystem_after_fork() {
             libc::PTHREAD_RWLOCK_INITIALIZER,
         );
     }
+    FORK_IN_PROGRESS.with(|forking| forking.set(false));
 }
 
 struct FilesystemHookGuard;
@@ -78,6 +82,9 @@ struct FilesystemHookGuard;
 impl FilesystemHookGuard {
     fn enter() -> Option<Self> {
         if !super::initialized() && !test_runtime_is_set() {
+            return None;
+        }
+        if FORK_IN_PROGRESS.with(|forking| forking.get()) {
             return None;
         }
         let entered = INSIDE_FILESYSTEM_HOOK.with(|inside| !inside.replace(true));
