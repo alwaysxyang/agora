@@ -140,6 +140,54 @@ fn encrypted_hook_configuration_reuses_derived_cipher_key_material() {
 }
 
 #[test]
+fn hook_configuration_exposes_local_broker_and_runtime_accessors() {
+    let values = HashMap::from([
+        ("AGORA_SANDBOX_TOKEN", "token"),
+        ("AGORA_SANDBOX_PROXY_IPV4", "127.0.0.1:41000"),
+        ("AGORA_SANDBOX_PROXY_IPV6", "[::1]:41001"),
+        ("AGORA_SANDBOX_EXECUTION_CONTROL", "127.0.0.1:41002"),
+        ("AGORA_SANDBOX_EXECUTION_TOKEN", "execution-token"),
+        ("AGORA_SANDBOX_AUDIT_CONTROL", "127.0.0.1:41003"),
+        ("AGORA_SANDBOX_AUDIT_TOKEN", "audit-token"),
+        ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
+        ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs"),
+        ("AGORA_SANDBOX_FILESYSTEM_MODE", "plain"),
+        ("AGORA_SANDBOX_LOCAL_FILESYSTEM_CONTROL", "/tmp/local.sock"),
+        ("AGORA_SANDBOX_LOCAL_FILESYSTEM_TOKEN", "local-token"),
+        ("AGORA_SANDBOX_TRACE_ID", "trace-root"),
+    ]);
+
+    let config = HookConfig::from_getter(|key| values.get(key).map(ToString::to_string)).unwrap();
+
+    assert_eq!(config.token(), "token");
+    assert_eq!(
+        config.execution_control(),
+        "127.0.0.1:41002".parse().unwrap()
+    );
+    assert_eq!(config.execution_token(), "execution-token");
+    assert_eq!(config.hook_libraries(), "/tmp/hook.dylib");
+    assert_eq!(config.filesystem_root(), "/tmp/agora-fs");
+    assert_eq!(
+        config.local_filesystem(),
+        Some(("/tmp/local.sock", "local-token"))
+    );
+    assert_eq!(config.remote_filesystem(), None);
+    assert_eq!(config.remote_current_directory(), None);
+    assert_eq!(config.trace().encode(), "trace-root");
+    assert!(!config.is_internal("127.0.0.1:42000".parse().unwrap()));
+    for (key, value) in [
+        ("AGORA_SANDBOX_LOCAL_FILESYSTEM_CONTROL", "/tmp/local.sock"),
+        ("AGORA_SANDBOX_LOCAL_FILESYSTEM_TOKEN", "local-token"),
+    ] {
+        assert!(
+            config
+                .child_environment()
+                .contains(&(key, value.to_string()))
+        );
+    }
+}
+
+#[test]
 fn hook_configuration_validates_and_propagates_remote_broker_values() {
     let routes = r#"[{"root":0,"logical_root":"/remote"}]"#;
     let values = HashMap::from([
@@ -275,6 +323,34 @@ fn hook_configuration_rejects_invalid_or_non_loopback_proxy_addresses() {
             .contains("invalid AGORA_SANDBOX_PROXY_IPV6")
     );
     assert!(
+        parse(&[("AGORA_SANDBOX_EXECUTION_CONTROL", "invalid")])
+            .unwrap_err()
+            .contains("invalid AGORA_SANDBOX_EXECUTION_CONTROL")
+    );
+    assert!(
+        parse(&[("AGORA_SANDBOX_EXECUTION_TOKEN", "")])
+            .unwrap_err()
+            .contains("AGORA_SANDBOX_EXECUTION_TOKEN")
+    );
+    assert!(
+        parse(&[("AGORA_SANDBOX_AUDIT_CONTROL", "invalid")])
+            .unwrap_err()
+            .contains("invalid AGORA_SANDBOX_AUDIT_CONTROL")
+    );
+    for key in [
+        "AGORA_SANDBOX_AUDIT_TOKEN",
+        "AGORA_SANDBOX_HOOK_LIBRARIES",
+        "AGORA_SANDBOX_FILESYSTEM_ROOT",
+        "AGORA_SANDBOX_FILESYSTEM_MODE",
+    ] {
+        assert!(parse(&[(key, "")]).unwrap_err().contains(key));
+    }
+    assert!(
+        parse(&[("AGORA_SANDBOX_TRACE_ID", "invalid trace")])
+            .unwrap_err()
+            .contains("invalid AGORA_SANDBOX_TRACE_ID")
+    );
+    assert!(
         parse(&[("AGORA_SANDBOX_PROXY_IPV4", "203.0.113.1:80")])
             .unwrap_err()
             .contains("IPv4 loopback")
@@ -304,6 +380,106 @@ fn hook_configuration_rejects_invalid_or_non_loopback_proxy_addresses() {
             .unwrap_err()
             .contains("IPv4 loopback")
     );
+}
+
+#[test]
+fn hook_configuration_rejects_inconsistent_filesystem_and_broker_values() {
+    let valid = HashMap::from([
+        ("AGORA_SANDBOX_TOKEN", "token"),
+        ("AGORA_SANDBOX_PROXY_IPV4", "127.0.0.1:41000"),
+        ("AGORA_SANDBOX_PROXY_IPV6", "[::1]:41001"),
+        ("AGORA_SANDBOX_EXECUTION_CONTROL", "127.0.0.1:41002"),
+        ("AGORA_SANDBOX_EXECUTION_TOKEN", "execution-token"),
+        ("AGORA_SANDBOX_AUDIT_CONTROL", "127.0.0.1:41003"),
+        ("AGORA_SANDBOX_AUDIT_TOKEN", "audit-token"),
+        ("AGORA_SANDBOX_HOOK_LIBRARIES", "/tmp/hook.dylib"),
+        ("AGORA_SANDBOX_FILESYSTEM_ROOT", "/tmp/agora-fs"),
+        ("AGORA_SANDBOX_FILESYSTEM_MODE", "plain"),
+        ("AGORA_SANDBOX_TRACE_ID", "trace-root"),
+    ]);
+    let parse = |overrides: &[(&str, Option<&str>)]| {
+        HookConfig::from_getter(|key| {
+            overrides
+                .iter()
+                .find_map(|(name, value)| (*name == key).then(|| value.map(str::to_string)))
+                .flatten()
+                .or_else(|| {
+                    (!overrides.iter().any(|(name, _)| *name == key))
+                        .then(|| valid.get(key).map(ToString::to_string))
+                        .flatten()
+                })
+        })
+    };
+
+    for (overrides, expected) in [
+        (
+            vec![("AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY", Some("key"))],
+            "plain filesystem mode cannot include a cipher key",
+        ),
+        (
+            vec![("AGORA_SANDBOX_FILESYSTEM_MODE", Some("encrypted"))],
+            "encrypted filesystem mode requires a cipher key",
+        ),
+        (
+            vec![("AGORA_SANDBOX_FILESYSTEM_MODE", Some("unknown"))],
+            "invalid AGORA_SANDBOX_FILESYSTEM_MODE",
+        ),
+        (
+            vec![
+                ("AGORA_SANDBOX_FILESYSTEM_MODE", Some("encrypted")),
+                ("AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY", Some("%%%")),
+            ],
+            "invalid AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY",
+        ),
+        (
+            vec![
+                ("AGORA_SANDBOX_FILESYSTEM_MODE", Some("encrypted")),
+                ("AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY", Some("AA==")),
+            ],
+            "invalid encrypted filesystem configuration",
+        ),
+        (
+            vec![("AGORA_SANDBOX_LOCAL_FILESYSTEM_CONTROL", Some("relative"))],
+            "local filesystem requires control and token together",
+        ),
+        (
+            vec![
+                ("AGORA_SANDBOX_LOCAL_FILESYSTEM_CONTROL", Some("relative")),
+                ("AGORA_SANDBOX_LOCAL_FILESYSTEM_TOKEN", Some("token")),
+            ],
+            "AGORA_SANDBOX_LOCAL_FILESYSTEM_CONTROL must be an absolute path",
+        ),
+        (
+            vec![
+                ("AGORA_SANDBOX_REMOTE_CONTROL", Some("relative")),
+                ("AGORA_SANDBOX_REMOTE_TOKEN", Some("token")),
+                ("AGORA_SANDBOX_REMOTE_ROOTS", Some("[]")),
+            ],
+            "AGORA_SANDBOX_REMOTE_CONTROL must be an absolute path",
+        ),
+        (
+            vec![
+                ("AGORA_SANDBOX_REMOTE_CONTROL", Some("/tmp/remote.sock")),
+                ("AGORA_SANDBOX_REMOTE_TOKEN", Some("token")),
+                ("AGORA_SANDBOX_REMOTE_ROOTS", Some("not-json")),
+            ],
+            "invalid AGORA_SANDBOX_REMOTE_ROOTS",
+        ),
+        (
+            vec![
+                ("AGORA_SANDBOX_REMOTE_CONTROL", Some("/tmp/remote.sock")),
+                ("AGORA_SANDBOX_REMOTE_TOKEN", Some("token")),
+                ("AGORA_SANDBOX_REMOTE_ROOTS", Some("[]")),
+            ],
+            "AGORA_SANDBOX_REMOTE_ROOTS cannot be empty",
+        ),
+    ] {
+        let error = parse(&overrides).unwrap_err();
+        assert!(
+            error.contains(expected),
+            "{error:?} did not contain {expected:?}"
+        );
+    }
 }
 
 #[test]

@@ -1,6 +1,7 @@
 use super::super::FilesystemHookRuntime;
-use super::{RemoteAnchor, RemoteFilesystem};
-use crate::nfs::protocol::RemoteRoute;
+use super::{RemoteAnchor, RemoteFilesystem, RemoteOpen, validate_entries};
+use crate::nfs::client::RemoteClient;
+use crate::nfs::protocol::{RemoteEntry, RemoteFileType, RemoteMetadata, RemoteRoute};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,23 @@ fn filesystem() -> RemoteFilesystem {
         ],
     )
     .unwrap()
+}
+
+fn metadata(file_type: RemoteFileType) -> RemoteMetadata {
+    RemoteMetadata {
+        file_type,
+        size: 1,
+        modified_seconds: 2,
+        modified_nanoseconds: 3,
+        identity: "identity".to_string(),
+    }
+}
+
+fn errno(error: &anyhow::Error) -> Option<libc::c_int> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::raw_os_error)
 }
 
 #[test]
@@ -65,6 +83,106 @@ fn remote_routes_reject_invalid_roots_and_non_utf8_children() {
     let filesystem = filesystem();
     let invalid = PathBuf::from("/remote/team").join(std::ffi::OsString::from_vec(vec![0xff]));
     assert!(filesystem.route_result(&invalid).is_err());
+}
+
+#[test]
+fn remote_filesystem_configuration_rejects_incomplete_and_overlapping_routes() {
+    let route = || RemoteRoute {
+        root: 0,
+        logical_root: "/remote".to_string(),
+    };
+    assert!(RemoteFilesystem::new("relative.sock", "token", vec![route()]).is_err());
+    assert!(RemoteFilesystem::new("/tmp/remote.sock", "", vec![route()]).is_err());
+    assert!(RemoteFilesystem::new("/tmp/remote.sock", "token", Vec::new()).is_err());
+    assert!(RemoteFilesystem::new("/", "token", vec![route()]).is_err());
+    assert!(
+        RemoteFilesystem::new(
+            "/tmp/remote.sock",
+            "token",
+            vec![
+                route(),
+                RemoteRoute {
+                    root: 1,
+                    logical_root: "/remote/team".to_string(),
+                },
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        RemoteFilesystem::new(
+            "/tmp/remote.sock",
+            "token",
+            vec![RemoteRoute {
+                root: 0,
+                logical_root: "/remote/../escape".to_string(),
+            }],
+        )
+        .is_err()
+    );
+    assert!(RemoteFilesystem::from_json("/tmp/remote.sock", "token", "not-json").is_err());
+}
+
+#[test]
+fn remote_routes_reject_relative_requests_cross_root_renames_and_invalid_entries() {
+    let filesystem = filesystem();
+    assert!(filesystem.route_result(Path::new("relative")).is_err());
+
+    let from = filesystem.route(Path::new("/remote/team/from")).unwrap();
+    let to = filesystem.route(Path::new("/archive/to")).unwrap();
+    assert_eq!(
+        errno(&filesystem.rename(&from, &to).unwrap_err()),
+        Some(libc::EXDEV)
+    );
+
+    for name in ["", ".", "..", "nested/name", "back\\slash", "nul\0name"] {
+        assert!(
+            validate_entries(vec![RemoteEntry {
+                name: name.to_string(),
+                metadata: metadata(RemoteFileType::File),
+            }])
+            .is_err(),
+            "entry {name:?} should be rejected"
+        );
+    }
+    let duplicate = RemoteEntry {
+        name: "duplicate".to_string(),
+        metadata: metadata(RemoteFileType::File),
+    };
+    assert!(validate_entries(vec![duplicate.clone(), duplicate]).is_err());
+}
+
+#[test]
+fn remote_metadata_rejects_invalid_anchors_and_exposes_mutable_open_targets() {
+    let filesystem = filesystem();
+    for anchor in ["../anchor", "nested/anchor", "/absolute"] {
+        assert!(
+            filesystem
+                .metadata_plan(anchor, &metadata(RemoteFileType::File))
+                .is_err()
+        );
+    }
+    assert_eq!(
+        filesystem
+            .restore_current_directory(Path::new(""), Path::new("/remote/team"))
+            .unwrap(),
+        None
+    );
+
+    let mut open = RemoteOpen {
+        client: RemoteClient::new("/tmp/missing-remote.sock", "token"),
+        target: Some(super::super::OpenTarget::Descriptor(
+            tempfile::tempfile().unwrap(),
+        )),
+        handle: None,
+        metadata: metadata(RemoteFileType::File),
+        writable: false,
+    };
+    assert!(matches!(
+        open.target_mut(),
+        super::super::OpenTarget::Descriptor(_)
+    ));
+    assert!(open.commit().is_err());
 }
 
 #[test]

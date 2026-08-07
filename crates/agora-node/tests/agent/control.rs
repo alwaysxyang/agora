@@ -1,6 +1,15 @@
 use super::*;
 
 #[cfg(unix)]
+fn process_test_timeout() -> std::time::Duration {
+    if std::env::var_os("CARGO_LLVM_COV").is_some() {
+        std::time::Duration::from_secs(60)
+    } else {
+        std::time::Duration::from_secs(10)
+    }
+}
+
+#[cfg(unix)]
 struct StartSignalOutput {
     started: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -20,7 +29,7 @@ impl AgentOutput for StartSignalOutput {
 async fn configured_agent_run_owns_its_cancellation() {
     use std::os::unix::fs::PermissionsExt;
 
-    const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let test_timeout = process_test_timeout();
 
     let temp = tempfile::tempdir().unwrap();
     let script = temp.path().join("slow-agent");
@@ -44,7 +53,7 @@ async fn configured_agent_run_owns_its_cancellation() {
     });
 
     tokio::select! {
-        started = tokio::time::timeout(TEST_TIMEOUT, started_rx) => {
+        started = tokio::time::timeout(test_timeout, started_rx) => {
             started
                 .expect("agent command did not produce startup output before the timeout")
                 .expect("agent command stopped before producing startup output");
@@ -56,7 +65,7 @@ async fn configured_agent_run_owns_its_cancellation() {
     assert!(stop.stop());
 
     assert_eq!(
-        tokio::time::timeout(TEST_TIMEOUT, run)
+        tokio::time::timeout(test_timeout, run)
             .await
             .expect("agent run did not stop before the timeout")
             .expect("agent run task failed")
@@ -70,7 +79,7 @@ async fn configured_agent_run_owns_its_cancellation() {
 async fn configured_agent_cancellation_stops_descendant_processes() {
     use std::os::unix::fs::PermissionsExt;
 
-    const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let test_timeout = process_test_timeout();
 
     let temp = tempfile::tempdir().unwrap();
     let descendant_pid = temp.path().join("descendant.pid");
@@ -101,7 +110,7 @@ async fn configured_agent_cancellation_stops_descendant_processes() {
             .await
     });
 
-    tokio::time::timeout(TEST_TIMEOUT, started_rx)
+    tokio::time::timeout(test_timeout, started_rx)
         .await
         .expect("agent command did not produce startup output before the timeout")
         .expect("agent command stopped before producing startup output");
@@ -112,7 +121,7 @@ async fn configured_agent_cancellation_stops_descendant_processes() {
         .unwrap();
     assert!(stop.stop());
     assert_eq!(
-        tokio::time::timeout(TEST_TIMEOUT, run)
+        tokio::time::timeout(test_timeout, run)
             .await
             .expect("agent run did not stop before the timeout")
             .expect("agent run task failed")
@@ -120,7 +129,7 @@ async fn configured_agent_cancellation_stops_descendant_processes() {
         AgentRunOutcome::Cancelled(AgentRunCancellation::Stopped)
     );
 
-    let descendant_stopped = tokio::time::timeout(TEST_TIMEOUT, async {
+    let descendant_stopped = tokio::time::timeout(test_timeout, async {
         loop {
             if unsafe { libc::kill(descendant_pid as libc::pid_t, 0) } == -1 {
                 break;
@@ -141,7 +150,7 @@ async fn configured_agent_cancellation_stops_descendant_processes() {
 async fn configured_agent_does_not_wait_for_descendant_pipe_eof() {
     use std::os::unix::fs::PermissionsExt;
 
-    const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let test_timeout = process_test_timeout();
 
     let temp = tempfile::tempdir().unwrap();
     let descendant_pid = temp.path().join("descendant.pid");
@@ -168,7 +177,7 @@ async fn configured_agent_does_not_wait_for_descendant_pipe_eof() {
         &mut output,
     );
 
-    let outcome = tokio::time::timeout(TEST_TIMEOUT, run).await;
+    let outcome = tokio::time::timeout(test_timeout, run).await;
     if outcome.is_err()
         && let Ok(descendant_pid) = std::fs::read_to_string(&descendant_pid)
         && let Ok(descendant_pid) = descendant_pid.trim().parse::<libc::pid_t>()

@@ -1,7 +1,7 @@
 use super::super::protocol::{
     AuditEventRequest, AuditResponse, decode_request, encode_response, frame_length,
 };
-use super::{AuditClient, AuditError, io};
+use super::{AuditClient, AuditConnection, AuditError, CONNECTIONS, io};
 use crate::callback::{FileAccessMode, FileContext, FileOpenMode, ProcessContext};
 use std::cell::RefCell;
 use std::io::{Read, Write};
@@ -111,6 +111,48 @@ fn audit_client_reuses_one_connection_for_multiple_events() {
     client.publish(file_request("/second")).unwrap();
 
     assert_eq!(server.join().unwrap(), 1);
+}
+
+#[test]
+fn audit_client_replaces_a_connection_cached_by_another_process() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let stale_stream = TcpStream::connect(address).unwrap();
+    drop(listener.accept().unwrap());
+    let client = AuditClient::new(address, "token");
+    CONNECTIONS.with(|connections| {
+        connections.borrow_mut().insert(
+            client.endpoint.clone(),
+            AuditConnection {
+                pid: std::process::id().wrapping_add(1),
+                stream: stale_stream,
+            },
+        );
+    });
+    let server = std::thread::spawn(move || drop(accept_request(&listener).unwrap()));
+
+    client.publish(file_request("/after-fork")).unwrap();
+
+    server.join().unwrap();
+    CONNECTIONS.with(|connections| connections.borrow_mut().clear());
+}
+
+#[test]
+fn audit_client_discards_a_connection_after_the_peer_disconnects() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream).unwrap();
+    });
+    let client = AuditClient::new(address, "token");
+
+    assert!(client.publish(file_request("/disconnected")).is_err());
+    CONNECTIONS.with(|connections| {
+        assert!(!connections.borrow().contains_key(&client.endpoint));
+    });
+
+    server.join().unwrap();
 }
 
 #[test]

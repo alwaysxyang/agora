@@ -159,6 +159,81 @@ fn node_config_generate_builds_a_lark_config_with_detected_codex_default() {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn node_config_generate_supports_the_interactive_terminal_flow() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let output_dir = tempfile::tempdir().unwrap();
+    let executable_dir = tempfile::tempdir().unwrap();
+    let codex = executable_dir.path().join("codex");
+    std::fs::write(&codex, "#!/bin/sh\n").unwrap();
+    let mut permissions = std::fs::metadata(&codex).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&codex, permissions).unwrap();
+    let config_path = output_dir.path().join("interactive.json");
+
+    let mut child = std::process::Command::new("/usr/bin/script")
+        .arg("-q")
+        .arg("/dev/null")
+        .arg(env!("CARGO_BIN_EXE_agora-node"))
+        .arg("config")
+        .arg("-g")
+        .arg(&config_path)
+        .current_dir(workspace.path())
+        .env("PATH", executable_dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || {
+        for answer in ["\r", "app-id\r", "secret\r", "\r", "\r", "gpt-5\r", "\r"] {
+            input.write_all(answer.as_bytes()).unwrap();
+            input.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("interactive config generation did not exit before the deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    writer.join().unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.windows(2).any(|window| window == b"\x1b["));
+    let config: NodeConfig = serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    let ChannelConfig::Lark(channel) = &config.channels[0] else {
+        panic!("generated channel should be Lark");
+    };
+    assert_eq!(channel.app_id, "app-id");
+    assert_eq!(channel.secret, "secret");
+    assert_generated_agent(
+        &config,
+        workspace.path(),
+        "lark",
+        &codex.to_string_lossy(),
+        "gpt-5",
+        "high",
+    );
+}
+
 #[test]
 fn node_config_generate_overwrites_an_existing_config() {
     let temp = tempfile::tempdir().unwrap();

@@ -1,11 +1,15 @@
 mod fts;
 
+#[cfg(test)]
+mod tests;
+
 pub(in crate::hook::filesystem) use fts::{active_fts_logical_path, register_active_fts_mapping};
 
 #[cfg(test)]
 pub(super) use fts::{
     FtsStreamState, fts_bulk_entry_names_for_test, fts_directory_descent_path_for_test,
-    fts_read_returns_virtual_entry_for_test, fts_stream_may_change_current_directory, fts_streams,
+    fts_getattrlistbulk_for_test, fts_read_returns_virtual_entry_for_test,
+    fts_stream_may_change_current_directory, fts_streams,
 };
 
 use super::*;

@@ -1,4 +1,5 @@
 use super::FileCipher;
+use base64::Engine as _;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 fn temporary_directory(name: &str) -> std::path::PathBuf {
@@ -171,6 +172,18 @@ fn filename_encryption_is_randomized_authenticated_and_byte_preserving() {
     assert_eq!(cipher.decrypt_name(&second).unwrap(), name);
     assert!(wrong.decrypt_name(&first).is_err());
     assert!(cipher.decrypt_name("").is_err());
+    assert!(
+        cipher
+            .decrypt_name(&format!("{}A", super::ENCRYPTED_NAME_PREFIX))
+            .is_err()
+    );
+    let incomplete = format!(
+        "{}{}",
+        super::ENCRYPTED_NAME_PREFIX,
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0_u8])
+    );
+    assert!(cipher.decrypt_name(&incomplete).is_err());
+    assert!(cipher.encrypt_name(&vec![b'x'; 300]).is_err());
 
     let mut corrupted = first.into_bytes();
     let last = corrupted.last_mut().unwrap();
@@ -208,6 +221,42 @@ fn encryption_failures_remove_temporary_ciphertext_files() {
             .encrypt(&mut plaintext, &blocked_parent.join("child"))
             .is_err()
     );
+
+    if unsafe { libc::geteuid() } != 0 {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let readonly = root.join("readonly");
+        std::fs::create_dir(&readonly).unwrap();
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(
+            cipher
+                .encrypt(&mut plaintext, &readonly.join("child"))
+                .is_err()
+        );
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn encrypted_file_overwrite_replaces_existing_plaintext() {
+    let root = temporary_directory("overwrite");
+    let encrypted = root.join("encrypted");
+    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+    let mut original = tempfile::tempfile().unwrap();
+    original.write_all(b"original").unwrap();
+    cipher.encrypt(&mut original, &encrypted).unwrap();
+    let mut replacement = tempfile::tempfile().unwrap();
+    replacement.write_all(b"replacement contents").unwrap();
+
+    cipher.overwrite(&mut replacement, &encrypted).unwrap();
+
+    let mut plaintext = tempfile::tempfile().unwrap();
+    cipher.decrypt(&encrypted, &mut plaintext).unwrap();
+    plaintext.rewind().unwrap();
+    let mut contents = String::new();
+    plaintext.read_to_string(&mut contents).unwrap();
+    assert_eq!(contents, "replacement contents");
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -224,6 +273,21 @@ fn decryption_rejects_malformed_headers_and_incomplete_blocks() {
     };
 
     assert!(decrypt(&root.join("missing")).contains("failed to open"));
+
+    let trailing = root.join("trailing-data");
+    let mut plaintext = tempfile::tempfile().unwrap();
+    plaintext.write_all(b"contents").unwrap();
+    cipher.encrypt(&mut plaintext, &trailing).unwrap();
+    let expected_length = std::fs::metadata(&trailing).unwrap().len();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&trailing)
+        .unwrap()
+        .write_all(b"trailing bytes")
+        .unwrap();
+    assert!(std::fs::metadata(&trailing).unwrap().len() > expected_length);
+    drop(cipher.open_file(&trailing).unwrap());
+    assert_eq!(std::fs::metadata(&trailing).unwrap().len(), expected_length);
 
     let incomplete_header = root.join("incomplete-header");
     std::fs::write(&incomplete_header, b"short").unwrap();

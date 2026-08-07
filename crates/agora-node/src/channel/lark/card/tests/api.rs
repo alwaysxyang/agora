@@ -69,6 +69,69 @@ async fn lark_card_coalesces_intermediate_updates_and_flushes_completion() {
 }
 
 #[tokio::test]
+async fn lark_card_flushes_queue_and_all_non_success_terminal_states() {
+    let server = lark_http_server().await;
+    let api = LarkApi::with_base_url(
+        LarkChannelConfig {
+            name: "lark-test".to_string(),
+            app_id: "app-id".to_string(),
+            secret: "secret".to_string(),
+            permission: Default::default(),
+            proxy: None,
+        },
+        server.base_url(),
+    )
+    .unwrap();
+    let card = |source: &str| {
+        LarkAgentCard::new(
+            LarkReplyTarget {
+                message_id: source.to_string(),
+            },
+            "codex-dev".to_string(),
+            None,
+            api.clone(),
+        )
+    };
+
+    let failed = card("om_failed");
+    failed.publish(RunEvent::Queued { ahead: 2 }).await.unwrap();
+    failed
+        .publish(RunEvent::Started {
+            run_id: "run-failed".to_string(),
+        })
+        .await
+        .unwrap();
+    failed
+        .publish(RunEvent::Failed {
+            message: "backend failed".to_string(),
+        })
+        .await
+        .unwrap();
+
+    card("om_stopped").publish(RunEvent::Stopped).await.unwrap();
+    card("om_interrupted")
+        .publish(RunEvent::Interrupted)
+        .await
+        .unwrap();
+
+    let requests = server.requests().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path.ends_with("/reply"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "PATCH")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn lark_api_replies_to_commands_with_threaded_text() {
     let server = lark_http_server().await;
     let api = LarkApi::with_base_url(

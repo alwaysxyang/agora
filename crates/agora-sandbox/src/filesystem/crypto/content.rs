@@ -433,3 +433,20 @@ fn write_all_at(file: &File, buffer: &[u8], offset: u64) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_random_access_and_block_offset_overflow_are_safe() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut file =
+            EncryptedFile::create(&directory.path().join("encrypted"), &[7_u8; 32]).unwrap();
+        let mut empty = [];
+
+        assert_eq!(file.read_at(&mut empty, 0).unwrap(), 0);
+        assert_eq!(file.write_at(&[], u64::MAX).unwrap(), 0);
+        assert!(block_offset(u64::MAX).is_err());
+    }
+}

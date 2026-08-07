@@ -58,6 +58,7 @@ async fn http_proxy_reports_closed_malformed_and_oversized_responses() {
     for (response, expected) in [
         (Vec::new(), io::ErrorKind::UnexpectedEof),
         (b"not http\r\n\r\n".to_vec(), io::ErrorKind::InvalidData),
+        (b"HTTP/1.1 \r\n\r\n".to_vec(), io::ErrorKind::InvalidData),
         (oversized, io::ErrorKind::InvalidData),
     ] {
         let (address, server) = responding_proxy(response).await;

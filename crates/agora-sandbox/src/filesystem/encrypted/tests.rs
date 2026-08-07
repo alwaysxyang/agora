@@ -1,10 +1,10 @@
 use super::{
-    EncryptedWorkspace, KEY_METADATA_VERSION, KeyMetadata, REKEY_JOURNAL_VERSION, RekeyEntry,
-    RekeyJournal,
+    EncryptedWorkspace, KEY_METADATA_VERSION, KeyMetadata, KeyMigrationStage,
+    REKEY_JOURNAL_VERSION, RekeyEntry, RekeyJournal,
 };
 use crate::filesystem::crypto::FileCipher;
 use crate::filesystem::metadata::{EntryState, Materializer, MetadataStore};
-use crate::filesystem::{OpenTarget, VirtualFilesystem};
+use crate::filesystem::{Credentials, OpenTarget, VirtualFilesystem};
 use base64::Engine;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -182,6 +182,47 @@ fn key_migration_reencrypts_logical_names_that_resemble_control_files() {
     let mut contents = Vec::new();
     file.read_to_end(&mut contents).unwrap();
     assert_eq!(contents, b"control-like contents");
+    drop(filesystem);
+    drop(workspace);
+    std::fs::remove_dir_all(lower).unwrap();
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
+fn key_migration_renames_encrypted_symlink_backings() {
+    let workdir = temporary_directory("migration-symlink");
+    let lower = temporary_directory("migration-symlink-lower");
+    std::fs::create_dir_all(&lower).unwrap();
+    let logical = lower.join("link");
+    let target = PathBuf::from("relative-target");
+
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    let filesystem = VirtualFilesystem::encrypted(
+        workspace.root(),
+        FileCipher::derive(b"old-key", workspace.salt()).unwrap(),
+    )
+    .unwrap();
+    filesystem
+        .create_symlink_authorized(&logical, &target, &Credentials::effective())
+        .unwrap();
+    let old_backing = filesystem.prepare_metadata(&logical, false).unwrap().0;
+    assert_eq!(std::fs::read_link(&old_backing).unwrap(), target);
+    drop(filesystem);
+    drop(workspace);
+
+    EncryptedWorkspace::migrate_key(&workdir, b"old-key", b"new-key").unwrap();
+
+    let workspace = EncryptedWorkspace::start(&workdir, b"new-key").unwrap();
+    let filesystem = VirtualFilesystem::encrypted(
+        workspace.root(),
+        FileCipher::derive(b"new-key", workspace.salt()).unwrap(),
+    )
+    .unwrap();
+    let new_backing = filesystem.prepare_metadata(&logical, false).unwrap().0;
+    assert_ne!(new_backing, old_backing);
+    assert!(!old_backing.exists());
+    assert_eq!(std::fs::read_link(new_backing).unwrap(), target);
+
     drop(filesystem);
     drop(workspace);
     std::fs::remove_dir_all(lower).unwrap();
@@ -401,6 +442,150 @@ fn key_migration_rejects_invalid_requests_and_cleans_staged_files() {
 }
 
 #[test]
+fn key_migration_removes_ciphertext_that_fails_staged_verification() {
+    let workdir = temporary_directory("migration-verification-failure");
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    let root = workspace.root().to_path_buf();
+    write_encrypted(
+        &FileCipher::derive(b"old-key", workspace.salt()).unwrap(),
+        &root.join("secret"),
+        b"secret contents",
+    );
+    drop(workspace);
+
+    let progress_root = root.clone();
+    let result = EncryptedWorkspace::migrate_key_with_progress(
+        &workdir,
+        b"old-key",
+        b"new-key",
+        move |stage| {
+            if stage == KeyMigrationStage::VerifyingNewKey {
+                let staged = rekey_files(&progress_root);
+                assert!(!staged.is_empty());
+                for path in staged {
+                    std::fs::write(path, b"corrupt staged ciphertext").unwrap();
+                }
+            }
+        },
+    );
+
+    assert!(result.is_err());
+    assert!(directory_tree_has_no_rekey_files(&root));
+    drop(EncryptedWorkspace::start(&workdir, b"old-key").unwrap());
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
+fn key_migration_cleans_staged_files_when_the_journal_cannot_be_published() {
+    let workdir = temporary_directory("migration-journal-failure");
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    let root = workspace.root().to_path_buf();
+    write_encrypted(
+        &FileCipher::derive(b"old-key", workspace.salt()).unwrap(),
+        &root.join("secret"),
+        b"secret contents",
+    );
+    drop(workspace);
+
+    let progress_root = root.clone();
+    let result = EncryptedWorkspace::migrate_key_with_progress(
+        &workdir,
+        b"old-key",
+        b"new-key",
+        move |stage| {
+            if stage == KeyMigrationStage::VerifyingNewKey {
+                std::fs::create_dir(progress_root.join(".rekey.json")).unwrap();
+            }
+        },
+    );
+
+    assert!(result.is_err());
+    std::fs::remove_dir(root.join(".rekey.json")).unwrap();
+    assert!(directory_tree_has_no_rekey_files(&root));
+    drop(EncryptedWorkspace::start(&workdir, b"old-key").unwrap());
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
+fn key_migration_recovers_when_a_source_disappears_before_publish() {
+    let workdir = temporary_directory("migration-source-disappeared");
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    let root = workspace.root().to_path_buf();
+    let source = root.join("secret");
+    write_encrypted(
+        &FileCipher::derive(b"old-key", workspace.salt()).unwrap(),
+        &source,
+        b"secret contents",
+    );
+    drop(workspace);
+
+    let removed_source = source.clone();
+    let result = EncryptedWorkspace::migrate_key_with_progress(
+        &workdir,
+        b"old-key",
+        b"new-key",
+        move |stage| {
+            if stage == KeyMigrationStage::VerifyingNewKey {
+                std::fs::remove_file(&removed_source).unwrap();
+            }
+        },
+    );
+
+    assert!(result.is_err());
+    assert!(!root.join(".rekey.json").exists());
+    assert!(directory_tree_has_no_rekey_files(&root));
+    drop(EncryptedWorkspace::start(&workdir, b"old-key").unwrap());
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
+fn key_migration_reports_and_recovers_a_metadata_update_failure() {
+    let workdir = temporary_directory("migration-metadata-failure");
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    let root = workspace.root().to_path_buf();
+    let source = root.join("secret");
+    write_encrypted(
+        &FileCipher::derive(b"old-key", workspace.salt()).unwrap(),
+        &source,
+        b"secret contents",
+    );
+    let key_path = root.join(".key.json");
+    let old_key_metadata = std::fs::read(&key_path).unwrap();
+    drop(workspace);
+
+    let blocked_key_path = key_path.clone();
+    let result = EncryptedWorkspace::migrate_key_with_progress(
+        &workdir,
+        b"old-key",
+        b"new-key",
+        move |stage| {
+            if stage == KeyMigrationStage::UpdatingMetadata {
+                std::fs::remove_file(&blocked_key_path).unwrap();
+                std::fs::create_dir(&blocked_key_path).unwrap();
+            }
+        },
+    );
+
+    let error = result.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("filesystem key migration recovery also failed")
+    );
+    std::fs::remove_dir(&key_path).unwrap();
+    std::fs::write(&key_path, old_key_metadata).unwrap();
+    EncryptedWorkspace::recover_migration(&root).unwrap();
+    assert!(!root.join(".rekey.json").exists());
+    assert!(directory_tree_has_no_rekey_files(&root));
+
+    let reopened = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    let cipher = FileCipher::derive(b"old-key", reopened.salt()).unwrap();
+    assert_eq!(decrypt(&cipher, &source), b"secret contents");
+    drop(reopened);
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
 fn migration_helpers_reject_external_paths_and_inconsistent_journals() {
     let workdir = temporary_directory("migration-helper-errors");
     let root = workdir.join("fs");
@@ -469,6 +654,11 @@ fn migration_helpers_reject_external_paths_and_inconsistent_journals() {
 }
 
 fn directory_tree_has_no_rekey_files(root: &std::path::Path) -> bool {
+    rekey_files(root).is_empty()
+}
+
+fn rekey_files(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
     let mut directories = vec![root.to_path_buf()];
     while let Some(directory) = directories.pop() {
         for entry in std::fs::read_dir(directory).unwrap() {
@@ -480,11 +670,11 @@ fn directory_tree_has_no_rekey_files(root: &std::path::Path) -> bool {
                 .to_string_lossy()
                 .starts_with(".agora-rekey-")
             {
-                return false;
+                files.push(entry.path());
             }
         }
     }
-    true
+    files
 }
 
 fn write_encrypted(cipher: &FileCipher, path: &std::path::Path, contents: &[u8]) {

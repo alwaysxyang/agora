@@ -85,6 +85,12 @@ fn inspection_bounds_and_malformed_protocols_finish_without_a_domain() {
         malformed_tls.inspect(b"\x16\x03\x03\x00\x01\xff"),
         InspectionState::Pending
     );
+
+    let mut invalid_client_hello = ProtocolInspector::new();
+    assert_eq!(
+        invalid_client_hello.inspect(b"\x16\x03\x03\x00\x04\x01\x00\x00\x00"),
+        InspectionState::Complete(InspectionObservation::default())
+    );
 }
 
 #[test]

@@ -507,6 +507,58 @@ async fn codex_agent_maps_all_supported_json_events_and_stream_boundaries() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn codex_agent_truncates_intermediate_messages_and_ignores_unknown_events() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("codex");
+    std::fs::write(
+        &script,
+        concat!(
+            "#!/bin/sh\n",
+            "cat >/dev/null\n",
+            "long=$(printf '%0250d' 0 | tr '0' 'x')\n",
+            "printf '%s\\n' \"{\\\"type\\\":\\\"item.completed\\\",\\\"item\\\":{\\\"id\\\":\\\"long-message\\\",\\\"type\\\":\\\"agent_message\\\",\\\"text\\\":\\\"  $long  \\\"}}\"\n",
+            "printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"future_item\"}}'\n",
+            "printf '%s\\n' '{\"type\":\"item.started\"}'\n",
+            "printf '%s\\n' '{\"type\":\"future.event\"}'\n",
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let agent =
+        ConfiguredAgent::from_config(agent(AgentType::Codex, &script, temp.path())).unwrap();
+    let mut output = VecAgentOutput::default();
+    let outcome = completed(
+        agent
+            .run(
+                AgentTask::new("exercise forward-compatible events"),
+                None,
+                AgentRunControl::new(),
+                &mut output,
+            )
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(outcome.session_update(), &AgentSessionUpdate::Unchanged);
+    let truncated = output
+        .events
+        .iter()
+        .find_map(|event| match event {
+            OutputEvent::Progress { id, text, .. } if id == "long-message" => Some(text),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(truncated.chars().count(), 243);
+    assert!(truncated.ends_with("..."));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn codex_agent_reports_delete_failures_with_stdout_and_stderr() {
     use std::os::unix::fs::PermissionsExt;
 

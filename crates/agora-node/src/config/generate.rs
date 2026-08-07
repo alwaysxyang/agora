@@ -354,6 +354,9 @@ fn open_config_file(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+#[cfg(test)]
+mod tests;
+
 #[cfg(not(unix))]
 fn open_config_file(path: &Path) -> io::Result<File> {
     OpenOptions::new()

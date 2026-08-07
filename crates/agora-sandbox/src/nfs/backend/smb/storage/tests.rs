@@ -109,6 +109,32 @@ async fn smb_storage_rejects_unknown_roots_before_network_access() {
     assert_errno(configured.connect(0).await, libc::EINVAL);
 }
 
+#[tokio::test]
+async fn smb_storage_propagates_connection_failures_for_every_remote_operation() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let config = SmbRemoteConfig::new("/remote", address.to_string(), "share").unwrap();
+    let storage = SmbStorage::new(&[config]);
+    let path = RemotePath::new(0, "file.txt").unwrap();
+    let renamed = RemotePath::new(0, "renamed.txt").unwrap();
+
+    assert!(storage.connect(0).await.is_err());
+    assert!(storage.stat(&path).await.is_err());
+    assert!(storage.read(&path).await.is_err());
+    assert!(
+        storage
+            .write_if_unchanged(&path, None, b"data")
+            .await
+            .is_err()
+    );
+    assert!(storage.list(&path).await.is_err());
+    assert!(storage.create_directory(&path).await.is_err());
+    assert!(storage.remove(&path, false).await.is_err());
+    assert!(storage.remove(&path, true).await.is_err());
+    assert!(storage.rename(&path, &renamed).await.is_err());
+}
+
 #[test]
 fn smb_root_and_wire_paths_keep_backend_details_inside_the_backend() {
     let config = SmbRemoteConfig::new("/remote", "server", "share")

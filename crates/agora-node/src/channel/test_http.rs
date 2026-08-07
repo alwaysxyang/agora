@@ -1,5 +1,5 @@
 use std::io;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Once};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -9,6 +9,13 @@ use tokio::time::{Instant, timeout_at};
 
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(super) fn enable_test_logging() {
+    static INITIALIZED: Once = Once::new();
+    INITIALIZED.call_once(|| {
+        agora_core::logger::init(std::io::sink(), agora_core::logger::LevelFilter::Debug).unwrap();
+    });
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct RecordedRequest {
@@ -312,4 +319,59 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn parse(payload: Vec<u8>) -> io::Result<RecordedRequest> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            let _ = stream.write_all(&payload).await;
+            let _ = stream.shutdown().await;
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let result = read_request(&mut stream).await;
+        client.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn request_parser_reports_truncated_oversized_and_invalid_requests() {
+        assert_eq!(
+            parse(Vec::new()).await.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        let mut oversized_header = b"GET / HTTP/1.1\r\nX-Fill: ".to_vec();
+        oversized_header.resize(MAX_REQUEST_SIZE + 1, b'x');
+        assert_eq!(
+            parse(oversized_header).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let oversized_body = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_REQUEST_SIZE
+        );
+        assert_eq!(
+            parse(oversized_body.into_bytes()).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        assert_eq!(
+            parse(b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\nab".to_vec())
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            parse(b"invalid\r\n\r\n".to_vec()).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 }

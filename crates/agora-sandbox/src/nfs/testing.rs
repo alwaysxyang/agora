@@ -280,3 +280,71 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_errno<T>(result: StorageResult<T>, expected: libc::c_int) {
+        match result {
+            Ok(_) => panic!("operation unexpectedly succeeded"),
+            Err(error) => assert_eq!(error.errno(), expected),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_storage_preserves_posix_conflict_type_and_directory_errors() {
+        let storage = MemoryStorage::default();
+        storage.insert_file(0, "file", b"data");
+        storage.insert_directory(0, "directory");
+        storage.insert_file(0, "directory/child", b"child");
+
+        assert_errno(
+            storage
+                .create_directory(&RemotePath::new(0, "file").unwrap())
+                .await,
+            libc::EEXIST,
+        );
+        assert_errno(
+            storage
+                .remove(&RemotePath::new(0, "file").unwrap(), true)
+                .await,
+            libc::ENOTDIR,
+        );
+        assert_errno(
+            storage
+                .remove(&RemotePath::new(0, "directory").unwrap(), false)
+                .await,
+            libc::EISDIR,
+        );
+        assert_errno(
+            storage
+                .remove(&RemotePath::new(0, "directory").unwrap(), true)
+                .await,
+            libc::ENOTEMPTY,
+        );
+        assert_errno(
+            storage
+                .rename(
+                    &RemotePath::new(0, "file").unwrap(),
+                    &RemotePath::new(1, "file").unwrap(),
+                )
+                .await,
+            libc::EXDEV,
+        );
+
+        let path = RemotePath::new(0, "file").unwrap();
+        let expected = storage.stat(&path).await.unwrap();
+        storage.replace(0, "file", b"outside");
+        assert_errno(
+            storage
+                .write_if_unchanged(&path, Some(&expected), b"sandbox")
+                .await,
+            libc::ESTALE,
+        );
+        assert_errno(
+            storage.write_if_unchanged(&path, None, b"sandbox").await,
+            libc::ESTALE,
+        );
+    }
+}

@@ -59,3 +59,22 @@ fn agent(
         subscribe: Vec::new(),
     }
 }
+
+#[test]
+fn configured_agent_rejects_unimplemented_one_shot_backends() {
+    let workspace = tempfile::tempdir().unwrap();
+    for (agent_type, expected) in [
+        (AgentType::Coco, "coco agent execution is not implemented"),
+        (
+            AgentType::ClaudeCode,
+            "claude code agent execution is not implemented",
+        ),
+    ] {
+        let result =
+            ConfiguredAgent::from_config(agent(agent_type, "/bin/false", workspace.path()));
+        let Err(error) = result else {
+            panic!("unimplemented agent backend unexpectedly succeeded");
+        };
+        assert!(error.to_string().contains(expected));
+    }
+}

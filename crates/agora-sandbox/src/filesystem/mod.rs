@@ -94,3 +94,6 @@ pub(crate) use vfs::{
 };
 #[cfg(target_os = "macos")]
 pub(crate) use workspace::FilesystemWorkspace;
+
+#[cfg(test)]
+mod tests;

@@ -71,7 +71,7 @@ async fn websocket_once_forwards_events_and_answers_ack_ping_and_close() {
         let websocket_url = websocket_url.clone();
         move |_| {
             MockResponse::json(format!(
-                r#"{{"code":0,"msg":"ok","data":{{"URL":"{websocket_url}","ClientConfig":{{"PingInterval":3600}}}}}}"#
+                r#"{{"code":0,"msg":"ok","data":{{"URL":"{websocket_url}","ClientConfig":{{"PingInterval":0}}}}}}"#
             ))
         }
     })
@@ -100,6 +100,10 @@ async fn websocket_once_forwards_events_and_answers_ack_ping_and_close() {
             }
         }
 
+        socket
+            .send(WebSocketMessage::Text("ignored".into()))
+            .await
+            .unwrap();
         socket
             .send(WebSocketMessage::Ping(vec![1, 2, 3].into()))
             .await
@@ -186,6 +190,52 @@ async fn websocket_once_uses_the_configured_proxy_for_http_and_websocket() {
         .unwrap();
 
     assert!(connected);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn websocket_loop_retries_startup_and_stops_after_its_receiver_closes() {
+    let endpoint = HttpMockServer::start(|_| {
+        MockResponse::json(r#"{"code":7,"msg":"temporarily unavailable","data":null}"#)
+    })
+    .await;
+    let api = LarkApi::with_base_url(config(), endpoint.base_url()).unwrap();
+    let (sender, receiver) = mpsc::channel(1);
+    let task = tokio::spawn(async move { api.run_websocket_loop(sender).await });
+
+    endpoint.wait_for_endpoint_count("endpoint", 1).await;
+    drop(receiver);
+
+    let error = tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("receiver closed"));
+}
+
+#[tokio::test]
+async fn websocket_loop_resets_backoff_after_a_clean_disconnect() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let websocket_url = format!("ws://{}/?service_id=1001", listener.local_addr().unwrap());
+    let endpoint = HttpMockServer::start(move |_| {
+        MockResponse::json(format!(
+            r#"{{"code":0,"msg":"ok","data":{{"URL":"{websocket_url}"}}}}"#
+        ))
+    })
+    .await;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        socket.send(WebSocketMessage::Close(None)).await.unwrap();
+    });
+    let api = LarkApi::with_base_url(config(), endpoint.base_url()).unwrap();
+    let (sender, receiver) = mpsc::channel(1);
+    drop(receiver);
+
+    let error = api.run_websocket_loop(sender).await.unwrap_err();
+
+    assert!(error.to_string().contains("receiver closed"));
     server.await.unwrap();
 }
 
@@ -341,6 +391,21 @@ async fn lark_http_results_cover_missing_fields_errors_and_binary_defaults() {
             .contains("denied")
     );
 
+    let bot_error: LarkBotInfoResponse =
+        serde_json::from_str(r#"{"code":1,"msg":"denied","bot":null}"#).unwrap();
+    assert!(
+        bot_error
+            .into_result()
+            .unwrap_err()
+            .to_string()
+            .contains("denied")
+    );
+
+    let mut frame = event_frame(Vec::new());
+    frame.headers.push(LarkFrameHeader::new("biz_rt", "old"));
+    let acknowledged = frame.into_ack(200, 9).unwrap();
+    assert_eq!(acknowledged.header("biz_rt"), Some("9"));
+
     let reply_missing: SendCardResponse =
         serde_json::from_str(r#"{"code":0,"msg":"ok","data":null}"#).unwrap();
     assert!(
@@ -427,6 +492,21 @@ async fn lark_patch_retries_transient_server_failures() {
         .unwrap();
 
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn lark_patch_retries_transport_failures_without_exposing_secrets() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let api = LarkApi::with_base_url(config(), format!("http://{address}")).unwrap();
+
+    let error = api
+        .patch_card("secret-token", "om_reply", &json!({ "schema": "2.0" }))
+        .await
+        .unwrap_err();
+
+    assert!(!error.to_string().contains("secret-token"));
 }
 
 #[tokio::test]

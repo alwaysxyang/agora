@@ -90,6 +90,57 @@ fn sync_encrypts_only_reported_ranges_and_propagates_them_to_peer_handles() {
 }
 
 #[test]
+fn sync_ignores_ranges_beyond_eof_and_reports_plaintext_read_failures() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("range-errors", b"data");
+    let (handle, _) = fixture.open(&path, b"data", true);
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Sync {
+                    handle: handle.clone(),
+                    ranges: vec![ByteRange::new(100, 101).unwrap()],
+                    durable: false,
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+
+    {
+        let mut handles = lock(&fixture.broker.handles);
+        let local = handles.get_mut(&handle).unwrap();
+        local.plaintext = File::open(fixture.root.path()).unwrap();
+        local.baseline = PlaintextIdentity::from_metadata(&local.plaintext.metadata().unwrap());
+    }
+    let response = fixture
+        .broker
+        .handle(
+            Request::Sync {
+                handle,
+                ranges: vec![ByteRange::new(0, 1).unwrap()],
+                durable: false,
+            },
+            None,
+        )
+        .response;
+    assert!(
+        matches!(response, Response::Error { message, .. } if message.contains("failed to read local plaintext range"))
+    );
+}
+
+#[test]
+fn broker_protocol_errors_preserve_their_message() {
+    let error = BrokerError::protocol_error(anyhow::anyhow!("invalid backing path"));
+
+    assert_eq!(error.errno, libc::EPROTO);
+    assert_eq!(error.message, "invalid backing path");
+}
+
+#[test]
 fn final_flush_persists_ranges_registered_by_writable_mappings() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("mapped", b"abcdef");

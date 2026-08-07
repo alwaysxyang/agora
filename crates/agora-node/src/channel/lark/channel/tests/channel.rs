@@ -1,5 +1,5 @@
 use super::*;
-use crate::channel::test_http::{HttpMockServer, MockResponse};
+use crate::channel::test_http::{HttpMockServer, MockResponse, enable_test_logging};
 use crate::config::{
     ChannelGroupPermissionConfig, ChannelPermissionConfig, ChannelUserPermissionConfig,
 };
@@ -120,6 +120,7 @@ fn image_extensions_cover_known_and_unknown_media_types() {
 
 #[tokio::test]
 async fn receiver_routes_ignored_interrupt_card_and_message_events() {
+    enable_test_logging();
     let mut channel = LarkChannel::with_api(api());
     channel.receiver = Some(event_receiver([
         LarkEvent::Ignore {
@@ -162,6 +163,65 @@ async fn receiver_routes_ignored_interrupt_card_and_message_events() {
 
     channel.receiver = Some(event_receiver([]));
     assert_eq!(channel.recv().await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn private_messages_support_text_replies_runs_and_actions() {
+    enable_test_logging();
+    assert_eq!(
+        LarkMessageEvent::normalize_content("file", "raw"),
+        ("raw".to_string(), Vec::new())
+    );
+
+    let (api, server) = permission_api().await;
+    let mut channel = LarkChannel::with_api(api);
+    let mut private_message = message("text");
+    private_message.chat_type = "p2p".to_string();
+    channel.receiver = Some(event_receiver([LarkEvent::Message(private_message)]));
+    let task = channel.recv().await.unwrap().unwrap();
+
+    channel
+        .reply(&task, ChannelReply::new("private reply"))
+        .await
+        .unwrap();
+    let run = channel
+        .open_run(
+            &task,
+            ChannelRunContext {
+                agent: crate::channel::ChannelAgent {
+                    name: "codex".to_string(),
+                },
+                interrupt: Some(InterruptCallback::new(|| true)),
+            },
+        )
+        .await
+        .unwrap();
+    run.publish(RunEvent::Started {
+        run_id: "run-private".to_string(),
+    })
+    .await
+    .unwrap();
+
+    channel.receiver = Some(event_receiver([LarkEvent::CardAction(
+        LarkCardActionEvent {
+            id: "evt-private-action".to_string(),
+            user_id: "ou-user".to_string(),
+            session_id: "oc-chat".to_string(),
+            message_id: "om-card".to_string(),
+            command: CommandRequest::new(["ask", "list"]),
+        },
+    )]));
+    assert!(channel.recv().await.unwrap().is_some());
+
+    let requests = server.requests().await;
+    assert!(requests.iter().any(|request| {
+        request.path == "/open-apis/im/v1/messages/om-message/reply"
+            && request.body.contains("private reply")
+    }));
+    assert!(requests.iter().any(|request| {
+        request.path == "/open-apis/im/v1/messages/om-message/reply"
+            && request.body.contains("interactive")
+    }));
 }
 
 #[tokio::test]

@@ -227,3 +227,6 @@ dyld_interpose!(
     agora_sandbox_pwritev,
     pwritev_nocancel
 );
+
+#[cfg(test)]
+mod tests;

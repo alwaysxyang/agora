@@ -341,3 +341,148 @@ fn telegram_rich_message_hides_raw_failure_details() {
     assert!(!rendered.contains("codex-dev"));
     assert!(!rendered.contains("token=abc"));
 }
+
+#[test]
+fn telegram_rich_message_ignores_output_after_a_terminal_event() {
+    let mut content = TelegramRichContent::new("codex-dev".to_string());
+    content.apply(RunEvent::Completed { exit_code: 0 });
+    let completed = content.render(false);
+
+    content.apply(RunEvent::Output(OutputEvent::Answer {
+        text: "must be ignored".to_string(),
+    }));
+
+    assert_eq!(content.render(false), completed);
+    assert!(!content.render(false).contains("must be ignored"));
+}
+
+#[test]
+fn telegram_section_splitting_handles_oversized_and_combined_sections() {
+    let oversized = "line<&>\n".repeat(1_000);
+    let messages = TelegramRichContent::split_sections(vec![
+        "first".to_string(),
+        oversized,
+        "second".to_string(),
+        "third".to_string(),
+    ]);
+
+    assert!(messages.len() >= 3);
+    assert_eq!(messages.first().map(String::as_str), Some("first"));
+    assert!(
+        messages
+            .iter()
+            .all(|message| TelegramRichContent::within_limits(message))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("&lt;&amp;&gt;"))
+    );
+    assert!(messages.last().unwrap().contains("second\n\nthird"));
+
+    let individually_valid =
+        TelegramRichContent::split_sections(vec!["a".repeat(20_000), "b".repeat(20_000)]);
+    assert_eq!(individually_valid.len(), 2);
+    assert!(
+        individually_valid
+            .iter()
+            .all(|message| TelegramRichContent::within_limits(message))
+    );
+}
+
+#[test]
+fn telegram_truncated_terminal_output_keeps_usage_and_partial_answer_state() {
+    let usage = TokenUsage {
+        input_tokens: 1_000_000,
+        cached_input_tokens: 999,
+        output_tokens: 0,
+        reasoning_output_tokens: 0,
+    };
+    let mut completed = TelegramRichContent::new("codex-dev".to_string());
+    completed.apply(RunEvent::Output(OutputEvent::Usage(usage)));
+    completed.apply(RunEvent::Completed { exit_code: 0 });
+    let truncated = completed.render_truncated(false);
+    assert!(truncated.contains("1.0M tokens"));
+    assert!(truncated.contains("Input 1.0M"));
+
+    let mut failed = TelegramRichContent::new("codex-dev".to_string());
+    failed.apply(RunEvent::Output(OutputEvent::Answer {
+        text: "界<&>".repeat(20_000),
+    }));
+    failed.apply(RunEvent::Failed {
+        message: "failed".to_string(),
+    });
+    let truncated = failed.render_truncated(false);
+    assert!(TelegramRichContent::within_limits(&truncated));
+    assert!(truncated.contains(i18n::PARTIAL_ANSWER_TITLE));
+    assert!(truncated.contains("&lt;&amp;&gt;"));
+}
+
+#[test]
+fn telegram_draft_and_terminal_rendering_cover_all_progress_labels() {
+    use super::super::{TelegramProcessPhase, TelegramProgressEntry, TelegramProgressKind};
+    use std::collections::VecDeque;
+
+    let mut content = TelegramRichContent::new("codex-dev".to_string());
+    content.process.push_front(TelegramProcessPhase {
+        thinking: None,
+        progress: VecDeque::new(),
+    });
+    assert!(content.render(true).contains(i18n::WAITING_FOR_AGENT));
+
+    content
+        .process
+        .front_mut()
+        .unwrap()
+        .progress
+        .push_back(TelegramProgressEntry {
+            id: "message".to_string(),
+            text: "Checking".to_string(),
+            status: ProgressStatus::Running,
+            kind: TelegramProgressKind::Message,
+            exit_code: None,
+        });
+    assert!(content.render(true).contains("● Checking"));
+
+    content.process.push_front(TelegramProcessPhase {
+        thinking: Some("first line\nsecond line".to_string()),
+        progress: VecDeque::from([
+            TelegramProgressEntry {
+                id: "completed".to_string(),
+                text: "true".to_string(),
+                status: ProgressStatus::Completed,
+                kind: TelegramProgressKind::Command,
+                exit_code: None,
+            },
+            TelegramProgressEntry {
+                id: "failed".to_string(),
+                text: "false".to_string(),
+                status: ProgressStatus::Failed,
+                kind: TelegramProgressKind::Command,
+                exit_code: None,
+            },
+            TelegramProgressEntry {
+                id: "stopped".to_string(),
+                text: "sleep 10".to_string(),
+                status: ProgressStatus::Stopped,
+                kind: TelegramProgressKind::Command,
+                exit_code: None,
+            },
+        ]),
+    });
+    let rendered = content.render(false);
+    assert!(rendered.contains("> ✦ first line\n> second line"));
+    assert!(rendered.contains("✓ Completed"));
+    assert!(rendered.contains("× Failed"));
+    assert!(rendered.contains("■ Stopped"));
+}
+
+#[test]
+fn telegram_escape_tail_accounts_for_structural_character_expansion() {
+    assert_eq!(TelegramRichContent::format_tokens(1_000_000), "1.0M");
+    assert_eq!(
+        TelegramRichContent::escape_tail("prefix&<>", 13),
+        "&amp;&lt;&gt;"
+    );
+    assert_eq!(TelegramRichContent::escape_tail("prefix&<>", 4), "&gt;");
+}

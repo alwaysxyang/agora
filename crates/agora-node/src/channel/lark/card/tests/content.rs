@@ -1,4 +1,6 @@
+use super::super::MAX_ANSWER_BYTES;
 use super::*;
+use crate::i18n;
 
 #[test]
 fn lark_permission_denial_card_owns_its_markdown_layout() {
@@ -813,4 +815,76 @@ fn lark_card_renders_token_usage_without_a_heading() {
         columns[3].pointer("/elements/0/content").unwrap(),
         "<font color='grey'>Reasoning</font>\n**1.9K**\n<font color='grey'>of output</font>"
     );
+}
+
+#[test]
+fn lark_reply_card_supports_plain_text_and_danger_actions() {
+    let text = LarkReplyCard::build(&ChannelReply::Text("plain reply".to_string()));
+    assert_eq!(
+        text.pointer("/body/elements/0/content")
+            .and_then(serde_json::Value::as_str),
+        Some("plain reply")
+    );
+
+    let danger = ChannelButton::new(
+        "Delete",
+        ChannelButtonStyle::Danger,
+        CommandRequest::new(["delete"]),
+    );
+    assert_eq!(LarkReplyCard::button(&danger)["type"], "danger");
+}
+
+#[test]
+fn lark_card_bounds_one_large_phase_and_preserves_terminal_markers() {
+    let mut content = LarkCardContent::new("codex-dev".to_string());
+    content.apply_output(OutputEvent::Thinking {
+        text: "One large phase".to_string(),
+    });
+    for index in 0..200 {
+        content.apply_output(OutputEvent::CommandExecution {
+            id: format!("command-{index}"),
+            command: format!("command {index}"),
+            status: if index == 198 {
+                ProgressStatus::Failed
+            } else if index == 199 {
+                ProgressStatus::Stopped
+            } else {
+                ProgressStatus::Completed
+            },
+            exit_code: None,
+        });
+    }
+    let mut markers = LarkCardContent::new("codex-dev".to_string());
+    markers.apply_output(OutputEvent::Progress {
+        id: "running-message".to_string(),
+        text: "Still running".to_string(),
+        status: ProgressStatus::Running,
+    });
+    markers.apply_output(OutputEvent::Progress {
+        id: "stopped-message".to_string(),
+        text: "Was stopped".to_string(),
+        status: ProgressStatus::Stopped,
+    });
+
+    let card = content.build_card();
+    let rendered = serde_json::to_string(&card).unwrap();
+    assert!(tagged_element_count(&card) <= 200);
+    assert!(rendered.contains("已省略"));
+    assert!(rendered.contains("×  Failed"));
+    assert!(rendered.contains("■  Stopped"));
+    let markers = serde_json::to_string(&markers.build_card()).unwrap();
+    assert!(markers.contains("<font color='blue'>●</font>  Still running"));
+    assert!(markers.contains("<font color='grey'>■</font>  Was stopped"));
+}
+
+#[test]
+fn lark_card_formats_token_extremes_and_truncates_unicode_on_a_boundary() {
+    assert_eq!(LarkCardContent::format_tokens(999), "999");
+    assert_eq!(LarkCardContent::format_tokens(1_000_000), "1.0M");
+
+    let answer = format!("prefix{}tail", "界".repeat(MAX_ANSWER_BYTES));
+    let truncated = LarkCardContent::truncate_answer(&answer);
+    assert!(truncated.starts_with(i18n::OUTPUT_TRUNCATED));
+    assert!(truncated.ends_with("tail"));
+    assert!(truncated.len() <= MAX_ANSWER_BYTES + "界".len());
 }

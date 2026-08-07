@@ -1,8 +1,12 @@
 use super::{
     FixedResolver, TlsAuthority, TlsBridge, load_pem_root_certificates, other_error, timeout_error,
 };
+use crate::network::UpstreamConnection;
+use crate::network::inspection::TlsClientHello;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 use std::io::ErrorKind;
+use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
 
 #[test]
 fn fallback_root_bundle_accepts_certificates_and_rejects_invalid_inputs() {
@@ -93,4 +97,61 @@ fn tls_bridge_rejects_empty_roots_and_resolver_debug_is_stable() {
     let certificate = authority.issue("example.com").unwrap();
     let resolver = FixedResolver(certificate.certified_key());
     assert_eq!(format!("{resolver:?}"), "FixedResolver");
+}
+
+#[tokio::test]
+async fn tls_bridge_rejects_a_wildcard_as_an_upstream_server_name() {
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let certificate = params.self_signed(&key).unwrap();
+    let root = certificate.der().clone();
+    let authority = TlsAuthority::from_pem(
+        certificate.pem().as_bytes(),
+        key.serialize_pem().as_bytes(),
+        2,
+    )
+    .unwrap();
+    let bridge = TlsBridge::with_root_certificates(authority, vec![root]).unwrap();
+    let (client, _client_peer) = tcp_pair().await;
+    let (upstream, _upstream_peer) = tcp_pair().await;
+
+    let result = bridge
+        .establish(
+            client,
+            UpstreamConnection {
+                stream: upstream,
+                initial_data: Vec::new(),
+            },
+            Vec::new(),
+            &TlsClientHello {
+                server_name: Some("*.example.com".to_string()),
+                alpn: Vec::new(),
+            },
+            "*.example.com".to_string(),
+            Duration::from_millis(25),
+        )
+        .await;
+    let Err(error) = result else {
+        panic!("wildcard TLS server identity unexpectedly succeeded");
+    };
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("invalid TLS server identity"));
+}
+
+async fn tcp_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let connected = TcpStream::connect(address);
+    let accepted = listener.accept();
+    let (connected, accepted) = tokio::join!(connected, accepted);
+    (connected.unwrap(), accepted.unwrap().0)
 }

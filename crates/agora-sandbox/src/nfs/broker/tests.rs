@@ -869,6 +869,10 @@ async fn broker_reclaims_unclaimed_open_and_anchor_resources() {
             .response,
         libc::EBADF,
     );
+    assert_eq!(
+        broker.reply_for_response(Response::Success).await.response,
+        Response::Success
+    );
     assert_errno(
         broker
             .handle(Request::Claim {
@@ -948,16 +952,21 @@ async fn broker_cleanup_and_path_helpers_cover_file_directory_and_cross_root_cas
     let broker = Broker::new(std::sync::Arc::new(MemoryStorage::default()), root.path()).unwrap();
     std::fs::write(root.path().join("file-anchor"), b"").unwrap();
     std::fs::create_dir(root.path().join("dir-anchor")).unwrap();
+    std::fs::create_dir(root.path().join("nonempty-anchor")).unwrap();
+    std::fs::write(root.path().join("nonempty-anchor/child"), b"").unwrap();
     broker
         .discard_abandoned_resources(vec![
             AbandonedResource::Anchor("file-anchor".to_string()),
             AbandonedResource::Anchor("dir-anchor".to_string()),
+            AbandonedResource::Anchor("nonempty-anchor".to_string()),
             AbandonedResource::Anchor("missing-anchor".to_string()),
             AbandonedResource::Handle("missing-handle".to_string()),
         ])
         .await;
     assert!(!root.path().join("file-anchor").exists());
     assert!(!root.path().join("dir-anchor").exists());
+    assert!(root.path().join("nonempty-anchor/child").is_file());
+    std::fs::remove_dir_all(root.path().join("nonempty-anchor")).unwrap();
 
     let source = RemotePath::new(0, "source").unwrap();
     let child = RemotePath::new(0, "source/child").unwrap();
@@ -995,4 +1004,22 @@ async fn broker_cleanup_and_path_helpers_cover_file_directory_and_cross_root_cas
     );
     let error = storage_io("context", std::io::Error::other("failure"));
     assert_eq!(error.errno(), libc::EIO);
+}
+
+#[test]
+fn close_on_exec_reports_an_invalid_descriptor() {
+    use std::os::fd::AsRawFd as _;
+
+    let file = std::mem::ManuallyDrop::new(std::fs::File::open("/dev/null").unwrap());
+    let descriptor = file.as_raw_fd();
+    assert_eq!(unsafe { libc::close(descriptor) }, 0);
+
+    let error = set_close_on_exec(&file).unwrap_err();
+
+    assert_eq!(error.errno(), libc::EBADF);
+    assert!(
+        error
+            .to_string()
+            .contains("protect anonymous remote descriptor")
+    );
 }

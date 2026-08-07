@@ -175,6 +175,90 @@ fn rejects_a_non_directory_md5_path() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn reports_invalid_work_and_runtime_directory_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workdir");
+    std::fs::write(&workdir, b"not a directory").unwrap();
+    let error = super::materialize(&workdir).unwrap_err();
+    assert!(error.to_string().contains("work directory"));
+
+    let missing_parent = root.path().join("missing/child");
+    let error = super::prepare_directory(&missing_parent).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("failed to create hook runtime directory")
+    );
+
+    let parent_file = root.path().join("parent-file");
+    std::fs::write(&parent_file, b"not a directory").unwrap();
+    let error = super::prepare_directory(&parent_file.join("child")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("failed to inspect hook runtime directory")
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn rejects_a_directory_as_the_materialization_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let hooks = root.path().join("runtime/hook");
+    std::fs::create_dir_all(hooks.join(".lock")).unwrap();
+
+    let error = super::lock(&hooks).unwrap_err();
+
+    assert!(error.to_string().contains("not a regular file"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn checksum_and_matching_file_report_native_path_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+    assert!(
+        super::checksum(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("MD5")
+    );
+
+    let parent = root.path().join("parent");
+    std::fs::write(&parent, b"not a directory").unwrap();
+    let error = super::is_matching_regular_file(&parent.join("child")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("failed to inspect embedded sandbox hook")
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn publish_reports_staging_and_destination_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let directory_file = root.path().join("not-a-directory");
+    std::fs::write(&directory_file, b"file").unwrap();
+    let error = super::publish(&directory_file, &directory_file.join("hook")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("failed to create embedded hook staging file")
+    );
+
+    let destination = root.path().join("existing-directory");
+    std::fs::create_dir(&destination).unwrap();
+    let error = super::publish(root.path(), &destination).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("failed to publish embedded sandbox hook")
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn materialized_hook_is_signed_and_exports_interpose_symbols() {
     let root = tempfile::tempdir().unwrap();
     let path = super::materialize(root.path()).unwrap();

@@ -73,6 +73,20 @@ unsafe extern "C" {
         entry: *mut libc::dirent,
         result: *mut *mut libc::dirent,
     ) -> libc::c_int;
+
+    fn fts_open(
+        paths: *const *mut libc::c_char,
+        options: libc::c_int,
+        compare: Option<
+            unsafe extern "C" fn(
+                *const *const libc::c_void,
+                *const *const libc::c_void,
+            ) -> libc::c_int,
+        >,
+    ) -> *mut libc::c_void;
+    fn fts_children(stream: *mut libc::c_void, options: libc::c_int) -> *mut libc::c_void;
+    fn fts_read(stream: *mut libc::c_void) -> *mut libc::c_void;
+    fn fts_close(stream: *mut libc::c_void) -> libc::c_int;
 }
 
 #[cfg(target_os = "macos")]
@@ -607,16 +621,22 @@ async fn upper_only_entries_are_visible_to_system_ls() {
     std::fs::write(source.join("lower.txt"), b"lower").unwrap();
     std::fs::write(source.join("hidden.txt"), b"hidden").unwrap();
 
-    let outcome = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
-        .run(
-            SandboxCommand::new("/bin/sh")
-                .args([
-                    "-c",
-                    "printf upper > upper.txt && /bin/mkdir upper-dir && /bin/rm hidden.txt && listing=$(/bin/ls -1) && printf '%s\n' \"$listing\" | /usr/bin/grep -qx upper.txt && printf '%s\n' \"$listing\" | /usr/bin/grep -qx upper-dir && printf '%s\n' \"$listing\" | /usr/bin/grep -qx lower.txt && ! printf '%s\n' \"$listing\" | /usr/bin/grep -qx hidden.txt && long_listing=$(/bin/ls -l) && printf '%s\n' \"$long_listing\" | /usr/bin/grep -q ' upper.txt$' && printf '%s\n' \"$long_listing\" | /usr/bin/grep -q ' upper-dir$' && test \"$(/bin/ls -ln upper.txt | /usr/bin/awk '{print $5}')\" = 5 && test \"$(/bin/ls -d upper-dir)\" = upper-dir && /bin/ls -la upper-dir >/dev/null",
-                ])
-                .current_dir(&source),
-        )
+    let run = Sandbox::new(sandbox_config_in(&workdir), NoopCallback).run(
+        SandboxCommand::new("/bin/bash")
+            .args([
+                "-c",
+                "printf upper > upper.txt && test \"$(/bin/cat upper.txt)\" = upper && /bin/mkdir upper-dir && /bin/rm hidden.txt && listing=$(/bin/ls -1) && printf '%s\n' \"$listing\" | /usr/bin/grep -qx upper.txt && printf '%s\n' \"$listing\" | /usr/bin/grep -qx upper-dir && printf '%s\n' \"$listing\" | /usr/bin/grep -qx lower.txt && ! printf '%s\n' \"$listing\" | /usr/bin/grep -qx hidden.txt && long_listing=$(/bin/ls -l) && printf '%s\n' \"$long_listing\" | /usr/bin/grep -q ' upper.txt$' && printf '%s\n' \"$long_listing\" | /usr/bin/grep -q ' upper-dir$' && test \"$(/bin/ls -ln upper.txt | /usr/bin/awk '{print $5}')\" = 5 && test \"$(/bin/ls -d upper-dir)\" = upper-dir && /bin/ls -la upper-dir >/dev/null",
+            ])
+            .current_dir(&source),
+    );
+    let timeout = if std::env::var_os("CARGO_LLVM_COV").is_some() {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(15)
+    };
+    let outcome = tokio::time::timeout(timeout, run)
         .await
+        .expect("system ls deadlocked while traversing an upper-only directory")
         .unwrap();
 
     assert!(outcome.status().success());
@@ -1436,6 +1456,8 @@ async fn runner_interposes_the_complete_filesystem_operation_set() {
         "renamed-at.txt",
         "created-at",
         "created",
+        "vectored.txt",
+        "mapped.bin",
     ] {
         assert!(!source.join(path).exists());
     }
@@ -1653,6 +1675,10 @@ fn filesystem_interposed_child_process() {
         std::ffi::CString::new(root.join("creat.txt").as_os_str().as_encoded_bytes()).unwrap();
     let spawn =
         std::ffi::CString::new(root.join("spawn.txt").as_os_str().as_encoded_bytes()).unwrap();
+    let vectored =
+        std::ffi::CString::new(root.join("vectored.txt").as_os_str().as_encoded_bytes()).unwrap();
+    let mapped =
+        std::ffi::CString::new(root.join("mapped.bin").as_os_str().as_encoded_bytes()).unwrap();
     let source_link =
         std::ffi::CString::new(root.join("source-link").as_os_str().as_encoded_bytes()).unwrap();
     let renamed_link =
@@ -1849,6 +1875,98 @@ fn filesystem_interposed_child_process() {
         assert_eq!(*libc::__error(), libc::EINVAL);
         assert_eq!(libc::truncate(creat.as_ptr(), 2), 0);
 
+        let vectored_file = libc::open(
+            vectored.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(vectored_file >= 0);
+        let initial = [b"ab".as_slice(), b"cd".as_slice()].map(|part| libc::iovec {
+            iov_base: part.as_ptr().cast_mut().cast(),
+            iov_len: part.len(),
+        });
+        assert_eq!(
+            libc::writev(
+                vectored_file,
+                initial.as_ptr(),
+                initial.len() as libc::c_int
+            ),
+            4
+        );
+        assert_eq!(libc::pwrite(vectored_file, b"XY".as_ptr().cast(), 2, 1), 2);
+        let positioned = [b"EF".as_slice(), b"GH".as_slice()].map(|part| libc::iovec {
+            iov_base: part.as_ptr().cast_mut().cast(),
+            iov_len: part.len(),
+        });
+        assert_eq!(
+            libc::pwritev(
+                vectored_file,
+                positioned.as_ptr(),
+                positioned.len() as libc::c_int,
+                4,
+            ),
+            4
+        );
+        assert_eq!(libc::fsync(vectored_file), 0);
+        let reader = libc::open(vectored.as_ptr(), libc::O_RDONLY);
+        assert!(reader >= 0);
+        let mut content = [0_u8; 8];
+        assert_eq!(
+            libc::read(reader, content.as_mut_ptr().cast(), content.len()),
+            8
+        );
+        assert_eq!(&content, b"aXYdEFGH");
+        assert_eq!(libc::close(reader), 0);
+        assert_eq!(libc::close(vectored_file), 0);
+
+        let mapped_file = libc::open(
+            mapped.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(mapped_file >= 0);
+        let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        assert!(page_size > 0);
+        let mapping_length = 3 * page_size;
+        assert_eq!(
+            libc::ftruncate(mapped_file, mapping_length as libc::off_t),
+            0
+        );
+        let mapping = libc::mmap(
+            std::ptr::null_mut(),
+            mapping_length,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            mapped_file,
+            0,
+        );
+        assert_ne!(mapping, libc::MAP_FAILED);
+        std::ptr::copy_nonoverlapping(b"mapped".as_ptr(), mapping.cast::<u8>(), 6);
+        assert_eq!(libc::msync(mapping, mapping_length, libc::MS_SYNC), 0);
+        assert_eq!(libc::close(mapped_file), 0);
+        let middle = mapping.cast::<u8>().add(page_size).cast();
+        assert_eq!(
+            libc::mprotect(middle, page_size, libc::PROT_READ),
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::mprotect(middle, page_size, libc::PROT_READ | libc::PROT_WRITE,),
+            0
+        );
+        std::ptr::copy_nonoverlapping(b"-data".as_ptr(), mapping.cast::<u8>().add(6), 5);
+        assert_eq!(libc::msync(mapping, mapping_length, libc::MS_ASYNC), 0);
+        let reader = libc::open(mapped.as_ptr(), libc::O_RDONLY);
+        assert!(reader >= 0);
+        let mut content = [0_u8; 11];
+        assert_eq!(
+            libc::read(reader, content.as_mut_ptr().cast(), content.len()),
+            11
+        );
+        assert_eq!(&content, b"mapped-data");
+        assert_eq!(libc::close(reader), 0);
+
         assert_eq!(libc::chmod(source.as_ptr(), 0o600), 0);
         assert_eq!(libc::stat(source.as_ptr(), status.as_mut_ptr()), 0);
         assert_eq!(u32::from((*status.as_ptr()).st_mode) & 0o777, 0o600);
@@ -2021,6 +2139,39 @@ fn filesystem_interposed_child_process() {
         assert_eq!(child_status, 0);
         assert_eq!(libc::posix_spawn_file_actions_destroy(&mut actions), 0);
 
+        assert_eq!(libc::munmap(middle, page_size), 0);
+        assert_eq!(libc::munmap(mapping, page_size), 0);
+        assert_eq!(
+            libc::munmap(mapping.cast::<u8>().add(2 * page_size).cast(), page_size,),
+            0
+        );
+        let mapped_file = libc::open(mapped.as_ptr(), libc::O_RDWR);
+        assert!(mapped_file >= 0);
+        let reservation = libc::mmap(
+            std::ptr::null_mut(),
+            page_size,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        assert_ne!(reservation, libc::MAP_FAILED);
+        let fixed = libc::mmap(
+            reservation,
+            page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_FIXED,
+            mapped_file,
+            0,
+        );
+        assert_eq!(fixed, reservation);
+        assert_eq!(
+            &std::slice::from_raw_parts(fixed.cast::<u8>(), 11),
+            b"mapped-data"
+        );
+        assert_eq!(libc::munmap(fixed, page_size), 0);
+        assert_eq!(libc::close(mapped_file), 0);
+
         assert_eq!(
             libc::openat(-1, c"missing.txt".as_ptr(), libc::O_RDONLY),
             -1
@@ -2038,6 +2189,12 @@ fn filesystem_interposed_child_process() {
         assert_eq!(*libc::__error(), libc::ENOTSUP);
         assert_eq!(libc::fclose(stream), 0);
 
+        let stream = libc::fopen(source.as_ptr(), c"r".as_ptr());
+        assert!(!stream.is_null());
+        let stream = libc::freopen(c"/dev/null".as_ptr(), c"r".as_ptr(), stream);
+        assert!(!stream.is_null());
+        assert_eq!(libc::fclose(stream), 0);
+
         let appended =
             std::ffi::CString::new(root.join("appended.txt").as_os_str().as_encoded_bytes())
                 .unwrap();
@@ -2045,6 +2202,17 @@ fn filesystem_interposed_child_process() {
         assert!(!stream.is_null());
         assert_eq!(libc::fclose(stream), 0);
         assert_eq!(libc::unlink(appended.as_ptr()), 0);
+
+        let original_directory = libc::open(c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
+        let device_directory = libc::open(c"/dev".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
+        assert!(original_directory >= 0);
+        assert!(device_directory >= 0);
+        *libc::__error() = libc::E2BIG;
+        assert_eq!(libc::fchdir(device_directory), 0);
+        assert_eq!(*libc::__error(), libc::E2BIG);
+        assert_eq!(libc::fchdir(original_directory), 0);
+        assert_eq!(libc::close(device_directory), 0);
+        assert_eq!(libc::close(original_directory), 0);
 
         assert_eq!(libc::mkdir(created.as_ptr(), 0o700), 0);
         let created_directory = libc::open(created.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
@@ -2072,6 +2240,20 @@ fn filesystem_interposed_child_process() {
         assert_eq!(libc::close(created_directory), 0);
         assert_eq!(libc::rename(creat.as_ptr(), renamed.as_ptr()), 0);
         assert_eq!(libc::unlink(renamed.as_ptr()), 0);
+
+        assert!(fts_open(std::ptr::null(), 0x010, None).is_null());
+        assert_eq!(*libc::__error(), libc::EFAULT);
+        let mut fts_paths = [root_path.as_ptr().cast_mut(), std::ptr::null_mut()];
+        let fts = fts_open(fts_paths.as_mut_ptr(), 0x004 | 0x010, None);
+        assert!(!fts.is_null());
+        assert!(!fts_read(fts).is_null());
+        assert!(!fts_children(fts, 0).is_null());
+        let mut fts_entries = 1;
+        while !fts_read(fts).is_null() {
+            fts_entries += 1;
+        }
+        assert!(fts_entries >= 3);
+        assert_eq!(fts_close(fts), 0);
 
         let directory = libc::opendir(root_path.as_ptr());
         assert!(!directory.is_null());

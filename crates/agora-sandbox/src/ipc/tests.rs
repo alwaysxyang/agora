@@ -1,5 +1,8 @@
+#[cfg(target_os = "macos")]
+use super::configure_no_sigpipe;
 use super::{MAX_FRAME_SIZE, receive, send};
 use crate::nfs::protocol::{PROTOCOL_VERSION, RequestId, Response, ResponseEnvelope};
+use serde::Serialize;
 use std::io::{Read, Write};
 use std::mem::zeroed;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -86,6 +89,102 @@ fn framed_transport_rejects_oversized_payloads_before_allocation() {
     let error = receive::<ResponseEnvelope>(&mut receiver).unwrap_err();
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn framed_transport_rejects_oversized_outbound_payloads() {
+    let (mut sender, _receiver) = UnixStream::pair().unwrap();
+
+    let error = send(&mut sender, &vec![0_u8; MAX_FRAME_SIZE + 1], None).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn framed_transport_reports_serialization_failures_as_invalid_data() {
+    struct InvalidMessage;
+
+    impl Serialize for InvalidMessage {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom(
+                "intentional serialization failure",
+            ))
+        }
+    }
+
+    let (mut sender, _receiver) = UnixStream::pair().unwrap();
+    let error = send(&mut sender, &InvalidMessage, None).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn framed_transport_reports_a_closed_peer() {
+    let (sender, mut receiver) = UnixStream::pair().unwrap();
+    drop(sender);
+
+    let error = receive::<ResponseEnvelope>(&mut receiver).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+}
+
+#[test]
+fn framed_transport_rejects_an_invalid_marker() {
+    let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+    sender.write_all(&[1]).unwrap();
+
+    let error = receive::<ResponseEnvelope>(&mut receiver).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn framed_transport_reports_truncated_frames() {
+    for frame in [&[0_u8, 0, 0][..], &[0_u8, 0, 0, 0, 2, b'{'][..]] {
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        sender.write_all(frame).unwrap();
+        drop(sender);
+
+        let error = receive::<ResponseEnvelope>(&mut receiver).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+}
+
+#[test]
+fn framed_transport_rejects_invalid_json() {
+    let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+    sender.write_all(&[0]).unwrap();
+    sender.write_all(&1_u32.to_be_bytes()).unwrap();
+    sender.write_all(b"{").unwrap();
+
+    let error = receive::<ResponseEnvelope>(&mut receiver).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn framed_transport_rejects_an_invalid_descriptor() {
+    let (mut sender, _receiver) = UnixStream::pair().unwrap();
+    let response = ResponseEnvelope {
+        version: PROTOCOL_VERSION,
+        request_id: request_id(),
+        response: Response::Success,
+    };
+
+    let error = send(&mut sender, &response, Some(-1)).unwrap_err();
+
+    assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn configuring_sigpipe_on_an_invalid_descriptor_reports_ebadf() {
+    let error = configure_no_sigpipe(-1).unwrap_err();
+
+    assert_eq!(error.raw_os_error(), Some(libc::EBADF));
 }
 
 #[test]

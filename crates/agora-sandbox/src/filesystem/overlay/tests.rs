@@ -1,6 +1,7 @@
-use super::OverlayStore;
+use super::{OverlayStore, StagedWrite, WriteReservation};
 use crate::filesystem::{EntryState, FileAttributes, FileCipher, Materializer};
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -51,6 +52,133 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.directory).unwrap();
     }
+}
+
+#[test]
+fn internal_transaction_paths_bypass_overlay_publication() {
+    let fixture = Fixture::new();
+    let internal = fixture.store.root().join("internal-created");
+
+    let (staged, existed, lease, directory) = fixture
+        .store
+        .transaction(|transaction| {
+            let (staged, existed, lease) = transaction.stage_file_open(&internal, true, true)?;
+            let directory = transaction.prepare_directory(fixture.store.root())?;
+            Ok((staged, existed, lease, directory))
+        })
+        .unwrap();
+
+    assert!(existed);
+    assert!(lease.is_none());
+    assert_eq!(staged.destination(), internal);
+    assert_eq!(directory, fixture.store.root());
+    std::fs::write(staged.destination(), b"internal").unwrap();
+    fixture.store.commit_created_file(staged, 0o600).unwrap();
+    assert_eq!(std::fs::read(internal).unwrap(), b"internal");
+}
+
+#[test]
+fn native_metadata_passthrough_rejects_internal_and_dangling_symlink_paths() {
+    let fixture = Fixture::new();
+    assert!(
+        !fixture
+            .store
+            .native_metadata_passthrough(fixture.store.root(), true, |_| true)
+            .unwrap()
+    );
+
+    let dangling = fixture.lower.join("dangling");
+    symlink("missing-target", &dangling).unwrap();
+    assert!(
+        !fixture
+            .store
+            .native_metadata_passthrough(&dangling, true, |_| true)
+            .unwrap()
+    );
+}
+
+#[test]
+fn encrypted_exclusive_reservation_is_removed_when_the_lease_cannot_open() {
+    let (fixture, _) = Fixture::encrypted();
+    let logical = fixture.lower.join("exclusive-create");
+    assert_eq!(
+        errno(&fixture.store.file_destination(&logical, false).unwrap_err()),
+        Some(libc::ENOENT)
+    );
+    let destination = fixture.store.file_destination(&logical, true).unwrap();
+    let lease = OverlayStore::write_lease_path(&destination).unwrap();
+    std::fs::create_dir(&lease).unwrap();
+
+    assert!(fixture.store.stage_file_open(&logical, true, true).is_err());
+    assert!(!destination.exists());
+}
+
+#[test]
+fn failed_symlink_creation_restores_absent_and_whiteout_metadata() {
+    let fixture = Fixture::new();
+    let invalid_target = Path::new(std::ffi::OsStr::from_bytes(b"invalid\0target"));
+
+    let absent = fixture.lower.join("absent-link");
+    assert!(
+        fixture
+            .store
+            .transaction(|transaction| transaction.create_symlink(&absent, invalid_target))
+            .is_err()
+    );
+    assert_eq!(fixture.store.state(&absent).unwrap(), None);
+    assert!(!fixture.store.destination(&absent).unwrap().exists());
+
+    let whiteout = fixture.lower.join("whiteout-link");
+    fixture
+        .store
+        .set_state_for_test(&whiteout, EntryState::Whiteout)
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .transaction(|transaction| transaction.create_symlink(&whiteout, invalid_target))
+            .is_err()
+    );
+    assert_eq!(
+        fixture.store.state(&whiteout).unwrap(),
+        Some(EntryState::Whiteout)
+    );
+}
+
+#[test]
+fn removing_an_entry_reports_parent_directory_permissions() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("entry");
+    std::fs::write(&file, b"data").unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let error = OverlayStore::remove_existing(&file).unwrap_err();
+
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(errno(&error), Some(libc::EACCES));
+}
+
+#[test]
+fn abandoned_reservation_survives_when_its_lock_file_disappears() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("reserved");
+    std::fs::write(&destination, b"reserved").unwrap();
+    let staged = StagedWrite {
+        logical: PathBuf::from("/reserved"),
+        destination: destination.clone(),
+        reservation: Some(WriteReservation {
+            file: std::fs::File::open(&destination).unwrap(),
+            lock_path: directory.path().join("missing-lock"),
+        }),
+    };
+
+    drop(staged);
+
+    assert_eq!(std::fs::read(destination).unwrap(), b"reserved");
 }
 
 fn errno(error: &anyhow::Error) -> Option<i32> {
@@ -547,6 +675,147 @@ fn stale_encrypted_writer_cannot_recreate_a_reconciled_cow_file() {
 }
 
 #[test]
+fn encrypted_writeback_rejects_invalid_or_stale_lease_destinations() {
+    let (fixture, _) = Fixture::encrypted();
+    let mut plaintext = tempfile::tempfile().unwrap();
+    plaintext.write_all(b"plaintext").unwrap();
+
+    let empty = tempfile::tempfile().unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .publish_encrypted(&mut plaintext, &empty)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        fixture
+            .store
+            .overwrite_encrypted(&mut plaintext, &empty)
+            .unwrap(),
+        None
+    );
+
+    let outside = fixture.directory.join("outside");
+    let outside_lease = tempfile::tempfile().unwrap();
+    OverlayStore::write_write_lease_destination(&outside_lease, &outside).unwrap();
+    assert_eq!(
+        errno(
+            &fixture
+                .store
+                .publish_encrypted(&mut plaintext, &outside_lease)
+                .unwrap_err()
+        ),
+        Some(libc::EIO)
+    );
+    assert_eq!(
+        errno(
+            &fixture
+                .store
+                .overwrite_encrypted(&mut plaintext, &outside_lease)
+                .unwrap_err()
+        ),
+        Some(libc::EIO)
+    );
+
+    let missing_destination = fixture.store.root().join("missing-current-lease");
+    let missing_lease = tempfile::tempfile().unwrap();
+    OverlayStore::write_write_lease_destination(&missing_lease, &missing_destination).unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .publish_encrypted(&mut plaintext, &missing_lease)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        fixture
+            .store
+            .overwrite_encrypted(&mut plaintext, &missing_lease)
+            .unwrap(),
+        None
+    );
+
+    let replaced_destination = fixture.store.root().join("replaced-current-lease");
+    let held_lease = tempfile::tempfile().unwrap();
+    OverlayStore::write_write_lease_destination(&held_lease, &replaced_destination).unwrap();
+    let current_lease = OverlayStore::write_lease_path(&replaced_destination).unwrap();
+    std::fs::write(
+        &current_lease,
+        replaced_destination.as_os_str().as_encoded_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .overwrite_encrypted(&mut plaintext, &held_lease)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn encrypted_namespace_leases_cover_file_directory_and_contention_paths() {
+    let (fixture, _) = Fixture::encrypted();
+    let destination = fixture.store.root().join("lease-target");
+    let first = fixture
+        .store
+        .acquire_write_lease(&destination, libc::LOCK_EX | libc::LOCK_NB)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        errno(
+            &fixture
+                .store
+                .acquire_write_lease(&destination, libc::LOCK_EX | libc::LOCK_NB)
+                .unwrap_err()
+        ),
+        Some(libc::EBUSY)
+    );
+    drop(first);
+
+    let leases = fixture
+        .store
+        .acquire_namespace_leases(&destination, false)
+        .unwrap();
+    assert_eq!(leases.len(), 1);
+    drop(leases);
+
+    let directory = fixture.store.root().join("lease-directory");
+    std::fs::create_dir(&directory).unwrap();
+    let child_destination = directory.join("child");
+    let child_lease_path = OverlayStore::write_lease_path(&child_destination).unwrap();
+    std::fs::write(
+        &child_lease_path,
+        child_destination.as_os_str().as_encoded_bytes(),
+    )
+    .unwrap();
+    let leases = fixture
+        .store
+        .acquire_namespace_leases(&directory, true)
+        .unwrap();
+    assert_eq!(leases.len(), 1);
+    drop(leases);
+
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&child_lease_path)
+        .unwrap();
+    OverlayStore::flock(&held, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+    assert_eq!(
+        errno(
+            &fixture
+                .store
+                .acquire_namespace_leases(&directory, true)
+                .unwrap_err()
+        ),
+        Some(libc::EBUSY)
+    );
+    OverlayStore::flock(&held, libc::LOCK_UN).unwrap();
+}
+
+#[test]
 fn pending_encrypted_exclusive_create_is_not_reconciled_as_an_orphan() {
     let (fixture, _) = Fixture::encrypted();
     let logical = fixture.lower.join("pending-create");
@@ -918,6 +1187,105 @@ fn cached_copy_up_refreshes_from_lower_before_a_later_write() {
     assert_eq!(
         fixture.store.visible_path(&source).unwrap(),
         source.canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn removing_a_cached_lower_file_clears_its_staged_copy() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("removed-cached-lower");
+    std::fs::write(&logical, b"lower").unwrap();
+    let staged = fixture.store.stage_write(&logical, false).unwrap();
+    let destination = staged.destination().to_path_buf();
+    drop(staged);
+    std::fs::remove_file(&logical).unwrap();
+
+    assert!(fixture.store.prepare_read(&logical).is_err());
+    assert!(!destination.exists());
+    assert_eq!(fixture.store.state_for_test(&logical).unwrap(), None);
+}
+
+#[test]
+fn creating_after_a_cached_lower_file_disappears_reuses_no_stale_data() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("recreated-cached-lower");
+    std::fs::write(&logical, b"lower").unwrap();
+    let staged = fixture.store.stage_write(&logical, false).unwrap();
+    let old_destination = staged.destination().to_path_buf();
+    drop(staged);
+    std::fs::remove_file(&logical).unwrap();
+
+    let staged = fixture.store.stage_write(&logical, true).unwrap();
+    assert!(!old_destination.exists());
+    std::fs::write(staged.destination(), b"new").unwrap();
+    fixture.store.commit_write(staged).unwrap();
+    assert_eq!(
+        std::fs::read(fixture.store.prepare_read(&logical).unwrap()).unwrap(),
+        b"new"
+    );
+}
+
+#[test]
+fn symlink_resolution_reports_a_cycle_after_the_bounded_walk() {
+    let fixture = Fixture::new();
+    let first = fixture.lower.join("first-link");
+    let second = fixture.lower.join("second-link");
+    symlink("second-link", &first).unwrap();
+    symlink("first-link", &second).unwrap();
+
+    assert_eq!(
+        errno(&fixture.store.resolve_final(&first, false).unwrap_err()),
+        Some(libc::ELOOP)
+    );
+}
+
+#[test]
+fn whiteouts_and_existing_entries_reject_directory_and_symlink_creation() {
+    let fixture = Fixture::new();
+    let existing = fixture.lower.join("existing");
+    std::fs::write(&existing, b"existing").unwrap();
+    assert_eq!(
+        errno(
+            &fixture
+                .store
+                .transaction(|transaction| {
+                    transaction.create_symlink(&existing, Path::new("target"))
+                })
+                .unwrap_err()
+        ),
+        Some(libc::EEXIST)
+    );
+
+    let whiteout = fixture.lower.join("whiteout-directory");
+    fixture
+        .store
+        .set_state_for_test(&whiteout, EntryState::Whiteout)
+        .unwrap();
+    let error = fixture
+        .store
+        .with_lock(|| fixture.store.ensure_directory_locked(&whiteout))
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let error = match fixture.store.directory_view(&whiteout) {
+        Ok(_) => panic!("whiteout unexpectedly produced a directory view"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::NotFound
+    );
+
+    let missing = fixture.lower.join("missing-directory");
+    let error = fixture
+        .store
+        .with_lock(|| fixture.store.ensure_directory_locked(&missing))
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::NotFound
     );
 }
 

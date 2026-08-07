@@ -699,3 +699,6 @@ dyld_interpose!(
 );
 
 dyld_interpose!(INTERPOSE_COPYFILE, agora_sandbox_copyfile, libc::copyfile);
+
+#[cfg(test)]
+mod tests;

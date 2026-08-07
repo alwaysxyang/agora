@@ -80,3 +80,15 @@ fn plain_workspace_rejects_a_file_as_its_root() {
     );
     std::fs::remove_dir_all(workdir).unwrap();
 }
+
+#[test]
+fn plain_workspace_rejects_existing_encrypted_key_state() {
+    let workdir = temporary_directory("encrypted-state");
+    std::fs::create_dir_all(workdir.join("fs")).unwrap();
+    std::fs::write(workdir.join("fs/.key.json"), b"encrypted state").unwrap();
+
+    let error = PlainWorkspace::start(&workdir).unwrap_err();
+
+    assert!(error.to_string().contains("use encrypted filesystem mode"));
+    std::fs::remove_dir_all(workdir).unwrap();
+}

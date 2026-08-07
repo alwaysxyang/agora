@@ -807,6 +807,18 @@ pub unsafe extern "C" fn agora_sandbox_getattrlistbulk(
     unsafe { sandbox_getattrlistbulk(directory, attributes, buffer, size, options) }
 }
 
+#[cfg(test)]
+pub(in crate::hook::filesystem) unsafe fn fts_getattrlistbulk_for_test(
+    directory: libc::c_int,
+    attributes: *mut libc::c_void,
+    buffer: *mut libc::c_void,
+    size: libc::size_t,
+) -> libc::c_int {
+    let stream = std::ptr::NonNull::<libc::c_void>::dangling().as_ptr();
+    let _bulk = FtsVirtualBulk::enter(stream);
+    unsafe { agora_sandbox_getattrlistbulk(directory, attributes, buffer, size, 0) }
+}
+
 fn fts_entry_is_visible(
     runtime: &FilesystemHookRuntime,
     entry: *mut DarwinFtsEntry,
@@ -1250,3 +1262,6 @@ dyld_interpose!(
     agora_sandbox_getattrlistbulk,
     darwin_getattrlistbulk
 );
+
+#[cfg(test)]
+mod tests;

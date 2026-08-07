@@ -3,7 +3,7 @@ use super::{
 };
 use crate::filesystem::FileCipher;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 #[test]
@@ -15,6 +15,97 @@ fn metadata_store_creates_and_validates_directory_markers() {
     store.ensure_marker(Path::new("/Users/bytedance")).unwrap();
     assert!(root.join("Users/bytedance/.metadata").is_file());
     assert!(store.has_marker(Path::new("/Users/bytedance")).unwrap());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_store_rejects_a_directory_as_a_marker() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let directory = Path::new("/project");
+    store.ensure_marker(directory).unwrap();
+    let marker = store.path(directory).unwrap();
+    std::fs::remove_file(&marker).unwrap();
+    std::fs::create_dir(&marker).unwrap();
+
+    assert!(store.ensure_marker(directory).is_err());
+    assert!(store.has_marker(directory).is_err());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_store_reports_an_unreadable_marker() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let directory = Path::new("/restricted");
+    store.ensure_marker(directory).unwrap();
+    let marker = store.path(directory).unwrap();
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0)).unwrap();
+    store.invalidate().unwrap();
+
+    let error = store.state(&directory.join("entry")).unwrap_err();
+
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("failed to read filesystem metadata")
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_store_reports_an_inaccessible_marker_ancestor() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let blocked = root.join("blocked");
+    std::fs::create_dir(&blocked).unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0)).unwrap();
+    let directory = Path::new("/blocked/child");
+
+    let ensure_error = store.ensure_marker(directory).unwrap_err();
+    let marker_error = store.has_marker(directory).unwrap_err();
+
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        ensure_error
+            .to_string()
+            .contains("failed to inspect filesystem metadata")
+    );
+    assert!(
+        marker_error
+            .to_string()
+            .contains("failed to inspect filesystem metadata")
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_cache_evicts_old_missing_directories_at_its_capacity() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let empty_marker = std::fs::read(root.join(".metadata")).unwrap();
+    for index in 0..=super::METADATA_CACHE_CAPACITY {
+        let backing = root.join(format!("directory-{index}"));
+        std::fs::create_dir(&backing).unwrap();
+        std::fs::write(backing.join(".metadata"), &empty_marker).unwrap();
+        let path = std::path::PathBuf::from(format!("/directory-{index}/entry"));
+        assert_eq!(store.state(&path).unwrap(), None);
+    }
+    let probes = store.probe_count();
+
+    assert_eq!(store.state(Path::new("/directory-0/entry")).unwrap(), None);
+    assert_eq!(store.probe_count(), probes + 1);
 
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -243,6 +334,48 @@ fn created_attributes_use_the_effective_identity() {
 }
 
 #[test]
+fn metadata_root_attributes_and_cached_authority_are_explicit() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let attributes = FileAttributes::created_file(0o640);
+
+    assert_eq!(store.attributes(Path::new("/")).unwrap(), None);
+    store
+        .set_attributes(Path::new("/"), attributes.clone())
+        .unwrap();
+    assert_eq!(store.attributes(Path::new("/")).unwrap(), None);
+    assert!(store.ensure_encrypted_name(Path::new("/tmp/file")).is_err());
+    assert!(MetadataStore::storage_name("*").is_err());
+    assert!(MetadataStore::decode("*").is_err());
+
+    let source_file = root.join("source");
+    std::fs::write(&source_file, b"content").unwrap();
+    let source = super::SourceIdentity::from_metadata(&source_file.metadata().unwrap());
+    let materialized = FileAttributes::from_metadata(&source_file.metadata().unwrap());
+    let cached = EntryState::Cached {
+        checksum: None,
+        materializer: Materializer::Copy,
+        source: Some(source),
+    };
+    assert!(!cached.stored_attributes_are_authoritative(&materialized));
+    let mut changed = materialized;
+    changed.mode ^= 0o100;
+    assert!(cached.stored_attributes_are_authoritative(&changed));
+    assert!(EntryState::Cow.stored_attributes_are_authoritative(&attributes));
+    assert!(
+        !EntryState::Cached {
+            checksum: None,
+            materializer: Materializer::Copy,
+            source: None,
+        }
+        .stored_attributes_are_authoritative(&attributes)
+    );
+    assert!(!EntryState::Whiteout.stored_attributes_are_authoritative(&attributes));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn metadata_is_stored_next_to_its_mirrored_directory() {
     let root = tempfile();
     let store = MetadataStore::new(&root).unwrap();
@@ -357,6 +490,223 @@ fn metadata_rejects_invalid_paths_and_records() {
             .unwrap_err()
             .to_string()
             .contains("unsupported")
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_rejects_invalid_version_three_records_and_encrypted_names() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let directory = Path::new("/tmp");
+    let path = store.path(directory).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": METADATA_VERSION,
+            "entries": {"empty": {}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    store.invalidate().unwrap();
+    assert!(
+        store
+            .entries(directory)
+            .unwrap_err()
+            .to_string()
+            .contains("empty")
+    );
+
+    let encrypted_prefix = super::super::crypto::ENCRYPTED_NAME_PREFIX;
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": METADATA_VERSION,
+            "entries": {format!("{encrypted_prefix}invalid"): {"entry": {"state": "cow"}}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    store.invalidate().unwrap();
+    assert!(
+        store
+            .entries(directory)
+            .unwrap_err()
+            .to_string()
+            .contains("requires a cipher")
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+
+    let root = tempfile();
+    let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
+    let store = MetadataStore::encrypted(&root, cipher.clone()).unwrap();
+    let path = store.path(directory).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": METADATA_VERSION,
+            "entries": {format!("{encrypted_prefix}invalid"): {"entry": {"state": "cow"}}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    store.invalidate().unwrap();
+    assert!(
+        store
+            .entries(directory)
+            .unwrap_err()
+            .to_string()
+            .contains("failed to decrypt")
+    );
+
+    let invalid_logical = cipher.encrypt_name(b".").unwrap();
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": METADATA_VERSION,
+            "entries": {invalid_logical: {"entry": {"state": "cow"}}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    store.invalidate().unwrap();
+    assert!(
+        store
+            .entries(directory)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid encrypted filesystem metadata name")
+    );
+
+    let encrypted_file = cipher.encrypt_name(b"file").unwrap();
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": METADATA_VERSION,
+            "entries": {
+                "file": {"entry": {"state": "cow"}},
+                encrypted_file: {"entry": {"state": "whiteout"}}
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    store.invalidate().unwrap();
+    assert!(
+        store
+            .entries(directory)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate")
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_rejects_invalid_serialization_generation_and_legacy_aliases() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let logical_a = MetadataStore::encode(std::ffi::OsStr::new("a"));
+    let logical_b = MetadataStore::encode(std::ffi::OsStr::new("b"));
+    let encrypted_name = format!("{}duplicate", super::super::crypto::ENCRYPTED_NAME_PREFIX);
+
+    let mut metadata = DirectoryMetadata::default();
+    metadata
+        .encrypted_names
+        .insert(logical_a.clone(), "invalid".to_string());
+    assert!(
+        store
+            .serialize_metadata(&metadata)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid encrypted filesystem filename")
+    );
+
+    metadata.encrypted_names.clear();
+    metadata
+        .encrypted_names
+        .insert(logical_a, encrypted_name.clone());
+    metadata.encrypted_names.insert(logical_b, encrypted_name);
+    assert!(
+        store
+            .serialize_metadata(&metadata)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate filesystem metadata record")
+    );
+
+    let directory = Path::new("/legacy");
+    let path = store.path(directory).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let backing = "0123456789abcdef0123456789abcdef";
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "entries": {},
+            "attributes": {},
+            "backing_names": {"a": backing, "b": backing}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    store.invalidate().unwrap();
+    assert!(
+        store
+            .entries(directory)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid filesystem backing name")
+    );
+
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "entries": {"Y2F0": {"state": "cow"}},
+            "attributes": {},
+            "backing_names": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    store.invalidate().unwrap();
+    assert_eq!(
+        store.entries(directory).unwrap(),
+        vec![(std::ffi::OsString::from("cat"), EntryState::Cow)]
+    );
+
+    store.generation.set_len(0).unwrap();
+    assert!(
+        store
+            .state(Path::new("/missing"))
+            .unwrap_err()
+            .to_string()
+            .contains("generation is incomplete")
+    );
+    std::fs::remove_dir_all(root).unwrap();
+
+    let root = tempfile();
+    let generation_path = root.join("generation");
+    std::fs::write(&generation_path, b"invalid").unwrap();
+    let generation = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&generation_path)
+        .unwrap();
+    assert!(
+        MetadataStore::with_generation(&root, generation, None)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("generation is invalid")
     );
     std::fs::remove_dir_all(root).unwrap();
 }

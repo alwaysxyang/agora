@@ -113,8 +113,9 @@ fn sandbox_cli_runs_from_one_strict_config_file() {
     let output = Command::new(env!("CARGO_BIN_EXE_agora-sandbox"))
         .arg("run")
         .arg("-c")
-        .arg(&config)
+        .arg("sandbox.json")
         .args(["-e", "/usr/bin/true"])
+        .current_dir(root.path())
         .output()
         .unwrap();
 
@@ -401,10 +402,17 @@ fn sandbox_cli_auto_generates_reuses_and_replaces_its_workdir_tls_ca() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn sandbox_cli_runs_an_interactive_bash_in_a_terminal() {
+fn sandbox_cli_interactive_encrypted_bash_can_cat_and_list() {
     let root = tempfile::tempdir().unwrap();
     let workdir = root.path().join("workdir");
-    let config = write_cli_config(root.path(), &workdir, "off", "plain", None, None);
+    let config = write_cli_config(
+        root.path(),
+        &workdir,
+        "off",
+        "encrypted",
+        Some("interactive-filesystem-key"),
+        None,
+    );
     let mut process = Command::new("/usr/bin/script");
     process
         .arg("-q")
@@ -419,11 +427,18 @@ fn sandbox_cli_runs_an_interactive_bash_in_a_terminal() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = process.spawn().unwrap();
+    let directory = root.path().to_string_lossy();
+    let directory = shell_words::quote(&directory);
     child
         .stdin
         .take()
         .unwrap()
-        .write_all(b"echo AGORA_INTERACTIVE_BASH_OK\nexit\n")
+        .write_all(
+            format!(
+                "cd {directory}\nprintf AGORA_CAT_OK > interactive.txt\ntest \"$(/bin/cat interactive.txt)\" = AGORA_CAT_OK || exit 31\n/bin/ls -1 > listing.txt\ncase \"$(/bin/cat listing.txt)\" in *interactive.txt*) ;; *) exit 32;; esac\necho AGORA_INTERACTIVE_FS_OK\nexit\n"
+            )
+            .as_bytes(),
+        )
         .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -445,7 +460,7 @@ fn sandbox_cli_runs_an_interactive_bash_in_a_terminal() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("AGORA_INTERACTIVE_BASH_OK"),
+        String::from_utf8_lossy(&output.stdout).contains("AGORA_INTERACTIVE_FS_OK"),
         "stdout={}",
         String::from_utf8_lossy(&output.stdout)
     );

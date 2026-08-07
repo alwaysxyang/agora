@@ -5,7 +5,8 @@ use crate::callback::{
     TlsOutcome, TlsPolicy,
 };
 use crate::protocol::{
-    ConnectRequest, HookOperation, PROTOCOL_VERSION, ProcessIdentity, encode_connect_request,
+    ConnectRequest, HookOperation, MAX_FRAME_SIZE, PROTOCOL_VERSION, ProcessIdentity,
+    encode_connect_request,
 };
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
@@ -281,6 +282,35 @@ async fn initial_payload_is_relayed_and_audited() {
 }
 
 #[tokio::test]
+async fn partial_protocol_before_eof_is_relayed_unchanged() {
+    let destination = echo_server().await;
+    let config = NetworkConfig {
+        domain_inspection_timeout: std::time::Duration::from_secs(2),
+        ..NetworkConfig::default()
+    };
+    let fixture = ProxyFixture::start_with_config(config).await;
+    let runtime = fixture.controller.runtime().clone();
+    let request = connect_request(&runtime, destination, "connection-partial-protocol");
+    let mut client = open_tunnel(&runtime, &request, &[]).await;
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+    client.write_all(b"G").await.unwrap();
+    client.shutdown().await.unwrap();
+
+    let mut echoed = [0_u8; 1];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        client.read_exact(&mut echoed),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(&echoed, b"G");
+
+    fixture.controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn server_first_bytes_are_relayed_without_a_proxy_response() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let destination = listener.local_addr().unwrap();
@@ -358,6 +388,27 @@ async fn invalid_credentials_and_versions_are_rejected_without_audit_events() {
     client.read_exact(&mut echoed).await.unwrap();
     assert_eq!(&echoed, b"still-alive");
 
+    fixture.controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn incomplete_and_oversized_proxy_request_heads_are_rejected() {
+    let fixture = ProxyFixture::start().await;
+    let runtime = fixture.controller.runtime().clone();
+
+    let mut incomplete = TcpStream::connect(runtime.proxy_ipv4()).await.unwrap();
+    incomplete.write_all(b"POST /incomplete").await.unwrap();
+    incomplete.shutdown().await.unwrap();
+    assert_stream_rejected(&mut incomplete).await;
+
+    let mut oversized = TcpStream::connect(runtime.proxy_ipv4()).await.unwrap();
+    oversized
+        .write_all(&vec![b'x'; MAX_FRAME_SIZE])
+        .await
+        .unwrap();
+    assert_stream_rejected(&mut oversized).await;
+
+    assert!(fixture.events.snapshot().is_empty());
     fixture.controller.shutdown().await.unwrap();
 }
 

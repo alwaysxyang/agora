@@ -127,6 +127,69 @@ async fn telegram_api_retries_server_errors() {
 }
 
 #[tokio::test]
+async fn telegram_api_retries_invalid_server_error_responses() {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let captured = Arc::clone(&attempts);
+    let server = HttpMockServer::start(move |_| {
+        if captured.fetch_add(1, Ordering::SeqCst) < 2 {
+            MockResponse::json("not-json").with_status(503)
+        } else {
+            MockResponse::json(
+                r#"{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}}"#,
+            )
+        }
+    })
+    .await;
+    let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
+
+    assert_eq!(api.bot_username().await.unwrap(), "agora_bot");
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn telegram_api_retries_connection_failures_and_redacts_the_token() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let api = TelegramApi::with_base_url(telegram_config(), format!("http://{address}")).unwrap();
+
+    let error = api.bot_username().await.unwrap_err().to_string();
+
+    assert!(error.contains("connection failed"));
+    assert!(!error.contains("123456:secret"));
+}
+
+#[tokio::test]
+async fn telegram_api_rejects_false_callback_draft_and_failed_download_results() {
+    let server = HttpMockServer::start(|request| match request.endpoint() {
+        "answerCallbackQuery" | "sendRichMessageDraft" => {
+            MockResponse::json(r#"{"ok":true,"result":false}"#)
+        }
+        "getFile" => MockResponse::json(
+            r#"{"ok":true,"result":{"file_id":"file","file_unique_id":"unique","file_path":"files/image.jpg"}}"#,
+        ),
+        "image.jpg" => MockResponse::bytes(Vec::new(), "image/jpeg").with_status(503),
+        endpoint => panic!("unexpected Telegram endpoint {endpoint}"),
+    })
+    .await;
+    let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
+    let target = TelegramReplyTarget {
+        chat_id: 1,
+        message_id: 2,
+        message_thread_id: None,
+        is_private: true,
+    };
+
+    assert!(api.answer_callback_query("query").await.is_err());
+    assert!(
+        api.send_rich_message_draft(&target, 7, "draft")
+            .await
+            .is_err()
+    );
+    assert!(api.download_file("file").await.is_err());
+}
+
+#[tokio::test]
 async fn telegram_api_does_not_retry_non_idempotent_message_sends() {
     let server = HttpMockServer::start_json_queue([
         r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#,
@@ -180,6 +243,7 @@ async fn telegram_transport_errors_do_not_expose_the_bot_token() {
 
 #[tokio::test]
 async fn telegram_channel_returns_supported_updates_in_order_and_advances_offset() {
+    crate::channel::test_http::enable_test_logging();
     let server = HttpMockServer::start_json_queue([
         r#"{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}}"#,
         r#"{"ok":true,"result":true}"#,

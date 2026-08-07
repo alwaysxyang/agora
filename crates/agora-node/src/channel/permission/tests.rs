@@ -183,3 +183,26 @@ async fn permission_gate_silently_consumes_unmentioned_denied_group_messages() {
     assert!(!admitted);
     assert!(!delivered.load(Ordering::Relaxed));
 }
+
+#[tokio::test]
+async fn permission_gate_reports_group_denial_even_when_delivery_fails() {
+    let permission = policy(&["user-1"], &[]);
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&delivered);
+
+    let admitted = permission
+        .admit(
+            "channel-1",
+            &AccessContext::group("user-1", "group-1", true),
+            move |message| async move {
+                captured.lock().unwrap().push(message);
+                Err::<(), _>(anyhow::anyhow!("delivery failed"))
+            },
+        )
+        .await;
+
+    assert!(!admitted);
+    let delivered = delivered.lock().unwrap();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].reason(), "当前群聊未在允许列表中。");
+}

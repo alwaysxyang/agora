@@ -461,12 +461,25 @@ fn smb_remote_config_normalizes_paths_and_redacts_credentials() {
             .server(),
         "[2001:db8::1]:445"
     );
+    assert_eq!(
+        SmbRemoteConfig::new("/bracketed", "[2001:db8::2]", "documents")
+            .unwrap()
+            .server(),
+        "[2001:db8::2]:445"
+    );
+    assert_eq!(
+        SmbRemoteConfig::new("/explicit-port", "files.example.com:1445", "documents")
+            .unwrap()
+            .server(),
+        "files.example.com:1445"
+    );
 }
 
 #[test]
 fn smb_remote_config_rejects_unsafe_roots_and_remote_paths() {
     assert!(SmbRemoteConfig::new("relative", "server", "share").is_err());
     assert!(SmbRemoteConfig::new("/", "server", "share").is_err());
+    assert!(SmbRemoteConfig::new("/remote/../escape", "server", "share").is_err());
     assert!(SmbRemoteConfig::new("/remote", "", "share").is_err());
     assert!(SmbRemoteConfig::new("/remote", "server:invalid", "share").is_err());
     assert!(SmbRemoteConfig::new("/remote", "server", "bad/share").is_err());
@@ -476,6 +489,14 @@ fn smb_remote_config_rejects_unsafe_roots_and_remote_paths() {
             .with_remote_path("../escape")
             .is_err()
     );
+    for path in ["bad\\path", "bad\0path"] {
+        assert!(
+            SmbRemoteConfig::new("/remote", "server", "share")
+                .unwrap()
+                .with_remote_path(path)
+                .is_err()
+        );
+    }
 }
 
 #[cfg(feature = "remote-smb")]
@@ -498,6 +519,12 @@ fn nfs_connection_status_output_is_clear_and_redacts_credentials() {
     super::write_remote_connection_status(
         &mut output,
         &remotes,
+        RemoteConnectionStatus::Connected { root: 9 },
+    )
+    .unwrap();
+    super::write_remote_connection_status(
+        &mut output,
+        &remotes,
         RemoteConnectionStatus::Unavailable {
             root: 0,
             errno: libc::EACCES,
@@ -509,6 +536,7 @@ fn nfs_connection_status_output_is_clear_and_redacts_credentials() {
     assert_eq!(
         output,
         "[agora-sandbox] NFS /smb connected: smb://files.example.com:445/documents/projects/current\n\
+[agora-sandbox] NFS route 9 has unknown status\n\
 [agora-sandbox] NFS /smb unavailable: Permission denied (os error 13)\n"
     );
     assert!(!output.contains("alice"));
@@ -668,6 +696,32 @@ fn sandbox_config_rejects_an_encrypted_key_in_plain_mode() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_config_rejects_encrypted_mode_without_a_key_and_resolves_relative_workdirs() {
+    let root = std::env::temp_dir().join(format!(
+        "agora-encrypted-filesystem-missing-key-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let hook = root.join("hook.dylib");
+    std::fs::write(&hook, b"hook").unwrap();
+
+    let mut missing_key = SandboxConfig::new(&hook);
+    missing_key.filesystem_mode = FilesystemMode::Encrypted;
+    assert!(
+        missing_key
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("filesystem key is required")
+    );
+
+    let relative = SandboxConfig::new(&hook).with_workdir("relative-sandbox-workdir");
+    assert!(relative.validate().is_ok());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn command_workdir_resolution_and_disabled_tls_defaults_are_explicit() {
     let current = std::env::current_dir().unwrap().canonicalize().unwrap();
@@ -766,6 +820,48 @@ fn configured_tls_ca_reuses_a_complete_pair_and_replaces_a_partial_pair() {
         first_private_key
     );
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_reports_unreadable_configured_tls_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    for (unreadable_certificate, expected) in [
+        (true, "failed to read TLS CA certificate"),
+        (false, "failed to read TLS CA private key"),
+    ] {
+        let root =
+            std::env::temp_dir().join(format!("agora-unreadable-tls-ca-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let certificate = root.join("ca.pem");
+        let private_key = root.join("ca-key.pem");
+        std::fs::write(&certificate, b"certificate").unwrap();
+        std::fs::write(&private_key, b"private key").unwrap();
+        let unreadable = if unreadable_certificate {
+            &certificate
+        } else {
+            &private_key
+        };
+        std::fs::set_permissions(unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut config = SandboxConfig::new(built_hook_library())
+            .with_workdir(root.join("workdir"))
+            .with_tls_ca(&certificate, &private_key);
+        config.network.tls = TlsMode::Auto;
+
+        let result = Sandbox::new(config, NoopCallback)
+            .run(SandboxCommand::new("/usr/bin/true"))
+            .await;
+
+        std::fs::set_permissions(unreadable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains(expected), "{error:#}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
@@ -886,6 +982,23 @@ fn process_group_helpers_treat_a_missing_group_as_already_stopped() {
     assert!(process_group_exists(0).unwrap());
     assert!(signal_process_group(0, libc::c_int::MAX).is_err());
     assert!(process_group_exists(-1).unwrap());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn foreground_terminal_reports_invalid_descriptors_and_skips_unhanded_restore() {
+    let mut terminal = super::ForegroundTerminal {
+        descriptor: -1,
+        original_process_group: unsafe { libc::getpgrp() },
+        handed_off: false,
+    };
+    terminal.restore().unwrap();
+    assert!(terminal.handoff(unsafe { libc::getpgrp() }).is_err());
+
+    terminal.handed_off = true;
+    assert!(terminal.restore().is_err());
+    terminal.handed_off = false;
+    assert!(super::set_terminal_process_group(-1, unsafe { libc::getpgrp() }).is_err());
 }
 
 #[tokio::test]
@@ -1153,7 +1266,12 @@ async fn child_spawn_failure_shuts_down_started_services() {
     std::fs::write(&hook, b"hook").unwrap();
     let config = SandboxConfig::new(&hook)
         .with_workdir(&root)
-        .with_plain_workspace();
+        .with_plain_workspace()
+        .with_smb_remote(
+            SmbRemoteConfig::new("/remote", "127.0.0.1", "missing")
+                .unwrap()
+                .with_credentials("user", "password"),
+        );
     let invalid_argument = std::ffi::OsString::from_vec(b"invalid\0argument".to_vec());
 
     let error = Sandbox::new(config, NoopCallback)
