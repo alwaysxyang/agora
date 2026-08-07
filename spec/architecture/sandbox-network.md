@@ -184,6 +184,8 @@ Sandbox::run
   -> validate explicit fixed PEM interception CA paths when configured
   -> use the configured persistent workdir and load or generate its default CA when explicit paths are absent
   -> create an authenticated loopback audit controller for process and file events
+  -> in encrypted filesystem mode, create an independent authenticated local content Broker
+     that retains anonymous plaintext descriptors and updates block-encrypted upper files
   -> create an authenticated loopback execution controller backed by <workdir>/fs
      whose incomplete handshakes expire after one second and whose active connections are capped at 64
   -> resolve the root executable and prepare a persistent native copy only when injection

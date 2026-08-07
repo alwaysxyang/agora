@@ -3,19 +3,47 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 1;
+pub(crate) const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RequestEnvelope {
     pub(crate) version: u16,
     pub(crate) token: String,
+    pub(crate) request_id: RequestId,
     pub(crate) request: Request,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ResponseEnvelope {
     pub(crate) version: u16,
+    pub(crate) request_id: RequestId,
     pub(crate) response: Response,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize)]
+pub(crate) struct RequestId(String);
+
+impl RequestId {
+    pub(crate) fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if value.len() != 32
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("invalid remote request ID");
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +73,9 @@ pub(crate) enum Request {
     Abort {
         handle: String,
     },
+    Claim {
+        request_id: RequestId,
+    },
     CreateDirectory {
         path: RemotePath,
         mode: u32,
@@ -66,6 +97,9 @@ pub(crate) enum Response {
     Open {
         handle: String,
         metadata: RemoteMetadata,
+    },
+    Synced {
+        metadata: Option<RemoteMetadata>,
     },
     Stat {
         metadata: RemoteMetadata,

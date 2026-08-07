@@ -1,5 +1,5 @@
 use super::super::FilesystemHookRuntime;
-use super::RemoteFilesystem;
+use super::{RemoteAnchor, RemoteFilesystem};
 use crate::nfs::protocol::RemoteRoute;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
@@ -121,4 +121,17 @@ fn remote_current_directory_is_restored_only_from_its_broker_anchor() {
     .unwrap();
     assert_eq!(restored.logical, Path::new("/remote/team/docs"));
     assert!(restored.remote);
+}
+
+#[test]
+fn remote_anchor_removes_its_temporary_inode_when_released() {
+    let runtime = tempfile::tempdir().unwrap();
+    let file = runtime
+        .path()
+        .join("anchor-0123456789abcdef0123456789abcdef");
+    std::fs::write(&file, []).unwrap();
+
+    drop(RemoteAnchor::adopt(&file).unwrap());
+
+    assert!(!file.exists());
 }

@@ -1,4 +1,6 @@
 #[cfg(target_os = "macos")]
+pub(crate) mod broker;
+#[cfg(target_os = "macos")]
 mod crypto;
 #[cfg(target_os = "macos")]
 mod encrypted;
@@ -76,7 +78,7 @@ pub(crate) fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) use crypto::FileCipher;
+pub(crate) use crypto::{EncryptedFile, FileCipher};
 #[cfg(target_os = "macos")]
 pub(crate) use encrypted::{EncryptedWorkspace, KeyMigrationStage};
 #[cfg(target_os = "macos")]

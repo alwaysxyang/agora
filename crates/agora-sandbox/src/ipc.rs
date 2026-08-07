@@ -1,4 +1,4 @@
-//! Unix socket framing and descriptor transfer for network filesystems.
+//! Unix socket framing and descriptor transfer shared by sandbox brokers.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;

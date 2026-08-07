@@ -261,11 +261,11 @@ unsafe fn sandbox_chdir(path: *const libc::c_char) -> libc::c_int {
         };
         let caller_errno = unsafe { *libc::__error() };
         match runtime.prepare_change_directory(path) {
-            Ok((mapped, logical, remote)) => {
+            Ok((mapped, logical, remote, anchor)) => {
                 let result = unsafe { original(mapped.as_ptr()) };
                 if result == 0 {
                     if remote || runtime.synchronize_current_directory().is_err() {
-                        runtime.set_current_directory_state(logical, remote);
+                        runtime.set_current_directory_state(logical, remote, anchor);
                     }
                     unsafe { set_errno(caller_errno) };
                 }
@@ -335,7 +335,7 @@ unsafe fn sandbox_fchdir(descriptor: libc::c_int) -> libc::c_int {
         let result = unsafe { original(descriptor) };
         if result == 0 {
             if managed_descriptor || runtime.synchronize_current_directory().is_err() {
-                runtime.set_current_directory_state(logical, remote_descriptor);
+                runtime.set_current_directory_state(logical, remote_descriptor, None);
             }
             unsafe { set_errno(caller_errno) };
         }

@@ -2,7 +2,7 @@
 
 use super::{
     PROTOCOL_VERSION, RemoteEntry, RemoteFileType, RemoteMetadata, RemotePath, Request,
-    RequestEnvelope, Response, ResponseEnvelope,
+    RequestEnvelope, RequestId, Response, ResponseEnvelope,
 };
 
 #[test]
@@ -10,6 +10,7 @@ fn protocol_round_trip_preserves_remote_operations() {
     let request = RequestEnvelope {
         version: PROTOCOL_VERSION,
         token: "run-token".to_string(),
+        request_id: RequestId::new("0123456789abcdef0123456789abcdef").unwrap(),
         request: Request::Rename {
             from: RemotePath::new(2, "old/name").unwrap(),
             to: RemotePath::new(2, "new/name").unwrap(),
@@ -21,6 +22,7 @@ fn protocol_round_trip_preserves_remote_operations() {
 
     let response = ResponseEnvelope {
         version: PROTOCOL_VERSION,
+        request_id: request.request_id.clone(),
         response: Response::List {
             entries: vec![RemoteEntry {
                 name: "file.txt".to_string(),
@@ -40,6 +42,13 @@ fn protocol_round_trip_preserves_remote_operations() {
         serde_json::from_slice::<ResponseEnvelope>(&encoded).unwrap(),
         response
     );
+}
+
+#[test]
+fn request_ids_reject_non_canonical_values() {
+    assert!(RequestId::new("0123456789abcdef0123456789abcdef").is_ok());
+    assert!(RequestId::new("short").is_err());
+    assert!(RequestId::new("0123456789ABCDEF0123456789ABCDEF").is_err());
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use super::{
-    FilesystemMode, Sandbox, SandboxCommand, SandboxConfig, SandboxOutcome, SecretBytes,
-    SmbRemoteConfig, process_group_exists, signal_process_group, terminate_process_group,
-    wait_for_child_or_service,
+    FilesystemMode, RuntimeServices, Sandbox, SandboxCommand, SandboxConfig, SandboxOutcome,
+    SecretBytes, SmbRemoteConfig, process_group_exists, signal_process_group,
+    terminate_process_group, wait_for_child_or_service,
 };
 use crate::audit::AuditController;
 use crate::callback::{Decision, Event, EventType, NoopCallback, TlsOutcome};
@@ -913,6 +913,7 @@ async fn proxy_failure_terminates_the_child_process() {
     .unwrap();
     controller.abort_listener_for_test();
     let process_group = child.id().unwrap() as libc::pid_t;
+    let mut local_filesystem = None;
     #[cfg(feature = "remote-smb")]
     let mut remote = None;
 
@@ -921,11 +922,14 @@ async fn proxy_failure_terminates_the_child_process() {
         wait_for_child_or_service(
             &mut child,
             process_group,
-            &mut controller,
-            &mut execution,
-            &mut audit,
-            #[cfg(feature = "remote-smb")]
-            &mut remote,
+            RuntimeServices {
+                network: &mut controller,
+                execution: &mut execution,
+                audit: &mut audit,
+                local_filesystem: &mut local_filesystem,
+                #[cfg(feature = "remote-smb")]
+                remote: &mut remote,
+            },
             #[cfg(feature = "remote-smb")]
             |_| {},
         ),
@@ -971,6 +975,7 @@ async fn execution_controller_failure_terminates_the_child_process() {
     .unwrap();
     execution.abort_server_for_test();
     let process_group = child.id().unwrap() as libc::pid_t;
+    let mut local_filesystem = None;
     #[cfg(feature = "remote-smb")]
     let mut remote = None;
 
@@ -979,11 +984,14 @@ async fn execution_controller_failure_terminates_the_child_process() {
         wait_for_child_or_service(
             &mut child,
             process_group,
-            &mut controller,
-            &mut execution,
-            &mut audit,
-            #[cfg(feature = "remote-smb")]
-            &mut remote,
+            RuntimeServices {
+                network: &mut controller,
+                execution: &mut execution,
+                audit: &mut audit,
+                local_filesystem: &mut local_filesystem,
+                #[cfg(feature = "remote-smb")]
+                remote: &mut remote,
+            },
             #[cfg(feature = "remote-smb")]
             |_| {},
         ),
@@ -1029,6 +1037,7 @@ async fn audit_controller_failure_terminates_the_child_process() {
     .unwrap();
     audit.abort_server_for_test();
     let process_group = child.id().unwrap() as libc::pid_t;
+    let mut local_filesystem = None;
     #[cfg(feature = "remote-smb")]
     let mut remote = None;
 
@@ -1037,11 +1046,14 @@ async fn audit_controller_failure_terminates_the_child_process() {
         wait_for_child_or_service(
             &mut child,
             process_group,
-            &mut controller,
-            &mut execution,
-            &mut audit,
-            #[cfg(feature = "remote-smb")]
-            &mut remote,
+            RuntimeServices {
+                network: &mut controller,
+                execution: &mut execution,
+                audit: &mut audit,
+                local_filesystem: &mut local_filesystem,
+                #[cfg(feature = "remote-smb")]
+                remote: &mut remote,
+            },
             #[cfg(feature = "remote-smb")]
             |_| {},
         ),
@@ -1095,16 +1107,20 @@ async fn nfs_broker_failure_terminates_the_child_process() {
     );
     remote.as_mut().unwrap().abort_server_for_test();
     let process_group = child.id().unwrap() as libc::pid_t;
+    let mut local_filesystem = None;
 
     let result = tokio::time::timeout(
         Duration::from_secs(1),
         wait_for_child_or_service(
             &mut child,
             process_group,
-            &mut controller,
-            &mut execution,
-            &mut audit,
-            &mut remote,
+            RuntimeServices {
+                network: &mut controller,
+                execution: &mut execution,
+                audit: &mut audit,
+                local_filesystem: &mut local_filesystem,
+                remote: &mut remote,
+            },
             |_| {},
         ),
     )

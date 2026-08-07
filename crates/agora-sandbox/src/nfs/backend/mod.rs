@@ -23,9 +23,13 @@ pub(crate) trait RemoteStorage: Send + Sync + 'static {
         &self,
         path: &RemotePath,
     ) -> impl Future<Output = StorageResult<(Vec<u8>, RemoteMetadata)>> + Send;
-    fn write(
+    /// Replaces `path` only when its current identity still matches `expected`.
+    /// Implementations must keep the comparison and mutation in one backend
+    /// critical section so an external writer cannot race between them.
+    fn write_if_unchanged(
         &self,
         path: &RemotePath,
+        expected: Option<&RemoteMetadata>,
         data: &[u8],
     ) -> impl Future<Output = StorageResult<RemoteMetadata>> + Send;
     fn list(

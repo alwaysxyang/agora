@@ -657,6 +657,41 @@ impl OverlayStore {
         })
     }
 
+    pub(crate) fn overwrite_encrypted(
+        &self,
+        plaintext: &mut File,
+        lease: &File,
+    ) -> Result<Option<PathBuf>> {
+        let cipher = self
+            .cipher
+            .as_ref()
+            .context("encrypted writeback requires a filesystem cipher")?;
+        self.with_lock(|| {
+            let Some(destination) = Self::read_write_lease_destination(lease)? else {
+                return Ok(None);
+            };
+            if !self.is_internal(&destination) {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+            }
+            let current_lease = match File::open(Self::write_lease_path(&destination)?) {
+                Ok(current) => current,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let held_identity = lease
+                .metadata()
+                .map(|metadata| (metadata.dev(), metadata.ino()))?;
+            let current_identity = current_lease
+                .metadata()
+                .map(|metadata| (metadata.dev(), metadata.ino()))?;
+            if held_identity != current_identity {
+                return Ok(None);
+            }
+            cipher.overwrite(plaintext, &destination)?;
+            Ok(Some(destination))
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn prepare_directory(&self, path: &Path) -> Result<PathBuf> {
         let path = self.normalize(path)?;

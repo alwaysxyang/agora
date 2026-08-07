@@ -1,5 +1,5 @@
 use super::{MAX_FRAME_SIZE, receive, send};
-use crate::nfs::protocol::{PROTOCOL_VERSION, Response, ResponseEnvelope};
+use crate::nfs::protocol::{PROTOCOL_VERSION, RequestId, Response, ResponseEnvelope};
 use std::io::{Read, Write};
 use std::mem::zeroed;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -10,6 +10,7 @@ fn framed_transport_round_trips_without_a_descriptor() {
     let (mut sender, mut receiver) = UnixStream::pair().unwrap();
     let response = ResponseEnvelope {
         version: PROTOCOL_VERSION,
+        request_id: request_id(),
         response: Response::Success,
     };
 
@@ -26,6 +27,7 @@ fn framed_transport_disables_sigpipe_without_a_descriptor() {
     let (mut sender, _receiver) = UnixStream::pair().unwrap();
     let response = ResponseEnvelope {
         version: PROTOCOL_VERSION,
+        request_id: request_id(),
         response: Response::Success,
     };
 
@@ -57,6 +59,7 @@ fn framed_transport_passes_one_close_on_exec_descriptor() {
     let (mut sender, mut receiver) = UnixStream::pair().unwrap();
     let response = ResponseEnvelope {
         version: PROTOCOL_VERSION,
+        request_id: request_id(),
         response: Response::Success,
     };
 
@@ -93,6 +96,7 @@ fn framed_transport_rejects_truncated_descriptor_control_messages() {
     send_descriptor_marker(&sender, &[first.as_raw_fd(), second.as_raw_fd()]);
     let payload = serde_json::to_vec(&ResponseEnvelope {
         version: PROTOCOL_VERSION,
+        request_id: request_id(),
         response: Response::Success,
     })
     .unwrap();
@@ -104,6 +108,10 @@ fn framed_transport_rejects_truncated_descriptor_control_messages() {
     let error = receive::<ResponseEnvelope>(&mut receiver).unwrap_err();
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+fn request_id() -> RequestId {
+    RequestId::new("0123456789abcdef0123456789abcdef").unwrap()
 }
 
 fn send_descriptor_marker(stream: &UnixStream, descriptors: &[RawFd]) {

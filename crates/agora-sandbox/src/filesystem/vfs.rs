@@ -115,8 +115,12 @@ pub(crate) struct PreparedFile {
     staged: Option<StagedWrite>,
     writeback: Option<Writeback>,
     publish_on_open: bool,
+    overwrite_on_open: bool,
     created_mode: Option<u32>,
     layer: FileLayer,
+    encrypted_backing: Option<PathBuf>,
+    broker_file: Option<File>,
+    writable: bool,
 }
 
 pub(crate) struct Writeback {
@@ -154,8 +158,12 @@ impl PreparedFile {
             staged,
             writeback: None,
             publish_on_open: false,
+            overwrite_on_open: false,
             created_mode: None,
             layer,
+            encrypted_backing: None,
+            broker_file: None,
+            writable: false,
         }
     }
 
@@ -169,6 +177,21 @@ impl PreparedFile {
 
     pub(crate) fn into_parts(self) -> (OpenTarget, Option<Writeback>, FileLayer) {
         (self.target, self.writeback, self.layer)
+    }
+
+    pub(crate) fn local_broker_source(&self) -> Result<Option<(PathBuf, File, bool)>> {
+        let Some(backing) = &self.encrypted_backing else {
+            return Ok(None);
+        };
+        let descriptor = self
+            .broker_file
+            .as_ref()
+            .context("encrypted local file has no broker descriptor")?;
+        Ok(Some((
+            backing.clone(),
+            descriptor.try_clone()?,
+            self.writable,
+        )))
     }
 }
 
@@ -523,6 +546,7 @@ impl VirtualFilesystem {
             plaintext.seek(SeekFrom::Start(0))?;
         }
         let baseline = PlaintextIdentity::from_file(&plaintext)?;
+        let broker_file = plaintext.try_clone()?;
         Ok(PreparedFile {
             target: OpenTarget::Descriptor(exposed),
             staged,
@@ -538,8 +562,12 @@ impl VirtualFilesystem {
                 None
             },
             publish_on_open: writes && (!existed || flags & libc::O_TRUNC != 0),
+            overwrite_on_open: writes && existed && flags & libc::O_TRUNC != 0,
             created_mode,
             layer: FileLayer::Upper,
+            encrypted_backing: Some(mapped),
+            broker_file: Some(broker_file),
+            writable: writes,
         })
     }
 
@@ -549,8 +577,21 @@ impl VirtualFilesystem {
 
     pub(crate) fn commit_open(&self, prepared: &mut PreparedFile) -> Result<()> {
         if let Some(writeback) = &prepared.writeback {
-            self.publish_writeback(writeback, prepared.publish_on_open)?;
+            if prepared.overwrite_on_open {
+                let mut plaintext = writeback
+                    .plaintext
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let lease = writeback
+                    .lease
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.overlay.overwrite_encrypted(&mut plaintext, &lease)?;
+            } else {
+                self.publish_writeback(writeback, prepared.publish_on_open)?;
+            }
             prepared.publish_on_open = false;
+            prepared.overwrite_on_open = false;
         }
         if let Some(staged) = prepared.staged.take() {
             if let Some(mode) = prepared.created_mode.take() {

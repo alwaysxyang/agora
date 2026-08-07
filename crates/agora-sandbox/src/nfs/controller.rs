@@ -236,6 +236,8 @@ where
 
     async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut connections = JoinSet::new();
+        let mut expiry = tokio::time::interval(Duration::from_secs(30));
+        expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
@@ -245,6 +247,7 @@ where
                     }
                 }
                 Some(_) = connections.join_next(), if !connections.is_empty() => {}
+                _ = expiry.tick() => self.state.broker.expire_requests().await,
                 accepted = self.listener.accept() => {
                     let (stream, _) = accepted.context("remote filesystem accept failed")?;
                     let Ok(permit) = Arc::clone(&self.connections).try_acquire_owned() else {
@@ -275,6 +278,7 @@ where
         .await
         .context("remote filesystem receive task failed")?;
         let (request, descriptor) = received?;
+        let request_id = request.request_id.clone();
         let reply = if descriptor.is_some() {
             crate::nfs::broker::BrokerReply {
                 response: Response::Error {
@@ -300,10 +304,14 @@ where
                 descriptor: None,
             }
         } else {
-            state.broker.handle(request.request).await
+            state
+                .broker
+                .handle_request(request_id.clone(), request.request)
+                .await
         };
         let response = ResponseEnvelope {
             version: PROTOCOL_VERSION,
+            request_id,
             response: reply.response,
         };
         tokio::task::spawn_blocking(move || {

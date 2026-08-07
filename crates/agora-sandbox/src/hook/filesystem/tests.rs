@@ -53,6 +53,7 @@ use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -163,6 +164,14 @@ impl NfsTestServer {
         let (socket, token) = started.recv().unwrap();
         (socket, token, shutdown, thread)
     }
+
+    fn anchor_count(&self) -> usize {
+        std::fs::read_dir(self._runtime_directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("anchor-"))
+            .count()
+    }
 }
 
 impl Drop for NfsTestServer {
@@ -258,6 +267,23 @@ fn nfs_files_use_anonymous_descriptors_without_overlay_state() {
 }
 
 #[test]
+fn metadata_only_remote_stat_releases_its_temporary_anchor() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_file(0, "file.txt", b"remote");
+    let path = Fixture::c_path(&nfs.logical_root.join("file.txt"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        for _ in 0..8 {
+            let mut status = std::mem::zeroed();
+            assert_eq!(sandbox_stat(path.as_ptr(), &mut status), 0);
+        }
+    });
+
+    assert_eq!(nfs.anchor_count(), 0);
+}
+
+#[test]
 fn nfs_existing_open_uses_one_remote_lookup() {
     let mut fixture = Fixture::new();
     let nfs = fixture.attach_nfs();
@@ -347,23 +373,49 @@ fn nfs_directory_from_fts_read_uses_its_remote_anchor_for_descent() {
     nfs.storage.insert_directory(0, "test");
     nfs.storage.insert_directory(0, "test/nested");
     let directory = nfs.logical_root.join("test/nested");
-    let path = Fixture::c_path(&directory);
 
     with_test_runtime(&fixture.runtime, || {
-        let (expected, _, _) = fixture
-            .runtime
-            .map_metadata(
-                path.as_ptr(),
-                libc::AT_FDCWD,
-                false,
-                &crate::filesystem::Credentials::effective(),
-            )
-            .unwrap();
+        let descent = fts_directory_descent_path_for_test(&directory).unwrap();
+        let descent = Path::new(std::ffi::OsStr::from_bytes(&descent));
         assert_eq!(
-            fts_directory_descent_path_for_test(&directory).unwrap(),
-            expected.as_bytes()
+            descent.parent().unwrap().canonicalize().unwrap(),
+            nfs._runtime_directory.path().canonicalize().unwrap()
+        );
+        assert!(
+            descent
+                .file_name()
+                .unwrap()
+                .as_bytes()
+                .starts_with(b"anchor-")
         );
     });
+}
+
+#[test]
+fn nfs_stat_releases_each_temporary_anchor_after_the_native_call() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    for index in 0..128 {
+        nfs.storage
+            .insert_file(0, &format!("file-{index}"), b"content");
+    }
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        for index in 0..128 {
+            let path = Fixture::c_path(&nfs.logical_root.join(format!("file-{index}")));
+            let mut status = std::mem::zeroed();
+            assert_eq!(sandbox_stat(path.as_ptr(), &mut status), 0);
+        }
+    });
+
+    assert_eq!(
+        std::fs::read_dir(nfs._runtime_directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().as_encoded_bytes().starts_with(b"anchor-"))
+            .count(),
+        0
+    );
 }
 
 #[test]
@@ -581,14 +633,13 @@ fn nfs_dup2_closes_the_replaced_remote_handle() {
             nfs.storage.data(0, "destination.txt"),
             Some(b"saved".to_vec())
         );
-        let error = fixture
+        fixture
             .runtime
             .remote
             .as_ref()
             .unwrap()
             .close(&old_handle)
-            .unwrap_err();
-        assert_eq!(error_errno(&error), libc::EBADF);
+            .unwrap();
 
         assert_eq!(sandbox_close(destination), 0);
         assert_eq!(sandbox_close(source), 0);
@@ -880,7 +931,7 @@ fn allowlisted_device_opens_bypass_audit_and_tracking() {
 fn root_no_follow_metadata_uses_the_native_root() {
     let fixture = Fixture::new();
 
-    let (mapped, plaintext_size, attributes) = fixture
+    let (mapped, plaintext_size, attributes, _anchor) = fixture
         .runtime
         .map_metadata(
             c"/".as_ptr(),
@@ -906,7 +957,7 @@ fn allowlisted_device_metadata_and_directories_ignore_overlay_state() {
         .set_attributes(Path::new("/dev/null"), attributes)
         .unwrap();
 
-    let (mapped, plaintext_size, attributes) = fixture
+    let (mapped, plaintext_size, attributes, _anchor) = fixture
         .runtime
         .map_metadata(
             c"/dev/null".as_ptr(),
@@ -1082,6 +1133,7 @@ fn managed_fts_streams_do_not_require_current_directory_resynchronization() {
             mappings: Vec::new(),
             presented: Vec::new(),
             traversal_paths: Vec::new(),
+            anchors: Vec::new(),
         },
     );
     assert!(!super::fts_stream_may_change_current_directory(stream));
@@ -2440,12 +2492,14 @@ fn logical_current_directory_drives_relative_path_resolution() {
     std::fs::write(&file, b"content").unwrap();
     let directory_path = Fixture::c_path(&directory);
 
-    let (mapped, logical, remote) = fixture
+    let (mapped, logical, remote, anchor) = fixture
         .runtime
         .prepare_change_directory(directory_path.as_ptr())
         .unwrap();
     assert_eq!(Path::new(mapped.to_str().unwrap()), directory);
-    fixture.runtime.set_current_directory_state(logical, remote);
+    fixture
+        .runtime
+        .set_current_directory_state(logical, remote, anchor);
 
     with_test_runtime(&fixture.runtime, || unsafe {
         let mut cwd = vec![0_i8; libc::PATH_MAX as usize];

@@ -15,6 +15,8 @@ const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
 const FILESYSTEM_ROOT: &str = "AGORA_SANDBOX_FILESYSTEM_ROOT";
 const FILESYSTEM_MODE: &str = "AGORA_SANDBOX_FILESYSTEM_MODE";
 const FILESYSTEM_CIPHER_KEY: &str = "AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY";
+const LOCAL_FILESYSTEM_CONTROL: &str = "AGORA_SANDBOX_LOCAL_FILESYSTEM_CONTROL";
+const LOCAL_FILESYSTEM_TOKEN: &str = "AGORA_SANDBOX_LOCAL_FILESYSTEM_TOKEN";
 const REMOTE_CONTROL: &str = "AGORA_SANDBOX_REMOTE_CONTROL";
 const REMOTE_TOKEN: &str = "AGORA_SANDBOX_REMOTE_TOKEN";
 const REMOTE_ROOTS: &str = "AGORA_SANDBOX_REMOTE_ROOTS";
@@ -30,7 +32,7 @@ const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
     "GIT_SSL_CAINFO",
 ];
 
-pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 23] = [
+pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 25] = [
     TOKEN,
     PROXY_IPV4,
     PROXY_IPV6,
@@ -42,6 +44,8 @@ pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 23] = [
     FILESYSTEM_ROOT,
     FILESYSTEM_MODE,
     FILESYSTEM_CIPHER_KEY,
+    LOCAL_FILESYSTEM_CONTROL,
+    LOCAL_FILESYSTEM_TOKEN,
     REMOTE_CONTROL,
     REMOTE_TOKEN,
     REMOTE_ROOTS,
@@ -70,6 +74,7 @@ pub(super) struct HookConfig {
     filesystem_mode: String,
     filesystem_cipher_key: Option<String>,
     filesystem_cipher: Option<crate::filesystem::FileCipher>,
+    local_filesystem: Option<(String, String)>,
     remote_filesystem: Option<RemoteHookConfig>,
     remote_current_directory: Option<PathBuf>,
     tls_trust_anchor_der: Option<String>,
@@ -118,6 +123,22 @@ impl HookConfig {
         }
         let filesystem_cipher =
             Self::decode_filesystem_cipher(&filesystem_mode, filesystem_cipher_key.as_deref())?;
+        let local_control = get(LOCAL_FILESYSTEM_CONTROL).filter(|value| !value.is_empty());
+        let local_token = get(LOCAL_FILESYSTEM_TOKEN).filter(|value| !value.is_empty());
+        let local_filesystem = match (local_control, local_token) {
+            (None, None) => None,
+            (Some(control), Some(token)) => {
+                if !Path::new(&control).is_absolute() {
+                    return Err(format!(
+                        "{LOCAL_FILESYSTEM_CONTROL} must be an absolute path"
+                    ));
+                }
+                Some((control, token))
+            }
+            _ => {
+                return Err("local filesystem requires control and token together".to_string());
+            }
+        };
         let remote_control = get(REMOTE_CONTROL).filter(|value| !value.is_empty());
         let remote_token = get(REMOTE_TOKEN).filter(|value| !value.is_empty());
         let remote_roots = get(REMOTE_ROOTS).filter(|value| !value.is_empty());
@@ -192,6 +213,7 @@ impl HookConfig {
             filesystem_mode,
             filesystem_cipher_key,
             filesystem_cipher,
+            local_filesystem,
             remote_filesystem,
             remote_current_directory,
             tls_trust_anchor_der,
@@ -237,6 +259,12 @@ impl HookConfig {
 
     pub(super) fn filesystem_cipher(&self) -> Option<crate::filesystem::FileCipher> {
         self.filesystem_cipher.clone()
+    }
+
+    pub(super) fn local_filesystem(&self) -> Option<(&str, &str)> {
+        self.local_filesystem
+            .as_ref()
+            .map(|(control, token)| (control.as_str(), token.as_str()))
     }
 
     pub(super) fn remote_filesystem(&self) -> Option<(&str, &str, &str)> {
@@ -306,6 +334,12 @@ impl HookConfig {
         if let Some(key) = &self.filesystem_cipher_key {
             environment.push((FILESYSTEM_CIPHER_KEY, key.clone()));
         }
+        if let Some((control, token)) = &self.local_filesystem {
+            environment.extend([
+                (LOCAL_FILESYSTEM_CONTROL, control.clone()),
+                (LOCAL_FILESYSTEM_TOKEN, token.clone()),
+            ]);
+        }
         if let Some(remote) = &self.remote_filesystem {
             environment.extend([
                 (REMOTE_CONTROL, remote.control.clone()),
@@ -347,6 +381,8 @@ pub(super) fn initialize() {
             FILESYSTEM_ROOT,
             FILESYSTEM_MODE,
             FILESYSTEM_CIPHER_KEY,
+            LOCAL_FILESYSTEM_CONTROL,
+            LOCAL_FILESYSTEM_TOKEN,
             REMOTE_CONTROL,
             REMOTE_TOKEN,
             REMOTE_ROOTS,

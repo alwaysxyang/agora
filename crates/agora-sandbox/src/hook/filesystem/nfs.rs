@@ -35,8 +35,13 @@ pub(super) struct RemoteOpen {
 
 pub(super) struct RemoteDirectoryView {
     logical: PathBuf,
-    anchor: CString,
+    anchor: RemoteAnchor,
     entries: Vec<RemoteEntry>,
+}
+
+pub(super) struct RemoteAnchor {
+    path: CString,
+    physical: PathBuf,
 }
 
 impl RemoteFilesystem {
@@ -173,13 +178,20 @@ impl RemoteFilesystem {
     }
 
     pub(super) fn stat(&self, path: &RoutedPath) -> Result<RemoteMetadata> {
-        self.stat_reply(path).map(|(metadata, _)| metadata)
+        let (metadata, anchor) = self.stat_reply(path)?;
+        drop(self.anchor(&anchor)?);
+        Ok(metadata)
     }
 
     pub(super) fn stat_plan(
         &self,
         path: &RoutedPath,
-    ) -> Result<(CString, Option<libc::off_t>, FileAttributes, RemoteMetadata)> {
+    ) -> Result<(
+        RemoteAnchor,
+        Option<libc::off_t>,
+        FileAttributes,
+        RemoteMetadata,
+    )> {
         let (metadata, anchor) = self.stat_reply(path)?;
         let (anchor, size, attributes) = self.metadata_plan(&anchor, &metadata)?;
         Ok((anchor, size, attributes, metadata))
@@ -212,8 +224,6 @@ impl RemoteFilesystem {
     pub(super) fn directory_view(&self, path: &RoutedPath) -> Result<RemoteDirectoryView> {
         let (entries, anchor) = self.list(path)?;
         let anchor = self.anchor(&anchor)?;
-        let anchor = CString::new(anchor.as_os_str().as_bytes())
-            .context("remote filesystem directory anchor contains NUL")?;
         Ok(RemoteDirectoryView {
             logical: path.logical.clone(),
             anchor,
@@ -228,10 +238,16 @@ impl RemoteFilesystem {
         })
     }
 
-    pub(super) fn sync(&self, handle: &str) -> Result<()> {
-        self.expect_success(Request::Sync {
+    pub(super) fn sync(&self, handle: &str) -> Result<Option<RemoteMetadata>> {
+        let reply = self.request(Request::Sync {
             handle: handle.to_string(),
-        })
+        })?;
+        match reply.response {
+            Response::Synced { metadata } => Ok(metadata),
+            _ => Err(protocol_error(
+                "remote filesystem sync returned an unexpected response",
+            )),
+        }
     }
 
     pub(super) fn close(&self, handle: &str) -> Result<()> {
@@ -268,10 +284,8 @@ impl RemoteFilesystem {
         &self,
         anchor: &str,
         metadata: &RemoteMetadata,
-    ) -> Result<(CString, Option<libc::off_t>, FileAttributes)> {
+    ) -> Result<(RemoteAnchor, Option<libc::off_t>, FileAttributes)> {
         let path = self.anchor(anchor)?;
-        let path = CString::new(path.as_os_str().as_bytes())
-            .context("remote filesystem metadata anchor contains NUL")?;
         let size =
             libc::off_t::try_from(metadata.size).context("remote filesystem file is too large")?;
         Ok((
@@ -297,7 +311,7 @@ impl RemoteFilesystem {
         }
     }
 
-    fn anchor(&self, anchor: &str) -> Result<PathBuf> {
+    fn anchor(&self, anchor: &str) -> Result<RemoteAnchor> {
         let path = Path::new(anchor);
         let mut components = path.components();
         if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
@@ -305,7 +319,7 @@ impl RemoteFilesystem {
                 "remote filesystem returned an invalid anchor",
             ));
         }
-        Ok(self.runtime.join(path))
+        RemoteAnchor::new(self.runtime.join(path))
     }
 
     fn is_anchor(&self, path: &Path) -> bool {
@@ -343,7 +357,7 @@ impl RemoteFilesystem {
 }
 
 impl RemoteOpen {
-    pub(super) fn commit(&self) -> Result<()> {
+    pub(super) fn commit(&mut self) -> Result<()> {
         let handle = self
             .handle
             .as_ref()
@@ -355,7 +369,12 @@ impl RemoteOpen {
             })
             .map_err(client_error)?;
         match reply.response {
-            Response::Success => Ok(()),
+            Response::Synced { metadata } => {
+                if let Some(metadata) = metadata {
+                    self.metadata = metadata;
+                }
+                Ok(())
+            }
             _ => Err(protocol_error(
                 "remote open commit returned an unexpected response",
             )),
@@ -412,11 +431,34 @@ impl RemoteDirectoryView {
     }
 
     pub(super) fn anchor(&self) -> &CStr {
-        &self.anchor
+        &self.anchor.path
     }
 
     pub(super) fn into_entries(self) -> Vec<RemoteEntry> {
         self.entries
+    }
+}
+
+impl RemoteAnchor {
+    fn new(physical: PathBuf) -> Result<Self> {
+        let path = CString::new(physical.as_os_str().as_bytes())
+            .context("remote filesystem anchor contains NUL")?;
+        Ok(Self { path, physical })
+    }
+
+    pub(super) fn path(&self) -> &CStr {
+        &self.path
+    }
+
+    pub(super) fn adopt(path: &Path) -> Result<Self> {
+        Self::new(path.to_path_buf())
+    }
+}
+
+impl Drop for RemoteAnchor {
+    fn drop(&mut self) {
+        let _ =
+            std::fs::remove_file(&self.physical).or_else(|_| std::fs::remove_dir(&self.physical));
     }
 }
 

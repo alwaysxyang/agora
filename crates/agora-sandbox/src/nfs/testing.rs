@@ -145,10 +145,27 @@ impl RemoteStorage for MemoryStorage {
         Ok((data, Self::metadata(entry)))
     }
 
-    async fn write(&self, path: &RemotePath, data: &[u8]) -> StorageResult<RemoteMetadata> {
+    async fn write_if_unchanged(
+        &self,
+        path: &RemotePath,
+        expected: Option<&RemoteMetadata>,
+        data: &[u8],
+    ) -> StorageResult<RemoteMetadata> {
         self.yield_if_requested().await;
         let mut entries = lock(&self.entries);
         let key = (path.root(), path.path().to_string());
+        let current = entries.get(&key).map(Self::metadata);
+        let unchanged = match (expected, current.as_ref()) {
+            (None, None) => true,
+            (Some(expected), Some(current)) => expected.identity == current.identity,
+            _ => false,
+        };
+        if !unchanged {
+            return Err(StorageError::new(
+                libc::ESTALE,
+                "remote file changed since it was opened",
+            ));
+        }
         let generation = entries.get(&key).map_or(1, |entry| entry.generation + 1);
         let entry = MemoryEntry {
             data: Some(data.to_vec()),

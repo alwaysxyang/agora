@@ -5,7 +5,9 @@ use crate::callback::Callback;
 use crate::execution::{ExecutionController, resolve_executable, resolve_shebang};
 pub use crate::filesystem::FilesystemMode;
 #[cfg(target_os = "macos")]
-use crate::filesystem::{EncryptedWorkspace, FilesystemWorkspace, KeyMigrationStage};
+use crate::filesystem::{
+    EncryptedWorkspace, FilesystemWorkspace, KeyMigrationStage, broker::LocalController,
+};
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
 pub use crate::nfs::SmbRemoteConfig;
 #[cfg(all(target_os = "macos", feature = "remote-smb"))]
@@ -57,6 +59,10 @@ const FILESYSTEM_ROOT: &str = "AGORA_SANDBOX_FILESYSTEM_ROOT";
 const FILESYSTEM_MODE: &str = "AGORA_SANDBOX_FILESYSTEM_MODE";
 #[cfg(target_os = "macos")]
 const FILESYSTEM_CIPHER_KEY: &str = "AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY";
+#[cfg(target_os = "macos")]
+const LOCAL_FILESYSTEM_CONTROL: &str = "AGORA_SANDBOX_LOCAL_FILESYSTEM_CONTROL";
+#[cfg(target_os = "macos")]
+const LOCAL_FILESYSTEM_TOKEN: &str = "AGORA_SANDBOX_LOCAL_FILESYSTEM_TOKEN";
 #[cfg(target_os = "macos")]
 const REMOTE_CONTROL: &str = "AGORA_SANDBOX_REMOTE_CONTROL";
 #[cfg(target_os = "macos")]
@@ -530,6 +536,17 @@ where
             .prefix("agora-sandbox-run-")
             .tempdir_in("/tmp")
             .context("failed to create sandbox runtime directory")?;
+        let mut local_filesystem = match filesystem.encrypted_cipher_key() {
+            Some(key) => Some(
+                LocalController::start(
+                    filesystem.root(),
+                    crate::filesystem::FileCipher::from_key(key)?,
+                    &runtime_directory.path().join("filesystem"),
+                )
+                .await?,
+            ),
+            None => None,
+        };
         let tls_ca_files = self.config.tls_ca_for_workdir()?;
         let hook_library = self.config.hook_library.canonicalize().with_context(|| {
             format!(
@@ -724,7 +741,14 @@ where
             .env_remove(REMOTE_CONTROL)
             .env_remove(REMOTE_TOKEN)
             .env_remove(REMOTE_ROOTS)
-            .env_remove(REMOTE_CURRENT_DIRECTORY);
+            .env_remove(REMOTE_CURRENT_DIRECTORY)
+            .env_remove(LOCAL_FILESYSTEM_CONTROL)
+            .env_remove(LOCAL_FILESYSTEM_TOKEN);
+        if let Some(local) = &local_filesystem {
+            child
+                .env(LOCAL_FILESYSTEM_CONTROL, local.runtime().socket())
+                .env(LOCAL_FILESYSTEM_TOKEN, local.runtime().token());
+        }
         #[cfg(feature = "remote-smb")]
         if let Some(remote) = &remote {
             let routes = self
@@ -772,6 +796,9 @@ where
                 if let Some(remote) = remote.take() {
                     let _ = remote.shutdown().await;
                 }
+                if let Some(local) = local_filesystem.take() {
+                    let _ = local.shutdown().await;
+                }
                 let _ = controller.shutdown().await;
                 let _ = execution.shutdown().await;
                 let _ = audit.shutdown().await;
@@ -790,6 +817,9 @@ where
             if let Some(remote) = remote.take() {
                 let _ = remote.shutdown().await;
             }
+            if let Some(local) = local_filesystem.take() {
+                let _ = local.shutdown().await;
+            }
             let _ = controller.shutdown().await;
             let _ = execution.shutdown().await;
             let _ = audit.shutdown().await;
@@ -798,11 +828,14 @@ where
         let status = wait_for_child_or_service(
             &mut child,
             process_group,
-            &mut controller,
-            &mut execution,
-            &mut audit,
-            #[cfg(feature = "remote-smb")]
-            &mut remote,
+            RuntimeServices {
+                network: &mut controller,
+                execution: &mut execution,
+                audit: &mut audit,
+                local_filesystem: &mut local_filesystem,
+                #[cfg(feature = "remote-smb")]
+                remote: &mut remote,
+            },
             #[cfg(feature = "remote-smb")]
             |status| {
                 let stdout = std::io::stdout();
@@ -820,6 +853,10 @@ where
         let shutdown = controller.shutdown().await;
         let execution_shutdown = execution.shutdown().await;
         let audit_shutdown = audit.shutdown().await;
+        let local_filesystem_shutdown = match local_filesystem.take() {
+            Some(local) => local.shutdown().await,
+            None => Ok(()),
+        };
         #[cfg(feature = "remote-smb")]
         let remote_shutdown = match remote.take() {
             Some(remote) => remote.shutdown().await,
@@ -830,6 +867,7 @@ where
         shutdown?;
         execution_shutdown?;
         audit_shutdown?;
+        local_filesystem_shutdown?;
         #[cfg(feature = "remote-smb")]
         remote_shutdown?;
 
@@ -1033,21 +1071,36 @@ fn set_terminal_process_group(
 }
 
 #[cfg(target_os = "macos")]
+struct RuntimeServices<'a> {
+    network: &'a mut NetworkController,
+    execution: &'a mut ExecutionController,
+    audit: &'a mut AuditController,
+    local_filesystem: &'a mut Option<LocalController>,
+    #[cfg(feature = "remote-smb")]
+    remote: &'a mut Option<RemoteController>,
+}
+
 async fn wait_for_child_or_service(
     child: &mut tokio::process::Child,
     process_group: libc::pid_t,
-    controller: &mut NetworkController,
-    execution: &mut ExecutionController,
-    audit: &mut AuditController,
-    #[cfg(feature = "remote-smb")] remote: &mut Option<RemoteController>,
+    services: RuntimeServices<'_>,
     #[cfg(feature = "remote-smb")] mut remote_status: impl FnMut(RemoteConnectionStatus),
 ) -> Result<ExitStatus> {
+    let RuntimeServices {
+        network: controller,
+        execution,
+        audit,
+        local_filesystem,
+        #[cfg(feature = "remote-smb")]
+        remote,
+    } = services;
     enum Completion {
         Child(std::io::Result<ExitStatus>),
         Proxy(anyhow::Error),
         Execution(anyhow::Error),
         Audit(anyhow::Error),
         Remote(anyhow::Error),
+        LocalFilesystem(anyhow::Error),
     }
 
     #[cfg(feature = "remote-smb")]
@@ -1055,12 +1108,20 @@ async fn wait_for_child_or_service(
     #[cfg(not(feature = "remote-smb"))]
     let remote_failure = std::future::pending::<anyhow::Error>();
     tokio::pin!(remote_failure);
+    let local_filesystem_failure = async {
+        match local_filesystem {
+            Some(controller) => controller.wait_failure().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(local_filesystem_failure);
     let completion = tokio::select! {
         status = child.wait() => Completion::Child(status),
         error = controller.wait_failure() => Completion::Proxy(error),
         error = execution.wait_failure() => Completion::Execution(error),
         error = audit.wait_failure() => Completion::Audit(error),
         error = &mut remote_failure => Completion::Remote(error),
+        error = &mut local_filesystem_failure => Completion::LocalFilesystem(error),
     };
     let result = match completion {
         Completion::Child(status) => status.context("sandbox child wait failed"),
@@ -1068,6 +1129,7 @@ async fn wait_for_child_or_service(
         Completion::Execution(error) => Err(error).context("sandbox execution controller failed"),
         Completion::Audit(error) => Err(error).context("sandbox audit controller failed"),
         Completion::Remote(error) => Err(error).context("sandbox remote filesystem failed"),
+        Completion::LocalFilesystem(error) => Err(error).context("sandbox local filesystem failed"),
     };
     let termination = terminate_process_group(child, process_group).await;
     match result {

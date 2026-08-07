@@ -181,11 +181,16 @@ unsafe fn sandbox_close(descriptor: libc::c_int) -> libc::c_int {
             return unsafe { fail_audit(&error, -1) };
         }
         let tracked = runtime.take_descriptor(descriptor);
-        if let Some((open, true)) = &tracked
-            && let Err(error) = runtime.finish_open_file(descriptor, open)
-        {
-            runtime.restore_descriptor(descriptor, Arc::clone(open));
-            return unsafe { fail(&error, -1) };
+        if let Some((open, true)) = &tracked {
+            let result = if runtime.has_mapping(open) {
+                runtime.commit_open_file(descriptor, open, true)
+            } else {
+                runtime.finish_open_file(descriptor, open)
+            };
+            if let Err(error) = result {
+                runtime.restore_descriptor(descriptor, Arc::clone(open));
+                return unsafe { fail(&error, -1) };
+            }
         }
         let result = unsafe { original(descriptor) };
         if result != 0
@@ -233,11 +238,16 @@ unsafe fn sandbox_fclose(stream: *mut libc::FILE) -> libc::c_int {
         };
         let flush_errno = (flush_result != 0).then(|| unsafe { *libc::__error() });
         let tracked = runtime.take_descriptor(descriptor);
-        if let Some((open, true)) = &tracked
-            && let Err(error) = runtime.finish_open_file(descriptor, open)
-        {
-            runtime.restore_descriptor(descriptor, Arc::clone(open));
-            return unsafe { fail(&error, -1) };
+        if let Some((open, true)) = &tracked {
+            let result = if runtime.has_mapping(open) {
+                runtime.commit_open_file(descriptor, open, true)
+            } else {
+                runtime.finish_open_file(descriptor, open)
+            };
+            if let Err(error) = result {
+                runtime.restore_descriptor(descriptor, Arc::clone(open));
+                return unsafe { fail(&error, -1) };
+            }
         }
         let result = unsafe { original(stream) };
         if result != 0 {
@@ -350,10 +360,10 @@ pub unsafe extern "C" fn agora_sandbox_dup2(
             let replaced = runtime.take_descriptor(destination);
             runtime.duplicate_descriptor(source, destination);
             if let Some((open, true)) = replaced
-                && open.remote.is_some()
-                && let Err(error) = runtime.finish_open_file(destination, &open)
+                && (open.remote.is_some() || open.local.is_some())
+                && !runtime.has_mapping(&open)
             {
-                return unsafe { fail(&error, -1) };
+                let _ = runtime.finish_open_file(-1, &open);
             }
         }
         result

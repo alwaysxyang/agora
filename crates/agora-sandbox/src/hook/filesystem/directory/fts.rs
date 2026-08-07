@@ -167,6 +167,7 @@ pub(in crate::hook::filesystem) struct FtsStreamState {
     pub(in crate::hook::filesystem) mappings: Vec<FtsRootMapping>,
     pub(in crate::hook::filesystem) presented: Vec<PresentedFtsEntry>,
     pub(in crate::hook::filesystem) traversal_paths: Vec<CString>,
+    pub(in crate::hook::filesystem) anchors: Vec<RemoteAnchor>,
 }
 
 impl FtsStreamState {
@@ -569,6 +570,7 @@ fn fts_read_virtual_entry_for_test(
             }],
             presented: Vec::new(),
             traversal_paths: Vec::new(),
+            anchors: Vec::new(),
         },
     );
     TEST_FTS_READ_ENTRY.with(|slot| slot.set(&mut entry as *mut DarwinFtsEntry as usize));
@@ -860,6 +862,7 @@ unsafe fn sandbox_fts_open(
 
         let mut mapped_paths = Vec::new();
         let mut mappings = Vec::new();
+        let mut anchors = Vec::new();
         let mut index = 0_usize;
         loop {
             let path = unsafe { *paths.add(index) };
@@ -871,7 +874,7 @@ unsafe fn sandbox_fts_open(
                 Ok(logical) => logical,
                 Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
             };
-            let (mapped, _, _) = match runtime.map_metadata(
+            let (mapped, _, _, anchor) = match runtime.map_metadata(
                 path,
                 libc::AT_FDCWD,
                 false,
@@ -893,6 +896,7 @@ unsafe fn sandbox_fts_open(
                 });
                 mapped_paths.push(mapped);
             }
+            anchors.extend(anchor);
             index += 1;
         }
         let mut mapped_argv = mapped_paths
@@ -909,6 +913,7 @@ unsafe fn sandbox_fts_open(
                     mappings,
                     presented: Vec::new(),
                     traversal_paths: Vec::new(),
+                    anchors,
                 },
             );
         }
@@ -943,7 +948,7 @@ fn repair_virtual_fts_entry(
     let logical_path = unsafe { trusted_fts_logical_path(runtime, path) }?;
     let logical = CString::new(logical_path.as_os_str().as_bytes())
         .context("logical FTS metadata path contains NUL")?;
-    let (mapped, plaintext_size, attributes) = runtime.map_metadata(
+    let (mapped, plaintext_size, attributes, mut anchor) = runtime.map_metadata(
         logical.as_ptr(),
         libc::AT_FDCWD,
         false,
@@ -963,6 +968,7 @@ fn repair_virtual_fts_entry(
             && let Some(state) = lock(fts_streams()).get_mut(&(stream as usize))
         {
             state.retarget_directory(entry, mapped, &logical_path)?;
+            state.anchors.extend(anchor.take());
         }
         return Ok(false);
     }
@@ -972,6 +978,7 @@ fn repair_virtual_fts_entry(
         return Err(io::Error::last_os_error().into());
     }
     unsafe { patch_stat(&mut status, plaintext_size, attributes.as_ref()) };
+    drop(anchor);
     let name = unsafe { CStr::from_ptr((*entry).fts_name.as_ptr()) }.to_bytes();
     let repaired = match status.st_mode & libc::S_IFMT {
         libc::S_IFDIR if matches!(name, b"." | b"..") => FTS_DOT,

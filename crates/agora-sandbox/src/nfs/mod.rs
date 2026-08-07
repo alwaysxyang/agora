@@ -12,7 +12,7 @@ pub(crate) mod controller;
 pub(crate) mod protocol;
 #[cfg(test)]
 pub(crate) mod testing;
-pub(crate) mod transport;
+pub(crate) use crate::ipc as transport;
 
 pub use backend::SmbRemoteConfig;
 
@@ -28,4 +28,17 @@ pub(crate) async fn start_controller(
         roots,
     )
     .await
+}
+
+#[cfg(all(test, feature = "remote-smb", not(agora_sandbox_hook_build)))]
+mod tests {
+    #[tokio::test]
+    async fn configured_controller_accepts_an_empty_remote_list() {
+        let runtime = tempfile::tempdir().unwrap();
+
+        let controller = super::start_controller(&[], runtime.path()).await.unwrap();
+
+        assert!(controller.runtime().socket().exists());
+        controller.shutdown().await.unwrap();
+    }
 }

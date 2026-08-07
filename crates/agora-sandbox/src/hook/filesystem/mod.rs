@@ -5,6 +5,9 @@ use super::dyld::{dyld_interpose, function_from_interpose};
 use super::set_errno;
 use crate::audit::{AuditClient, AuditError, AuditEventRequest, FileOperation};
 use crate::callback::{FileAccessMode, FileContext, FileOpenMode, ProcessContext};
+use crate::filesystem::broker::{
+    LocalClient, LocalClientError, protocol::ByteRange as LocalByteRange,
+};
 use crate::filesystem::{
     AccessPlan, AccessRequest, Credentials, DirectoryView, FileAttributes, FileLayer, MetadataPlan,
     OpenIntent, OpenTarget, PreparedFile, StagedWrite, VirtualFilesystem, Writeback,
@@ -12,7 +15,7 @@ use crate::filesystem::{
 };
 use crate::trace::TraceContext;
 use anyhow::{Context, Result};
-use nfs::{RemoteDirectoryView, RemoteFilesystem, RemoteOpen};
+use nfs::{RemoteAnchor, RemoteDirectoryView, RemoteFilesystem, RemoteOpen};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
@@ -21,6 +24,7 @@ use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock};
 
 const NATIVE_PASSTHROUGH_ROOTS: &[&str] = &["/dev"];
@@ -106,12 +110,14 @@ impl Drop for FilesystemHookGuard {
 
 struct FilesystemHookRuntime {
     filesystem: VirtualFilesystem,
+    local: Option<LocalClient>,
     remote: Option<RemoteFilesystem>,
     audit: Option<AuditClient>,
     trace: TraceContext,
     prepared_executable: Option<PathBuf>,
     current_directory: Mutex<CurrentDirectory>,
     open_files: Mutex<HashMap<libc::c_int, Arc<OpenFile>>>,
+    mappings: Mutex<Vec<MemoryMapping>>,
     directory_descriptors: Mutex<HashMap<libc::c_int, DirectoryDescriptor>>,
 }
 
@@ -124,21 +130,34 @@ struct DirectoryDescriptor {
 struct CurrentDirectory {
     logical: PathBuf,
     remote: bool,
+    _anchor: Option<RemoteAnchor>,
 }
 
 struct PreparedOpen {
     prepared: PreparedOpenFile,
     file: FileContext,
     logical: PathBuf,
+    local: Option<LocalRegistration>,
 }
 
 struct OpenFile {
     file: FileContext,
     logical: Mutex<PathBuf>,
     writeback: Option<Writeback>,
+    local: Option<LocalRegistration>,
     remote: Option<RemoteRegistration>,
     layer: FileLayer,
     close_on_exec: bool,
+    finished: AtomicBool,
+}
+
+#[derive(Clone)]
+struct MemoryMapping {
+    start: usize,
+    end: usize,
+    file_offset: u64,
+    writable: bool,
+    open: Arc<OpenFile>,
 }
 
 enum PreparedOpenFile {
@@ -152,6 +171,19 @@ struct RemoteRegistration {
     writable: bool,
 }
 
+struct LocalRegistration {
+    handle: String,
+    writable: bool,
+    dirty: Mutex<Vec<LocalByteRange>>,
+}
+
+type MetadataMapping = (
+    CString,
+    Option<libc::off_t>,
+    Option<FileAttributes>,
+    Option<RemoteAnchor>,
+);
+
 static FILESYSTEM_RUNTIME: OnceLock<Option<FilesystemHookRuntime>> = OnceLock::new();
 
 impl PreparedOpen {
@@ -164,9 +196,11 @@ impl PreparedOpen {
                 file: self.file,
                 logical: Mutex::new(self.logical),
                 writeback,
+                local: self.local,
                 remote,
                 layer,
                 close_on_exec,
+                finished: AtomicBool::new(false),
             },
         )
     }
@@ -240,6 +274,7 @@ impl OpenRequest {
             prepared: self.prepared,
             file: self.file,
             logical: self.logical,
+            local: None,
         }
     }
 }
@@ -313,6 +348,9 @@ impl FilesystemHookRuntime {
                         .ok()?;
                         Some(Self {
                             filesystem,
+                            local: config
+                                .local_filesystem()
+                                .map(|(control, token)| LocalClient::new(control, token)),
                             remote,
                             audit: Some(AuditClient::new(
                                 config.audit_control(),
@@ -322,6 +360,7 @@ impl FilesystemHookRuntime {
                             prepared_executable,
                             current_directory: Mutex::new(current_directory),
                             open_files: Mutex::new(HashMap::new()),
+                            mappings: Mutex::new(Vec::new()),
                             directory_descriptors: Mutex::new(HashMap::new()),
                         })
                     })
@@ -338,6 +377,7 @@ impl FilesystemHookRuntime {
         let current_directory = Self::native_current_directory(&filesystem)?;
         Ok(Self {
             filesystem,
+            local: None,
             remote: None,
             audit: None,
             trace: TraceContext::parse("test-trace").map_err(anyhow::Error::msg)?,
@@ -345,8 +385,10 @@ impl FilesystemHookRuntime {
             current_directory: Mutex::new(CurrentDirectory {
                 logical: current_directory,
                 remote: false,
+                _anchor: None,
             }),
             open_files: Mutex::new(HashMap::new()),
+            mappings: Mutex::new(Vec::new()),
             directory_descriptors: Mutex::new(HashMap::new()),
         })
     }
@@ -358,6 +400,7 @@ impl FilesystemHookRuntime {
         let current_directory = Self::native_current_directory(&filesystem)?;
         Ok(Self {
             filesystem,
+            local: None,
             remote: None,
             audit: None,
             trace: TraceContext::parse("test-trace").map_err(anyhow::Error::msg)?,
@@ -365,8 +408,10 @@ impl FilesystemHookRuntime {
             current_directory: Mutex::new(CurrentDirectory {
                 logical: current_directory,
                 remote: false,
+                _anchor: None,
             }),
             open_files: Mutex::new(HashMap::new()),
+            mappings: Mutex::new(Vec::new()),
             directory_descriptors: Mutex::new(HashMap::new()),
         })
     }
@@ -400,11 +445,13 @@ impl FilesystemHookRuntime {
             return Ok(CurrentDirectory {
                 logical,
                 remote: true,
+                _anchor: RemoteAnchor::adopt(&native).ok(),
             });
         }
         Ok(CurrentDirectory {
             logical: native,
             remote: false,
+            _anchor: None,
         })
     }
 
@@ -474,20 +521,21 @@ impl FilesystemHookRuntime {
         directory: libc::c_int,
         follow_final: bool,
         credentials: &Credentials,
-    ) -> Result<(CString, Option<libc::off_t>, Option<FileAttributes>)> {
+    ) -> Result<MetadataMapping> {
         let logical = unsafe { self.logical_path(path, directory) }?;
         if let Some(native) = self.native_passthrough_path(&logical)? {
             let mapped = CString::new(native.as_os_str().as_bytes())
                 .context("native passthrough path contains NUL")?;
-            return Ok((mapped, None, None));
+            return Ok((mapped, None, None, None));
         }
         if let Some(remote) = &self.remote
             && let Some(routed) = remote.route_result(&logical)?
         {
             self.publish_open_writers(routed.logical())?;
             match remote.stat_plan(&routed) {
-                Ok((mapped, plaintext_size, attributes, _)) => {
-                    return Ok((mapped, plaintext_size, Some(attributes)));
+                Ok((anchor, plaintext_size, attributes, _)) => {
+                    let mapped = anchor.path().to_owned();
+                    return Ok((mapped, plaintext_size, Some(attributes), Some(anchor)));
                 }
                 Err(error) if error_errno(&error) == libc::ENOENT => {}
                 Err(error) => return Err(error),
@@ -504,7 +552,7 @@ impl FilesystemHookRuntime {
             .map(libc::off_t::try_from)
             .transpose()
             .context("plaintext filesystem file is too large")?;
-        Ok((mapped, plaintext_size, attributes))
+        Ok((mapped, plaintext_size, attributes, None))
     }
 
     unsafe fn prepare_access(
@@ -746,19 +794,35 @@ impl FilesystemHookRuntime {
 
     fn commit_open(&self, prepared: &mut PreparedOpen) -> Result<()> {
         match &mut prepared.prepared {
-            PreparedOpenFile::Local(prepared) => self.filesystem.commit_open(prepared),
+            PreparedOpenFile::Local(local) => {
+                self.filesystem.commit_open(local)?;
+                if let Some(client) = &self.local
+                    && let Some((path, descriptor, writable)) = local.local_broker_source()?
+                {
+                    let opened = client.open(&path, descriptor.as_raw_fd(), writable)?;
+                    prepared.local = Some(LocalRegistration {
+                        handle: opened.handle,
+                        writable,
+                        dirty: Mutex::new(Vec::new()),
+                    });
+                }
+                Ok(())
+            }
             PreparedOpenFile::Remote(prepared) => prepared.commit(),
         }
     }
 
     fn has_open_writer(&self, logical: &Path) -> bool {
         lock(&self.open_files).values().any(|open| {
-            (open.writeback.is_some() || open.remote.as_ref().is_some_and(|remote| remote.writable))
+            (open.writeback.is_some()
+                || open.local.as_ref().is_some_and(|local| local.writable)
+                || open.remote.as_ref().is_some_and(|remote| remote.writable))
                 && open.logical() == logical
         })
     }
 
     fn publish_open_writers(&self, logical: &Path) -> Result<()> {
+        self.flush_logical_mappings(logical, false)?;
         let files = lock(&self.open_files)
             .iter()
             .map(|(&descriptor, open)| (descriptor, Arc::clone(open)))
@@ -766,11 +830,12 @@ impl FilesystemHookRuntime {
         let mut seen = HashSet::new();
         for (descriptor, open) in files {
             if (open.writeback.is_some()
+                || open.local.as_ref().is_some_and(|local| local.writable)
                 || open.remote.as_ref().is_some_and(|remote| remote.writable))
                 && open.logical() == logical
                 && seen.insert(Arc::as_ptr(&open))
             {
-                self.commit_open_file(descriptor, &open)?;
+                self.commit_open_file(descriptor, &open, false)?;
             }
         }
         Ok(())
@@ -824,6 +889,27 @@ impl FilesystemHookRuntime {
         lock(&self.open_files).get(&descriptor).cloned()
     }
 
+    pub(super) fn retain_local_files_after_fork(&self) -> Result<()> {
+        let Some(local) = &self.local else {
+            return Ok(());
+        };
+        let mut handles = lock(&self.open_files)
+            .values()
+            .filter_map(|open| open.local.as_ref().map(|local| local.handle.clone()))
+            .collect::<Vec<_>>();
+        handles.extend(lock(&self.mappings).iter().filter_map(|mapping| {
+            mapping
+                .open
+                .local
+                .as_ref()
+                .map(|local| local.handle.clone())
+        }));
+        handles.sort_unstable();
+        handles.dedup();
+        local.retain(handles)?;
+        Ok(())
+    }
+
     fn duplicate_descriptor(&self, source: libc::c_int, destination: libc::c_int) {
         let mut files = lock(&self.open_files);
         let close_on_exec = files.get(&source).is_some_and(|open| open.close_on_exec);
@@ -871,20 +957,56 @@ impl FilesystemHookRuntime {
     fn writeback(&self, descriptor: libc::c_int) -> Result<()> {
         let open = lock(&self.open_files).get(&descriptor).cloned();
         if let Some(open) = open {
-            self.commit_open_file(descriptor, &open)?;
+            self.flush_open_mappings(&open, true)?;
+            self.commit_open_file(descriptor, &open, true)?;
         }
         Ok(())
     }
 
-    fn commit_open_file(&self, descriptor: libc::c_int, open: &OpenFile) -> Result<()> {
+    fn record_local_write(&self, descriptor: libc::c_int, start: u64, end: u64) {
+        let Some(open) = self.tracked_open(descriptor) else {
+            return;
+        };
+        let Some(registration) = &open.local else {
+            return;
+        };
+        if !registration.writable || start >= end {
+            return;
+        }
+        let Ok(range) = LocalByteRange::new(start, end) else {
+            return;
+        };
+        insert_dirty_range(&mut lock(&registration.dirty), range);
+        let _ = self.commit_open_file(descriptor, &open, false);
+    }
+
+    fn commit_open_file(
+        &self,
+        descriptor: libc::c_int,
+        open: &OpenFile,
+        durable: bool,
+    ) -> Result<()> {
+        if let Some(registration) = &open.local {
+            let local = self
+                .local
+                .as_ref()
+                .context("local filesystem runtime is unavailable")?;
+            let mut dirty = lock(&registration.dirty);
+            local.sync(&registration.handle, dirty.clone(), durable)?;
+            dirty.clear();
+            return if descriptor >= 0 {
+                self.refresh_open_attributes(descriptor, open)
+            } else {
+                Ok(())
+            };
+        }
         if let Some(registration) = &open.remote {
             let remote = self
                 .remote
                 .as_ref()
                 .context("remote filesystem runtime is unavailable")?;
-            remote.sync(&registration.handle)?;
-            if let Some(path) = remote.route_result(&open.logical())? {
-                *lock(&registration.metadata) = remote.stat(&path)?;
+            if let Some(metadata) = remote.sync(&registration.handle)? {
+                *lock(&registration.metadata) = metadata;
             }
             return Ok(());
         }
@@ -894,6 +1016,9 @@ impl FilesystemHookRuntime {
         let Some(logical) = self.filesystem.commit_writeback(writeback)? else {
             return Ok(());
         };
+        if descriptor < 0 {
+            return Ok(());
+        }
         let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
         if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
             return Err(io::Error::last_os_error().into());
@@ -902,14 +1027,32 @@ impl FilesystemHookRuntime {
     }
 
     fn finish_open_file(&self, descriptor: libc::c_int, open: &OpenFile) -> Result<()> {
-        if let Some(registration) = &open.remote {
-            return self
-                .remote
-                .as_ref()
-                .context("remote filesystem runtime is unavailable")?
-                .close(&registration.handle);
+        if open.finished.swap(true, Ordering::AcqRel) {
+            return Ok(());
         }
-        self.commit_open_file(descriptor, open)
+        let result = (|| {
+            if let Some(registration) = &open.local {
+                self.commit_open_file(descriptor, open, true)?;
+                return self
+                    .local
+                    .as_ref()
+                    .context("local filesystem runtime is unavailable")?
+                    .close(&registration.handle)
+                    .map_err(Into::into);
+            }
+            if let Some(registration) = &open.remote {
+                return self
+                    .remote
+                    .as_ref()
+                    .context("remote filesystem runtime is unavailable")?
+                    .close(&registration.handle);
+            }
+            self.commit_open_file(descriptor, open, true)
+        })();
+        if result.is_err() {
+            open.finished.store(false, Ordering::Release);
+        }
+        result
     }
 
     fn commit_all_open_files(&self) -> Result<()> {
@@ -923,7 +1066,7 @@ impl FilesystemHookRuntime {
         }
         drop(files);
         for (descriptor, open) in open_files {
-            self.commit_open_file(descriptor, &open)?;
+            self.commit_open_file(descriptor, &open, true)?;
         }
         Ok(())
     }
@@ -941,6 +1084,14 @@ impl FilesystemHookRuntime {
         }
         self.filesystem
             .set_attributes(Path::new(path), FileAttributes::from_stat(&status))
+    }
+
+    fn refresh_open_attributes(&self, descriptor: libc::c_int, open: &OpenFile) -> Result<()> {
+        let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        self.filesystem.refresh_timestamps(&open.logical(), &status)
     }
 
     fn create_directory(
@@ -1117,22 +1268,23 @@ impl FilesystemHookRuntime {
     fn prepare_change_directory(
         &self,
         path: *const libc::c_char,
-    ) -> Result<(CString, PathBuf, bool)> {
+    ) -> Result<(CString, PathBuf, bool, Option<RemoteAnchor>)> {
         let requested = unsafe { self.logical_path(path, libc::AT_FDCWD) }?;
         if let Some(native) = self.native_passthrough_path(&requested)? {
             let mapped = CString::new(native.as_os_str().as_bytes())
                 .context("native passthrough path contains NUL")?;
-            return Ok((mapped, native, false));
+            return Ok((mapped, native, false, None));
         }
         if let Some(remote) = &self.remote
             && let Some(routed) = remote.route_result(&requested)?
         {
             match remote.stat_plan(&routed) {
-                Ok((mapped, _, _, metadata)) => {
+                Ok((anchor, _, _, metadata)) => {
                     if metadata.file_type != crate::nfs::protocol::RemoteFileType::Directory {
                         return Err(io::Error::from_raw_os_error(libc::ENOTDIR).into());
                     }
-                    return Ok((mapped, requested, true));
+                    let mapped = anchor.path().to_owned();
+                    return Ok((mapped, requested, true, Some(anchor)));
                 }
                 Err(error) if error_errno(&error) == libc::ENOENT => {}
                 Err(error) => return Err(error),
@@ -1145,7 +1297,7 @@ impl FilesystemHookRuntime {
         self.logical_or_host(&logical)?;
         let mapped = CString::new(mapped.as_os_str().as_bytes())
             .context("mapped filesystem path contains NUL")?;
-        Ok((mapped, logical, false))
+        Ok((mapped, logical, false, None))
     }
 
     fn remote_directory_view(
@@ -1220,19 +1372,25 @@ impl FilesystemHookRuntime {
     #[cfg(test)]
     fn set_current_directory(&self, directory: PathBuf) {
         let remote = self.is_nfs_route(&directory);
-        self.set_current_directory_state(directory, remote);
+        self.set_current_directory_state(directory, remote, None);
     }
 
-    fn set_current_directory_state(&self, directory: PathBuf, remote: bool) {
+    fn set_current_directory_state(
+        &self,
+        directory: PathBuf,
+        remote: bool,
+        anchor: Option<RemoteAnchor>,
+    ) {
         *lock(&self.current_directory) = CurrentDirectory {
             logical: directory,
             remote,
+            _anchor: anchor,
         };
     }
 
     fn synchronize_current_directory(&self) -> Result<()> {
         let directory = Self::native_current_directory(&self.filesystem)?;
-        self.set_current_directory_state(directory, false);
+        self.set_current_directory_state(directory, false, None);
         Ok(())
     }
 
@@ -1388,6 +1546,7 @@ pub(super) fn flush_before_exec() -> Result<()> {
     let Some(runtime) = FILESYSTEM_RUNTIME.get().and_then(Option::as_ref) else {
         return Ok(());
     };
+    runtime.flush_memory_mappings()?;
     runtime.commit_all_open_files()
 }
 
@@ -1399,6 +1558,7 @@ pub(super) fn flush_at_exit() {
         libc::fflush(std::ptr::null_mut());
     }
     if let Some(runtime) = FILESYSTEM_RUNTIME.get().and_then(Option::as_ref) {
+        let _ = runtime.flush_memory_mappings();
         let _ = runtime.commit_all_open_files();
     }
 }
@@ -1419,6 +1579,12 @@ fn with_test_runtime<T>(runtime: &FilesystemHookRuntime, operation: impl FnOnce(
 }
 
 fn error_errno(error: &anyhow::Error) -> libc::c_int {
+    if let Some(error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<LocalClientError>())
+    {
+        return error.errno();
+    }
     error
         .chain()
         .find_map(|cause| {
@@ -1463,6 +1629,22 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn insert_dirty_range(ranges: &mut Vec<LocalByteRange>, range: LocalByteRange) {
+    ranges.push(range);
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged: Vec<LocalByteRange> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    *ranges = merged;
+}
+
 fn configure_descriptor(descriptor: libc::c_int, flags: libc::c_int) -> Result<()> {
     let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
     if descriptor_flags < 0 {
@@ -1484,8 +1666,11 @@ fn configure_descriptor(descriptor: libc::c_int, flags: libc::c_int) -> Result<(
     Ok(())
 }
 
+mod data;
 mod descriptor;
 mod directory;
+mod lifecycle;
+mod mapping;
 mod metadata;
 mod namespace;
 mod nfs;

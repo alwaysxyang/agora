@@ -172,7 +172,7 @@ unsafe fn mapped_stat(
         follow_final,
         &Credentials::effective(),
     ) {
-        Ok((mapped, plaintext_size, attributes)) => {
+        Ok((mapped, plaintext_size, attributes, _anchor)) => {
             let result = unsafe { original(mapped.as_ptr(), status) };
             if result == 0 && !status.is_null() {
                 unsafe { patch_stat(&mut *status, plaintext_size, attributes.as_ref()) };
@@ -261,7 +261,7 @@ unsafe fn sandbox_fstatat(
         let caller_errno = unsafe { *libc::__error() };
         let follow_final = flags & libc::AT_SYMLINK_NOFOLLOW == 0;
         match runtime.map_metadata(path, directory, follow_final, &Credentials::effective()) {
-            Ok((mapped, plaintext_size, attributes)) => {
+            Ok((mapped, plaintext_size, attributes, _anchor)) => {
                 let result = unsafe { original(libc::AT_FDCWD, mapped.as_ptr(), status, flags) };
                 if result == 0 && !status.is_null() {
                     unsafe { patch_stat(&mut *status, plaintext_size, attributes.as_ref()) };
@@ -458,7 +458,7 @@ unsafe fn sandbox_readlink(
             return unsafe { original(path, buffer, size) };
         };
         match runtime.map_metadata(path, libc::AT_FDCWD, false, &Credentials::effective()) {
-            Ok((mapped, _, _)) => unsafe { original(mapped.as_ptr(), buffer, size) },
+            Ok((mapped, _, _, _anchor)) => unsafe { original(mapped.as_ptr(), buffer, size) },
             Err(error) => unsafe { fail(&error, -1) },
         }
     })
@@ -495,7 +495,7 @@ unsafe fn sandbox_readlinkat(
             return -1;
         };
         match runtime.map_metadata(path, directory, false, &Credentials::effective()) {
-            Ok((mapped, _, _)) => unsafe { original(mapped.as_ptr(), buffer, size) },
+            Ok((mapped, _, _, _anchor)) => unsafe { original(mapped.as_ptr(), buffer, size) },
             Err(error) => unsafe { fail(&error, -1) },
         }
     })

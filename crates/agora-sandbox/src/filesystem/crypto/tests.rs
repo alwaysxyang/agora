@@ -1,5 +1,4 @@
-use super::{CHUNK_SIZE, DATA_RECORD, FileCipher, MAGIC, VERSION};
-use std::fs::{File, OpenOptions};
+use super::FileCipher;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 fn temporary_directory(name: &str) -> std::path::PathBuf {
@@ -31,6 +30,90 @@ fn encrypted_file_round_trip_never_writes_plaintext_to_the_backing_file() {
     let mut restored = Vec::new();
     decrypted.read_to_end(&mut restored).unwrap();
     assert_eq!(restored, marker);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn encrypted_file_random_overwrite_changes_only_the_affected_ciphertext_block() {
+    let root = temporary_directory("random-overwrite");
+    let encrypted = root.join("encrypted");
+    let cipher = FileCipher::derive(b"workspace key", b"0123456789abcdef").unwrap();
+    let original = vec![b'a'; super::PLAINTEXT_BLOCK_SIZE * 3];
+    let mut plaintext = tempfile::tempfile().unwrap();
+    plaintext.write_all(&original).unwrap();
+    plaintext.seek(SeekFrom::Start(0)).unwrap();
+    cipher.encrypt(&mut plaintext, &encrypted).unwrap();
+    let before = std::fs::read(&encrypted).unwrap();
+
+    let mut file = cipher.open_file(&encrypted).unwrap();
+    file.write_at(b"changed", (super::PLAINTEXT_BLOCK_SIZE + 17) as u64)
+        .unwrap();
+    file.sync_all().unwrap();
+    let after = std::fs::read(&encrypted).unwrap();
+
+    let first =
+        super::CONTENT_HEADER_SIZE..super::CONTENT_HEADER_SIZE + super::CIPHERTEXT_BLOCK_SIZE;
+    let third_start = super::CONTENT_HEADER_SIZE + super::CIPHERTEXT_BLOCK_SIZE * 2;
+    let third = third_start..third_start + super::CIPHERTEXT_BLOCK_SIZE;
+    assert_eq!(&before[first.clone()], &after[first]);
+    assert_eq!(&before[third.clone()], &after[third]);
+    assert_ne!(before, after);
+
+    let mut restored = vec![0; original.len()];
+    assert_eq!(file.read_at(&mut restored, 0).unwrap(), original.len());
+    let mut expected = original;
+    expected[super::PLAINTEXT_BLOCK_SIZE + 17..super::PLAINTEXT_BLOCK_SIZE + 24]
+        .copy_from_slice(b"changed");
+    assert_eq!(restored, expected);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn encrypted_file_supports_sparse_extension_and_truncation() {
+    let root = temporary_directory("resize");
+    let encrypted = root.join("encrypted");
+    let cipher = FileCipher::derive(b"workspace key", b"0123456789abcdef").unwrap();
+    let mut plaintext = tempfile::tempfile().unwrap();
+    plaintext.write_all(b"prefix").unwrap();
+    cipher.encrypt(&mut plaintext, &encrypted).unwrap();
+    let offset = (super::PLAINTEXT_BLOCK_SIZE * 3 + 11) as u64;
+
+    let mut file = cipher.open_file(&encrypted).unwrap();
+    file.write_at(b"tail", offset).unwrap();
+    assert_eq!(file.len(), offset + 4);
+    let mut hole = vec![1; offset as usize - 6];
+    assert_eq!(file.read_at(&mut hole, 6).unwrap(), hole.len());
+    assert!(hole.iter().all(|byte| *byte == 0));
+
+    file.set_len(3).unwrap();
+    file.sync_all().unwrap();
+    assert_eq!(file.len(), 3);
+    let mut restored = [0; 8];
+    assert_eq!(file.read_at(&mut restored, 0).unwrap(), 3);
+    assert_eq!(&restored[..3], b"pre");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn encrypted_file_authenticates_each_random_access_block() {
+    let root = temporary_directory("block-authentication");
+    let encrypted = root.join("encrypted");
+    let cipher = FileCipher::derive(b"workspace key", b"0123456789abcdef").unwrap();
+    let mut plaintext = tempfile::tempfile().unwrap();
+    plaintext
+        .write_all(&vec![b'x'; super::PLAINTEXT_BLOCK_SIZE * 2])
+        .unwrap();
+    cipher.encrypt(&mut plaintext, &encrypted).unwrap();
+    let mut bytes = std::fs::read(&encrypted).unwrap();
+    bytes[super::CONTENT_HEADER_SIZE + 20] ^= 0x40;
+    std::fs::write(&encrypted, bytes).unwrap();
+
+    let file = cipher.open_file(&encrypted).unwrap();
+    let mut block = vec![0; super::PLAINTEXT_BLOCK_SIZE];
+    assert!(file.read_at(&mut block, 0).is_err());
 
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -129,7 +212,7 @@ fn encryption_failures_remove_temporary_ciphertext_files() {
 }
 
 #[test]
-fn decryption_rejects_malformed_record_shapes_and_trailing_data() {
+fn decryption_rejects_malformed_headers_and_incomplete_blocks() {
     let root = temporary_directory("malformed");
     let cipher = FileCipher::derive(b"key", b"0123456789abcdef").unwrap();
     let decrypt = |path: &std::path::Path| {
@@ -144,56 +227,25 @@ fn decryption_rejects_malformed_record_shapes_and_trailing_data() {
 
     let incomplete_header = root.join("incomplete-header");
     std::fs::write(&incomplete_header, b"short").unwrap();
-    assert!(decrypt(&incomplete_header).contains("failed to decrypt"));
+    assert!(decrypt(&incomplete_header).contains("encrypted filesystem"));
 
     let invalid_format = root.join("invalid-format");
-    let mut invalid_header = [0_u8; 17];
-    invalid_header[..MAGIC.len()].copy_from_slice(b"INVALID\0");
-    invalid_header[MAGIC.len()] = VERSION;
-    std::fs::write(&invalid_format, invalid_header).unwrap();
-    assert!(decrypt(&invalid_format).contains("failed to decrypt"));
+    std::fs::write(&invalid_format, [0_u8; super::CONTENT_HEADER_SIZE]).unwrap();
+    assert!(decrypt(&invalid_format).contains("encrypted filesystem"));
 
-    let incomplete_record = root.join("incomplete-record");
-    write_header(&incomplete_record, [1; 8]);
-    assert!(decrypt(&incomplete_record).contains("failed to decrypt"));
-
-    let oversized_record = root.join("oversized-record");
-    let mut oversized = write_header(&oversized_record, [2; 8]);
-    oversized.write_all(&[DATA_RECORD]).unwrap();
-    oversized
-        .write_all(&((CHUNK_SIZE as u32) + 1).to_be_bytes())
-        .unwrap();
-    drop(oversized);
-    assert!(decrypt(&oversized_record).contains("failed to decrypt"));
-
-    let invalid_record = root.join("invalid-record");
-    let prefix = [3; 8];
-    let mut invalid = write_header(&invalid_record, prefix);
-    cipher
-        .write_record(&mut invalid, prefix, 0, 9, Vec::new())
-        .unwrap();
-    drop(invalid);
-    assert!(decrypt(&invalid_record).contains("failed to decrypt"));
-
-    let trailing = root.join("trailing");
+    let incomplete_block = root.join("incomplete-block");
     let mut plaintext = tempfile::tempfile().unwrap();
-    plaintext.write_all(b"secret").unwrap();
-    cipher.encrypt(&mut plaintext, &trailing).unwrap();
-    OpenOptions::new()
-        .append(true)
-        .open(&trailing)
-        .unwrap()
-        .write_all(b"x")
+    plaintext
+        .write_all(&vec![b'x'; super::PLAINTEXT_BLOCK_SIZE])
         .unwrap();
-    assert!(decrypt(&trailing).contains("failed to decrypt"));
+    cipher.encrypt(&mut plaintext, &incomplete_block).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&incomplete_block)
+        .unwrap()
+        .set_len((super::CONTENT_HEADER_SIZE + super::CIPHERTEXT_BLOCK_SIZE / 2) as u64)
+        .unwrap();
+    assert!(decrypt(&incomplete_block).contains("failed to decrypt"));
 
     std::fs::remove_dir_all(root).unwrap();
-}
-
-fn write_header(path: &std::path::Path, nonce_prefix: [u8; 8]) -> File {
-    let mut file = File::create(path).unwrap();
-    file.write_all(MAGIC).unwrap();
-    file.write_all(&[VERSION]).unwrap();
-    file.write_all(&nonce_prefix).unwrap();
-    file
 }
