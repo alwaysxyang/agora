@@ -23,11 +23,10 @@ unsafe fn sandbox_truncate(path: *const libc::c_char, length: libc::off_t) -> li
             unsafe { set_errno(libc::EINVAL) };
             return -1;
         }
-        let request =
-            match runtime.prepare_open(path, libc::AT_FDCWD, libc::O_WRONLY | libc::O_TRUNC, 0) {
-                Ok(request) => request,
-                Err(error) => return unsafe { fail(&error, -1) },
-            };
+        let request = match runtime.prepare_open(path, libc::AT_FDCWD, libc::O_WRONLY, 0) {
+            Ok(request) => request,
+            Err(error) => return unsafe { fail(&error, -1) },
+        };
         match request.native_path() {
             Ok(Some(native)) => return unsafe { original(native.as_ptr(), length) },
             Ok(None) => {}
