@@ -23,10 +23,11 @@ macro_rules! dyld_interpose {
     ($name:ident, $replacement:path, $replacee:path) => {
         #[used]
         #[unsafe(link_section = "__DATA,__interpose")]
-        static $name: $crate::hook::dyld::DyldInterpose = $crate::hook::dyld::DyldInterpose {
-            replacement: $replacement as *const () as *const libc::c_void,
-            replacee: $replacee as *const () as *const libc::c_void,
-        };
+        static $name: $crate::platform::hook::dyld::DyldInterpose =
+            $crate::platform::hook::dyld::DyldInterpose {
+                replacement: $replacement as *const () as *const libc::c_void,
+                replacee: $replacee as *const () as *const libc::c_void,
+            };
     };
 }
 

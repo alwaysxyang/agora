@@ -1,6 +1,9 @@
 #![cfg(target_os = "macos")]
 
-use super::config::{self, CHILD_RUNTIME_ENVIRONMENT, HookConfig, REMOTE_CURRENT_DIRECTORY};
+use super::config::{
+    self, CHILD_RUNTIME_ENVIRONMENT, HookConfig, INHERITED_LOCAL_DESCRIPTORS,
+    REMOTE_CURRENT_DIRECTORY,
+};
 use super::dyld::{dyld_interpose, function_from_interpose};
 use super::set_errno;
 use crate::audit::{AuditClient, AuditEventRequest};
@@ -200,6 +203,9 @@ impl ChildEnvironment {
             entry.push(b'=');
             entry.extend_from_slice(value.as_bytes());
             values.push(CString::new(entry).ok()?);
+        }
+        if let Some(descriptors) = super::filesystem::inherited_local_descriptors() {
+            values.push(CString::new(format!("{INHERITED_LOCAL_DESCRIPTORS}={descriptors}")).ok()?);
         }
         if let Some(directory) = remote_current_directory {
             let mut entry = Vec::with_capacity(

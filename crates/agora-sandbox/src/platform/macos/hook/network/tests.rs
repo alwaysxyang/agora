@@ -1,6 +1,6 @@
 use super::super::{HOOK_INITIALIZED, flush_filesystem_at_exit, initialize_hook, initialized};
 use super::*;
-use crate::hook::config::HookConfig;
+use crate::platform::hook::config::HookConfig;
 use crate::protocol::parse_connect_request_prefix;
 use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
@@ -157,7 +157,7 @@ fn c_path(path: &std::path::Path) -> CString {
 }
 
 fn configured_hook_child() {
-    use crate::hook::{filesystem, process};
+    use crate::platform::hook::{filesystem, process};
 
     assert!(initialized());
 
@@ -456,7 +456,7 @@ fn configured_hook_runtime_exercises_exported_entry_points() {
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "hook::network::tests::configured_hook_runtime_exercises_exported_entry_points",
+            "platform::hook::network::tests::configured_hook_runtime_exercises_exported_entry_points",
             "--nocapture",
         ])
         .env("AGORA_SANDBOX_COVERAGE_CHILD", "1")

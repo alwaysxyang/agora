@@ -64,6 +64,8 @@ const LOCAL_FILESYSTEM_CONTROL: &str = "AGORA_SANDBOX_LOCAL_FILESYSTEM_CONTROL";
 #[cfg(target_os = "macos")]
 const LOCAL_FILESYSTEM_TOKEN: &str = "AGORA_SANDBOX_LOCAL_FILESYSTEM_TOKEN";
 #[cfg(target_os = "macos")]
+const INHERITED_LOCAL_DESCRIPTORS: &str = "AGORA_SANDBOX_INHERITED_LOCAL_DESCRIPTORS";
+#[cfg(target_os = "macos")]
 const REMOTE_CONTROL: &str = "AGORA_SANDBOX_REMOTE_CONTROL";
 #[cfg(target_os = "macos")]
 const REMOTE_TOKEN: &str = "AGORA_SANDBOX_REMOTE_TOKEN";
@@ -743,7 +745,8 @@ where
             .env_remove(REMOTE_ROOTS)
             .env_remove(REMOTE_CURRENT_DIRECTORY)
             .env_remove(LOCAL_FILESYSTEM_CONTROL)
-            .env_remove(LOCAL_FILESYSTEM_TOKEN);
+            .env_remove(LOCAL_FILESYSTEM_TOKEN)
+            .env_remove(INHERITED_LOCAL_DESCRIPTORS);
         if let Some(local) = &local_filesystem {
             child
                 .env(LOCAL_FILESYSTEM_CONTROL, local.runtime().socket())

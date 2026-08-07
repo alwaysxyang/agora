@@ -290,7 +290,7 @@ impl FilesystemHookRuntime {
             .any(|candidate| Arc::ptr_eq(candidate, open))
     }
 
-    fn finish_unreferenced(&self, opens: Vec<Arc<OpenFile>>) -> Result<()> {
+    pub(super) fn finish_unreferenced(&self, opens: Vec<Arc<OpenFile>>) -> Result<()> {
         for open in opens {
             if !self.has_descriptor(&open) && !self.has_mapping(&open) {
                 self.finish_open_file(-1, &open)?;

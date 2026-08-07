@@ -402,7 +402,7 @@ fn sandbox_cli_auto_generates_reuses_and_replaces_its_workdir_tls_ca() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn sandbox_cli_interactive_encrypted_bash_can_cat_and_list() {
+fn sandbox_cli_encrypted_ls_lists_upper_file() {
     let root = tempfile::tempdir().unwrap();
     let workdir = root.path().join("workdir");
     let config = write_cli_config(
@@ -413,56 +413,67 @@ fn sandbox_cli_interactive_encrypted_bash_can_cat_and_list() {
         Some("interactive-filesystem-key"),
         None,
     );
-    let mut process = Command::new("/usr/bin/script");
-    process
-        .arg("-q")
-        .arg("/dev/null")
-        .arg(env!("CARGO_BIN_EXE_agora-sandbox"))
-        .arg("run")
-        .arg("-c")
-        .arg(&config)
-        .arg("-e")
-        .arg("/bin/bash")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = process.spawn().unwrap();
     let directory = root.path().to_string_lossy();
     let directory = shell_words::quote(&directory);
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(
-            format!(
-                "cd {directory}\nprintf AGORA_CAT_OK > interactive.txt\ntest \"$(/bin/cat interactive.txt)\" = AGORA_CAT_OK || exit 31\n/bin/ls -1 > listing.txt\ncase \"$(/bin/cat listing.txt)\" in *interactive.txt*) ;; *) exit 32;; esac\necho AGORA_INTERACTIVE_FS_OK\nexit\n"
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            panic!("interactive sandbox Bash did not exit before the deadline");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let output = child.wait_with_output().unwrap();
-
+    let create_script = format!("cd {directory} && printf AGORA_UPPER_ONLY > interactive.txt");
+    let create = format!("/bin/bash -c {}", shell_words::quote(&create_script));
+    let created = configured_command(&config, create).output().unwrap();
     assert!(
-        status.success(),
-        "stderr={}",
+        created.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&created.stdout),
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let list = format!("/bin/ls -1 {directory}");
+    let output = configured_command(&config, list).output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("AGORA_INTERACTIVE_FS_OK"),
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim_end_matches('\r') == "interactive.txt"),
         "stdout={}",
         String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_cli_external_command_writes_to_encrypted_redirection() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workdir");
+    let audit = root.path().join("audit.jsonl");
+    let config = write_cli_config(
+        root.path(),
+        &workdir,
+        "off",
+        "encrypted",
+        Some("redirection-filesystem-key"),
+        Some(&audit),
+    );
+    let directory = root.path().to_string_lossy();
+    let directory = shell_words::quote(&directory);
+    let script = format!(
+        "cd {directory} && /bin/echo inherited-output > redirected.txt && /bin/cat redirected.txt"
+    );
+    let command = format!("/bin/bash -c {}", shell_words::quote(&script));
+    let output = configured_command(&config, command).output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}\naudit={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        std::fs::read_to_string(&audit).unwrap_or_default(),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "inherited-output\n"
     );
 }
 

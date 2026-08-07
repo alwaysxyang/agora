@@ -17,6 +17,7 @@ const FILESYSTEM_MODE: &str = "AGORA_SANDBOX_FILESYSTEM_MODE";
 const FILESYSTEM_CIPHER_KEY: &str = "AGORA_SANDBOX_FILESYSTEM_CIPHER_KEY";
 const LOCAL_FILESYSTEM_CONTROL: &str = "AGORA_SANDBOX_LOCAL_FILESYSTEM_CONTROL";
 const LOCAL_FILESYSTEM_TOKEN: &str = "AGORA_SANDBOX_LOCAL_FILESYSTEM_TOKEN";
+pub(super) const INHERITED_LOCAL_DESCRIPTORS: &str = "AGORA_SANDBOX_INHERITED_LOCAL_DESCRIPTORS";
 const REMOTE_CONTROL: &str = "AGORA_SANDBOX_REMOTE_CONTROL";
 const REMOTE_TOKEN: &str = "AGORA_SANDBOX_REMOTE_TOKEN";
 const REMOTE_ROOTS: &str = "AGORA_SANDBOX_REMOTE_ROOTS";
@@ -32,7 +33,7 @@ const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
     "GIT_SSL_CAINFO",
 ];
 
-pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 25] = [
+pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 26] = [
     TOKEN,
     PROXY_IPV4,
     PROXY_IPV6,
@@ -46,6 +47,7 @@ pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 25] = [
     FILESYSTEM_CIPHER_KEY,
     LOCAL_FILESYSTEM_CONTROL,
     LOCAL_FILESYSTEM_TOKEN,
+    INHERITED_LOCAL_DESCRIPTORS,
     REMOTE_CONTROL,
     REMOTE_TOKEN,
     REMOTE_ROOTS,
@@ -75,6 +77,7 @@ pub(super) struct HookConfig {
     filesystem_cipher_key: Option<String>,
     filesystem_cipher: Option<crate::filesystem::FileCipher>,
     local_filesystem: Option<(String, String)>,
+    inherited_local_descriptors: Option<String>,
     remote_filesystem: Option<RemoteHookConfig>,
     remote_current_directory: Option<PathBuf>,
     tls_trust_anchor_der: Option<String>,
@@ -139,6 +142,8 @@ impl HookConfig {
                 return Err("local filesystem requires control and token together".to_string());
             }
         };
+        let inherited_local_descriptors =
+            get(INHERITED_LOCAL_DESCRIPTORS).filter(|value| !value.is_empty());
         let remote_control = get(REMOTE_CONTROL).filter(|value| !value.is_empty());
         let remote_token = get(REMOTE_TOKEN).filter(|value| !value.is_empty());
         let remote_roots = get(REMOTE_ROOTS).filter(|value| !value.is_empty());
@@ -214,6 +219,7 @@ impl HookConfig {
             filesystem_cipher_key,
             filesystem_cipher,
             local_filesystem,
+            inherited_local_descriptors,
             remote_filesystem,
             remote_current_directory,
             tls_trust_anchor_der,
@@ -265,6 +271,10 @@ impl HookConfig {
         self.local_filesystem
             .as_ref()
             .map(|(control, token)| (control.as_str(), token.as_str()))
+    }
+
+    pub(super) fn inherited_local_descriptors(&self) -> Option<&str> {
+        self.inherited_local_descriptors.as_deref()
     }
 
     pub(super) fn remote_filesystem(&self) -> Option<(&str, &str, &str)> {
@@ -383,6 +393,7 @@ pub(super) fn initialize() {
             FILESYSTEM_CIPHER_KEY,
             LOCAL_FILESYSTEM_CONTROL,
             LOCAL_FILESYSTEM_TOKEN,
+            INHERITED_LOCAL_DESCRIPTORS,
             REMOTE_CONTROL,
             REMOTE_TOKEN,
             REMOTE_ROOTS,

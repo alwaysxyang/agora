@@ -3,7 +3,9 @@ mod fts;
 #[cfg(test)]
 mod tests;
 
-pub(in crate::hook::filesystem) use fts::{active_fts_logical_path, register_active_fts_mapping};
+pub(in crate::platform::hook::filesystem) use fts::{
+    active_fts_logical_path, register_active_fts_mapping,
+};
 
 #[cfg(test)]
 pub(super) use fts::{
@@ -13,6 +15,7 @@ pub(super) use fts::{
 };
 
 use super::*;
+use crate::platform::hook::abi::darwin_readdir_r;
 
 type FchdirFn = unsafe extern "C" fn(libc::c_int) -> libc::c_int;
 type ChdirFn = unsafe extern "C" fn(*const libc::c_char) -> libc::c_int;
@@ -23,15 +26,6 @@ type FdopendirFn = unsafe extern "C" fn(libc::c_int) -> *mut libc::DIR;
 type ReaddirFn = unsafe extern "C" fn(*mut libc::DIR) -> *mut libc::dirent;
 type RewinddirFn = unsafe extern "C" fn(*mut libc::DIR);
 type ClosedirFn = unsafe extern "C" fn(*mut libc::DIR) -> libc::c_int;
-
-unsafe extern "C" {
-    #[link_name = "readdir_r"]
-    fn darwin_readdir_r(
-        directory: *mut libc::DIR,
-        entry: *mut libc::dirent,
-        result: *mut *mut libc::dirent,
-    ) -> libc::c_int;
-}
 
 pub(super) struct DirectoryCursor {
     sources: Vec<DirectorySource>,

@@ -8,8 +8,8 @@ use super::{
 use base64::Engine;
 use std::ffi::{CString, c_void};
 
-const CA_DER: &str = include_str!("../../../../tests/fixtures/test-ca.der.b64");
-const LEAF_DER: &str = include_str!("../../../../tests/fixtures/test-leaf.der.b64");
+const CA_DER: &str = include_str!("../../../../../../tests/fixtures/test-ca.der.b64");
+const LEAF_DER: &str = include_str!("../../../../../../tests/fixtures/test-leaf.der.b64");
 
 type CfType = *const c_void;
 type SecTrust = *const c_void;

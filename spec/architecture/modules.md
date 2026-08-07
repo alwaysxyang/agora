@@ -180,8 +180,9 @@ Rules:
   independent native egress-denial layer.
 - Keep proxy endpoints and credentials private to one run, authenticate every request, and reject
   mismatched protocol versions or credentials.
-- Keep the wire protocol and Mach-O hook as private `protocol` and `hook` source modules inside
-  `agora-sandbox`; do not expose them as workspace crates or public integration APIs.
+- Keep the wire protocol and compile-time-selected platform hook as private `protocol` and
+  `platform/*/hook` source modules inside `agora-sandbox`; do not expose them as workspace crates
+  or public integration APIs.
 - Keep backend credentials, endpoints, and protocol clients in the parent-side `nfs` module. New
   remote protocols implement the `nfs` storage trait; they must not add mounts, protocol code, or
   credentials to the injected hook.

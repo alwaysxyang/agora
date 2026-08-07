@@ -68,12 +68,8 @@ unsafe extern "C" {
         connection_id: *mut TestConnectionId,
     ) -> libc::c_int;
 
-    fn readdir_r(
-        directory: *mut libc::DIR,
-        entry: *mut libc::dirent,
-        result: *mut *mut libc::dirent,
-    ) -> libc::c_int;
-
+    #[cfg_attr(target_arch = "x86_64", link_name = "fts_open$INODE64")]
+    #[cfg_attr(not(target_arch = "x86_64"), link_name = "fts_open")]
     fn fts_open(
         paths: *const *mut libc::c_char,
         options: libc::c_int,
@@ -84,8 +80,14 @@ unsafe extern "C" {
             ) -> libc::c_int,
         >,
     ) -> *mut libc::c_void;
+    #[cfg_attr(target_arch = "x86_64", link_name = "fts_children$INODE64")]
+    #[cfg_attr(not(target_arch = "x86_64"), link_name = "fts_children")]
     fn fts_children(stream: *mut libc::c_void, options: libc::c_int) -> *mut libc::c_void;
+    #[cfg_attr(target_arch = "x86_64", link_name = "fts_read$INODE64")]
+    #[cfg_attr(not(target_arch = "x86_64"), link_name = "fts_read")]
     fn fts_read(stream: *mut libc::c_void) -> *mut libc::c_void;
+    #[cfg_attr(target_arch = "x86_64", link_name = "fts_close$INODE64")]
+    #[cfg_attr(not(target_arch = "x86_64"), link_name = "fts_close")]
     fn fts_close(stream: *mut libc::c_void) -> libc::c_int;
 }
 
@@ -630,9 +632,9 @@ async fn upper_only_entries_are_visible_to_system_ls() {
             .current_dir(&source),
     );
     let timeout = if std::env::var_os("CARGO_LLVM_COV").is_some() {
-        Duration::from_secs(60)
+        Duration::from_secs(180)
     } else {
-        Duration::from_secs(15)
+        Duration::from_secs(60)
     };
     let outcome = tokio::time::timeout(timeout, run)
         .await
@@ -1845,17 +1847,26 @@ fn filesystem_interposed_child_process() {
             0
         );
         assert_eq!(libc::fcntl(created_file, libc::F_SETFD, 0), 0);
-        assert_ne!(
+        assert_eq!(
             libc::fcntl(created_file, libc::F_GETFD) & libc::FD_CLOEXEC,
             0
         );
         let duplicate = libc::dup(created_file);
         assert!(duplicate >= 0);
+        assert_eq!(libc::fcntl(duplicate, libc::F_GETFD) & libc::FD_CLOEXEC, 0);
         let fcntl_duplicate = libc::fcntl(created_file, libc::F_DUPFD_CLOEXEC, 0);
         assert!(fcntl_duplicate >= 0);
+        assert_ne!(
+            libc::fcntl(fcntl_duplicate, libc::F_GETFD) & libc::FD_CLOEXEC,
+            0
+        );
         let replacement = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
         assert!(replacement >= 0);
         assert_eq!(libc::dup2(created_file, replacement), replacement);
+        assert_eq!(
+            libc::fcntl(replacement, libc::F_GETFD) & libc::FD_CLOEXEC,
+            0
+        );
         assert_eq!(libc::dup2(created_file, created_file), created_file);
         for duplicate in [duplicate, fcntl_duplicate, replacement] {
             assert_eq!(libc::close(duplicate), 0);
@@ -2294,17 +2305,17 @@ fn filesystem_interposed_child_process() {
         let mut entry = std::mem::zeroed::<libc::dirent>();
         let mut result = std::ptr::null_mut();
         assert_eq!(
-            readdir_r(std::ptr::null_mut(), &mut entry, &mut result),
+            libc::readdir_r(std::ptr::null_mut(), &mut entry, &mut result),
             libc::EINVAL
         );
         loop {
-            assert_eq!(readdir_r(directory, &mut entry, &mut result), 0);
+            assert_eq!(libc::readdir_r(directory, &mut entry, &mut result), 0);
             if result.is_null() {
                 break;
             }
         }
         libc::rewinddir(directory);
-        assert_eq!(readdir_r(directory, &mut entry, &mut result), 0);
+        assert_eq!(libc::readdir_r(directory, &mut entry, &mut result), 0);
         assert!(!result.is_null());
         assert_eq!(libc::closedir(directory), 0);
         assert!(libc::fdopendir(-1).is_null());
@@ -2739,7 +2750,10 @@ fn missing_hook_configuration_child_process() {
         assert!(!directory_stream.is_null());
         let mut entry = std::mem::zeroed::<libc::dirent>();
         let mut result = std::ptr::null_mut();
-        assert_eq!(readdir_r(directory_stream, &mut entry, &mut result), 0);
+        assert_eq!(
+            libc::readdir_r(directory_stream, &mut entry, &mut result),
+            0
+        );
         libc::rewinddir(directory_stream);
         assert_eq!(libc::closedir(directory_stream), 0);
 

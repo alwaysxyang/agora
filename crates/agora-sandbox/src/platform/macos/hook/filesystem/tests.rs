@@ -2010,6 +2010,47 @@ fn registry_aliases_not_temporary_arc_clones_determine_the_last_close() {
 }
 
 #[test]
+fn full_sync_discards_stale_descriptor_aliases() {
+    let fixture = Fixture::new();
+    let runtime = FilesystemHookRuntime::new_encrypted(
+        fixture.directory.join("stale-alias-workdir/fs"),
+        b"test-key",
+        b"0123456789abcdef",
+    )
+    .unwrap();
+    let logical = fixture.lower.join("stale-alias.txt");
+    let path = Fixture::c_path(&logical);
+
+    with_test_runtime(&runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(descriptor >= 0);
+        assert_eq!(libc::write(descriptor, b"persisted".as_ptr().cast(), 9), 9);
+        let duplicate = sandbox_dup(descriptor);
+        assert!(duplicate >= 0);
+
+        assert_eq!(libc::close(descriptor), 0);
+        assert!(runtime.tracked_open(descriptor).is_some());
+        runtime.commit_all_open_files().unwrap();
+        assert!(runtime.tracked_open(descriptor).is_none());
+        assert!(runtime.tracked_open(duplicate).is_some());
+        assert_eq!(sandbox_close(duplicate), 0);
+    });
+
+    with_test_runtime(&runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(descriptor >= 0);
+        let mut contents = [0_u8; 9];
+        assert_eq!(libc::read(descriptor, contents.as_mut_ptr().cast(), 9), 9);
+        assert_eq!(&contents, b"persisted");
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+}
+
+#[test]
 fn unsupported_darwin_symlink_open_flags_fail_before_staging() {
     let fixture = Fixture::new();
     let file = fixture.lower.join("darwin-open-flags");

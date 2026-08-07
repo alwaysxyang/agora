@@ -392,7 +392,7 @@ pub extern "C" fn agora_sandbox_fcntl_setfd_argument(
         };
         if runtime
             .tracked_open(descriptor)
-            .is_some_and(|open| open.close_on_exec)
+            .is_some_and(|open| open.close_on_exec && open.local.is_none())
         {
             flags | libc::FD_CLOEXEC
         } else {

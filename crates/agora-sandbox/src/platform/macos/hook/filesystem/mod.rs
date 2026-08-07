@@ -16,18 +16,21 @@ use crate::filesystem::{
 use crate::trace::TraceContext;
 use anyhow::{Context, Result};
 use nfs::{RemoteAnchor, RemoteDirectoryView, RemoteFilesystem, RemoteOpen};
+use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CStr, CString, OsStr};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io;
 use std::os::fd::{AsRawFd, IntoRawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock};
 
 const NATIVE_PASSTHROUGH_ROOTS: &[&str] = &["/dev"];
+const INHERITED_LOCAL_DESCRIPTOR_VERSION: u8 = 1;
+const MAX_INHERITED_LOCAL_DESCRIPTORS: usize = 256;
 
 thread_local! {
     static INSIDE_FILESYSTEM_HOOK: Cell<bool> = const { Cell::new(false) };
@@ -149,6 +152,23 @@ struct OpenFile {
     layer: FileLayer,
     close_on_exec: bool,
     finished: AtomicBool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct InheritedLocalDescriptors {
+    version: u8,
+    descriptors: Vec<InheritedLocalDescriptor>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct InheritedLocalDescriptor {
+    descriptor: libc::c_int,
+    device: u64,
+    inode: u64,
+    file: FileContext,
+    logical: Vec<u8>,
+    handle: String,
+    writable: bool,
 }
 
 #[derive(Clone)]
@@ -346,7 +366,7 @@ impl FilesystemHookRuntime {
                             config.remote_current_directory(),
                         )
                         .ok()?;
-                        Some(Self {
+                        let runtime = Self {
                             filesystem,
                             local: config
                                 .local_filesystem()
@@ -362,7 +382,11 @@ impl FilesystemHookRuntime {
                             open_files: Mutex::new(HashMap::new()),
                             mappings: Mutex::new(Vec::new()),
                             directory_descriptors: Mutex::new(HashMap::new()),
-                        })
+                        };
+                        runtime.restore_inherited_local_descriptors(
+                            config.inherited_local_descriptors(),
+                        );
+                        Some(runtime)
                     })
                 })
             });
@@ -912,7 +936,9 @@ impl FilesystemHookRuntime {
 
     fn duplicate_descriptor(&self, source: libc::c_int, destination: libc::c_int) {
         let mut files = lock(&self.open_files);
-        let close_on_exec = files.get(&source).is_some_and(|open| open.close_on_exec);
+        let close_on_exec = files
+            .get(&source)
+            .is_some_and(|open| open.close_on_exec && open.local.is_none());
         match files.get(&source).cloned() {
             Some(open) => {
                 files.insert(destination, open);
@@ -938,6 +964,94 @@ impl FilesystemHookRuntime {
             None => {
                 directories.remove(&destination);
             }
+        }
+    }
+
+    fn encode_inherited_local_descriptors(&self) -> Option<String> {
+        let files = lock(&self.open_files);
+        let mut descriptors = Vec::new();
+        for (&descriptor, open) in files.iter() {
+            let Some(local) = &open.local else {
+                continue;
+            };
+            let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+            if flags < 0 || flags & libc::FD_CLOEXEC != 0 {
+                continue;
+            }
+            let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+            if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
+                continue;
+            }
+            descriptors.push(InheritedLocalDescriptor {
+                descriptor,
+                device: status.st_dev as u64,
+                inode: status.st_ino,
+                file: open.file.clone(),
+                logical: open.logical().into_os_string().into_vec(),
+                handle: local.handle.clone(),
+                writable: local.writable,
+            });
+        }
+        if descriptors.is_empty() {
+            return None;
+        }
+        serde_json::to_string(&InheritedLocalDescriptors {
+            version: INHERITED_LOCAL_DESCRIPTOR_VERSION,
+            descriptors,
+        })
+        .ok()
+    }
+
+    fn restore_inherited_local_descriptors(&self, encoded: Option<&str>) {
+        let Some(encoded) = encoded else {
+            return;
+        };
+        let Ok(inherited) = serde_json::from_str::<InheritedLocalDescriptors>(encoded) else {
+            return;
+        };
+        if inherited.version != INHERITED_LOCAL_DESCRIPTOR_VERSION
+            || inherited.descriptors.len() > MAX_INHERITED_LOCAL_DESCRIPTORS
+            || self.local.is_none()
+        {
+            return;
+        }
+        let mut handles = HashMap::<String, Arc<OpenFile>>::new();
+        let mut files = lock(&self.open_files);
+        for inherited in inherited.descriptors {
+            if inherited.descriptor < 0 {
+                continue;
+            }
+            let flags = unsafe { libc::fcntl(inherited.descriptor, libc::F_GETFD) };
+            if flags < 0 || flags & libc::FD_CLOEXEC != 0 {
+                continue;
+            }
+            let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+            if unsafe { libc::fstat(inherited.descriptor, &mut status) } != 0
+                || status.st_dev as u64 != inherited.device
+                || status.st_ino != inherited.inode
+            {
+                continue;
+            }
+            let open = handles
+                .entry(inherited.handle.clone())
+                .or_insert_with(|| {
+                    Arc::new(OpenFile {
+                        file: inherited.file,
+                        logical: Mutex::new(PathBuf::from(OsString::from_vec(inherited.logical))),
+                        writeback: None,
+                        local: Some(LocalRegistration {
+                            handle: inherited.handle,
+                            writable: inherited.writable,
+                            dirty: Mutex::new(Vec::new()),
+                        }),
+                        remote: None,
+                        layer: FileLayer::Upper,
+                        close_on_exec: true,
+                        finished: AtomicBool::new(false),
+                    })
+                })
+                .clone();
+            files.insert(inherited.descriptor, open);
         }
     }
 
@@ -1056,7 +1170,16 @@ impl FilesystemHookRuntime {
     }
 
     fn commit_all_open_files(&self) -> Result<()> {
-        let files = lock(&self.open_files);
+        let mut files = lock(&self.open_files);
+        let mut stale = Vec::new();
+        files.retain(|&descriptor, open| {
+            if unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0 {
+                true
+            } else {
+                stale.push(Arc::clone(open));
+                false
+            }
+        });
         let mut seen = HashSet::new();
         let mut open_files = Vec::new();
         for (&descriptor, open) in files.iter() {
@@ -1065,8 +1188,15 @@ impl FilesystemHookRuntime {
             }
         }
         drop(files);
+        self.finish_unreferenced(stale)?;
         for (descriptor, open) in open_files {
-            self.commit_open_file(descriptor, &open, true)?;
+            self.commit_open_file(descriptor, &open, true)
+                .with_context(|| {
+                    format!(
+                        "failed to synchronize descriptor {descriptor} for {}",
+                        open.logical().display()
+                    )
+                })?;
         }
         Ok(())
     }
@@ -1537,6 +1667,14 @@ pub(super) fn tracked_remote_current_directory() -> Option<PathBuf> {
         let current = lock(&runtime.current_directory);
         current.remote.then(|| current.logical.clone())
     })
+}
+
+pub(super) fn inherited_local_descriptors() -> Option<String> {
+    let _guard = FilesystemHookGuard::enter()?;
+    FILESYSTEM_RUNTIME
+        .get()
+        .and_then(Option::as_ref)
+        .and_then(FilesystemHookRuntime::encode_inherited_local_descriptors)
 }
 
 pub(super) fn flush_before_exec() -> Result<()> {

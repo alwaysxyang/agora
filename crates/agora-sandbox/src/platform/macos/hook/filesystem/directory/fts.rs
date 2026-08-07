@@ -1,35 +1,13 @@
 use super::super::metadata::{original_lstat, patch_stat};
 use super::super::*;
 use super::DirectoryCursor;
+use crate::platform::hook::abi::{
+    DarwinFtsEntry, FtsCompareFn, darwin_fts_children, darwin_fts_close, darwin_fts_open,
+    darwin_fts_read, darwin_fts_set, darwin_getattrlistbulk,
+};
 use std::cell::{Cell, RefCell};
 use std::os::unix::fs::FileTypeExt;
 
-#[repr(C)]
-pub(super) struct DarwinFtsEntry {
-    fts_cycle: *mut DarwinFtsEntry,
-    fts_parent: *mut DarwinFtsEntry,
-    fts_link: *mut DarwinFtsEntry,
-    fts_number: libc::c_long,
-    fts_pointer: *mut libc::c_void,
-    fts_accpath: *mut libc::c_char,
-    fts_path: *mut libc::c_char,
-    fts_errno: libc::c_int,
-    fts_symfd: libc::c_int,
-    fts_pathlen: libc::c_ushort,
-    fts_namelen: libc::c_ushort,
-    fts_ino: libc::ino_t,
-    fts_dev: libc::dev_t,
-    fts_nlink: libc::nlink_t,
-    fts_level: libc::c_short,
-    fts_info: libc::c_ushort,
-    fts_flags: libc::c_ushort,
-    fts_instr: libc::c_ushort,
-    fts_statp: *mut libc::stat,
-    fts_name: [libc::c_char; 1],
-}
-
-pub(super) type FtsCompareFn =
-    unsafe extern "C" fn(*const *const DarwinFtsEntry, *const *const DarwinFtsEntry) -> libc::c_int;
 type FtsOpenFn = unsafe extern "C" fn(
     *const *mut libc::c_char,
     libc::c_int,
@@ -58,40 +36,6 @@ const FTS_DEFAULT: libc::c_ushort = 3;
 const FTS_SKIP: libc::c_int = 4;
 const FTS_NOCHDIR: libc::c_int = 0x004;
 const DARWIN_VNODE_TYPE_DIRECTORY: u32 = 2;
-
-unsafe extern "C" {
-    #[link_name = "fts_children"]
-    fn darwin_fts_children(stream: *mut libc::c_void, options: libc::c_int) -> *mut DarwinFtsEntry;
-
-    #[link_name = "fts_open"]
-    fn darwin_fts_open(
-        paths: *const *mut libc::c_char,
-        options: libc::c_int,
-        compare: Option<FtsCompareFn>,
-    ) -> *mut libc::c_void;
-
-    #[link_name = "fts_close"]
-    fn darwin_fts_close(stream: *mut libc::c_void) -> libc::c_int;
-
-    #[link_name = "fts_read"]
-    fn darwin_fts_read(stream: *mut libc::c_void) -> *mut DarwinFtsEntry;
-
-    #[link_name = "fts_set"]
-    fn darwin_fts_set(
-        stream: *mut libc::c_void,
-        entry: *mut DarwinFtsEntry,
-        instruction: libc::c_int,
-    ) -> libc::c_int;
-
-    #[link_name = "getattrlistbulk"]
-    fn darwin_getattrlistbulk(
-        directory: libc::c_int,
-        attributes: *mut libc::c_void,
-        buffer: *mut libc::c_void,
-        size: libc::size_t,
-        options: u64,
-    ) -> libc::c_int;
-}
 
 thread_local! {
     static ACTIVE_FTS_STREAM: Cell<usize> = const { Cell::new(0) };
@@ -146,13 +90,13 @@ struct FtsBulkCursor {
     next: usize,
 }
 
-pub(in crate::hook::filesystem) struct FtsRootMapping {
+pub(in crate::platform::hook::filesystem) struct FtsRootMapping {
     physical: Vec<u8>,
     logical: Vec<u8>,
     resolved: Vec<u8>,
 }
 
-pub(in crate::hook::filesystem) struct PresentedFtsEntry {
+pub(in crate::platform::hook::filesystem) struct PresentedFtsEntry {
     entry: usize,
     original_path: usize,
     original_access_path: usize,
@@ -163,11 +107,11 @@ pub(in crate::hook::filesystem) struct PresentedFtsEntry {
     logical_access_path: CString,
 }
 
-pub(in crate::hook::filesystem) struct FtsStreamState {
-    pub(in crate::hook::filesystem) mappings: Vec<FtsRootMapping>,
-    pub(in crate::hook::filesystem) presented: Vec<PresentedFtsEntry>,
-    pub(in crate::hook::filesystem) traversal_paths: Vec<CString>,
-    pub(in crate::hook::filesystem) anchors: Vec<RemoteAnchor>,
+pub(in crate::platform::hook::filesystem) struct FtsStreamState {
+    pub(in crate::platform::hook::filesystem) mappings: Vec<FtsRootMapping>,
+    pub(in crate::platform::hook::filesystem) presented: Vec<PresentedFtsEntry>,
+    pub(in crate::platform::hook::filesystem) traversal_paths: Vec<CString>,
+    pub(in crate::platform::hook::filesystem) anchors: Vec<RemoteAnchor>,
 }
 
 impl FtsStreamState {
@@ -338,7 +282,9 @@ impl FtsStreamState {
     }
 }
 
-pub(in crate::hook::filesystem) fn active_fts_logical_path(path: &Path) -> Option<PathBuf> {
+pub(in crate::platform::hook::filesystem) fn active_fts_logical_path(
+    path: &Path,
+) -> Option<PathBuf> {
     let stream = FtsVirtualBulk::active_stream()?;
     let path = path.as_os_str().as_bytes();
     lock(fts_streams())
@@ -347,7 +293,10 @@ pub(in crate::hook::filesystem) fn active_fts_logical_path(path: &Path) -> Optio
         .map(|path| PathBuf::from(OsStr::from_bytes(&path)))
 }
 
-pub(in crate::hook::filesystem) fn register_active_fts_mapping(physical: &Path, logical: &Path) {
+pub(in crate::platform::hook::filesystem) fn register_active_fts_mapping(
+    physical: &Path,
+    logical: &Path,
+) {
     let Some(stream) = FtsVirtualBulk::active_stream() else {
         return;
     };
@@ -379,12 +328,13 @@ fn logical_basename(path: &[u8]) -> &[u8] {
     path.rsplit(|byte| *byte == b'/').next().unwrap_or(path)
 }
 
-pub(in crate::hook::filesystem) fn fts_streams() -> &'static Mutex<HashMap<usize, FtsStreamState>> {
+pub(in crate::platform::hook::filesystem) fn fts_streams()
+-> &'static Mutex<HashMap<usize, FtsStreamState>> {
     static STREAMS: OnceLock<Mutex<HashMap<usize, FtsStreamState>>> = OnceLock::new();
     STREAMS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(in crate::hook::filesystem) fn fts_stream_may_change_current_directory(
+pub(in crate::platform::hook::filesystem) fn fts_stream_may_change_current_directory(
     stream: *mut libc::c_void,
 ) -> bool {
     !lock(fts_streams()).contains_key(&(stream as usize))
@@ -510,7 +460,7 @@ impl FtsBulkCursor {
 }
 
 #[cfg(test)]
-pub(in crate::hook::filesystem) fn fts_bulk_entry_names_for_test(
+pub(in crate::platform::hook::filesystem) fn fts_bulk_entry_names_for_test(
     runtime: &FilesystemHookRuntime,
     descriptor: libc::c_int,
 ) -> Result<Vec<Vec<u8>>> {
@@ -521,14 +471,14 @@ pub(in crate::hook::filesystem) fn fts_bulk_entry_names_for_test(
 }
 
 #[cfg(test)]
-pub(in crate::hook::filesystem) fn fts_read_returns_virtual_entry_for_test(
+pub(in crate::platform::hook::filesystem) fn fts_read_returns_virtual_entry_for_test(
     logical: &Path,
 ) -> Result<bool> {
     Ok(fts_read_virtual_entry_for_test(logical, FTS_NSOK)?.is_some())
 }
 
 #[cfg(test)]
-pub(in crate::hook::filesystem) fn fts_directory_descent_path_for_test(
+pub(in crate::platform::hook::filesystem) fn fts_directory_descent_path_for_test(
     logical: &Path,
 ) -> Result<Vec<u8>> {
     fts_read_virtual_entry_for_test(logical, FTS_D)?
@@ -808,7 +758,7 @@ pub unsafe extern "C" fn agora_sandbox_getattrlistbulk(
 }
 
 #[cfg(test)]
-pub(in crate::hook::filesystem) unsafe fn fts_getattrlistbulk_for_test(
+pub(in crate::platform::hook::filesystem) unsafe fn fts_getattrlistbulk_for_test(
     directory: libc::c_int,
     attributes: *mut libc::c_void,
     buffer: *mut libc::c_void,

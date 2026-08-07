@@ -8,7 +8,7 @@ use super::{
 use crate::audit::AuditEventRequest;
 use crate::callback::ProcessOperation;
 use crate::execution::{EXECUTION_PROTOCOL_VERSION, decode_prepare_request};
-use crate::hook::config::HookConfig;
+use crate::platform::hook::config::HookConfig;
 use crate::trace::TraceContext;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsString};
