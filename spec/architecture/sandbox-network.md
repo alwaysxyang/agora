@@ -97,8 +97,8 @@ The configuration rejects unknown fields. Omitted settings retain the previous r
 `workdir` is `~/.agora-sandbox`, `tls` is `off`, the local filesystem is `plain`, NFS roots are
 empty, and audit records go to stdout. A relative `workdir` or `audit.file` is resolved from the
 configuration file's directory, while a leading `~` uses `HOME`. The configuration must be a
-regular non-symlink file. Ownership and permission policy is left to the caller and the operating
-system; callers storing filesystem keys or remote credentials should protect the file accordingly.
+regular non-symlink file owned by the effective user, with permissions no broader than `0600`;
+group/world access, owner execute, and special mode bits are rejected before credentials are read.
 `tls` accepts `off` or `auto`. The CLI supports `filesystem.local.encrypt` values `plain` and
 `encrypted`; plain mode rejects a key, while encrypted mode requires a non-empty
 `filesystem.local.key`. An empty JSON object therefore selects all defaults.

@@ -153,7 +153,7 @@ fn config_rejects_malformed_smb_uris() {
 }
 
 #[test]
-fn config_file_accepts_normal_permissions_but_not_a_symlink() {
+fn config_file_requires_owner_only_permissions_and_rejects_a_symlink() {
     let root = tempfile::tempdir().unwrap();
     let path = write_config(
         root.path(),
@@ -164,9 +164,12 @@ fn config_file_accepts_normal_permissions_but_not_a_symlink() {
         }"#,
     );
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(RunConfig::load(&path).is_ok());
+    assert!(load_error(&path).contains("permissions must be no broader than 0600"));
 
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(load_error(&path).contains("permissions must be no broader than 0600"));
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     assert!(RunConfig::load(&path).is_ok());
 
     let link = root.path().join("sandbox-link.json");
@@ -180,5 +183,23 @@ fn config_file_accepts_normal_permissions_but_not_a_symlink() {
     assert!(
         load_error(Path::new(std::ffi::OsStr::from_bytes(fifo.as_bytes())))
             .contains("not a regular file")
+    );
+}
+
+#[test]
+fn config_file_owner_validation_uses_the_effective_user() {
+    let effective_user = unsafe { libc::geteuid() };
+    assert!(
+        validate_config_owner(Path::new("sandbox.json"), effective_user, effective_user).is_ok()
+    );
+    assert!(
+        validate_config_owner(
+            Path::new("sandbox.json"),
+            effective_user.wrapping_add(1),
+            effective_user,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("not owned by the current user")
     );
 }

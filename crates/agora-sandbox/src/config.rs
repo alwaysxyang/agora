@@ -5,6 +5,7 @@ use agora_sandbox::runner::{SandboxConfig, SmbRemoteConfig};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::fs::{File, OpenOptions};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub(super) struct RunConfig {
@@ -238,7 +239,24 @@ fn open_config(path: &Path) -> Result<File> {
     if !metadata.is_file() {
         bail!("sandbox config is not a regular file: {}", path.display());
     }
+    validate_config_owner(path, metadata.uid(), unsafe { libc::geteuid() })?;
+    if metadata.permissions().mode() & 0o7177 != 0 {
+        bail!(
+            "sandbox config permissions must be no broader than 0600: {}",
+            path.display()
+        );
+    }
     Ok(file)
+}
+
+fn validate_config_owner(path: &Path, owner: libc::uid_t, current_user: libc::uid_t) -> Result<()> {
+    if owner != current_user {
+        bail!(
+            "sandbox config is not owned by the current user: {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
