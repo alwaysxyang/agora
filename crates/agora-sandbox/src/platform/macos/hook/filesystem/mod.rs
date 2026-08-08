@@ -84,6 +84,15 @@ impl FilesystemHookGuard {
         if !super::initialized() && !test_runtime_is_set() {
             return None;
         }
+
+        Self::enter_initialized()
+    }
+
+    // Keep Darwin TLV access out of the pre-initialization fast path. On x86_64,
+    // optimized code may otherwise hoist the access above the initialized check
+    // while libSystem is still bootstrapping thread-local storage.
+    #[inline(never)]
+    fn enter_initialized() -> Option<Self> {
         if FORK_IN_PROGRESS.with(|forking| forking.get()) {
             return None;
         }
