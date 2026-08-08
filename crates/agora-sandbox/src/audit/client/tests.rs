@@ -166,6 +166,7 @@ fn audit_client_publishes_after_its_thread_local_cache_is_destroyed() {
         while Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
                     read_request(&mut stream).unwrap();
                     stream
                         .write_all(&encode_response(&AuditResponse::Accepted).unwrap())

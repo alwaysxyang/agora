@@ -7,7 +7,7 @@ use crate::audit::AuditController;
 use crate::callback::{Decision, Event, EventType, NoopCallback, TlsOutcome};
 use crate::execution::ExecutionController;
 #[cfg(target_os = "macos")]
-use crate::filesystem::EncryptedWorkspace;
+use crate::filesystem::{EncryptedWorkspace, FilesystemWorkspace};
 use crate::network::{NetworkConfig, NetworkController, NetworkRunContext, TlsMode};
 #[cfg(feature = "remote-smb")]
 use crate::nfs::{
@@ -637,6 +637,32 @@ fn sandbox_config_rejects_remote_root_collisions() {
     );
 
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(all(target_os = "macos", feature = "remote-smb"))]
+#[test]
+fn remote_connection_probe_requires_a_visible_logical_parent_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workspace");
+    let filesystem = FilesystemWorkspace::start(&workdir, FilesystemMode::Plain, None).unwrap();
+    let existing = root.path().join("existing");
+    std::fs::create_dir(&existing).unwrap();
+    let regular_file = root.path().join("regular-file");
+    std::fs::write(&regular_file, b"not a directory").unwrap();
+
+    assert_eq!(
+        super::remote_logical_parent_errno(&filesystem, &existing.join("smb")).unwrap(),
+        None
+    );
+    assert_eq!(
+        super::remote_logical_parent_errno(&filesystem, &root.path().join("missing").join("smb"))
+            .unwrap(),
+        Some(libc::ENOENT)
+    );
+    assert_eq!(
+        super::remote_logical_parent_errno(&filesystem, &regular_file.join("smb")).unwrap(),
+        Some(libc::ENOTDIR)
+    );
 }
 
 #[cfg(target_os = "macos")]

@@ -102,16 +102,20 @@ impl RemoteController {
     pub(crate) async fn start_with_storage_and_connection_probes<S>(
         storage: Arc<S>,
         runtime_directory: &Path,
-        roots: u32,
+        preflight_errors: &[Option<libc::c_int>],
     ) -> Result<Self>
     where
         S: RemoteStorage,
     {
         let mut controller =
             Self::start_with_storage(Arc::clone(&storage), runtime_directory).await?;
-        for root in 0..roots {
+        for (root, preflight_error) in preflight_errors.iter().copied().enumerate() {
+            let root = u32::try_from(root).context("too many remote filesystem roots")?;
             let storage = Arc::clone(&storage);
             controller.connection_probes.spawn(async move {
+                if let Some(errno) = preflight_error {
+                    return RemoteConnectionStatus::Unavailable { root, errno };
+                }
                 match storage.connect(root).await {
                     Ok(()) => RemoteConnectionStatus::Connected { root },
                     Err(error) => RemoteConnectionStatus::Unavailable {

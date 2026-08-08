@@ -28,11 +28,11 @@ const FILESYSTEM_KEY: &str = "test-filesystem-key";
 
 #[cfg(target_os = "macos")]
 fn sandbox_lifecycle_timeout(seconds: u64) -> Duration {
-    let multiplier = if cfg!(target_arch = "x86_64") || std::env::var_os("CARGO_LLVM_COV").is_some()
-    {
-        4
-    } else {
-        1
+    let coverage = std::env::var_os("CARGO_LLVM_COV").is_some();
+    let multiplier = match (cfg!(target_arch = "x86_64"), coverage) {
+        (true, true) => 8,
+        (true, false) | (false, true) => 4,
+        (false, false) => 1,
     };
     Duration::from_secs(seconds.saturating_mul(multiplier))
 }

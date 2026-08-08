@@ -104,9 +104,13 @@ system; callers storing filesystem keys or remote credentials should protect the
 `filesystem.local.key`. An empty JSON object therefore selects all defaults.
 
 Configured NFS roots are probed asynchronously after their Broker starts, so remote readiness never
-delays child startup. The CLI writes one sanitized connected or unavailable status line per root to
-stdout when each probe completes. A failed probe does not stop the run, and later access retries the
-backend connection.
+delays child startup. The logical root itself is synthetic, but its parent must already be visible as
+a directory in the local overlay when the probe starts; a missing or non-directory parent reports
+the route as unavailable without attempting the remote connection. An SMB probe then validates a
+configured share subpath by statting it and requiring a directory before reporting success; a share
+URL without a subpath needs only a successful share connection. The CLI writes one sanitized
+connected or unavailable status line per root to stdout when each probe completes. A failed probe
+does not stop the run, and later access retries the backend connection.
 
 The CLI contains the hook and automatically materializes it below
 `<workdir>/runtime/hook/<md5>/libagora_sandbox.dylib` before constructing `SandboxConfig`. It has no

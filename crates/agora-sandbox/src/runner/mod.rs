@@ -534,6 +534,13 @@ where
             )
         })
         .await?;
+        #[cfg(feature = "remote-smb")]
+        let remote_preflight_errors = self
+            .config
+            .smb_remotes
+            .iter()
+            .map(|remote| remote_logical_parent_errno(&filesystem, remote.logical_root()))
+            .collect::<Result<Vec<_>>>()?;
         let runtime_directory = tempfile::Builder::new()
             .prefix("agora-sandbox-run-")
             .tempdir_in("/tmp")
@@ -699,6 +706,7 @@ where
             match crate::nfs::start_controller(
                 &self.config.smb_remotes,
                 &runtime_directory.path().join("nfs"),
+                &remote_preflight_errors,
             )
             .await
             {
@@ -1144,6 +1152,21 @@ async fn wait_for_child_or_service(
             let _ = termination;
             Err(error)
         }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "remote-smb"))]
+fn remote_logical_parent_errno(
+    filesystem: &FilesystemWorkspace,
+    logical_root: &Path,
+) -> Result<Option<libc::c_int>> {
+    let parent = logical_root
+        .parent()
+        .with_context(|| format!("SMB logical root has no parent: {}", logical_root.display()))?;
+    match filesystem.visible_directory(parent)? {
+        Some(true) => Ok(None),
+        Some(false) => Ok(Some(libc::ENOTDIR)),
+        None => Ok(Some(libc::ENOENT)),
     }
 }
 

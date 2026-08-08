@@ -529,6 +529,21 @@ impl OverlayStore {
         self.transaction(|transaction| transaction.visible_exists(path))
     }
 
+    #[cfg(not(agora_sandbox_hook_build))]
+    pub(crate) fn visible_directory(&self, path: &Path) -> Result<Option<bool>> {
+        self.transaction(|transaction| {
+            if !transaction.visible_exists(path)? {
+                return Ok(None);
+            }
+            let visible = transaction.visible_path(path)?;
+            match visible.metadata() {
+                Ok(metadata) => Ok(Some(metadata.is_dir())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn native_metadata_passthrough(
         &self,

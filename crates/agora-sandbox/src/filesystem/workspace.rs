@@ -1,4 +1,6 @@
 use super::{EncryptedWorkspace, FilesystemMode};
+#[cfg(not(agora_sandbox_hook_build))]
+use super::{FileCipher, OverlayStore};
 use anyhow::{Context, Result, bail};
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
@@ -45,6 +47,18 @@ impl FilesystemWorkspace {
             Self::Encrypted(workspace) => Some(workspace.cipher_key()),
             Self::Plain(_) => None,
         }
+    }
+
+    #[cfg(not(agora_sandbox_hook_build))]
+    pub(crate) fn visible_directory(&self, path: &Path) -> Result<Option<bool>> {
+        let overlay = match self {
+            Self::Encrypted(workspace) => OverlayStore::encrypted(
+                workspace.root(),
+                FileCipher::from_key(workspace.cipher_key())?,
+            )?,
+            Self::Plain(workspace) => OverlayStore::new(workspace.root())?,
+        };
+        overlay.visible_directory(path)
     }
 }
 

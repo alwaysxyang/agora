@@ -1,7 +1,7 @@
 use super::{
     FILE_ATTRIBUTE_DIRECTORY, SmbRoot, SmbStorage, build_rename_information, configured_storage,
     expect_success, metadata_from_close, metadata_from_create, metadata_from_file, remote_path,
-    smb_errno, stale_file, storage_error, wire_path,
+    smb_errno, stale_file, storage_error, validate_remote_root, wire_path,
 };
 use crate::nfs::SmbRemoteConfig;
 use crate::nfs::backend::{RemoteStorage, StorageResult};
@@ -51,6 +51,34 @@ fn smb_metadata_uses_stable_remote_identity_fields() {
     assert_eq!(
         metadata.identity,
         "file:42:133485408001234567:133485408000000000"
+    );
+}
+
+#[test]
+fn smb_connection_probe_requires_the_configured_remote_path_to_be_a_directory() {
+    let directory = FileInfo {
+        size: 0,
+        is_directory: true,
+        created: FileTime(0),
+        modified: FileTime(0),
+        accessed: FileTime(0),
+    };
+    validate_remote_root(Ok(directory)).unwrap();
+
+    let file = FileInfo {
+        size: 0,
+        is_directory: false,
+        created: FileTime(0),
+        modified: FileTime(0),
+        accessed: FileTime(0),
+    };
+    assert_errno(validate_remote_root(Ok(file)), libc::ENOTDIR);
+    assert_errno(
+        validate_remote_root(Err(Error::Protocol {
+            status: NtStatus::OBJECT_NAME_NOT_FOUND,
+            command: Command::Create,
+        })),
+        libc::ENOENT,
     );
 }
 

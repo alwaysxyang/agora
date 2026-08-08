@@ -66,8 +66,14 @@ impl SmbStorage {
 
 impl RemoteStorage for SmbStorage {
     async fn connect(&self, root: u32) -> StorageResult<()> {
-        self.root_by_index(root).await?.session().await?;
-        Ok(())
+        let mut root = self.root_by_index(root).await?;
+        let remote_path = root.config.remote_path().to_string();
+        let session = root.session().await?;
+        if remote_path.is_empty() {
+            return Ok(());
+        }
+        let result = session.client.stat(&mut session.tree, &remote_path).await;
+        validate_remote_root(result)
     }
 
     async fn stat(&self, path: &RemotePath) -> StorageResult<RemoteMetadata> {
@@ -595,6 +601,17 @@ fn metadata_from_file(info: &smb2::FileInfo) -> RemoteMetadata {
     );
     metadata.identity = format!("{}:{}", metadata.identity, info.created.0);
     metadata
+}
+
+fn validate_remote_root(result: Result<smb2::FileInfo, smb2::Error>) -> StorageResult<()> {
+    let info = result.map_err(storage_error)?;
+    if !info.is_directory {
+        return Err(StorageError::new(
+            libc::ENOTDIR,
+            "configured SMB root is not a directory",
+        ));
+    }
+    Ok(())
 }
 
 fn metadata_from_create(response: &CreateResponse) -> RemoteMetadata {

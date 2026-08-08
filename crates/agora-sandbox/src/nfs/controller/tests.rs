@@ -88,7 +88,7 @@ async fn controller_probes_remote_roots_without_blocking_startup() {
         RemoteController::start_with_storage_and_connection_probes(
             Arc::clone(&storage),
             runtime.path(),
-            2,
+            &[None, None],
         ),
     )
     .await
@@ -123,6 +123,33 @@ async fn controller_probes_remote_roots_without_blocking_startup() {
             },
         ]
     );
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn controller_reports_a_failed_local_preflight_without_connecting() {
+    let runtime = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    storage.block_connections();
+
+    let mut controller = RemoteController::start_with_storage_and_connection_probes(
+        storage,
+        runtime.path(),
+        &[Some(libc::ENOENT)],
+    )
+    .await
+    .unwrap();
+
+    let event = tokio::time::timeout(Duration::from_millis(100), controller.wait_event())
+        .await
+        .expect("a local preflight failure must not wait for the remote connection");
+    assert!(matches!(
+        event,
+        RemoteControllerEvent::Connection(RemoteConnectionStatus::Unavailable {
+            root: 0,
+            errno: libc::ENOENT,
+        })
+    ));
     controller.shutdown().await.unwrap();
 }
 
