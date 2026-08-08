@@ -41,6 +41,8 @@ async fn persists_and_serializes_session_by_channel_and_agent() {
         effort: None,
         agent_sandbox: None,
         proxy: None,
+        timeout_seconds: 3600,
+        max_output_bytes: 64 * 1024 * 1024,
         subscribe: Vec::new(),
     };
     let agent = ConfiguredAgent::from_config(agent).unwrap();
@@ -106,6 +108,8 @@ async fn none_isolation_queues_and_resumes_across_channels() {
         effort: None,
         agent_sandbox: None,
         proxy: None,
+        timeout_seconds: 3600,
+        max_output_bytes: 64 * 1024 * 1024,
         subscribe: Vec::new(),
     })
     .unwrap();
@@ -239,6 +243,8 @@ async fn session_isolation_separates_backend_sessions_and_reuses_workspace() {
         effort: None,
         agent_sandbox: None,
         proxy: None,
+        timeout_seconds: 3600,
+        max_output_bytes: 64 * 1024 * 1024,
         subscribe: Vec::new(),
     })
     .unwrap();
@@ -343,6 +349,8 @@ async fn replaces_a_missing_agent_session_with_a_new_session() {
         effort: None,
         agent_sandbox: None,
         proxy: None,
+        timeout_seconds: 3600,
+        max_output_bytes: 64 * 1024 * 1024,
         subscribe: Vec::new(),
     })
     .unwrap();

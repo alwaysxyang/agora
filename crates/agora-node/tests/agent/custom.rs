@@ -64,3 +64,49 @@ async fn custom_agent_reports_backend_session_deletion_as_unsupported() {
         DeleteSessionOutcome::Unsupported
     );
 }
+
+#[tokio::test]
+async fn custom_agent_applies_the_configured_execution_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = agent(AgentType::Custom, "/bin/sh", temp.path());
+    config.timeout_seconds = 1;
+    let agent = ConfiguredAgent::from_config(config).unwrap();
+    let mut output = VecAgentOutput::default();
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        agent.run(
+            AgentTask::new("printf started; exec /bin/sleep 30"),
+            None,
+            AgentRunControl::new(),
+            &mut output,
+        ),
+    )
+    .await
+    .expect("configured agent timeout was not applied")
+    .unwrap_err();
+
+    assert!(error.to_string().contains("timed out"));
+    assert_eq!(output.answer_text(), "started");
+}
+
+#[tokio::test]
+async fn custom_agent_applies_the_configured_combined_output_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = agent(AgentType::Custom, "/bin/sh", temp.path());
+    config.max_output_bytes = 4;
+    let agent = ConfiguredAgent::from_config(config).unwrap();
+    let mut output = VecAgentOutput::default();
+
+    let error = agent
+        .run(
+            AgentTask::new("printf 1234; printf 5678 >&2"),
+            None,
+            AgentRunControl::new(),
+            &mut output,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("output limit"));
+}

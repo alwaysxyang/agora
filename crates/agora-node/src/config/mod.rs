@@ -1,8 +1,9 @@
 use serde::Deserialize;
 use serde::de::Error as _;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 pub mod generate;
@@ -16,6 +17,51 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        let mut channel_names = HashSet::new();
+        for channel in &self.channels {
+            let name = channel.name();
+            if name.trim().is_empty() {
+                anyhow::bail!("channel name must not be empty");
+            }
+            if !channel_names.insert(name) {
+                anyhow::bail!("duplicate channel name: {name}");
+            }
+        }
+
+        let mut agent_names = HashSet::new();
+        for agent in &self.agents {
+            if agent.name.trim().is_empty() {
+                anyhow::bail!("agent name must not be empty");
+            }
+            if !agent_names.insert(agent.name.as_str()) {
+                anyhow::bail!("duplicate agent name: {}", agent.name);
+            }
+            if agent.path.trim().is_empty() {
+                anyhow::bail!("agent path must not be empty: {}", agent.name);
+            }
+            if !Path::new(&agent.workspace).is_absolute() {
+                anyhow::bail!("agent workspace must be absolute: {}", agent.name);
+            }
+            if agent.timeout_seconds == 0 {
+                anyhow::bail!("agent timeout_seconds must be positive: {}", agent.name);
+            }
+            if agent.max_output_bytes == 0 {
+                anyhow::bail!("agent max_output_bytes must be positive: {}", agent.name);
+            }
+            for subscription in &agent.subscribe {
+                if !channel_names.contains(subscription.channel.as_str()) {
+                    anyhow::bail!(
+                        "agent subscription references an unknown channel: {} -> {}",
+                        agent.name,
+                        subscription.channel
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn apply_proxy_defaults(&mut self) {
         let Some(proxy) = &self.proxy else {
             return;
@@ -46,7 +92,19 @@ pub struct AgentConfig {
     pub agent_sandbox: Option<AgentSandbox>,
     #[serde(default)]
     pub proxy: Option<HttpProxy>,
+    #[serde(default = "default_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_max_output_bytes")]
+    pub max_output_bytes: usize,
     pub subscribe: Vec<AgentSubscription>,
+}
+
+fn default_timeout_seconds() -> u64 {
+    3600
+}
+
+fn default_max_output_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 fn default_workspace() -> String {

@@ -12,6 +12,7 @@ mod custom;
 mod run;
 
 use codex::CodexAgent;
+use command::CommandLimits;
 use custom::CustomAgent;
 pub use run::{AgentRunCancellation, AgentRunControl, AgentRunOutcome};
 
@@ -144,6 +145,10 @@ pub struct ConfiguredAgent {
 impl ConfiguredAgent {
     pub fn from_config(config: AgentConfig) -> Result<Self> {
         let env = Self::proxy_environment(config.proxy.as_ref());
+        let limits = CommandLimits::new(
+            std::time::Duration::from_secs(config.timeout_seconds),
+            config.max_output_bytes,
+        );
         let backend = match config.agent_type {
             AgentType::Codex => AgentBackend::Codex(CodexAgent::new(
                 config.name.clone(),
@@ -152,8 +157,11 @@ impl ConfiguredAgent {
                 config.effort.clone(),
                 config.agent_sandbox,
                 env,
+                limits,
             )),
-            AgentType::Custom => AgentBackend::Custom(CustomAgent::new(config.path.clone(), env)),
+            AgentType::Custom => {
+                AgentBackend::Custom(CustomAgent::new(config.path.clone(), env, limits))
+            }
             AgentType::Coco => {
                 return Err(anyhow!("one-shot coco agent execution is not implemented"));
             }

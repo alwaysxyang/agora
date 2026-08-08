@@ -123,6 +123,7 @@ fn key_migration_ignores_persistent_executable_caches() {
                 checksum: None,
                 materializer: Materializer::Executable,
                 source: None,
+                variant: None,
             },
         )
         .unwrap();

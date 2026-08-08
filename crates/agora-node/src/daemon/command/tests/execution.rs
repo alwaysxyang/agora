@@ -230,6 +230,8 @@ async fn stopping_a_card_run_advances_the_next_queued_task() {
         effort: None,
         agent_sandbox: None,
         proxy: None,
+        timeout_seconds: 3600,
+        max_output_bytes: 64 * 1024 * 1024,
         subscribe: Vec::new(),
     })
     .unwrap();

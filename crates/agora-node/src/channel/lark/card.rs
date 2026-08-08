@@ -1,5 +1,5 @@
 use super::LarkReplyTarget;
-use super::channel::LarkInterruptRegistration;
+use super::channel::{LarkConversation, LarkInterruptRegistration};
 use super::lark_api::LarkApi;
 use crate::channel::permission::PermissionDenial;
 use crate::channel::{
@@ -55,6 +55,7 @@ pub(super) struct LarkCardContent {
     answer: String,
     usage: Option<TokenUsage>,
     state: LarkRunState,
+    conversation: LarkConversation,
 }
 
 struct LarkProcessPhase {
@@ -119,7 +120,7 @@ impl LarkReplyCard {
         )
     }
 
-    pub(super) fn build(reply: &ChannelReply) -> Value {
+    pub(super) fn build(reply: &ChannelReply, conversation: LarkConversation) -> Value {
         match reply {
             ChannelReply::Text(text) => Self::card(
                 i18n::AGENT_STATUS_TITLE,
@@ -129,18 +130,18 @@ impl LarkReplyCard {
                     "content": text
                 })],
             ),
-            ChannelReply::AgentList(agents) => Self::agent_list(agents),
+            ChannelReply::AgentList(agents) => Self::agent_list(agents, conversation),
             ChannelReply::AgentStatus(agent) => Self::agent_status(agent),
         }
     }
 
-    fn agent_list(agents: &[ChannelAgentStatus]) -> Value {
+    fn agent_list(agents: &[ChannelAgentStatus], conversation: LarkConversation) -> Value {
         let mut elements = Vec::new();
         for (index, agent) in agents.iter().enumerate() {
             if index > 0 {
                 elements.push(json!({ "tag": "hr" }));
             }
-            elements.push(Self::agent_row(agent));
+            elements.push(Self::agent_row(agent, conversation));
         }
         if !elements.is_empty() {
             elements.push(json!({ "tag": "hr" }));
@@ -197,7 +198,7 @@ impl LarkReplyCard {
         )
     }
 
-    fn agent_row(agent: &ChannelAgentStatus) -> Value {
+    fn agent_row(agent: &ChannelAgentStatus, conversation: LarkConversation) -> Value {
         let (color, state, description) = Self::status_text(agent.enabled());
         let mut columns = vec![json!({
             "tag": "column",
@@ -217,7 +218,7 @@ impl LarkReplyCard {
                 "tag": "column",
                 "width": "auto",
                 "vertical_align": "center",
-                "elements": [Self::button(button)]
+                "elements": [Self::button(button, conversation)]
             }));
         }
         json!({
@@ -228,7 +229,7 @@ impl LarkReplyCard {
         })
     }
 
-    fn button(button: &ChannelButton) -> Value {
+    fn button(button: &ChannelButton, conversation: LarkConversation) -> Value {
         let button_type = match button.style() {
             ChannelButtonStyle::Default => "default",
             ChannelButtonStyle::Primary => "primary",
@@ -245,7 +246,8 @@ impl LarkReplyCard {
             "behaviors": [{
                 "type": "callback",
                 "value": {
-                    "agora_command": button.command()
+                    "agora_command": button.command(),
+                    "agora_conversation": conversation.as_str()
                 }
             }]
         })
@@ -303,12 +305,18 @@ impl LarkCardContent {
             answer: String::new(),
             usage: None,
             state: LarkRunState::Running,
+            conversation: LarkConversation::Private,
         }
     }
 
-    pub(super) fn with_interrupt(agent_name: String, interrupt: Option<String>) -> Self {
+    pub(super) fn with_interrupt(
+        agent_name: String,
+        interrupt: Option<String>,
+        conversation: LarkConversation,
+    ) -> Self {
         Self {
             interrupt,
+            conversation,
             ..Self::new(agent_name)
         }
     }
@@ -612,7 +620,8 @@ impl LarkCardContent {
                     "behaviors": [{
                         "type": "callback",
                         "value": {
-                            "agora_interrupt": interrupt
+                            "agora_interrupt": interrupt,
+                            "agora_conversation": self.conversation.as_str()
                         }
                     }]
                 }]
@@ -990,6 +999,7 @@ impl LarkAgentCard {
         target: LarkReplyTarget,
         agent_name: String,
         interrupt: Option<LarkInterruptRegistration>,
+        conversation: LarkConversation,
         api: LarkApi,
     ) -> Self {
         let interrupt_id = interrupt
@@ -1004,7 +1014,11 @@ impl LarkAgentCard {
                 state: Mutex::new(LarkAgentCardState {
                     token: None,
                     message_id: None,
-                    content: LarkCardContent::with_interrupt(agent_name, interrupt_id),
+                    content: LarkCardContent::with_interrupt(
+                        agent_name,
+                        interrupt_id,
+                        conversation,
+                    ),
                     version: 0,
                     sent_version: 0,
                     last_update: None,

@@ -55,6 +55,8 @@ fn agent(name: &str, channel: &str) -> AgentConfig {
         effort: None,
         agent_sandbox: None,
         proxy: None,
+        timeout_seconds: 3600,
+        max_output_bytes: 64 * 1024 * 1024,
         subscribe: vec![AgentSubscription {
             channel: channel.to_string(),
             filter: None,
@@ -73,6 +75,8 @@ fn custom_agent(name: &str) -> AgentConfig {
         effort: None,
         agent_sandbox: None,
         proxy: None,
+        timeout_seconds: 3600,
+        max_output_bytes: 64 * 1024 * 1024,
         subscribe: Vec::new(),
     }
 }

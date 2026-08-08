@@ -1,4 +1,4 @@
-use super::command::{Command, CommandOutput};
+use super::command::{Command, CommandLimits, CommandOutput};
 use super::{
     Agent, AgentOutcome, AgentOutput, AgentRequest, AgentSessionUpdate, DeleteSessionOutcome,
 };
@@ -19,6 +19,7 @@ pub(super) struct CodexAgent {
     effort: Option<String>,
     agent_sandbox: Option<AgentSandbox>,
     env: HashMap<String, String>,
+    limits: CommandLimits,
 }
 
 impl CodexAgent {
@@ -29,6 +30,7 @@ impl CodexAgent {
         effort: Option<String>,
         agent_sandbox: Option<AgentSandbox>,
         env: HashMap<String, String>,
+        limits: CommandLimits,
     ) -> Self {
         Self {
             name,
@@ -37,6 +39,7 @@ impl CodexAgent {
             effort,
             agent_sandbox,
             env,
+            limits,
         }
     }
 
@@ -72,7 +75,8 @@ impl CodexAgent {
                 .args(args)
                 .envs(self.env.clone())
                 .current_dir(workdir)
-                .input(input),
+                .input(input)
+                .limits(self.limits),
             resume_requested,
             _attachment_dir: attachment_dir,
         })
@@ -166,7 +170,8 @@ impl Agent for CodexAgent {
     async fn delete_session(&self, session_id: &str) -> Result<DeleteSessionOutcome> {
         let command = Command::new(&self.path)
             .args(["delete", "--force", session_id])
-            .envs(self.env.clone());
+            .envs(self.env.clone())
+            .limits(self.limits);
         let mut command_output = DeleteSessionCommandOutput::default();
         let outcome = command.run(&mut command_output).await?;
         if outcome.exit_code() != 0 {

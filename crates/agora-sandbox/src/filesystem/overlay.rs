@@ -554,6 +554,7 @@ impl OverlayStore {
                         checksum,
                         materializer: Materializer::Executable,
                         source,
+                        variant: Some(Self::executable_variant()),
                     },
                 )?;
             }
@@ -728,17 +729,22 @@ impl OverlayStore {
         self.with_lock(|| {
             let destination = self.plain_destination(&source)?;
             let source_identity = SourceIdentity::from_metadata(&source.metadata()?);
+            let variant = Self::executable_variant();
             let cached = self.reconciled_state_locked(&source)?;
-            let reusable_destination =
-                destination.is_file() && destination.metadata()?.mode() & 0o111 != 0;
+            let reusable_destination = destination
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0);
             if reusable_destination
                 && matches!(
                     cached,
                     Some(EntryState::Cached {
+                        checksum: Some(ref checksum),
                         materializer: Materializer::Executable,
                         source: Some(ref cached_source),
-                        ..
+                        variant: Some(ref cached_variant),
                     }) if cached_source == &source_identity
+                        && cached_variant == &variant
+                        && Self::checksum(&destination).is_ok_and(|current| &current == checksum)
                 )
             {
                 return Ok(destination);
@@ -751,14 +757,16 @@ impl OverlayStore {
                 parent.join(format!(".agora-executable-{}.tmp", Uuid::new_v4().simple()));
             let result = (|| {
                 prepare(&temporary)?;
+                let checksum = Self::checksum(&temporary)?;
                 Self::remove_existing(&destination)?;
                 fs::rename(&temporary, &destination)?;
                 self.metadata.set(
                     &source,
                     EntryState::Cached {
-                        checksum: None,
+                        checksum: Some(checksum),
                         materializer: Materializer::Executable,
                         source: Some(source_identity),
+                        variant: Some(variant),
                     },
                 )?;
                 Ok(destination.clone())
@@ -783,6 +791,10 @@ impl OverlayStore {
             digest.update(&buffer[..read]);
         }
         Ok(Self::hex_digest(digest.finalize().as_slice()))
+    }
+
+    fn executable_variant() -> String {
+        format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH)
     }
 
     #[cfg(test)]
@@ -1261,6 +1273,7 @@ impl OverlayStore {
                     checksum: Some(Self::hex_digest(digest.finalize().as_slice())),
                     materializer,
                     source: Some(SourceIdentity::from_metadata(&source_metadata)),
+                    variant: None,
                 },
                 Some(attributes),
             )?;

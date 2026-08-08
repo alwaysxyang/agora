@@ -12,6 +12,7 @@ use clap::{ColorChoice, Parser, Subcommand};
 use serde::Serialize;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -34,7 +35,7 @@ struct Arguments {
 enum CliCommand {
     /// Run an executable inside the configured sandbox
     Run {
-        /// Owner-only sandbox JSON configuration file
+        /// Sandbox JSON configuration file
         #[arg(short = 'c', long)]
         config: PathBuf,
 
@@ -157,6 +158,7 @@ impl AuditOutput {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(path)
             .with_context(|| format!("failed to open audit file {}", path.display()))?;
         Ok(Self::File(file))

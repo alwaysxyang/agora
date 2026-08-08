@@ -40,6 +40,8 @@ async fn updates_queue_depth_before_starting_serialized_agent_runs() {
         effort: None,
         agent_sandbox: None,
         proxy: None,
+        timeout_seconds: 3600,
+        max_output_bytes: 64 * 1024 * 1024,
         subscribe: Vec::new(),
     })
     .unwrap();

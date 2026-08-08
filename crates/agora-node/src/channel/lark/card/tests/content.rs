@@ -64,7 +64,7 @@ fn lark_agent_list_card_renders_one_right_aligned_toggle_button_per_agent() {
         agent_status_with_button("reviewer", false),
     ]);
 
-    let card = LarkReplyCard::build(&reply);
+    let card = LarkReplyCard::build(&reply, LarkConversation::Private);
     assert_eq!(
         card.pointer("/header/title/content").unwrap(),
         "当前对话的 Agent 状态"
@@ -87,7 +87,8 @@ fn lark_agent_list_card_renders_one_right_aligned_toggle_button_per_agent() {
             "agora_command": {
                 "path": ["ask", "disable"],
                 "arguments": { "agent_name": "codex-dev" }
-            }
+            },
+            "agora_conversation": "private"
         })
     );
     assert_eq!(second_button.pointer("/text/content").unwrap(), "Enable");
@@ -98,7 +99,8 @@ fn lark_agent_list_card_renders_one_right_aligned_toggle_button_per_agent() {
             "agora_command": {
                 "path": ["ask", "enable"],
                 "arguments": { "agent_name": "reviewer" }
-            }
+            },
+            "agora_conversation": "private"
         })
     );
     let rendered = serde_json::to_string(&card).unwrap();
@@ -111,7 +113,7 @@ fn lark_agent_list_card_renders_one_right_aligned_toggle_button_per_agent() {
 fn lark_agent_status_card_is_compact_and_has_no_toggle_button() {
     let reply = ChannelReply::agent_status(ChannelAgentStatus::new("reviewer", false));
 
-    let card = LarkReplyCard::build(&reply);
+    let card = LarkReplyCard::build(&reply, LarkConversation::Private);
     let rendered = serde_json::to_string(&card).unwrap();
     assert_eq!(
         card.pointer("/header/subtitle/content").unwrap(),
@@ -544,8 +546,11 @@ fn lark_card_shows_a_placeholder_before_agent_output() {
 
 #[test]
 fn lark_card_shows_a_bottom_stop_button_only_while_the_task_is_active() {
-    let mut content =
-        LarkCardContent::with_interrupt("codex-dev".to_string(), Some("interrupt-42".to_string()));
+    let mut content = LarkCardContent::with_interrupt(
+        "codex-dev".to_string(),
+        Some("interrupt-42".to_string()),
+        LarkConversation::Private,
+    );
 
     let running = content.build_card();
     let elements = running
@@ -564,7 +569,8 @@ fn lark_card_shows_a_bottom_stop_button_only_while_the_task_is_active() {
     assert_eq!(
         button.pointer("/behaviors/0/value").unwrap(),
         &serde_json::json!({
-            "agora_interrupt": "interrupt-42"
+            "agora_interrupt": "interrupt-42",
+            "agora_conversation": "private"
         })
     );
 
@@ -819,7 +825,10 @@ fn lark_card_renders_token_usage_without_a_heading() {
 
 #[test]
 fn lark_reply_card_supports_plain_text_and_danger_actions() {
-    let text = LarkReplyCard::build(&ChannelReply::Text("plain reply".to_string()));
+    let text = LarkReplyCard::build(
+        &ChannelReply::Text("plain reply".to_string()),
+        LarkConversation::Private,
+    );
     assert_eq!(
         text.pointer("/body/elements/0/content")
             .and_then(serde_json::Value::as_str),
@@ -831,7 +840,10 @@ fn lark_reply_card_supports_plain_text_and_danger_actions() {
         ChannelButtonStyle::Danger,
         CommandRequest::new(["delete"]),
     );
-    assert_eq!(LarkReplyCard::button(&danger)["type"], "danger");
+    assert_eq!(
+        LarkReplyCard::button(&danger, LarkConversation::Private)["type"],
+        "danger"
+    );
 }
 
 #[test]

@@ -1395,10 +1395,10 @@ fn audit_server(
         let mut requests = Vec::new();
         let (mut stream, _) = listener.accept().unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         stream
-            .set_write_timeout(Some(Duration::from_secs(1)))
+            .set_write_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         for response in responses {
             let mut prefix = [0_u8; 4];

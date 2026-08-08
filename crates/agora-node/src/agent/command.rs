@@ -1,12 +1,13 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::future::{Future, ready};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command as TokioCommand};
 
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 
 pub trait CommandOutput {
     fn stdout(&mut self, chunk: &[u8]) -> impl Future<Output = Result<()>> + Send;
@@ -35,6 +36,22 @@ pub struct Command {
     env: Vec<(String, String)>,
     current_dir: Option<PathBuf>,
     input: String,
+    limits: Option<CommandLimits>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CommandLimits {
+    timeout: Duration,
+    max_output_bytes: usize,
+}
+
+impl CommandLimits {
+    pub(super) fn new(timeout: Duration, max_output_bytes: usize) -> Self {
+        Self {
+            timeout,
+            max_output_bytes,
+        }
+    }
 }
 
 impl Command {
@@ -45,6 +62,7 @@ impl Command {
             env: Vec::new(),
             current_dir: None,
             input: String::new(),
+            limits: None,
         }
     }
 
@@ -80,7 +98,35 @@ impl Command {
         self
     }
 
+    pub(super) fn limits(mut self, limits: CommandLimits) -> Self {
+        self.limits = Some(limits);
+        self
+    }
+
     pub async fn run<O>(self, output: &mut O) -> Result<CommandOutcome>
+    where
+        O: CommandOutput + Send,
+    {
+        let limits = self.limits;
+        let run = self.run_inner(output, limits.map(|limits| limits.max_output_bytes));
+        match limits {
+            Some(limits) => tokio::time::timeout(limits.timeout, run)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "agent command timed out after {} seconds",
+                        limits.timeout.as_secs_f64()
+                    )
+                })?,
+            None => run.await,
+        }
+    }
+
+    async fn run_inner<O>(
+        self,
+        output: &mut O,
+        max_output_bytes: Option<usize>,
+    ) -> Result<CommandOutcome>
     where
         O: CommandOutput + Send,
     {
@@ -105,15 +151,19 @@ impl Command {
             .stdin
             .take()
             .context("agent command stdin is unavailable")?;
-        stdin
-            .write_all(self.input.as_bytes())
-            .await
-            .context("write agent command input failed")?;
-        stdin
-            .shutdown()
-            .await
-            .context("close agent command stdin failed")?;
-        drop(stdin);
+        let input = self.input;
+        let stdin_writer = async move {
+            stdin
+                .write_all(input.as_bytes())
+                .await
+                .context("write agent command input failed")?;
+            stdin
+                .shutdown()
+                .await
+                .context("close agent command stdin failed")
+        };
+        tokio::pin!(stdin_writer);
+        let mut stdin_open = true;
 
         let mut stdout = child
             .stdout
@@ -127,22 +177,33 @@ impl Command {
         let mut stderr_open = true;
         let mut stdout_buffer = [0_u8; 4096];
         let mut stderr_buffer = [0_u8; 4096];
+        let mut output_bytes = 0_usize;
 
         let status = loop {
             tokio::select! {
+                result = &mut stdin_writer, if stdin_open => {
+                    result?;
+                    stdin_open = false;
+                }
                 status = child.wait() => {
                     break status.context("wait for agent command failed")?;
                 }
                 result = stdout.read(&mut stdout_buffer), if stdout_open => {
                     match result.context("read agent command stdout failed")? {
                         0 => stdout_open = false,
-                        size => output.stdout(&stdout_buffer[..size]).await?,
+                        size => {
+                            record_output_bytes(&mut output_bytes, size, max_output_bytes)?;
+                            output.stdout(&stdout_buffer[..size]).await?;
+                        }
                     }
                 }
                 result = stderr.read(&mut stderr_buffer), if stderr_open => {
                     match result.context("read agent command stderr failed")? {
                         0 => stderr_open = false,
-                        size => output.stderr(&stderr_buffer[..size]).await?,
+                        size => {
+                            record_output_bytes(&mut output_bytes, size, max_output_bytes)?;
+                            output.stderr(&stderr_buffer[..size]).await?;
+                        }
                     }
                 }
             }
@@ -154,13 +215,19 @@ impl Command {
                 result = stdout.read(&mut stdout_buffer), if stdout_open => {
                     match result.context("read agent command stdout failed")? {
                         0 => stdout_open = false,
-                        size => output.stdout(&stdout_buffer[..size]).await?,
+                        size => {
+                            record_output_bytes(&mut output_bytes, size, max_output_bytes)?;
+                            output.stdout(&stdout_buffer[..size]).await?;
+                        }
                     }
                 }
                 result = stderr.read(&mut stderr_buffer), if stderr_open => {
                     match result.context("read agent command stderr failed")? {
                         0 => stderr_open = false,
-                        size => output.stderr(&stderr_buffer[..size]).await?,
+                        size => {
+                            record_output_bytes(&mut output_bytes, size, max_output_bytes)?;
+                            output.stderr(&stderr_buffer[..size]).await?;
+                        }
                     }
                 }
             }
@@ -168,9 +235,34 @@ impl Command {
         output.finish().await?;
 
         Ok(CommandOutcome {
-            exit_code: status.code().unwrap_or_default(),
+            exit_code: exit_status_code(status),
         })
     }
+}
+
+fn record_output_bytes(total: &mut usize, size: usize, maximum: Option<usize>) -> Result<()> {
+    *total = total
+        .checked_add(size)
+        .context("agent command output byte count overflowed")?;
+    if let Some(maximum) = maximum
+        && *total > maximum
+    {
+        bail!("agent command output limit exceeded: maximum {maximum} bytes");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn exit_status_code(status: std::process::ExitStatus) -> i32 {
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1)
+}
+
+#[cfg(not(unix))]
+fn exit_status_code(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
 }
 
 #[cfg(unix)]
@@ -216,6 +308,9 @@ impl ProcessGroupGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 #[cfg(unix)]
 impl Drop for ProcessGroupGuard {

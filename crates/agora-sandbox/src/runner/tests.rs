@@ -456,23 +456,27 @@ fn smb_remote_config_normalizes_paths_and_redacts_credentials() {
     assert_eq!(remote.username(), "alice");
     assert!(!format!("{remote:?}").contains("top secret"));
     assert_eq!(
-        SmbRemoteConfig::new("/ipv6", "2001:db8::1", "documents")
-            .unwrap()
-            .server(),
-        "[2001:db8::1]:445"
-    );
-    assert_eq!(
-        SmbRemoteConfig::new("/bracketed", "[2001:db8::2]", "documents")
-            .unwrap()
-            .server(),
-        "[2001:db8::2]:445"
-    );
-    assert_eq!(
         SmbRemoteConfig::new("/explicit-port", "files.example.com:1445", "documents")
             .unwrap()
             .server(),
         "files.example.com:1445"
     );
+}
+
+#[test]
+fn smb_remote_config_rejects_ipv6_literal_endpoints() {
+    for server in [
+        "2001:db8::1",
+        "[2001:db8::1]",
+        "[2001:db8::1]:445",
+        "[2001:db8::1]:1445",
+    ] {
+        let error = SmbRemoteConfig::new("/remote", server, "documents").unwrap_err();
+        assert!(
+            error.to_string().contains("IPv6 literals are unsupported"),
+            "unexpected error for {server}: {error:#}"
+        );
+    }
 }
 
 #[test]

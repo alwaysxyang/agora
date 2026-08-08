@@ -34,6 +34,8 @@ async fn reset_stops_the_scope_deletes_the_session_and_starts_fresh_next_time() 
         effort: None,
         agent_sandbox: None,
         proxy: None,
+        timeout_seconds: 3600,
+        max_output_bytes: 64 * 1024 * 1024,
         subscribe: Vec::new(),
     })
     .unwrap();
@@ -130,6 +132,8 @@ async fn reset_preserves_the_mapping_when_backend_deletion_fails() {
         effort: None,
         agent_sandbox: None,
         proxy: None,
+        timeout_seconds: 3600,
+        max_output_bytes: 64 * 1024 * 1024,
         subscribe: Vec::new(),
     })
     .unwrap();
@@ -178,6 +182,8 @@ async fn reset_removes_the_mapping_when_backend_deletion_is_unsupported() {
         effort: None,
         agent_sandbox: None,
         proxy: None,
+        timeout_seconds: 3600,
+        max_output_bytes: 64 * 1024 * 1024,
         subscribe: Vec::new(),
     })
     .unwrap();

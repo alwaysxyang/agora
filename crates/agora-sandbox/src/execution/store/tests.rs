@@ -81,13 +81,18 @@ fn executable_store_prepares_and_caches_a_native_copy() {
         checksum,
         materializer,
         source: source_identity,
+        variant,
     }) = store.overlay.state_for_test(&source).unwrap()
     else {
         panic!("missing executable cache metadata");
     };
-    assert_eq!(checksum, None);
+    assert!(checksum.is_some());
     assert_eq!(materializer, Materializer::Executable);
     assert!(source_identity.is_some());
+    assert_eq!(
+        variant.as_deref(),
+        Some(format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH).as_str())
+    );
     assert!(!first.with_extension("md5").exists());
     assert!(first.is_file());
     assert_ne!(first, Path::new("/bin/sh"));
@@ -115,7 +120,11 @@ fn executable_store_prepares_and_caches_a_native_copy() {
         serde_json::from_slice(&fs::read(metadata_path).unwrap()).unwrap();
     assert_eq!(metadata["version"], 3);
     assert!(metadata["entries"].get("sh").is_some());
-    assert!(metadata["entries"]["sh"]["entry"].get("checksum").is_none());
+    assert!(metadata["entries"]["sh"]["entry"]["checksum"].is_string());
+    assert_eq!(
+        metadata["entries"]["sh"]["entry"]["variant"],
+        format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH)
+    );
 }
 
 #[test]

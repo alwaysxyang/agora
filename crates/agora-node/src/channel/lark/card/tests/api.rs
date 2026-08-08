@@ -20,6 +20,7 @@ async fn lark_card_coalesces_intermediate_updates_and_flushes_completion() {
         },
         "codex-dev".to_string(),
         None,
+        LarkConversation::Private,
         api,
     );
 
@@ -89,6 +90,7 @@ async fn lark_card_flushes_queue_and_all_non_success_terminal_states() {
             },
             "codex-dev".to_string(),
             None,
+            LarkConversation::Private,
             api.clone(),
         )
     };
@@ -193,6 +195,7 @@ async fn lark_agent_toggle_action_patches_the_original_status_card() {
         session_id: "oc_chat".to_string(),
         message_id: "om_status_card".to_string(),
         command: CommandRequest::new(["ask", "enable"]).with_argument("agent_name", "reviewer"),
+        conversation: Some(LarkConversation::Group),
     });
 
     channel
@@ -269,5 +272,10 @@ async fn lark_ask_message_replies_with_a_threaded_interactive_card() {
     assert_eq!(
         card.pointer("/header/title/content").unwrap(),
         "当前对话的 Agent 状态"
+    );
+    assert_eq!(
+        card.pointer("/body/elements/0/columns/1/elements/0/behaviors/0/value/agora_conversation")
+            .and_then(serde_json::Value::as_str),
+        Some("group")
     );
 }

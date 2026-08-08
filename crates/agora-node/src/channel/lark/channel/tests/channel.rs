@@ -145,6 +145,7 @@ async fn receiver_routes_ignored_interrupt_card_and_message_events() {
             session_id: "oc-chat".to_string(),
             message_id: "om-card".to_string(),
             callback_id: registration.id().to_string(),
+            conversation: None,
         }),
         LarkEvent::CardAction(LarkCardActionEvent {
             id: "evt-action".to_string(),
@@ -152,6 +153,7 @@ async fn receiver_routes_ignored_interrupt_card_and_message_events() {
             session_id: "oc-chat".to_string(),
             message_id: "om-card".to_string(),
             command: CommandRequest::new(["ask", "list"]),
+            conversation: None,
         }),
     ]));
 
@@ -209,6 +211,7 @@ async fn private_messages_support_text_replies_runs_and_actions() {
             session_id: "oc-chat".to_string(),
             message_id: "om-card".to_string(),
             command: CommandRequest::new(["ask", "list"]),
+            conversation: None,
         },
     )]));
     assert!(channel.recv().await.unwrap().is_some());
@@ -380,6 +383,7 @@ async fn lark_actions_check_the_actor_but_do_not_require_a_new_mention() {
             session_id: "oc-chat".to_string(),
             message_id: "om-card-denied".to_string(),
             callback_id: registration.id().to_string(),
+            conversation: None,
         }),
         LarkEvent::CardAction(LarkCardActionEvent {
             id: "evt-allowed".to_string(),
@@ -387,6 +391,7 @@ async fn lark_actions_check_the_actor_but_do_not_require_a_new_mention() {
             session_id: "oc-chat".to_string(),
             message_id: "om-card-allowed".to_string(),
             command: CommandRequest::new(["ask", "list"]),
+            conversation: None,
         }),
     ]));
 
@@ -399,6 +404,65 @@ async fn lark_actions_check_the_actor_but_do_not_require_a_new_mention() {
         request.path == "/open-apis/im/v1/messages/om-card-denied/reply"
             && request.body.contains("User ID：`ou-denied`")
     }));
+}
+
+#[tokio::test]
+async fn marked_group_card_actions_survive_channel_reconstruction() {
+    let event = LarkEvent::from_lark_event_payload(
+        r#"{
+            "schema":"2.0",
+            "header":{"event_id":"evt-restarted","event_type":"card.action.trigger"},
+            "event":{
+                "operator":{"open_id":"ou-allowed"},
+                "action":{"tag":"button","value":{
+                    "agora_conversation":"group",
+                    "agora_command":{"path":["ask","list"],"arguments":{}}
+                }},
+                "context":{"open_message_id":"om-card","open_chat_id":"oc-restarted"}
+            }
+        }"#,
+    )
+    .unwrap();
+    let (api, _server) = permission_api().await;
+    let mut channel = LarkChannel::with_api_and_permission(
+        api,
+        permission(&["ou-allowed"], &[("oc-restarted", false)]),
+    );
+    assert!(channel.group_sessions.is_empty());
+    channel.receiver = Some(event_receiver([event]));
+
+    let task = channel.recv().await.unwrap();
+
+    assert!(task.is_some());
+    assert_eq!(task.unwrap().task_id(), "evt-restarted");
+}
+
+#[tokio::test]
+async fn marked_private_card_actions_survive_channel_reconstruction() {
+    let event = LarkEvent::from_lark_event_payload(
+        r#"{
+            "schema":"2.0",
+            "header":{"event_id":"evt-private-restarted","event_type":"card.action.trigger"},
+            "event":{
+                "operator":{"open_id":"ou-allowed"},
+                "action":{"tag":"button","value":{
+                    "agora_conversation":"private",
+                    "agora_command":{"path":["ask","list"],"arguments":{}}
+                }},
+                "context":{"open_message_id":"om-card","open_chat_id":"oc-private"}
+            }
+        }"#,
+    )
+    .unwrap();
+    let (api, _server) = permission_api().await;
+    let mut channel = LarkChannel::with_api_and_permission(api, permission(&["ou-allowed"], &[]));
+    assert!(channel.group_sessions.is_empty());
+    channel.receiver = Some(event_receiver([event]));
+
+    let task = channel.recv().await.unwrap();
+
+    assert!(task.is_some());
+    assert_eq!(task.unwrap().task_id(), "evt-private-restarted");
 }
 
 #[tokio::test]
@@ -448,6 +512,7 @@ async fn card_action_tasks_cannot_open_agent_runs() {
         session_id: "oc-chat".to_string(),
         message_id: "om-card".to_string(),
         command: CommandRequest::new(["ask", "list"]),
+        conversation: None,
     });
     let error = channel
         .open_run(

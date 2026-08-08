@@ -1616,7 +1616,7 @@ fn executable_metadata_and_failed_publication_are_consistent() {
 }
 
 #[test]
-fn unchanged_executable_identity_reuses_cache_without_rehashing_contents() {
+fn executable_cache_rebuilds_when_the_recorded_checksum_is_wrong() {
     let fixture = Fixture::new();
     let source = fixture.lower.join("large-tool");
     std::fs::write(&source, b"source executable").unwrap();
@@ -1644,15 +1644,88 @@ fn unchanged_executable_identity_reuses_cache_without_rehashing_contents() {
                 checksum: Some("intentionally-invalid".to_string()),
                 materializer,
                 source: Some(source_identity),
+                variant: Some(format!(
+                    "{}/{}",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                )),
             },
         )
         .unwrap();
 
-    let reused = fixture.store.prepare_executable(&source, |_| {
-        anyhow::bail!("unchanged source must not be prepared again")
+    let rebuilt = fixture.store.prepare_executable(&source, |temporary| {
+        std::fs::write(temporary, b"rebuilt executable")?;
+        std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o755))?;
+        Ok(())
     });
 
-    assert_eq!(reused.unwrap(), destination);
+    assert_eq!(rebuilt.unwrap(), destination);
+    assert_eq!(std::fs::read(destination).unwrap(), b"rebuilt executable");
+}
+
+#[test]
+fn executable_cache_rebuilds_when_the_target_variant_is_wrong() {
+    let fixture = Fixture::new();
+    let source = fixture.lower.join("variant-tool");
+    std::fs::write(&source, b"source executable").unwrap();
+    let destination = fixture
+        .store
+        .prepare_executable(&source, |temporary| {
+            std::fs::write(temporary, b"first executable")?;
+            std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        })
+        .unwrap();
+    let state = fixture.store.state(&source).unwrap().unwrap();
+    let mut stored = serde_json::to_value(state).unwrap();
+    stored["variant"] = serde_json::Value::String("different-target".to_string());
+    fixture
+        .store
+        .set_state_for_test(&source, serde_json::from_value(stored).unwrap())
+        .unwrap();
+
+    fixture
+        .store
+        .prepare_executable(&source, |temporary| {
+            std::fs::write(temporary, b"target executable")?;
+            std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(std::fs::read(destination).unwrap(), b"target executable");
+}
+
+#[test]
+fn executable_cache_rebuilds_when_the_destination_is_a_symlink() {
+    let fixture = Fixture::new();
+    let source = fixture.lower.join("symlink-tool");
+    std::fs::write(&source, b"source executable").unwrap();
+    let destination = fixture
+        .store
+        .prepare_executable(&source, |temporary| {
+            std::fs::write(temporary, b"prepared executable")?;
+            std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        })
+        .unwrap();
+    let external = fixture.lower.join("external-cache-target");
+    std::fs::write(&external, b"prepared executable").unwrap();
+    std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_file(&destination).unwrap();
+    symlink(&external, &destination).unwrap();
+
+    fixture
+        .store
+        .prepare_executable(&source, |temporary| {
+            std::fs::write(temporary, b"rebuilt executable")?;
+            std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(destination.symlink_metadata().unwrap().is_file());
+    assert_eq!(std::fs::read(destination).unwrap(), b"rebuilt executable");
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use super::command::{Command, CommandOutput};
+use super::command::{Command, CommandLimits, CommandOutput};
 use super::{
     Agent, AgentOutcome, AgentOutput, AgentRequest, AgentSessionUpdate, DeleteSessionOutcome,
 };
@@ -10,11 +10,12 @@ use std::collections::HashMap;
 pub(super) struct CustomAgent {
     path: String,
     env: HashMap<String, String>,
+    limits: CommandLimits,
 }
 
 impl CustomAgent {
-    pub(super) fn new(path: String, env: HashMap<String, String>) -> Self {
-        Self { path, env }
+    pub(super) fn new(path: String, env: HashMap<String, String>, limits: CommandLimits) -> Self {
+        Self { path, env, limits }
     }
 }
 
@@ -31,7 +32,8 @@ impl Agent for CustomAgent {
         let command = Command::new(&self.path)
             .envs(self.env.clone())
             .current_dir(workdir)
-            .input(input);
+            .input(input)
+            .limits(self.limits);
         let mut command_output = RawCommandOutput::new(output);
         let outcome = command.run(&mut command_output).await?;
         Ok(AgentOutcome::new(

@@ -36,6 +36,8 @@ pub(crate) enum EntryState {
         materializer: Materializer,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<SourceIdentity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        variant: Option<String>,
     },
     Cow,
     Whiteout,

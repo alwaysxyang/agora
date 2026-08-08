@@ -242,6 +242,7 @@ impl DaemonShutdown {
 
 impl Daemon {
     pub fn new(mut config: NodeConfig) -> Result<Self> {
+        config.validate()?;
         config.apply_proxy_defaults();
         let store = SessionStore::open_default()?;
         let scheduler = ExecutionScheduler::default();

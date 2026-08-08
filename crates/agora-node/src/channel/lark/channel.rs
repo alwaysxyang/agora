@@ -71,6 +71,7 @@ pub(super) struct LarkCardActionEvent {
     pub(super) session_id: String,
     pub(super) message_id: String,
     pub(super) command: CommandRequest,
+    pub(super) conversation: Option<LarkConversation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +81,41 @@ pub(super) struct LarkInterruptEvent {
     pub(super) session_id: String,
     pub(super) message_id: String,
     pub(super) callback_id: String,
+    pub(super) conversation: Option<LarkConversation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LarkConversation {
+    Private,
+    Group,
+}
+
+impl LarkConversation {
+    fn from_chat_type(chat_type: &str) -> Self {
+        if chat_type == "p2p" {
+            Self::Private
+        } else {
+            Self::Group
+        }
+    }
+
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Group => "group",
+        }
+    }
+
+    fn from_action_value(value: &Value) -> Result<Option<Self>> {
+        match value.pointer("/event/action/value/agora_conversation") {
+            None => Ok(None),
+            Some(Value::String(value)) if value == "private" => Ok(Some(Self::Private)),
+            Some(Value::String(value)) if value == "group" => Ok(Some(Self::Group)),
+            Some(_) => Err(anyhow!(
+                "lark card action has an invalid agora conversation"
+            )),
+        }
+    }
 }
 
 impl LarkEvent {
@@ -134,6 +170,7 @@ impl LarkInterruptEvent {
                 "/event/action/value/agora_interrupt",
                 "event.action.value.agora_interrupt",
             )?,
+            conversation: LarkConversation::from_action_value(value)?,
         })
     }
 }
@@ -229,6 +266,7 @@ impl LarkCardActionEvent {
             )?,
             command: serde_json::from_value(command)
                 .context("lark card action has an invalid agora command")?,
+            conversation: LarkConversation::from_action_value(value)?,
         })
     }
 }
@@ -404,6 +442,15 @@ impl LarkTask {
             LarkTaskSource::CardAction(_) => None,
         }
     }
+
+    fn conversation(&self) -> Option<LarkConversation> {
+        match &self.source {
+            LarkTaskSource::Message(event) => {
+                Some(LarkConversation::from_chat_type(&event.chat_type))
+            }
+            LarkTaskSource::CardAction(event) => event.conversation,
+        }
+    }
 }
 
 impl ChannelTask for LarkTask {
@@ -512,10 +559,32 @@ impl LarkChannel {
         Ok(mentioned)
     }
 
-    async fn admit_action(&self, user_id: &str, session_id: &str, message_id: &str) -> bool {
-        let context = match self.group_sessions.get(session_id).copied() {
-            Some(false) => AccessContext::private(user_id),
-            Some(true) => AccessContext::group_action(user_id, session_id),
+    fn action_conversation(
+        &self,
+        session_id: &str,
+        conversation: Option<LarkConversation>,
+    ) -> Option<LarkConversation> {
+        conversation.or_else(|| {
+            self.group_sessions.get(session_id).copied().map(|group| {
+                if group {
+                    LarkConversation::Group
+                } else {
+                    LarkConversation::Private
+                }
+            })
+        })
+    }
+
+    async fn admit_action(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        message_id: &str,
+        conversation: Option<LarkConversation>,
+    ) -> bool {
+        let context = match self.action_conversation(session_id, conversation) {
+            Some(LarkConversation::Private) => AccessContext::private(user_id),
+            Some(LarkConversation::Group) => AccessContext::group_action(user_id, session_id),
             None => AccessContext::unresolved_group(user_id, session_id),
         };
         let target = LarkReplyTarget {
@@ -620,7 +689,12 @@ impl LarkChannel {
             }
             LarkEvent::CardAction(event) => {
                 if !self
-                    .admit_action(&event.user_id, &event.session_id, &event.message_id)
+                    .admit_action(
+                        &event.user_id,
+                        &event.session_id,
+                        &event.message_id,
+                        event.conversation,
+                    )
                     .await
                 {
                     return Ok(None);
@@ -635,7 +709,12 @@ impl LarkChannel {
             }
             LarkEvent::Interrupt(event) => {
                 if !self
-                    .admit_action(&event.user_id, &event.session_id, &event.message_id)
+                    .admit_action(
+                        &event.user_id,
+                        &event.session_id,
+                        &event.message_id,
+                        event.conversation,
+                    )
                     .await
                 {
                     return Ok(None);
@@ -691,8 +770,17 @@ impl Channel for LarkChannel {
         let interrupt = context
             .interrupt
             .map(|callback| self.interrupts.register(callback));
+        let conversation = task
+            .conversation()
+            .context("lark message conversation is unavailable")?;
         Ok(LarkRun {
-            card: LarkAgentCard::new(target, context.agent.name, interrupt, self.api.clone()),
+            card: LarkAgentCard::new(
+                target,
+                context.agent.name,
+                interrupt,
+                conversation,
+                self.api.clone(),
+            ),
         })
     }
 
@@ -707,14 +795,28 @@ impl Channel for LarkChannel {
                 }
                 None => {
                     self.api
-                        .reply_card(&token, &event.reply_target(), &LarkReplyCard::build(&reply))
+                        .reply_card(
+                            &token,
+                            &event.reply_target(),
+                            &LarkReplyCard::build(
+                                &reply,
+                                LarkConversation::from_chat_type(&event.chat_type),
+                            ),
+                        )
                         .await?;
                     Ok(())
                 }
             },
             LarkTaskSource::CardAction(event) => {
+                let conversation = self
+                    .action_conversation(&event.session_id, event.conversation)
+                    .context("lark card action conversation is unresolved")?;
                 self.api
-                    .patch_card(&token, &event.message_id, &LarkReplyCard::build(&reply))
+                    .patch_card(
+                        &token,
+                        &event.message_id,
+                        &LarkReplyCard::build(&reply, conversation),
+                    )
                     .await
             }
         }

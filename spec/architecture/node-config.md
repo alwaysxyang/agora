@@ -47,6 +47,8 @@ Daemon process settings such as pid files, state directory, log level, foregroun
       "model": "gpt-5.4",
       "effort": "xhigh",
       "agent_sandbox": "danger-full-access",
+      "timeout_seconds": 3600,
+      "max_output_bytes": 67108864,
       "subscribe": [
         {
           "channel": "lark1",
@@ -58,7 +60,7 @@ Daemon process settings such as pid files, state directory, log level, foregroun
 }
 ```
 
-This shape keeps channels and agents separate. `channels` defines named channel adapters. `agents` defines local agent entries with direct `isolate`, `type`, and `path` fields plus optional `workspace`, `model`, `effort`, `agent_sandbox`, and `proxy` overrides. The optional top-level `proxy` supplies the default HTTP proxy for every channel and agent that does not define its own value.
+This shape keeps channels and agents separate. `channels` defines named channel adapters. `agents` defines local agent entries with direct `isolate`, `type`, and `path` fields plus optional `workspace`, `model`, `effort`, `agent_sandbox`, `proxy`, `timeout_seconds`, and `max_output_bytes` overrides. The optional top-level `proxy` supplies the default HTTP proxy for every channel and agent that does not define its own value.
 
 The config file should parse as one object with `channels` and `agents` lists. A list with one channel and one agent is valid. Adding another local agent should only require appending another object to `agents` and subscribing it to one or more existing channel names.
 
@@ -97,6 +99,8 @@ Supported initial agent `type` values:
 `effort` is an optional Codex reasoning-effort override. `CodexAgent` passes it as `--config model_reasoning_effort={effort}`. When omitted or `null`, Codex uses its normal model-specific default or user configuration. Values are forwarded to Codex rather than validated by Agora so supported effort levels can evolve with the CLI and selected model.
 
 `agent_sandbox` is the optional sandbox policy of the backend agent. It is deliberately named separately from Agora's future runtime sandbox and from `isolate`, which controls backend conversation and queue boundaries rather than filesystem access. Supported values are `read-only`, `workspace-write`, and `danger-full-access`. When omitted or `null`, Codex uses its normal CLI and user-config resolution. When configured, `CodexAgent` passes the selected `sandbox_mode` and sets `approval_policy` to `never` because the daemon cannot service an interactive approval prompt. `danger-full-access` therefore gives the Codex child process the permissions of the daemon user and should only be enabled for trusted channel inputs.
+
+`timeout_seconds` is the positive per-execution wall-clock limit and defaults to `3600`. It begins when the agent backend starts, after any same-scope FIFO wait. `max_output_bytes` is the positive combined raw stdout-plus-stderr limit and defaults to `67108864` (64 MiB). It does not count files, SMB traffic, encrypted filesystem I/O, or task attachments. Timing out or exceeding the output boundary terminates the child process group and fails the run while retaining output already delivered to the channel.
 
 `proxy` is an optional HTTP proxy in `host:port`, `http://host:port`, or `http://user:password@host:port` form. A component-level proxy overrides the top-level default. Agent processes receive the selected proxy through `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and `https_proxy`. Lark and Telegram use the selected proxy for their HTTP transport; Lark also uses HTTP CONNECT for its WebSocket connection.
 
@@ -248,7 +252,7 @@ ChannelTask
   -> Channel output
 ```
 
-Command-based agents may use `agent::command::Command`, which writes input to stdin, delivers raw stdout and stderr bytes to an agent-provided handler, and reports the child exit status. The command helper does not know which channel requested the task, which agent uses it, how output is encoded, or whether a session exists.
+Command-based agents may use `agent::command::Command`, which writes input while concurrently draining raw stdout and stderr, delivers those chunks to an agent-provided handler, enforces the configured execution limits, and reports the child exit status. Unix signal exits use the conventional `128 + signal` code. The command helper does not know which channel requested the task, which agent uses it, how output is encoded, or whether a session exists.
 
 `CodexAgent` supplies its own command arguments and JSONL handler. It consumes an optional opaque session id, extracts `thread.started.thread_id`, publishes `item.completed` agent-message text instead of raw JSON lines, and returns a neutral session update. It does not own the channel-to-agent session mapping. Other agents can reuse the command helper with another output handler or implement a different execution strategy entirely.
 
@@ -317,6 +321,7 @@ The daemon should reject invalid config before starting the channel:
 - An explicitly configured `workspace` should be absolute.
 - Agent `type` must be present and supported.
 - Agent `path` must be present.
+- `timeout_seconds` and `max_output_bytes` must be positive when explicitly configured; omitted values use their documented defaults.
 - `model` and `effort`, when present, must be strings; Agora forwards their values to Codex without maintaining its own model or effort allowlist.
 - `proxy`, whether top-level or component-specific, must use HTTP, include a valid host and non-zero port, and use `user:password` when credentials are present.
 - Every `subscribe[].channel` value must reference an existing channel name.

@@ -182,4 +182,122 @@ fn omitted_workspace_uses_the_agora_home_directory() {
         config.isolation_scope("ignored", "ignored"),
         IsolationScope::Shared
     );
+    assert_eq!(config.timeout_seconds, 3600);
+    assert_eq!(config.max_output_bytes, 67_108_864);
+}
+
+#[test]
+fn agent_execution_limits_accept_explicit_values() {
+    let config: AgentConfig = serde_json::from_str(
+        r#"{
+            "name":"agent",
+            "isolate":"none",
+            "type":"custom",
+            "path":"agent",
+            "timeout_seconds":15,
+            "max_output_bytes":4096,
+            "subscribe":[]
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(config.timeout_seconds, 15);
+    assert_eq!(config.max_output_bytes, 4096);
+}
+
+#[test]
+fn node_config_rejects_zero_agent_execution_limits() {
+    for (field, expected) in [
+        ("timeout_seconds", "agent timeout_seconds must be positive"),
+        (
+            "max_output_bytes",
+            "agent max_output_bytes must be positive",
+        ),
+    ] {
+        let document = format!(
+            r#"{{
+                "channels":[],
+                "agents":[{{
+                    "name":"agent",
+                    "isolate":"none",
+                    "workspace":"/tmp/work",
+                    "type":"custom",
+                    "path":"agent",
+                    "{field}":0,
+                    "subscribe":[]
+                }}]
+            }}"#
+        );
+        let config: NodeConfig = serde_json::from_str(&document).unwrap();
+
+        let error = config.validate().unwrap_err();
+
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected validation error: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn node_config_rejects_ambiguous_or_invalid_runtime_entries() {
+    let cases = [
+        (
+            r#"{"channels":[{"type":"local","name":""}],"agents":[]}"#,
+            "channel name must not be empty",
+        ),
+        (
+            r#"{"channels":[{"type":"local","name":"same"},{"type":"http","name":"same"}],"agents":[]}"#,
+            "duplicate channel name: same",
+        ),
+        (
+            r#"{"channels":[],"agents":[{"name":"","isolate":"none","workspace":"/tmp/work","type":"custom","path":"agent","subscribe":[]}]}"#,
+            "agent name must not be empty",
+        ),
+        (
+            r#"{"channels":[],"agents":[{"name":"same","isolate":"none","workspace":"/tmp/one","type":"custom","path":"agent","subscribe":[]},{"name":"same","isolate":"none","workspace":"/tmp/two","type":"custom","path":"agent","subscribe":[]}]}"#,
+            "duplicate agent name: same",
+        ),
+        (
+            r#"{"channels":[],"agents":[{"name":"agent","isolate":"none","workspace":"/tmp/work","type":"custom","path":"","subscribe":[]}]}"#,
+            "agent path must not be empty: agent",
+        ),
+        (
+            r#"{"channels":[],"agents":[{"name":"agent","isolate":"none","workspace":"relative","type":"custom","path":"agent","subscribe":[]}]}"#,
+            "agent workspace must be absolute: agent",
+        ),
+        (
+            r#"{"channels":[],"agents":[{"name":"agent","isolate":"none","workspace":"/tmp/work","type":"custom","path":"agent","subscribe":[{"channel":"missing"}]}]}"#,
+            "agent subscription references an unknown channel: agent -> missing",
+        ),
+    ];
+
+    for (document, expected) in cases {
+        let config: NodeConfig = serde_json::from_str(document).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected validation error: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn node_config_accepts_unique_entries_and_existing_subscriptions() {
+    let config: NodeConfig = serde_json::from_str(
+        r#"{
+            "channels":[{"type":"local","name":"local"}],
+            "agents":[{
+                "name":"agent",
+                "isolate":"none",
+                "workspace":"/tmp/work",
+                "type":"custom",
+                "path":"agent",
+                "subscribe":[{"channel":"local"}]
+            }]
+        }"#,
+    )
+    .unwrap();
+
+    config.validate().unwrap();
 }

@@ -243,6 +243,8 @@ fn example_config() -> AgentConfig {
         effort: None,
         agent_sandbox: None,
         proxy: None,
+        timeout_seconds: 3600,
+        max_output_bytes: 64 * 1024 * 1024,
         subscribe: vec![agora_node::config::AgentSubscription {
             channel: "lark1".to_string(),
             filter: None,

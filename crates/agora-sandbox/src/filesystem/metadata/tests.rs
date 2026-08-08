@@ -142,6 +142,7 @@ fn metadata_round_trips_cached_cow_and_whiteout_states() {
                 checksum: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
                 materializer: Materializer::Copy,
                 source: None,
+                variant: None,
             },
         )
         .unwrap();
@@ -356,6 +357,7 @@ fn metadata_root_attributes_and_cached_authority_are_explicit() {
         checksum: None,
         materializer: Materializer::Copy,
         source: Some(source),
+        variant: None,
     };
     assert!(!cached.stored_attributes_are_authoritative(&materialized));
     let mut changed = materialized;
@@ -367,6 +369,7 @@ fn metadata_root_attributes_and_cached_authority_are_explicit() {
             checksum: None,
             materializer: Materializer::Copy,
             source: None,
+            variant: None,
         }
         .stored_attributes_are_authoritative(&attributes)
     );

@@ -1,5 +1,7 @@
 use super::super::LarkReplyTarget;
-use super::super::channel::{LarkCardActionEvent, LarkChannel, LarkMessageEvent, LarkTask};
+use super::super::channel::{
+    LarkCardActionEvent, LarkChannel, LarkConversation, LarkMessageEvent, LarkTask,
+};
 use super::super::lark_api::LarkApi;
 use super::{LarkAgentCard, LarkCardContent, LarkReplyCard};
 use crate::channel::permission::PermissionDenial;

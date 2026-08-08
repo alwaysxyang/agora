@@ -68,6 +68,8 @@ fn command_test_agent(name: &str, workspace: &std::path::Path) -> ConfiguredAgen
         effort: None,
         agent_sandbox: None,
         proxy: None,
+        timeout_seconds: 3600,
+        max_output_bytes: 64 * 1024 * 1024,
         subscribe: Vec::new(),
     })
     .unwrap()

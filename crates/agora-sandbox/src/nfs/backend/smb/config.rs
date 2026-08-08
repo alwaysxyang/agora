@@ -140,14 +140,23 @@ fn normalize_server(server: String) -> Result<String> {
     if server.is_empty() || server.contains(['/', '\\']) {
         bail!("SMB server is invalid");
     }
-    if server.parse::<std::net::SocketAddr>().is_ok() {
+    if let Ok(address) = server.parse::<std::net::SocketAddr>() {
+        if address.is_ipv6() {
+            bail!("SMB server IPv6 literals are unsupported");
+        }
         return Ok(server.to_owned());
     }
     if server.starts_with('[') && server.ends_with(']') {
+        if server[1..server.len() - 1]
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok()
+        {
+            bail!("SMB server IPv6 literals are unsupported");
+        }
         return Ok(format!("{server}:445"));
     }
     if server.parse::<std::net::Ipv6Addr>().is_ok() {
-        return Ok(format!("[{server}]:445"));
+        bail!("SMB server IPv6 literals are unsupported");
     }
     if server.contains(':') {
         if server

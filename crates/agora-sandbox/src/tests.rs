@@ -9,6 +9,7 @@ use agora_sandbox::callback::{
     NetworkProtocol, ProcessContext, ProcessEvent, ProcessOperation, Subsystem,
 };
 use std::net::{IpAddr, Ipv4Addr};
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use uuid::Uuid;
 
@@ -228,6 +229,39 @@ fn audit_state_reports_an_unusable_output_directory() {
             .contains("failed to create audit directory")
     );
 
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn audit_output_creates_new_files_with_private_permissions() {
+    let root = std::env::temp_dir().join(format!("agora-audit-mode-{}", Uuid::new_v4()));
+    let path = root.join("audit.jsonl");
+
+    let output = AuditOutput::new(Some(&path)).unwrap();
+
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    drop(output);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn audit_output_preserves_existing_file_permissions() {
+    let root = std::env::temp_dir().join(format!("agora-audit-existing-{}", Uuid::new_v4()));
+    let path = root.join("audit.jsonl");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(&path, b"").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+    let output = AuditOutput::new(Some(&path)).unwrap();
+
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    drop(output);
     std::fs::remove_dir_all(root).unwrap();
 }
 
