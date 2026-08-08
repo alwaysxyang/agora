@@ -1,7 +1,7 @@
 use super::super::TelegramReplyTarget;
 use super::*;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[tokio::test]
 async fn telegram_api_uses_an_authenticated_http_proxy() {
@@ -186,7 +186,28 @@ async fn telegram_api_rejects_false_callback_draft_and_failed_download_results()
             .await
             .is_err()
     );
-    assert!(api.download_file("file").await.is_err());
+    assert!(api.download_file("file", usize::MAX).await.is_err());
+}
+
+#[tokio::test]
+async fn telegram_image_download_rejects_an_oversized_body() {
+    let server = HttpMockServer::start(|request| match request.endpoint() {
+        "getFile" => MockResponse::json(
+            r#"{"ok":true,"result":{"file_id":"file","file_unique_id":"unique","file_path":"files/image.jpg"}}"#,
+        ),
+        "image.jpg" => MockResponse::bytes(b"oversized".to_vec(), "image/jpeg"),
+        endpoint => panic!("unexpected Telegram endpoint {endpoint}"),
+    })
+    .await;
+    let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
+
+    let error = api
+        .download_file("file", 4)
+        .await
+        .err()
+        .expect("oversized image must be rejected");
+
+    assert!(error.to_string().contains("maximum 4 bytes"));
 }
 
 #[tokio::test]
@@ -511,34 +532,47 @@ async fn telegram_group_mention_requirement_matches_only_the_current_bot() {
 
 #[tokio::test]
 async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
-    let server = HttpMockServer::start(|request| {
+    let callback_data = Arc::new(Mutex::new(None::<String>));
+    let response_callback_data = Arc::clone(&callback_data);
+    let server = HttpMockServer::start(move |request| {
         let result = match request.endpoint() {
             "getMe" => r#"{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}"#,
             "setMyCommands" | "answerCallbackQuery" => "true",
             "sendRichMessage" | "editMessageText" => r#"{"message_id":88}"#,
             "getUpdates" => {
-                r#"[
-                    {
-                        "update_id":501,
-                        "callback_query":{
-                            "id":"callback-1",
-                            "from":{"id":42,"is_bot":false},
-                            "message":{
-                                "message_id":88,
-                                "chat":{"id":1,"type":"private"}
+                let callback_data = response_callback_data
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("active run must publish callback data before polling");
+                return MockResponse::json(
+                    serde_json::json!({
+                        "ok": true,
+                        "result": [
+                            {
+                                "update_id": 501,
+                                "callback_query": {
+                                    "id": "callback-1",
+                                    "from": {"id": 42, "is_bot": false},
+                                    "message": {
+                                        "message_id": 88,
+                                        "chat": {"id": 1, "type": "private"}
+                                    },
+                                    "data": callback_data
+                                }
                             },
-                            "data":"agora_interrupt:interrupt-1"
-                        }
-                    },
-                    {
-                        "update_id":502,
-                        "message":{
-                            "message_id":32,
-                            "chat":{"id":1,"type":"private"},
-                            "text":"after stop"
-                        }
-                    }
-                ]"#
+                            {
+                                "update_id": 502,
+                                "message": {
+                                    "message_id": 32,
+                                    "chat": {"id": 1, "type": "private"},
+                                    "text": "after stop"
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                );
             }
             method => panic!("unexpected Telegram method {method}"),
         };
@@ -607,10 +641,12 @@ async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
         active["reply_markup"]["inline_keyboard"][0][0]["text"],
         "结束任务"
     );
-    assert_eq!(
-        active["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
-        "agora_interrupt:interrupt-1"
-    );
+    let active_callback_data = active["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(active_callback_data.starts_with("agora_interrupt:interrupt-"));
+    *callback_data.lock().unwrap() = Some(active_callback_data);
     assert_eq!(
         active["reply_markup"]["inline_keyboard"][0][0]["style"],
         "danger"
@@ -671,37 +707,62 @@ async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
     );
 }
 
+#[test]
+fn telegram_interrupt_callback_ids_do_not_repeat_after_restart() {
+    let first = TelegramInterruptCallbacks::default()
+        .register(InterruptCallback::new(|| true))
+        .callback_data();
+    let second = TelegramInterruptCallbacks::default()
+        .register(InterruptCallback::new(|| true))
+        .callback_data();
+
+    assert_ne!(first, second);
+}
+
 #[tokio::test]
 async fn telegram_callbacks_check_the_actor_without_requiring_a_new_mention() {
-    let server = HttpMockServer::start(|request| {
+    let callback_data = Arc::new(Mutex::new(None::<String>));
+    let response_callback_data = Arc::clone(&callback_data);
+    let server = HttpMockServer::start(move |request| {
         let result = match request.endpoint() {
             "getMe" => r#"{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}"#,
             "setMyCommands" | "answerCallbackQuery" => "true",
             "getUpdates" => {
-                r#"[
-                    {
-                        "update_id":621,
-                        "callback_query":{
-                            "id":"callback-denied",
-                            "from":{"id":7,"is_bot":false},
-                            "message":{
-                                "message_id":91,
-                                "message_thread_id":44,
-                                "chat":{"id":-1001,"type":"group"}
+                let callback_data = response_callback_data
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("interrupt must be registered before polling");
+                return MockResponse::json(
+                    serde_json::json!({
+                        "ok": true,
+                        "result": [
+                            {
+                                "update_id": 621,
+                                "callback_query": {
+                                    "id": "callback-denied",
+                                    "from": {"id": 7, "is_bot": false},
+                                    "message": {
+                                        "message_id": 91,
+                                        "message_thread_id": 44,
+                                        "chat": {"id": -1001, "type": "group"}
+                                    },
+                                    "data": callback_data
+                                }
                             },
-                            "data":"agora_interrupt:interrupt-1"
-                        }
-                    },
-                    {
-                        "update_id":622,
-                        "message":{
-                            "message_id":92,
-                            "from":{"id":42,"is_bot":false},
-                            "chat":{"id":-1001,"type":"group"},
-                            "text":"@agora_bot continue"
-                        }
-                    }
-                ]"#
+                            {
+                                "update_id": 622,
+                                "message": {
+                                    "message_id": 92,
+                                    "from": {"id": 42, "is_bot": false},
+                                    "chat": {"id": -1001, "type": "group"},
+                                    "text": "@agora_bot continue"
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                );
             }
             "sendRichMessage" => r#"{"message_id":93}"#,
             method => panic!("unexpected Telegram method {method}"),
@@ -716,10 +777,11 @@ async fn telegram_callbacks_check_the_actor_without_requiring_a_new_mention() {
     let mut channel = TelegramChannel::with_api_and_permission(api, access);
     let interrupted = Arc::new(AtomicBool::new(false));
     let callback_interrupted = Arc::clone(&interrupted);
-    let _registration = channel.interrupts.register(InterruptCallback::new(move || {
+    let registration = channel.interrupts.register(InterruptCallback::new(move || {
         callback_interrupted.store(true, Ordering::Relaxed);
         true
     }));
+    *callback_data.lock().unwrap() = Some(registration.callback_data());
 
     let task = channel.next_task().await.unwrap();
 

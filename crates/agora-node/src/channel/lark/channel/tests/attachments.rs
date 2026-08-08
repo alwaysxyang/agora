@@ -1,4 +1,5 @@
 use super::*;
+use crate::channel::test_http::{HttpMockServer, MockResponse};
 
 #[tokio::test]
 async fn downloads_a_lark_message_image_resource() {
@@ -49,7 +50,7 @@ async fn downloads_a_lark_message_image_resource() {
     .unwrap();
 
     let image = api
-        .download_message_image("token", "om_post_1", "img_trace")
+        .download_message_image("token", "om_post_1", "img_trace", usize::MAX)
         .await
         .unwrap();
 
@@ -141,4 +142,54 @@ async fn resolves_lark_post_images_into_task_attachments() {
     assert_eq!(image.media_type(), "image/png");
     assert_eq!(image.data(), b"image-bytes");
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn rejects_lark_post_images_above_the_cumulative_attachment_limit() {
+    let LarkEvent::Message(event) = LarkEvent::from_lark_event_payload(
+        r#"{
+            "schema": "2.0",
+            "header": {"event_id": "evt_post_2", "event_type": "im.message.receive_v1"},
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_123"}},
+                "message": {
+                    "message_id": "om_post_2",
+                    "chat_id": "oc_123",
+                    "chat_type": "group",
+                    "message_type": "post",
+                    "content": "{\"title\":\"\",\"content\":[[{\"tag\":\"img\",\"image_key\":\"first\"},{\"tag\":\"img\",\"image_key\":\"second\"}]]}"
+                }
+            }
+        }"#,
+    )
+    .unwrap() else {
+        panic!("receive event should contain a message");
+    };
+    let server = HttpMockServer::start(|request| {
+        if request.path.contains("tenant_access_token/internal") {
+            MockResponse::json(r#"{"code":0,"msg":"ok","tenant_access_token":"token"}"#)
+        } else {
+            MockResponse::bytes(b"123456".to_vec(), "image/png")
+        }
+    })
+    .await;
+    let api = LarkApi::with_base_url(
+        LarkChannelConfig {
+            name: "lark-test".to_string(),
+            app_id: "app-id".to_string(),
+            secret: "secret".to_string(),
+            permission: Default::default(),
+            proxy: None,
+        },
+        server.base_url(),
+    )
+    .unwrap();
+    let channel = LarkChannel::with_api(api);
+
+    let error = channel
+        .task_from_event_with_attachment_limit(event, 10)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("maximum 4 bytes"));
 }

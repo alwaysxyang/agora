@@ -94,7 +94,11 @@ impl TelegramApi {
         Ok(())
     }
 
-    pub(super) async fn download_file(&self, file_id: &str) -> Result<TelegramFileResource> {
+    pub(super) async fn download_file(
+        &self,
+        file_id: &str,
+        maximum_bytes: usize,
+    ) -> Result<TelegramFileResource> {
         let file: TelegramFile = self.request("getFile", &GetFileRequest { file_id }).await?;
         let file_path = file
             .file_path
@@ -122,11 +126,9 @@ impl TelegramApi {
             .and_then(|value| value.split(';').next())
             .unwrap_or("application/octet-stream")
             .to_string();
-        let data = response
-            .bytes()
+        let data = http::read_body_limited(response, maximum_bytes)
             .await
-            .map_err(|err| Self::safe_transport_error("downloadFile", "response", &err))?
-            .to_vec();
+            .map_err(|err| anyhow!("telegram downloadFile response failed: {err}"))?;
         let file_name = file_path
             .rsplit('/')
             .find(|name| !name.is_empty())

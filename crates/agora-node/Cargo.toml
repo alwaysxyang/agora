@@ -19,3 +19,4 @@ serde_json = { workspace = true }
 tempfile = "3.27.0"
 tokio = { workspace = true }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+uuid = { workspace = true }

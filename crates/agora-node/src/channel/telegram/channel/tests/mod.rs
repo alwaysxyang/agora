@@ -1,5 +1,5 @@
 use super::super::telegram_api::{TelegramApi, TelegramBotCommand};
-use super::{TelegramChannel, TelegramUpdate};
+use super::{TelegramChannel, TelegramInterruptCallbacks, TelegramUpdate};
 use crate::channel::permission::PermissionDenial;
 use crate::channel::test_http::{HttpMockServer, MockResponse};
 use crate::channel::{

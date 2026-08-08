@@ -3,7 +3,7 @@ use super::card::{LarkAgentCard, LarkReplyCard};
 use super::lark_api::LarkApi;
 use crate::channel::permission::{AccessContext, PermissionGate};
 use crate::channel::{
-    Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, InterruptCallback, RunEvent,
+    Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, InterruptCallbacks, RunEvent,
 };
 #[cfg(test)]
 use crate::config::ChannelPermissionConfig;
@@ -14,8 +14,6 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -172,74 +170,6 @@ impl LarkInterruptEvent {
             )?,
             conversation: LarkConversation::from_action_value(value)?,
         })
-    }
-}
-
-struct LarkInterruptCallbacksInner {
-    next_id: AtomicU64,
-    callbacks: Mutex<HashMap<String, InterruptCallback>>,
-}
-
-#[derive(Clone)]
-pub(super) struct LarkInterruptCallbacks {
-    inner: Arc<LarkInterruptCallbacksInner>,
-}
-
-impl Default for LarkInterruptCallbacks {
-    fn default() -> Self {
-        Self {
-            inner: Arc::new(LarkInterruptCallbacksInner {
-                next_id: AtomicU64::new(1),
-                callbacks: Mutex::new(HashMap::new()),
-            }),
-        }
-    }
-}
-
-impl LarkInterruptCallbacks {
-    pub(super) fn register(&self, callback: InterruptCallback) -> LarkInterruptRegistration {
-        let id = format!(
-            "interrupt-{}",
-            self.inner.next_id.fetch_add(1, Ordering::Relaxed)
-        );
-        self.callbacks().insert(id.clone(), callback);
-        LarkInterruptRegistration {
-            id,
-            callbacks: self.clone(),
-        }
-    }
-
-    pub(super) fn trigger(&self, id: &str) -> bool {
-        let callback = self.callbacks().remove(id);
-        callback.is_some_and(|callback| callback.trigger())
-    }
-
-    fn remove(&self, id: &str) {
-        self.callbacks().remove(id);
-    }
-
-    fn callbacks(&self) -> std::sync::MutexGuard<'_, HashMap<String, InterruptCallback>> {
-        self.inner
-            .callbacks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-pub(super) struct LarkInterruptRegistration {
-    id: String,
-    callbacks: LarkInterruptCallbacks,
-}
-
-impl LarkInterruptRegistration {
-    pub(super) fn id(&self) -> &str {
-        &self.id
-    }
-}
-
-impl Drop for LarkInterruptRegistration {
-    fn drop(&mut self) {
-        self.callbacks.remove(&self.id);
     }
 }
 
@@ -489,7 +419,7 @@ pub struct LarkChannel {
     permission: PermissionGate,
     bot_open_id: Option<String>,
     group_sessions: HashMap<String, bool>,
-    interrupts: LarkInterruptCallbacks,
+    interrupts: InterruptCallbacks,
     receiver: Option<LarkWebSocketReceiver>,
 }
 
@@ -501,7 +431,7 @@ impl LarkChannel {
             permission,
             bot_open_id: None,
             group_sessions: HashMap::new(),
-            interrupts: LarkInterruptCallbacks::default(),
+            interrupts: InterruptCallbacks::default(),
             receiver: None,
         })
     }
@@ -532,7 +462,7 @@ impl LarkChannel {
             permission: PermissionGate::new(permission),
             bot_open_id: None,
             group_sessions: HashMap::new(),
-            interrupts: LarkInterruptCallbacks::default(),
+            interrupts: InterruptCallbacks::default(),
             receiver: None,
         }
     }
@@ -601,7 +531,17 @@ impl LarkChannel {
     }
 
     pub(super) async fn task_from_event(&self, event: LarkMessageEvent) -> Result<LarkTask> {
+        self.task_from_event_with_attachment_limit(event, crate::http::MAX_TASK_ATTACHMENT_BYTES)
+            .await
+    }
+
+    async fn task_from_event_with_attachment_limit(
+        &self,
+        event: LarkMessageEvent,
+        maximum_bytes: usize,
+    ) -> Result<LarkTask> {
         let mut content = TaskContent::new(event.input());
+        let mut remaining_bytes = maximum_bytes;
         if !event.image_keys().is_empty() {
             let token = self
                 .api
@@ -611,9 +551,12 @@ impl LarkChannel {
             for (index, image_key) in event.image_keys().iter().enumerate() {
                 let image = self
                     .api
-                    .download_message_image(&token, &event.message_id, image_key)
+                    .download_message_image(&token, &event.message_id, image_key, remaining_bytes)
                     .await
-                    .with_context(|| format!("download lark message image failed: {image_key}"))?;
+                    .map_err(|err| {
+                        anyhow!("download lark message image failed: {image_key}: {err}")
+                    })?;
+                remaining_bytes -= image.data.len();
                 let file_name = format!(
                     "lark-image-{}.{}",
                     index + 1,

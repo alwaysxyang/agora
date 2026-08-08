@@ -121,8 +121,16 @@ impl AgentDispatcher {
                     .execute_agent(&key, &agent, agent_task, control, &mut output)
                     .await;
                 match result {
-                    Ok(AgentRunOutcome::Completed(outcome)) => {
+                    Ok(AgentRunOutcome::Completed(outcome)) if outcome.exit_code() == 0 => {
                         output.completed(outcome.exit_code()).await
+                    }
+                    Ok(AgentRunOutcome::Completed(outcome)) => {
+                        let err = anyhow::anyhow!(
+                            "agent process exited with status {}",
+                            outcome.exit_code()
+                        );
+                        output.failed(err.to_string()).await?;
+                        Err(err)
                     }
                     Ok(AgentRunOutcome::Cancelled(cancellation)) => {
                         output.cancelled(cancellation).await

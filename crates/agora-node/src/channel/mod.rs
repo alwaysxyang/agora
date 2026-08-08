@@ -3,9 +3,11 @@ use crate::channel::telegram::{TelegramChannel, TelegramRun, TelegramTask};
 use crate::config::ChannelConfig;
 use crate::task::{ChannelTaskInput, CommandRequest, OutputEvent};
 use anyhow::{Result, bail};
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
 pub mod lark;
 mod permission;
@@ -103,6 +105,55 @@ impl InterruptCallback {
 impl fmt::Debug for InterruptCallback {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("InterruptCallback")
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct InterruptCallbacks {
+    inner: Arc<Mutex<HashMap<String, InterruptCallback>>>,
+}
+
+impl InterruptCallbacks {
+    pub(crate) fn register(&self, callback: InterruptCallback) -> InterruptRegistration {
+        let id = format!("interrupt-{}", Uuid::new_v4().simple());
+        self.callbacks().insert(id.clone(), callback);
+        InterruptRegistration {
+            id,
+            callbacks: self.clone(),
+        }
+    }
+
+    pub(crate) fn trigger(&self, id: &str) -> bool {
+        self.callbacks()
+            .remove(id)
+            .is_some_and(|callback| callback.trigger())
+    }
+
+    fn remove(&self, id: &str) {
+        self.callbacks().remove(id);
+    }
+
+    fn callbacks(&self) -> std::sync::MutexGuard<'_, HashMap<String, InterruptCallback>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+pub(crate) struct InterruptRegistration {
+    id: String,
+    callbacks: InterruptCallbacks,
+}
+
+impl InterruptRegistration {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Drop for InterruptRegistration {
+    fn drop(&mut self) {
+        self.callbacks.remove(&self.id);
     }
 }
 

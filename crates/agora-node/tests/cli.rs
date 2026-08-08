@@ -406,6 +406,8 @@ fn node_help_describes_the_config_fields() {
         "model",
         "effort",
         "agent_sandbox",
+        "timeout_seconds",
+        "max_output_bytes",
         "HTTP_PROXY/HTTPS_PROXY",
         "subscribe",
         "filter",

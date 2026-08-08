@@ -87,6 +87,9 @@ FIELD REFERENCE
     effort                   Optional Codex reasoning effort override.
     agent_sandbox            Optional Codex sandbox: "read-only",
                              "workspace-write", or "danger-full-access".
+    timeout_seconds          Optional positive execution timeout; defaults to 3600.
+    max_output_bytes         Optional positive combined stdout/stderr limit; defaults
+                             to 67108864 (64 MiB).
     proxy                    Optional agent-specific HTTP proxy. Injected as
                              HTTP_PROXY/HTTPS_PROXY in upper and lower case.
     subscribe                Channel subscriptions for this agent.

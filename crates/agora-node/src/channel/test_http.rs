@@ -45,6 +45,7 @@ pub(super) struct MockResponse {
     status: u16,
     body: Vec<u8>,
     content_type: &'static str,
+    include_content_length: bool,
     delay: Duration,
 }
 
@@ -54,6 +55,7 @@ impl MockResponse {
             status: 200,
             body: body.into().into_bytes(),
             content_type: "application/json",
+            include_content_length: true,
             delay: Duration::ZERO,
         }
     }
@@ -68,8 +70,14 @@ impl MockResponse {
             status: 200,
             body: body.into(),
             content_type,
+            include_content_length: true,
             delay: Duration::ZERO,
         }
+    }
+
+    pub(super) fn without_content_length(mut self) -> Self {
+        self.include_content_length = false;
+        self
     }
 }
 
@@ -305,11 +313,14 @@ async fn write_response(stream: &mut TcpStream, response: MockResponse) -> io::R
     } else {
         "Error"
     };
+    let content_length = response
+        .include_content_length
+        .then(|| format!("content-length: {}\r\n", response.body.len()));
     let head = format!(
-        "HTTP/1.1 {} {reason}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {} {reason}\r\ncontent-type: {}\r\n{}connection: close\r\n\r\n",
         response.status,
         response.content_type,
-        response.body.len(),
+        content_length.as_deref().unwrap_or_default(),
     );
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(&response.body).await

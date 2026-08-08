@@ -2,7 +2,8 @@ use super::rich_message::TelegramRichMessage;
 use super::telegram_api::{TelegramApi, TelegramBotCommand};
 use crate::channel::permission::{AccessContext, PermissionDenial, PermissionGate};
 use crate::channel::{
-    Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, InterruptCallback, RunEvent,
+    Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, InterruptCallback,
+    InterruptCallbacks, InterruptRegistration, RunEvent,
 };
 #[cfg(test)]
 use crate::config::ChannelPermissionConfig;
@@ -13,9 +14,7 @@ use agora_core::logger;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::collections::VecDeque;
 
 const TELEGRAM_INTERRUPT_PREFIX: &str = "agora_interrupt:";
 const TELEGRAM_COMMANDS: &[TelegramBotCommand<'static>] = &[
@@ -39,72 +38,30 @@ pub struct TelegramRun {
     message: TelegramRichMessage,
 }
 
-struct TelegramInterruptCallbacksInner {
-    next_id: AtomicU64,
-    callbacks: StdMutex<HashMap<String, InterruptCallback>>,
-}
-
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) struct TelegramInterruptCallbacks {
-    inner: Arc<TelegramInterruptCallbacksInner>,
-}
-
-impl Default for TelegramInterruptCallbacks {
-    fn default() -> Self {
-        Self {
-            inner: Arc::new(TelegramInterruptCallbacksInner {
-                next_id: AtomicU64::new(1),
-                callbacks: StdMutex::new(HashMap::new()),
-            }),
-        }
-    }
+    callbacks: InterruptCallbacks,
 }
 
 impl TelegramInterruptCallbacks {
     fn register(&self, callback: InterruptCallback) -> TelegramInterruptRegistration {
-        let id = format!(
-            "interrupt-{}",
-            self.inner.next_id.fetch_add(1, Ordering::Relaxed)
-        );
-        self.callbacks().insert(id.clone(), callback);
         TelegramInterruptRegistration {
-            id,
-            callbacks: self.clone(),
+            registration: self.callbacks.register(callback),
         }
     }
 
     fn trigger(&self, id: &str) -> bool {
-        self.callbacks()
-            .remove(id)
-            .is_some_and(|callback| callback.trigger())
-    }
-
-    fn remove(&self, id: &str) {
-        self.callbacks().remove(id);
-    }
-
-    fn callbacks(&self) -> std::sync::MutexGuard<'_, HashMap<String, InterruptCallback>> {
-        self.inner
-            .callbacks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.callbacks.trigger(id)
     }
 }
 
 pub(super) struct TelegramInterruptRegistration {
-    id: String,
-    callbacks: TelegramInterruptCallbacks,
+    registration: InterruptRegistration,
 }
 
 impl TelegramInterruptRegistration {
     pub(super) fn callback_data(&self) -> String {
-        format!("{TELEGRAM_INTERRUPT_PREFIX}{}", self.id)
-    }
-}
-
-impl Drop for TelegramInterruptRegistration {
-    fn drop(&mut self) {
-        self.callbacks.remove(&self.id);
+        format!("{TELEGRAM_INTERRUPT_PREFIX}{}", self.registration.id())
     }
 }
 
@@ -284,7 +241,7 @@ impl TelegramChannel {
         };
         let image = self
             .api
-            .download_file(&file_id)
+            .download_file(&file_id, crate::http::MAX_TASK_ATTACHMENT_BYTES)
             .await
             .with_context(|| format!("download telegram image failed: {file_id}"))?;
         if let ChannelTaskInput::Message(content) = &mut task.input {

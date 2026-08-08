@@ -1,9 +1,10 @@
 use super::LarkReplyTarget;
-use super::channel::{LarkConversation, LarkInterruptRegistration};
+use super::channel::LarkConversation;
 use super::lark_api::LarkApi;
 use crate::channel::permission::PermissionDenial;
 use crate::channel::{
-    ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun, RunEvent,
+    ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun,
+    InterruptRegistration, RunEvent,
 };
 use crate::i18n::{self, RunStatus};
 use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
@@ -34,7 +35,7 @@ impl Clone for LarkAgentCard {
 struct LarkAgentCardInner {
     target: LarkReplyTarget,
     api: LarkApi,
-    _interrupt: Option<LarkInterruptRegistration>,
+    _interrupt: Option<InterruptRegistration>,
     state: Mutex<LarkAgentCardState>,
 }
 
@@ -998,13 +999,13 @@ impl LarkAgentCard {
     pub(super) fn new(
         target: LarkReplyTarget,
         agent_name: String,
-        interrupt: Option<LarkInterruptRegistration>,
+        interrupt: Option<InterruptRegistration>,
         conversation: LarkConversation,
         api: LarkApi,
     ) -> Self {
         let interrupt_id = interrupt
             .as_ref()
-            .map(LarkInterruptRegistration::id)
+            .map(InterruptRegistration::id)
             .map(str::to_string);
         Self {
             inner: Arc::new(LarkAgentCardInner {

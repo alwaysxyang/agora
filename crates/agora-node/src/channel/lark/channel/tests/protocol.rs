@@ -66,7 +66,7 @@ fn parses_lark_interrupt_card_action() {
 
 #[test]
 fn lark_interrupt_callbacks_are_one_shot_and_removed_with_their_registration() {
-    let callbacks = LarkInterruptCallbacks::default();
+    let callbacks = InterruptCallbacks::default();
     let calls = Arc::new(AtomicUsize::new(0));
     let callback_calls = Arc::clone(&calls);
     let registration = callbacks.register(InterruptCallback::new(move || {
@@ -83,6 +83,20 @@ fn lark_interrupt_callbacks_are_one_shot_and_removed_with_their_registration() {
     let callback_id = registration.id().to_string();
     drop(registration);
     assert!(!callbacks.trigger(&callback_id));
+}
+
+#[test]
+fn lark_interrupt_callback_ids_do_not_repeat_after_restart() {
+    let first = InterruptCallbacks::default()
+        .register(InterruptCallback::new(|| true))
+        .id()
+        .to_string();
+    let second = InterruptCallbacks::default()
+        .register(InterruptCallback::new(|| true))
+        .id()
+        .to_string();
+
+    assert_ne!(first, second);
 }
 
 #[test]

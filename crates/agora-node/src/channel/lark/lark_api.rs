@@ -313,6 +313,7 @@ impl LarkApi {
         token: &str,
         message_id: &str,
         image_key: &str,
+        maximum_bytes: usize,
     ) -> Result<LarkImageResource> {
         let response = self
             .client
@@ -336,11 +337,9 @@ impl LarkApi {
             .and_then(|value| value.split(';').next())
             .unwrap_or("application/octet-stream")
             .to_string();
-        let data = response
-            .bytes()
+        let data = http::read_body_limited(response, maximum_bytes)
             .await
-            .context("read lark message image failed")?
-            .to_vec();
+            .map_err(|err| anyhow!("read lark message image failed: {err}"))?;
         Ok(LarkImageResource { media_type, data })
     }
 

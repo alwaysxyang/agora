@@ -1,6 +1,8 @@
 use crate::config::HttpProxy;
-use anyhow::{Context, Result};
-use reqwest::{Client, ClientBuilder};
+use anyhow::{Context, Result, bail};
+use reqwest::{Client, ClientBuilder, Response};
+
+pub(crate) const MAX_TASK_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) fn client(builder: ClientBuilder, proxy: Option<&HttpProxy>) -> Result<Client> {
     let builder = match proxy {
@@ -21,4 +23,30 @@ pub(crate) fn client(builder: ClientBuilder, proxy: Option<&HttpProxy>) -> Resul
         builder
     };
     builder.build().context("build HTTP client failed")
+}
+
+pub(crate) async fn read_body_limited(mut response: Response, maximum: usize) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        bail!("HTTP response body limit exceeded: maximum {maximum} bytes");
+    }
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(maximum);
+    let mut data = Vec::with_capacity(capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| anyhow::anyhow!("HTTP response body read failed"))?
+    {
+        if chunk.len() > maximum.saturating_sub(data.len()) {
+            bail!("HTTP response body limit exceeded: maximum {maximum} bytes");
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
 }

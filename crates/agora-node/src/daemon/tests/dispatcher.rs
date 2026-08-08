@@ -140,6 +140,52 @@ async fn forwards_custom_agent_stderr_to_the_channel_run() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn reports_nonzero_agent_exit_as_failed() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("failing-agent");
+    std::fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let channel = RecordingChannel {
+        contexts: Arc::new(Mutex::new(Vec::new())),
+        events: Arc::clone(&events),
+    };
+    let dispatcher =
+        AgentDispatcher::new(SessionStore::open(temp.path().join("store.db")).unwrap());
+    let mut config = custom_agent("custom");
+    config.path = script.to_string_lossy().into_owned();
+
+    assert!(
+        dispatcher
+            .dispatch_channel_task(
+                &channel,
+                vec![ConfiguredAgent::from_config(config).unwrap()],
+                TestTask,
+            )
+            .await
+            .is_err()
+    );
+
+    let events = events.lock().unwrap();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            RunEvent::Failed { message } if message.contains("exited with status 7")
+        )),
+        "unexpected events: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RunEvent::Completed { .. }))
+    );
+}
+
 #[tokio::test]
 async fn daemon_skips_unsupported_and_unsubscribed_channels() {
     let temp = tempfile::tempdir().unwrap();
@@ -225,7 +271,7 @@ async fn agent_run_output_publishes_every_terminal_state() {
         })
         .await
         .unwrap();
-    output.completed(7).await.unwrap();
+    output.completed(0).await.unwrap();
     output.failed("failed".to_string()).await.unwrap();
     output
         .cancelled(crate::agent::AgentRunCancellation::Stopped)
@@ -246,7 +292,7 @@ async fn agent_run_output_publishes_every_terminal_state() {
             RunEvent::Output(OutputEvent::Thinking {
                 text: "checking".to_string(),
             }),
-            RunEvent::Completed { exit_code: 7 },
+            RunEvent::Completed { exit_code: 0 },
             RunEvent::Failed {
                 message: "failed".to_string(),
             },

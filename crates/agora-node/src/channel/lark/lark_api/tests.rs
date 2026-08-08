@@ -457,19 +457,43 @@ async fn lark_http_results_cover_missing_fields_errors_and_binary_defaults() {
     .await;
     let api = LarkApi::with_base_url(config(), server.base_url()).unwrap();
     let image = api
-        .download_message_image("token", "message", "raw")
+        .download_message_image("token", "message", "raw", usize::MAX)
         .await
         .unwrap();
     assert_eq!(image.media_type, "invalid content type");
     assert_eq!(image.data, b"raw-image");
     assert!(
-        api.download_message_image("token", "message", "missing")
+        api.download_message_image("token", "message", "missing", usize::MAX)
             .await
             .err()
             .unwrap()
             .to_string()
             .contains("404")
     );
+}
+
+#[tokio::test]
+async fn lark_image_download_rejects_declared_and_streamed_oversized_bodies() {
+    for include_content_length in [true, false] {
+        let server = HttpMockServer::start(move |_| {
+            let response = MockResponse::bytes(b"oversized".to_vec(), "image/png");
+            if include_content_length {
+                response
+            } else {
+                response.without_content_length()
+            }
+        })
+        .await;
+        let api = LarkApi::with_base_url(config(), server.base_url()).unwrap();
+
+        let error = api
+            .download_message_image("token", "message", "image", 4)
+            .await
+            .err()
+            .expect("oversized image must be rejected");
+
+        assert!(error.to_string().contains("maximum 4 bytes"));
+    }
 }
 
 #[tokio::test]
