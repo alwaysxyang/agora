@@ -87,7 +87,6 @@ impl LarkApi {
                         "lark websocket disconnected channel={}, reconnecting",
                         self.name
                     );
-                    backoff.reset();
                 }
                 Err(_) => {
                     if connected {
@@ -107,7 +106,7 @@ impl LarkApi {
                 return Err(anyhow!("agora lark receiver closed"));
             }
 
-            let delay = backoff.next_delay();
+            let delay = backoff.next_delay_after_attempt(connected);
             logger::info!(
                 "lark websocket reconnect scheduled channel={} delay_secs={}",
                 self.name,
@@ -492,6 +491,13 @@ impl LarkReconnectBackoff {
 
     pub(super) fn reset(&mut self) {
         self.next_delay = Duration::from_secs(LARK_RECONNECT_INITIAL_DELAY_SECONDS);
+    }
+
+    pub(super) fn next_delay_after_attempt(&mut self, connected: bool) -> Duration {
+        if connected {
+            self.reset();
+        }
+        self.next_delay()
     }
 }
 

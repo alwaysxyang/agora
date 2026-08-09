@@ -1,5 +1,5 @@
 use super::rich_message::TelegramRichMessage;
-use super::telegram_api::{TelegramApi, TelegramBotCommand};
+use super::telegram_api::{TelegramApi, TelegramBotCommand, TelegramFileDownloadError};
 use crate::channel::permission::{AccessContext, PermissionDenial, PermissionGate};
 use crate::channel::{
     Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, InterruptCallback,
@@ -17,6 +17,7 @@ use serde_json::Value;
 use std::collections::VecDeque;
 
 const TELEGRAM_INTERRUPT_PREFIX: &str = "agora_interrupt:";
+const TELEGRAM_IMAGE_MAX_ATTEMPTS: usize = 3;
 const TELEGRAM_COMMANDS: &[TelegramBotCommand<'static>] = &[
     TelegramBotCommand::new("stop", i18n::STOP_COMMAND_DESCRIPTION),
     TelegramBotCommand::new("reset", i18n::RESET_COMMAND_DESCRIPTION),
@@ -30,6 +31,7 @@ pub struct TelegramChannel {
     interrupts: TelegramInterruptCallbacks,
     pending: VecDeque<TelegramTask>,
     next_offset: Option<i64>,
+    image_retry: Option<(i64, usize)>,
     bot_username: Option<String>,
 }
 
@@ -84,6 +86,7 @@ impl TelegramChannel {
             interrupts: TelegramInterruptCallbacks::default(),
             pending: VecDeque::new(),
             next_offset: None,
+            image_retry: None,
             bot_username: None,
         }
     }
@@ -183,20 +186,39 @@ impl TelegramChannel {
                                 self.advance_offset(update_id);
                                 continue;
                             }
-                            let task = self.resolve_task_image(task).await?;
+                            let task = match self.resolve_task_image(task).await {
+                                Ok(task) => {
+                                    self.image_retry = None;
+                                    task
+                                }
+                                Err(error)
+                                    if error.is_retryable()
+                                        && self.retry_image_update(update_id) =>
+                                {
+                                    return Err(error.into());
+                                }
+                                Err(error) => {
+                                    logger::error!(
+                                        "telegram image update discarded channel={} update_id={} retryable={} error={}",
+                                        self.api.name(),
+                                        update_id,
+                                        error.is_retryable(),
+                                        error
+                                    );
+                                    self.image_retry = None;
+                                    self.advance_offset(update_id);
+                                    continue;
+                                }
+                            };
+                            let (input, input_bytes, attachments) = task.input.receipt_log_fields();
                             logger::info!(
-                                "telegram message received channel={} session={} message_id={} input={} attachments={}",
+                                "telegram message received channel={} session={} message_id={} input={} input_bytes={} attachments={}",
                                 self.api.name(),
                                 task.session_id(),
                                 task.reply_target.message_id,
-                                task.input
-                                    .message()
-                                    .map(TaskContent::text)
-                                    .unwrap_or_default(),
-                                task.input
-                                    .message()
-                                    .map(|content| content.attachments().len())
-                                    .unwrap_or_default()
+                                input,
+                                input_bytes,
+                                attachments
                             );
                             self.pending.push_back(task);
                         }
@@ -235,15 +257,17 @@ impl TelegramChannel {
         Ok(())
     }
 
-    async fn resolve_task_image(&self, mut task: TelegramTask) -> Result<TelegramTask> {
+    async fn resolve_task_image(
+        &self,
+        mut task: TelegramTask,
+    ) -> std::result::Result<TelegramTask, TelegramFileDownloadError> {
         let Some(file_id) = task.image_file_id.take() else {
             return Ok(task);
         };
         let image = self
             .api
             .download_file(&file_id, crate::http::MAX_TASK_ATTACHMENT_BYTES)
-            .await
-            .with_context(|| format!("download telegram image failed: {file_id}"))?;
+            .await?;
         if let ChannelTaskInput::Message(content) = &mut task.input {
             *content = std::mem::take(content).with_attachment(TaskAttachment::image(
                 image.file_name,
@@ -252,6 +276,15 @@ impl TelegramChannel {
             ));
         }
         Ok(task)
+    }
+
+    fn retry_image_update(&mut self, update_id: i64) -> bool {
+        let attempts = match self.image_retry {
+            Some((current, attempts)) if current == update_id => attempts.saturating_add(1),
+            _ => 1,
+        };
+        self.image_retry = Some((update_id, attempts));
+        attempts < TELEGRAM_IMAGE_MAX_ATTEMPTS
     }
 
     fn advance_offset(&mut self, update_id: i64) {

@@ -217,4 +217,13 @@ fn lark_reconnect_backoff_retries_forever_with_a_cap() {
 
     backoff.reset();
     assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+
+    assert_eq!(
+        backoff.next_delay_after_attempt(false),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        backoff.next_delay_after_attempt(true),
+        Duration::from_secs(1)
+    );
 }

@@ -1,5 +1,5 @@
 use crate::config::HttpProxy;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use reqwest::{Client, ClientBuilder, Response};
 
 pub(crate) const MAX_TASK_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
@@ -25,12 +25,15 @@ pub(crate) fn client(builder: ClientBuilder, proxy: Option<&HttpProxy>) -> Resul
     builder.build().context("build HTTP client failed")
 }
 
-pub(crate) async fn read_body_limited(mut response: Response, maximum: usize) -> Result<Vec<u8>> {
+pub(crate) async fn read_body_limited(
+    mut response: Response,
+    maximum: usize,
+) -> std::result::Result<Vec<u8>, BodyReadError> {
     if response
         .content_length()
         .is_some_and(|length| length > maximum as u64)
     {
-        bail!("HTTP response body limit exceeded: maximum {maximum} bytes");
+        return Err(BodyReadError::LimitExceeded { maximum });
     }
     let capacity = response
         .content_length()
@@ -41,12 +44,38 @@ pub(crate) async fn read_body_limited(mut response: Response, maximum: usize) ->
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| anyhow::anyhow!("HTTP response body read failed"))?
+        .map_err(|_| BodyReadError::ReadFailed)?
     {
         if chunk.len() > maximum.saturating_sub(data.len()) {
-            bail!("HTTP response body limit exceeded: maximum {maximum} bytes");
+            return Err(BodyReadError::LimitExceeded { maximum });
         }
         data.extend_from_slice(&chunk);
     }
     Ok(data)
 }
+
+#[derive(Debug)]
+pub(crate) enum BodyReadError {
+    LimitExceeded { maximum: usize },
+    ReadFailed,
+}
+
+impl BodyReadError {
+    pub(crate) fn is_limit_exceeded(&self) -> bool {
+        matches!(self, Self::LimitExceeded { .. })
+    }
+}
+
+impl std::fmt::Display for BodyReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LimitExceeded { maximum } => write!(
+                formatter,
+                "HTTP response body limit exceeded: maximum {maximum} bytes"
+            ),
+            Self::ReadFailed => formatter.write_str("HTTP response body read failed"),
+        }
+    }
+}
+
+impl std::error::Error for BodyReadError {}

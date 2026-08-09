@@ -46,6 +46,7 @@ pub(super) struct MockResponse {
     body: Vec<u8>,
     content_type: &'static str,
     include_content_length: bool,
+    declared_content_length: Option<usize>,
     delay: Duration,
 }
 
@@ -56,6 +57,7 @@ impl MockResponse {
             body: body.into().into_bytes(),
             content_type: "application/json",
             include_content_length: true,
+            declared_content_length: None,
             delay: Duration::ZERO,
         }
     }
@@ -71,8 +73,14 @@ impl MockResponse {
             body: body.into(),
             content_type,
             include_content_length: true,
+            declared_content_length: None,
             delay: Duration::ZERO,
         }
+    }
+
+    pub(super) fn with_declared_content_length(mut self, length: usize) -> Self {
+        self.declared_content_length = Some(length);
+        self
     }
 
     pub(super) fn without_content_length(mut self) -> Self {
@@ -313,9 +321,14 @@ async fn write_response(stream: &mut TcpStream, response: MockResponse) -> io::R
     } else {
         "Error"
     };
-    let content_length = response
-        .include_content_length
-        .then(|| format!("content-length: {}\r\n", response.body.len()));
+    let content_length = response.include_content_length.then(|| {
+        format!(
+            "content-length: {}\r\n",
+            response
+                .declared_content_length
+                .unwrap_or(response.body.len())
+        )
+    });
     let head = format!(
         "HTTP/1.1 {} {reason}\r\ncontent-type: {}\r\n{}connection: close\r\n\r\n",
         response.status,

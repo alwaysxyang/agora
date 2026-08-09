@@ -157,7 +157,7 @@ If multiple agents subscribe to the same channel, each card must identify the re
 
 For the local MVP, Lark message intake must use an in-process WebSocket long connection created from the configured `app_id` and `secret`. The daemon should not require `lark-cli`, shelling out to local developer tools, or a third-party Lark channel wrapper crate to receive events. The receive path should acknowledge Lark events promptly and hand normalized message tasks to the daemon for backend agent execution.
 
-The Lark intake loop should reconnect indefinitely when the WebSocket disconnects, endpoint bootstrap fails, or the local network is temporarily unavailable. Reconnect attempts should use bounded backoff so a broken network does not cause a tight retry loop.
+The Lark intake loop should reconnect indefinitely when the WebSocket disconnects, endpoint bootstrap fails, or the local network is temporarily unavailable. Reconnect attempts should use bounded backoff so a broken network does not cause a tight retry loop. Any successfully established WebSocket resets the accumulated backoff before the next reconnect, including when that connection later reports an error.
 
 When a Lark channel uses an HTTP proxy, the complete WebSocket CONNECT handshake, including TCP connection, request write, and response-header read, has a 10-second timeout. A timeout fails that connection attempt and enters the normal reconnect path.
 

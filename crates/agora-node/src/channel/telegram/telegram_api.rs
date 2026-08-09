@@ -98,12 +98,21 @@ impl TelegramApi {
         &self,
         file_id: &str,
         maximum_bytes: usize,
-    ) -> Result<TelegramFileResource> {
-        let file: TelegramFile = self.request("getFile", &GetFileRequest { file_id }).await?;
+    ) -> std::result::Result<TelegramFileResource, TelegramFileDownloadError> {
+        let file: TelegramFile = self
+            .request_with_attempts(
+                "getFile",
+                &GetFileRequest { file_id },
+                TELEGRAM_REQUEST_MAX_ATTEMPTS,
+            )
+            .await
+            .map_err(TelegramFileDownloadError::from_api)?;
         let file_path = file
             .file_path
             .filter(|path| !path.is_empty())
-            .ok_or_else(|| anyhow!("telegram getFile response missing file path"))?;
+            .ok_or_else(|| {
+                TelegramFileDownloadError::permanent("telegram getFile response missing file path")
+            })?;
         let response = self
             .client
             .get(format!(
@@ -114,10 +123,20 @@ impl TelegramApi {
             ))
             .send()
             .await
-            .map_err(|err| Self::safe_transport_error("downloadFile", "request", &err))?;
+            .map_err(|err| {
+                TelegramFileDownloadError::from_api(Self::safe_transport_error(
+                    "downloadFile",
+                    "request",
+                    &err,
+                    true,
+                ))
+            })?;
         let status = response.status();
         if !status.is_success() {
-            bail!("telegram downloadFile failed http status={status}");
+            return Err(TelegramFileDownloadError::new(
+                status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error(),
+                format!("telegram downloadFile failed http status={status}"),
+            ));
         }
         let media_type = response
             .headers()
@@ -128,7 +147,12 @@ impl TelegramApi {
             .to_string();
         let data = http::read_body_limited(response, maximum_bytes)
             .await
-            .map_err(|err| anyhow!("telegram downloadFile response failed: {err}"))?;
+            .map_err(|err| {
+                TelegramFileDownloadError::new(
+                    !err.is_limit_exceeded(),
+                    format!("telegram downloadFile response failed: {err}"),
+                )
+            })?;
         let file_name = file_path
             .rsplit('/')
             .find(|name| !name.is_empty())
@@ -224,6 +248,7 @@ impl TelegramApi {
     {
         self.request_with_attempts(method, body, TELEGRAM_REQUEST_MAX_ATTEMPTS)
             .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn request_once<B, T>(&self, method: &str, body: &B) -> Result<T>
@@ -231,7 +256,9 @@ impl TelegramApi {
         B: Serialize + ?Sized,
         T: DeserializeOwned,
     {
-        self.request_with_attempts(method, body, 1).await
+        self.request_with_attempts(method, body, 1)
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn request_with_attempts<B, T>(
@@ -239,7 +266,7 @@ impl TelegramApi {
         method: &str,
         body: &B,
         max_attempts: usize,
-    ) -> Result<T>
+    ) -> std::result::Result<T, TelegramApiError>
     where
         B: Serialize + ?Sized,
         T: DeserializeOwned,
@@ -259,22 +286,36 @@ impl TelegramApi {
                     attempt += 1;
                     continue;
                 }
-                Err(err) => return Err(Self::safe_transport_error(method, "request", &err)),
+                Err(err) => {
+                    return Err(Self::safe_transport_error(method, "request", &err, true));
+                }
             };
             let status = response.status();
+            let retryable_status =
+                status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
             let envelope = match response.json::<TelegramResponse<T>>().await {
                 Ok(envelope) => envelope,
-                Err(_) if status.is_server_error() && attempt < max_attempts => {
+                Err(_) if retryable_status && attempt < max_attempts => {
                     Self::wait_before_retry(attempt, None).await;
                     attempt += 1;
                     continue;
                 }
-                Err(err) => return Err(Self::safe_transport_error(method, "response", &err)),
+                Err(err) => {
+                    return Err(Self::safe_transport_error(
+                        method,
+                        "response",
+                        &err,
+                        retryable_status,
+                    ));
+                }
             };
             if envelope.ok {
-                return envelope
-                    .result
-                    .ok_or_else(|| anyhow!("telegram {method} response missing result"));
+                return envelope.result.ok_or_else(|| {
+                    TelegramApiError::new(
+                        false,
+                        format!("telegram {method} response missing result"),
+                    )
+                });
             }
 
             let error_code = envelope.error_code;
@@ -282,8 +323,7 @@ impl TelegramApi {
                 .parameters
                 .as_ref()
                 .and_then(|parameters| parameters.retry_after);
-            let retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                || status.is_server_error()
+            let retryable = retryable_status
                 || error_code == Some(429)
                 || error_code.is_some_and(|code| (500..600).contains(&code));
             if retryable && attempt < max_attempts {
@@ -298,7 +338,10 @@ impl TelegramApi {
             let description = envelope
                 .description
                 .unwrap_or_else(|| "unknown Telegram API error".to_string());
-            bail!("telegram {method} failed code={code}: {description}");
+            return Err(TelegramApiError::new(
+                retryable,
+                format!("telegram {method} failed code={code}: {description}"),
+            ));
         }
     }
 
@@ -314,7 +357,12 @@ impl TelegramApi {
         format!("{}/bot{}/{}", self.base_url, self.token, method)
     }
 
-    fn safe_transport_error(method: &str, phase: &str, err: &reqwest::Error) -> anyhow::Error {
+    fn safe_transport_error(
+        method: &str,
+        phase: &str,
+        err: &reqwest::Error,
+        retryable: bool,
+    ) -> TelegramApiError {
         let kind = if err.is_timeout() {
             "timed out"
         } else if err.is_connect() {
@@ -326,7 +374,10 @@ impl TelegramApi {
         } else {
             "transport failed"
         };
-        anyhow!("telegram {method} {phase} failed: {kind}")
+        TelegramApiError::new(
+            retryable,
+            format!("telegram {method} {phase} failed: {kind}"),
+        )
     }
 
     fn draft_id_seed() -> i64 {
@@ -349,6 +400,64 @@ impl TelegramApi {
         http::client(builder, proxy).context("build telegram http client failed")
     }
 }
+
+#[derive(Debug)]
+struct TelegramApiError {
+    retryable: bool,
+    message: String,
+}
+
+impl TelegramApiError {
+    fn new(retryable: bool, message: impl Into<String>) -> Self {
+        Self {
+            retryable,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for TelegramApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TelegramApiError {}
+
+#[derive(Debug)]
+pub(super) struct TelegramFileDownloadError {
+    retryable: bool,
+    message: String,
+}
+
+impl TelegramFileDownloadError {
+    fn new(retryable: bool, message: impl Into<String>) -> Self {
+        Self {
+            retryable,
+            message: message.into(),
+        }
+    }
+
+    fn from_api(error: TelegramApiError) -> Self {
+        Self::new(error.retryable, error.message)
+    }
+
+    fn permanent(message: impl Into<String>) -> Self {
+        Self::new(false, message)
+    }
+
+    pub(super) fn is_retryable(&self) -> bool {
+        self.retryable
+    }
+}
+
+impl std::fmt::Display for TelegramFileDownloadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TelegramFileDownloadError {}
 
 #[derive(Serialize)]
 struct EmptyRequest {}

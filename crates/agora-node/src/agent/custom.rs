@@ -49,12 +49,71 @@ impl Agent for CustomAgent {
 
 struct RawCommandOutput<'a, O> {
     output: &'a mut O,
+    stdout_buffer: Vec<u8>,
+    stderr_buffer: Vec<u8>,
 }
 
 impl<'a, O> RawCommandOutput<'a, O> {
     fn new(output: &'a mut O) -> Self {
-        Self { output }
+        Self {
+            output,
+            stdout_buffer: Vec::new(),
+            stderr_buffer: Vec::new(),
+        }
     }
+
+    async fn write_answer(&mut self, text: String) -> Result<()>
+    where
+        O: AgentOutput + Send,
+    {
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.output.write(OutputEvent::Answer { text }).await
+    }
+
+    async fn flush(&mut self) -> Result<()>
+    where
+        O: AgentOutput + Send,
+    {
+        let stdout = decode_utf8(&mut self.stdout_buffer, &[], true);
+        self.write_answer(stdout).await?;
+        let stderr = decode_utf8(&mut self.stderr_buffer, &[], true);
+        self.write_answer(stderr).await
+    }
+}
+
+fn decode_utf8(buffer: &mut Vec<u8>, chunk: &[u8], final_chunk: bool) -> String {
+    buffer.extend_from_slice(chunk);
+    let mut decoded = String::new();
+    loop {
+        match std::str::from_utf8(buffer) {
+            Ok(text) => {
+                decoded.push_str(text);
+                buffer.clear();
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                decoded.push_str(
+                    std::str::from_utf8(&buffer[..valid])
+                        .expect("UTF-8 validator reported an invalid valid prefix"),
+                );
+                if let Some(invalid) = error.error_len() {
+                    decoded.push('�');
+                    buffer.drain(..valid + invalid);
+                } else {
+                    buffer.drain(..valid);
+                    if final_chunk {
+                        decoded.push_str(&String::from_utf8_lossy(buffer));
+                        buffer.clear();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    decoded
 }
 
 impl<O> CommandOutput for RawCommandOutput<'_, O>
@@ -62,18 +121,19 @@ where
     O: AgentOutput + Send,
 {
     async fn stdout(&mut self, chunk: &[u8]) -> Result<()> {
-        self.output
-            .write(OutputEvent::Answer {
-                text: String::from_utf8_lossy(chunk).into_owned(),
-            })
-            .await
+        let text = decode_utf8(&mut self.stdout_buffer, chunk, false);
+        self.write_answer(text).await
     }
 
     async fn stderr(&mut self, chunk: &[u8]) -> Result<()> {
-        self.output
-            .write(OutputEvent::Answer {
-                text: String::from_utf8_lossy(chunk).into_owned(),
-            })
-            .await
+        let text = decode_utf8(&mut self.stderr_buffer, chunk, false);
+        self.write_answer(text).await
+    }
+
+    async fn finish(&mut self) -> Result<()> {
+        self.flush().await
     }
 }
+
+#[cfg(test)]
+mod tests;

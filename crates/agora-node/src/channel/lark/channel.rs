@@ -613,20 +613,16 @@ impl LarkChannel {
                 let sender_id = event.sender_id.clone();
                 let message_id = event.message_id.clone();
                 let task = self.task_from_event(event).await?;
+                let (input, input_bytes, attachments) = task.input.receipt_log_fields();
                 logger::info!(
-                    "lark message received channel={} session={} sender={} message_id={} input={} attachments={}",
+                    "lark message received channel={} session={} sender={} message_id={} input={} input_bytes={} attachments={}",
                     self.name(),
                     session_id,
                     sender_id,
                     message_id,
-                    task.input
-                        .message()
-                        .map(TaskContent::text)
-                        .unwrap_or_default(),
-                    task.input
-                        .message()
-                        .map(|content| content.attachments().len())
-                        .unwrap_or_default()
+                    input,
+                    input_bytes,
+                    attachments
                 );
                 Ok(Some(task))
             }

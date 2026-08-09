@@ -7,6 +7,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
+const RECEIPT_LOG_TEXT_MAX_BYTES: usize = 2 * 1024;
+const RECEIPT_LOG_TRUNCATION_MARKER: &str = "[truncated]";
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CommandRequest {
     path: Vec<String>,
@@ -63,6 +66,31 @@ impl ChannelTaskInput {
             Self::Command(command) => Some(command),
         }
     }
+
+    pub(crate) fn receipt_log_fields(&self) -> (String, usize, usize) {
+        match self {
+            Self::Message(content) => (
+                receipt_log_text(content.text()),
+                content.text().len(),
+                content.attachments().len(),
+            ),
+            Self::Command(_) => (String::new(), 0, 0),
+        }
+    }
+}
+
+fn receipt_log_text(text: &str) -> String {
+    let mut logged = text.escape_debug().collect::<String>();
+    if logged.len() <= RECEIPT_LOG_TEXT_MAX_BYTES {
+        return logged;
+    }
+    let mut end = RECEIPT_LOG_TEXT_MAX_BYTES.saturating_sub(RECEIPT_LOG_TRUNCATION_MARKER.len());
+    while !logged.is_char_boundary(end) {
+        end -= 1;
+    }
+    logged.truncate(end);
+    logged.push_str(RECEIPT_LOG_TRUNCATION_MARKER);
+    logged
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

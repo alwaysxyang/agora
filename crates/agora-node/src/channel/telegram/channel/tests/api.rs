@@ -147,6 +147,26 @@ async fn telegram_api_retries_invalid_server_error_responses() {
 }
 
 #[tokio::test]
+async fn telegram_api_retries_an_invalid_rate_limit_response() {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let captured = Arc::clone(&attempts);
+    let server = HttpMockServer::start(move |_| {
+        if captured.fetch_add(1, Ordering::SeqCst) == 0 {
+            MockResponse::json("not-json").with_status(429)
+        } else {
+            MockResponse::json(
+                r#"{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}}"#,
+            )
+        }
+    })
+    .await;
+    let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
+
+    assert_eq!(api.bot_username().await.unwrap(), "agora_bot");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn telegram_api_retries_connection_failures_and_redacts_the_token() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -390,6 +410,106 @@ async fn telegram_channel_retries_an_image_update_without_advancing_its_offset()
     assert_eq!(polls.len(), 2);
     let retry: serde_json::Value = serde_json::from_str(&polls[1].body).unwrap();
     assert_eq!(retry.get("offset"), None);
+}
+
+#[tokio::test]
+async fn telegram_channel_skips_a_permanently_invalid_image_update() {
+    let server = HttpMockServer::start(|request| match request.endpoint() {
+        "getMe" => MockResponse::json(
+            r#"{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}}"#,
+        ),
+        "setMyCommands" => MockResponse::json(r#"{"ok":true,"result":true}"#),
+        "getUpdates" => MockResponse::json(
+            r#"{"ok":true,"result":[
+                {"update_id":305,"message":{"message_id":25,"chat":{"id":1,"type":"private"},"photo":[{"file_id":"invalid"}]}},
+                {"update_id":306,"message":{"message_id":26,"chat":{"id":1,"type":"private"},"text":"after invalid image"}}
+            ]}"#,
+        ),
+        "getFile" => MockResponse::json(
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: wrong file identifier"}"#,
+        )
+        .with_status(400),
+        endpoint => panic!("unexpected Telegram endpoint {endpoint}"),
+    })
+    .await;
+    let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
+    let mut channel = TelegramChannel::with_api(api);
+
+    let task = channel.next_task().await.unwrap();
+
+    assert_eq!(task.task_id(), "306");
+    assert_eq!(
+        task.input().message().unwrap().text(),
+        "after invalid image"
+    );
+    assert_eq!(server.endpoint_count("getFile").await, 1);
+    assert_eq!(server.endpoint_count("getUpdates").await, 1);
+}
+
+#[tokio::test]
+async fn telegram_channel_stops_retrying_a_transient_image_failure() {
+    let server = HttpMockServer::start(|request| match request.endpoint() {
+        "getMe" => MockResponse::json(
+            r#"{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}}"#,
+        ),
+        "setMyCommands" => MockResponse::json(r#"{"ok":true,"result":true}"#),
+        "getUpdates" => MockResponse::json(
+            r#"{"ok":true,"result":[
+                {"update_id":305,"message":{"message_id":25,"chat":{"id":1,"type":"private"},"photo":[{"file_id":"temporary"}]}},
+                {"update_id":306,"message":{"message_id":26,"chat":{"id":1,"type":"private"},"text":"after retries"}}
+            ]}"#,
+        ),
+        "getFile" => MockResponse::json(
+            r#"{"ok":true,"result":{"file_id":"temporary","file_unique_id":"unique","file_path":"photos/image.jpg"}}"#,
+        ),
+        "image.jpg" => MockResponse::bytes(Vec::new(), "image/jpeg").with_status(503),
+        endpoint => panic!("unexpected Telegram endpoint {endpoint}"),
+    })
+    .await;
+    let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
+    let mut channel = TelegramChannel::with_api(api);
+
+    assert!(channel.next_task().await.is_err());
+    assert!(channel.next_task().await.is_err());
+    let task = channel.next_task().await.unwrap();
+
+    assert_eq!(task.task_id(), "306");
+    assert_eq!(task.input().message().unwrap().text(), "after retries");
+    assert_eq!(server.endpoint_count("getFile").await, 3);
+    assert_eq!(server.endpoint_count("image.jpg").await, 3);
+    assert_eq!(server.endpoint_count("getUpdates").await, 3);
+}
+
+#[tokio::test]
+async fn telegram_channel_skips_an_oversized_image_without_retrying() {
+    let server = HttpMockServer::start(|request| match request.endpoint() {
+        "getMe" => MockResponse::json(
+            r#"{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}}"#,
+        ),
+        "setMyCommands" => MockResponse::json(r#"{"ok":true,"result":true}"#),
+        "getUpdates" => MockResponse::json(
+            r#"{"ok":true,"result":[
+                {"update_id":305,"message":{"message_id":25,"chat":{"id":1,"type":"private"},"photo":[{"file_id":"oversized"}]}},
+                {"update_id":306,"message":{"message_id":26,"chat":{"id":1,"type":"private"},"text":"after oversized image"}}
+            ]}"#,
+        ),
+        "getFile" => MockResponse::json(
+            r#"{"ok":true,"result":{"file_id":"oversized","file_unique_id":"unique","file_path":"photos/image.jpg"}}"#,
+        ),
+        "image.jpg" => MockResponse::bytes(Vec::new(), "image/jpeg")
+            .with_declared_content_length(crate::http::MAX_TASK_ATTACHMENT_BYTES + 1),
+        endpoint => panic!("unexpected Telegram endpoint {endpoint}"),
+    })
+    .await;
+    let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
+    let mut channel = TelegramChannel::with_api(api);
+
+    let task = channel.next_task().await.unwrap();
+
+    assert_eq!(task.task_id(), "306");
+    assert_eq!(server.endpoint_count("getFile").await, 1);
+    assert_eq!(server.endpoint_count("image.jpg").await, 1);
+    assert_eq!(server.endpoint_count("getUpdates").await, 1);
 }
 
 #[tokio::test]
