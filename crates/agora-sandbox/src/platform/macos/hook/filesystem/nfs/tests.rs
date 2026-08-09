@@ -1,8 +1,19 @@
 use super::super::FilesystemHookRuntime;
-use super::{RemoteAnchor, RemoteFilesystem, RemoteOpen, validate_entries};
+use super::{
+    RemoteAnchor, RemoteFilesystem, RemoteOpen, decode_list_descriptor, validate_entries,
+    validate_entry_count,
+};
 use crate::nfs::client::RemoteClient;
-use crate::nfs::protocol::{RemoteEntry, RemoteFileType, RemoteMetadata, RemoteRoute};
+use crate::nfs::protocol::{
+    MAX_REMOTE_DIRECTORY_ENTRIES, MAX_REMOTE_DIRECTORY_PAYLOAD_BYTES, PROTOCOL_VERSION,
+    RemoteEntry, RemoteFileType, RemoteMetadata, RemoteRoute, Request, RequestEnvelope, Response,
+    ResponseEnvelope,
+};
+use crate::nfs::transport;
+use std::io::{Seek, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 
 fn filesystem() -> RemoteFilesystem {
@@ -153,6 +164,15 @@ fn remote_routes_reject_relative_requests_cross_root_renames_and_invalid_entries
 }
 
 #[test]
+fn remote_directory_entry_limit_is_enforced_before_validation_allocates() {
+    validate_entry_count(MAX_REMOTE_DIRECTORY_ENTRIES).unwrap();
+    assert_eq!(
+        errno(&validate_entry_count(MAX_REMOTE_DIRECTORY_ENTRIES + 1).unwrap_err()),
+        Some(libc::EOVERFLOW)
+    );
+}
+
+#[test]
 fn remote_metadata_rejects_invalid_anchors_and_exposes_mutable_open_targets() {
     let filesystem = filesystem();
     for anchor in ["../anchor", "nested/anchor", "/absolute"] {
@@ -252,4 +272,80 @@ fn remote_anchor_removes_its_temporary_inode_when_released() {
     drop(RemoteAnchor::adopt(&file).unwrap());
 
     assert!(!file.exists());
+}
+
+#[test]
+fn invalid_claimed_list_payload_releases_its_anchor() {
+    let runtime = tempfile::tempdir().unwrap();
+    let anchor = "anchor-0123456789abcdef0123456789abcdef";
+    std::fs::create_dir(runtime.path().join(anchor)).unwrap();
+    let socket = runtime.path().join("nfs.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut list_stream, _) = listener.accept().unwrap();
+        let (list, descriptor) = transport::receive::<RequestEnvelope>(&mut list_stream).unwrap();
+        assert!(descriptor.is_none());
+        assert!(matches!(list.request, Request::List { .. }));
+        let mut payload = tempfile::tempfile().unwrap();
+        payload.write_all(b"not-json").unwrap();
+        payload.rewind().unwrap();
+        transport::send(
+            &mut list_stream,
+            &ResponseEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: list.request_id.clone(),
+                response: Response::List {
+                    anchor: anchor.to_string(),
+                },
+            },
+            Some(payload.as_raw_fd()),
+        )
+        .unwrap();
+
+        let (mut claim_stream, _) = listener.accept().unwrap();
+        let (claim, descriptor) = transport::receive::<RequestEnvelope>(&mut claim_stream).unwrap();
+        assert!(descriptor.is_none());
+        assert_eq!(
+            claim.request,
+            Request::Claim {
+                request_id: list.request_id,
+            }
+        );
+        transport::send(
+            &mut claim_stream,
+            &ResponseEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: claim.request_id,
+                response: Response::Success,
+            },
+            None,
+        )
+        .unwrap();
+    });
+    let filesystem = RemoteFilesystem::new(
+        &socket,
+        "token",
+        vec![RemoteRoute {
+            root: 0,
+            logical_root: "/remote".to_string(),
+        }],
+    )
+    .unwrap();
+    let path = filesystem.route(Path::new("/remote")).unwrap();
+
+    assert!(filesystem.directory_view(&path).is_err());
+    assert!(!runtime.path().join(anchor).exists());
+    server.join().unwrap();
+}
+
+#[test]
+fn hook_rejects_an_oversized_list_descriptor_before_decoding_it() {
+    let payload = tempfile::tempfile().unwrap();
+    payload
+        .set_len(MAX_REMOTE_DIRECTORY_PAYLOAD_BYTES + 1)
+        .unwrap();
+
+    let error = decode_list_descriptor(payload.into()).unwrap_err();
+
+    assert_eq!(errno(&error), Some(libc::EOVERFLOW));
 }

@@ -158,7 +158,9 @@ Current status:
   mount. The parent owns backend credentials and sessions, while the hook receives only route ids,
   a socket path, and a per-run token and operates through anonymous regular-file descriptors and
   short-lived opaque empty directory anchors. Remote requests use replayable request IDs and
-  explicit resource claims. The local encrypted Broker and NFS Broker share only private IPC
+  explicit resource claims. The generic Broker owns file, directory, and operation limits; a
+  timed-out backend operation resets only its configured root's session state. The local encrypted
+  Broker and NFS Broker share only private IPC
   framing; their protocols, handles, and synchronization policies remain independent. A Broker
   failure is monitored alongside the other run services.
 - The CLI renders one compact JSON Lines record per network connection attempt, intercepted

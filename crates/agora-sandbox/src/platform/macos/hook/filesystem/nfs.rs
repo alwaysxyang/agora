@@ -1,11 +1,14 @@
 use crate::filesystem::FileAttributes;
 use crate::nfs::client::{RemoteClient, RemoteClientError, decode_json_descriptor};
 use crate::nfs::protocol::{
-    RemoteEntry, RemoteFileType, RemoteMetadata, RemotePath, RemoteRoute, Request, Response,
+    MAX_REMOTE_DIRECTORY_ENTRIES, MAX_REMOTE_DIRECTORY_PAYLOAD_BYTES, RemoteEntry, RemoteFileType,
+    RemoteMetadata, RemotePath, RemoteRoute, Request, Response,
 };
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
+use std::fs::File;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -209,17 +212,17 @@ impl RemoteFilesystem {
         }
     }
 
-    fn list(&self, path: &RoutedPath) -> Result<(Vec<RemoteEntry>, String)> {
+    fn list(&self, path: &RoutedPath) -> Result<(Vec<RemoteEntry>, RemoteAnchor)> {
         let mut reply = self.request(Request::List {
             path: path.remote.clone(),
         })?;
         match reply.response {
             Response::List { anchor } => {
+                let anchor = self.anchor(&anchor)?;
                 let descriptor = reply.descriptor.take().ok_or_else(|| {
                     protocol_error("remote list response did not include a descriptor")
                 })?;
-                let entries = decode_json_descriptor(descriptor)
-                    .map_err(|_| protocol_error("remote list payload is invalid"))?;
+                let entries = decode_list_descriptor(descriptor)?;
                 Ok((validate_entries(entries)?, anchor))
             }
             _ => Err(protocol_error(
@@ -230,7 +233,6 @@ impl RemoteFilesystem {
 
     pub(super) fn directory_view(&self, path: &RoutedPath) -> Result<RemoteDirectoryView> {
         let (entries, anchor) = self.list(path)?;
-        let anchor = self.anchor(&anchor)?;
         Ok(RemoteDirectoryView {
             logical: path.logical.clone(),
             anchor,
@@ -421,6 +423,22 @@ impl Drop for RemoteOpen {
     }
 }
 
+fn decode_list_descriptor(descriptor: OwnedFd) -> Result<Vec<RemoteEntry>> {
+    let descriptor = File::from(descriptor);
+    let length = descriptor
+        .metadata()
+        .context("failed to inspect remote list payload")?
+        .len();
+    if length > MAX_REMOTE_DIRECTORY_PAYLOAD_BYTES {
+        return Err(anyhow::Error::new(std::io::Error::from_raw_os_error(
+            libc::EOVERFLOW,
+        )))
+        .context("remote directory exceeds the sandbox listing limit");
+    }
+    decode_json_descriptor(descriptor.into())
+        .map_err(|_| protocol_error("remote list payload is invalid"))
+}
+
 impl RoutedPath {
     pub(super) fn logical(&self) -> &Path {
         &self.logical
@@ -505,6 +523,7 @@ fn normalize_request_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn validate_entries(entries: Vec<RemoteEntry>) -> Result<Vec<RemoteEntry>> {
+    validate_entry_count(entries.len())?;
     let mut seen = HashSet::with_capacity(entries.len());
     for entry in &entries {
         if entry.name.is_empty()
@@ -517,6 +536,16 @@ fn validate_entries(entries: Vec<RemoteEntry>) -> Result<Vec<RemoteEntry>> {
         }
     }
     Ok(entries)
+}
+
+fn validate_entry_count(count: usize) -> Result<()> {
+    if count > MAX_REMOTE_DIRECTORY_ENTRIES {
+        return Err(anyhow::Error::new(std::io::Error::from_raw_os_error(
+            libc::EOVERFLOW,
+        )))
+        .context("remote directory exceeds the sandbox listing limit");
+    }
+    Ok(())
 }
 
 fn client_error(error: RemoteClientError) -> anyhow::Error {

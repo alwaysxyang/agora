@@ -1,19 +1,21 @@
 use super::{
-    FILE_ATTRIBUTE_DIRECTORY, SmbRoot, SmbStorage, build_rename_information, configured_storage,
-    expect_success, metadata_from_close, metadata_from_create, metadata_from_file, remote_path,
-    smb_errno, stale_file, storage_error, validate_read_response_size, validate_remote_root,
-    wire_path,
+    FILE_ATTRIBUTE_DIRECTORY, SmbRoot, SmbStorage, build_open_request, build_rename_information,
+    configured_storage, expect_success, metadata_from_close, metadata_from_create,
+    metadata_from_file, remote_path, smb_errno, staging_path, stale_file, storage_error,
+    validate_directory_entry_count, validate_read_response_size, validate_remote_root,
+    validate_transfer_size, wire_path,
 };
 use crate::nfs::SmbRemoteConfig;
 use crate::nfs::backend::{RemoteStorage, StorageResult};
 use crate::nfs::protocol::{RemoteFileType, RemotePath};
 use smb2::client::tree::FileInfo;
 use smb2::msg::close::CloseResponse;
-use smb2::msg::create::{CreateAction, CreateResponse};
+use smb2::msg::create::{CreateAction, CreateDisposition, CreateResponse, ShareAccess};
 use smb2::msg::header::Header;
 use smb2::pack::FileTime;
+use smb2::types::flags::FileAccessMask;
 use smb2::types::{Command, FileId, OplockLevel, TreeId, status::NtStatus};
-use smb2::{Error, Frame, Tree};
+use smb2::{Error, ErrorKind, Frame, Tree};
 
 fn assert_errno<T>(result: StorageResult<T>, expected: libc::c_int) {
     match result {
@@ -92,6 +94,24 @@ fn smb_reads_reject_empty_and_oversized_responses() {
 }
 
 #[test]
+fn smb_rejects_an_opened_file_that_exceeds_the_transfer_limit() {
+    validate_transfer_size(4, 4).unwrap();
+    assert_eq!(
+        validate_transfer_size(5, 4).unwrap_err().kind(),
+        ErrorKind::Io
+    );
+}
+
+#[test]
+fn smb_rejects_a_directory_before_building_a_second_oversized_entry_vector() {
+    validate_directory_entry_count(2, 2).unwrap();
+    assert_eq!(
+        validate_directory_entry_count(3, 2).unwrap_err().errno(),
+        libc::EOVERFLOW
+    );
+}
+
+#[test]
 fn smb_errors_map_to_posix_errno_without_string_matching() {
     let missing = smb2::Error::Protocol {
         status: NtStatus::OBJECT_NAME_NOT_FOUND,
@@ -108,10 +128,46 @@ fn smb_errors_map_to_posix_errno_without_string_matching() {
 
 #[test]
 fn smb_rename_information_requests_atomic_target_replacement() {
-    let buffer = build_rename_information("folder\\target.txt");
+    let buffer = build_rename_information("folder\\target.txt", true);
 
     assert_eq!(buffer[0], 1, "ReplaceIfExists must be true");
     assert_eq!(u32::from_le_bytes(buffer[16..20].try_into().unwrap()), 34);
+
+    let create = build_rename_information("folder\\new.txt", false);
+    assert_eq!(create[0], 0, "new files must not replace a raced target");
+}
+
+#[test]
+fn smb_rename_opens_both_files_and_directories() {
+    let tree = Tree {
+        tree_id: TreeId(7),
+        share_name: "share".to_string(),
+        server: "server:445".to_string(),
+        is_dfs: false,
+        encrypt_data: false,
+    };
+    let request = build_open_request(
+        &tree,
+        "folder",
+        CreateDisposition::FileOpen,
+        FileAccessMask::new(FileAccessMask::DELETE),
+        ShareAccess(ShareAccess::FILE_SHARE_DELETE),
+        0,
+    );
+
+    assert_eq!(request.create_options, 0);
+}
+
+#[test]
+fn smb_writeback_stages_to_an_opaque_sibling() {
+    let staged = staging_path("folder/report.docx", "0123456789abcdef");
+
+    assert_eq!(staged, "folder/.agora-write-0123456789abcdef.tmp");
+    assert!(!staged.contains("report.docx"));
+    assert_eq!(
+        staging_path("report.docx", "fedcba9876543210"),
+        ".agora-write-fedcba9876543210.tmp"
+    );
 }
 
 #[tokio::test]
@@ -122,14 +178,17 @@ async fn smb_storage_rejects_unknown_roots_before_network_access() {
 
     assert_errno(storage.connect(0).await, libc::EINVAL);
     assert_errno(storage.stat(&path).await, libc::EINVAL);
-    assert_errno(storage.read_into(&path, &mut file).await, libc::EINVAL);
+    assert_errno(
+        storage.read_into(&path, &mut file, u64::MAX).await,
+        libc::EINVAL,
+    );
     assert_errno(
         storage
             .write_from_if_unchanged(&path, None, &mut file, 0)
             .await,
         libc::EINVAL,
     );
-    assert_errno(storage.list(&path).await, libc::EINVAL);
+    assert_errno(storage.list(&path, usize::MAX).await, libc::EINVAL);
     assert_errno(storage.create_directory(&path).await, libc::EINVAL);
     assert_errno(storage.remove(&path, false).await, libc::EINVAL);
     assert_errno(
@@ -162,14 +221,14 @@ async fn smb_storage_propagates_connection_failures_for_every_remote_operation()
 
     assert!(storage.connect(0).await.is_err());
     assert!(storage.stat(&path).await.is_err());
-    assert!(storage.read_into(&path, &mut file).await.is_err());
+    assert!(storage.read_into(&path, &mut file, u64::MAX).await.is_err());
     assert!(
         storage
             .write_from_if_unchanged(&path, None, &mut file, 0)
             .await
             .is_err()
     );
-    assert!(storage.list(&path).await.is_err());
+    assert!(storage.list(&path, usize::MAX).await.is_err());
     assert!(storage.create_directory(&path).await.is_err());
     assert!(storage.remove(&path, false).await.is_err());
     assert!(storage.remove(&path, true).await.is_err());

@@ -4,6 +4,17 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const PROTOCOL_VERSION: u16 = 3;
+#[cfg(not(agora_sandbox_hook_build))]
+pub(crate) const MAX_REMOTE_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub(crate) const MAX_REMOTE_DIRECTORY_ENTRIES: usize = 100_000;
+pub(crate) const MAX_REMOTE_DIRECTORY_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(not(agora_sandbox_hook_build))]
+pub(crate) const REMOTE_OPERATION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15 * 60);
+#[cfg(not(agora_sandbox_hook_build))]
+pub(crate) const REMOTE_RESET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const REMOTE_CLIENT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15 * 60 + 5);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RequestEnvelope {

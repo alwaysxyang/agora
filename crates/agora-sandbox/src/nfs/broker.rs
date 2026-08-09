@@ -1,6 +1,8 @@
 use crate::nfs::backend::{RemoteStorage, StorageError, StorageResult};
 use crate::nfs::protocol::{
-    RemoteFileType, RemoteMetadata, RemotePath, Request, RequestId, Response,
+    MAX_REMOTE_DIRECTORY_ENTRIES, MAX_REMOTE_DIRECTORY_PAYLOAD_BYTES, MAX_REMOTE_FILE_BYTES,
+    REMOTE_OPERATION_TIMEOUT, REMOTE_RESET_TIMEOUT, RemoteFileType, RemoteMetadata, RemotePath,
+    Request, RequestId, Response,
 };
 use md5::{Digest, Md5};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -35,6 +37,28 @@ where
     closed_handles: Mutex<HandleTombstones>,
     list_payloads: Mutex<HashMap<String, File>>,
     root_mutations: Mutex<HashMap<u32, Arc<Mutex<()>>>>,
+    limits: RemoteLimits,
+}
+
+#[derive(Clone, Copy)]
+struct RemoteLimits {
+    max_file_bytes: u64,
+    max_directory_entries: usize,
+    max_directory_payload_bytes: u64,
+    operation_timeout: Duration,
+    reset_timeout: Duration,
+}
+
+impl Default for RemoteLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: MAX_REMOTE_FILE_BYTES,
+            max_directory_entries: MAX_REMOTE_DIRECTORY_ENTRIES,
+            max_directory_payload_bytes: MAX_REMOTE_DIRECTORY_PAYLOAD_BYTES,
+            operation_timeout: REMOTE_OPERATION_TIMEOUT,
+            reset_timeout: REMOTE_RESET_TIMEOUT,
+        }
+    }
 }
 
 struct RemoteHandle {
@@ -89,6 +113,14 @@ where
     S: RemoteStorage,
 {
     pub(crate) fn new(storage: Arc<S>, staging: impl AsRef<Path>) -> std::io::Result<Self> {
+        Self::new_with_limits(storage, staging, RemoteLimits::default())
+    }
+
+    fn new_with_limits(
+        storage: Arc<S>,
+        staging: impl AsRef<Path>,
+        limits: RemoteLimits,
+    ) -> std::io::Result<Self> {
         let staging = staging.as_ref().to_path_buf();
         std::fs::create_dir_all(&staging)?;
         Ok(Self {
@@ -99,6 +131,7 @@ where
             closed_handles: Mutex::new(HandleTombstones::default()),
             list_payloads: Mutex::new(HashMap::new()),
             root_mutations: Mutex::new(HashMap::new()),
+            limits,
         })
     }
 
@@ -135,15 +168,47 @@ where
     }
 
     pub(crate) async fn handle(&self, request: Request) -> BrokerReply {
-        match self.dispatch(request).await {
-            Ok(reply) => reply,
-            Err(error) => BrokerReply {
-                response: Response::Error {
-                    errno: error.errno,
-                    message: error.message,
-                },
-                descriptor: None,
-            },
+        let started = Instant::now();
+        let root =
+            match tokio::time::timeout(self.limits.operation_timeout, self.request_root(&request))
+                .await
+            {
+                Ok(root) => root,
+                Err(_) => return error_reply(operation_timed_out()),
+            };
+        let remaining = self
+            .limits
+            .operation_timeout
+            .saturating_sub(started.elapsed());
+        let result = tokio::time::timeout(remaining, self.dispatch(request)).await;
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(root) = root {
+                    let _ =
+                        tokio::time::timeout(self.limits.reset_timeout, self.storage.reset(root))
+                            .await;
+                }
+                Err(operation_timed_out())
+            }
+        };
+        result.unwrap_or_else(error_reply)
+    }
+
+    async fn request_root(&self, request: &Request) -> Option<u32> {
+        match request {
+            Request::Open { path, .. }
+            | Request::Stat { path }
+            | Request::List { path }
+            | Request::Access { path, .. }
+            | Request::CreateDirectory { path, .. }
+            | Request::Remove { path, .. } => Some(path.root()),
+            Request::Rename { from, .. } => Some(from.root()),
+            Request::Sync { handle } | Request::Close { handle } => {
+                let handle = self.handles.lock().await.get(handle).cloned()?;
+                Some(handle.lock().await.path.root())
+            }
+            Request::Abort { .. } | Request::Claim { .. } => None,
         }
     }
 
@@ -402,6 +467,12 @@ where
             ));
         }
         let force_publish = existing.is_none() || flags & libc::O_TRUNC != 0;
+        if existing
+            .as_ref()
+            .is_some_and(|metadata| metadata.size > self.limits.max_file_bytes)
+        {
+            return Err(file_too_large());
+        }
         let mut temporary = tempfile::NamedTempFile::new_in(&self.staging)
             .map_err(|error| storage_io("failed to create anonymous remote file", error))?;
         let (mut metadata, baseline) = if force_publish {
@@ -416,7 +487,7 @@ where
         } else {
             let metadata = self
                 .storage
-                .read_into(&path, temporary.as_file_mut())
+                .read_into(&path, temporary.as_file_mut(), self.limits.max_file_bytes)
                 .await?;
             (metadata.clone(), Some(metadata))
         };
@@ -428,7 +499,7 @@ where
             .metadata()
             .map_err(|error| storage_io("failed to inspect anonymous remote file", error))?
             .len();
-        let checksum = checksum_file(temporary.as_file_mut())?;
+        let checksum = checksum_file(temporary.as_file_mut(), self.limits.operation_timeout)?;
         let retained = temporary
             .reopen()
             .map_err(|error| storage_io("failed to retain anonymous remote file", error))?;
@@ -513,15 +584,30 @@ where
     }
 
     async fn list(&self, path: RemotePath) -> StorageResult<BrokerReply> {
-        let entries = self.storage.list(&path).await?;
+        let entries = self
+            .storage
+            .list(&path, self.limits.max_directory_entries)
+            .await?;
+        if entries.len() > self.limits.max_directory_entries {
+            return Err(directory_too_large());
+        }
         let mut payload = tempfile::tempfile_in(&self.staging)
             .map_err(|error| storage_io("failed to create remote list payload", error))?;
-        serde_json::to_writer(&mut payload, &entries).map_err(|error| {
-            StorageError::new(
+        let (serialized, exceeded) = {
+            let mut limited =
+                LimitedWriter::new(&mut payload, self.limits.max_directory_payload_bytes);
+            let serialized = serde_json::to_writer(&mut limited, &entries);
+            (serialized, limited.exceeded())
+        };
+        if let Err(error) = serialized {
+            if exceeded {
+                return Err(directory_too_large());
+            }
+            return Err(StorageError::new(
                 libc::EIO,
                 format!("failed to serialize remote list: {error}"),
-            )
-        })?;
+            ));
+        }
         payload
             .flush()
             .and_then(|()| payload.seek(SeekFrom::Start(0)).map(|_| ()))
@@ -607,7 +693,10 @@ where
             .metadata()
             .map_err(|error| storage_io("failed to inspect anonymous remote file", error))?
             .len();
-        let checksum = checksum_file(&mut snapshot)?;
+        if length > self.limits.max_file_bytes {
+            return Err(file_too_large());
+        }
+        let checksum = checksum_file(&mut snapshot, self.limits.operation_timeout)?;
         if !handle.force_publish && checksum == handle.checksum {
             return Ok(handle.baseline.clone());
         }
@@ -706,12 +795,16 @@ where
     }
 }
 
-fn checksum_file(file: &mut File) -> StorageResult<[u8; 16]> {
+fn checksum_file(file: &mut File, maximum_duration: Duration) -> StorageResult<[u8; 16]> {
     file.seek(SeekFrom::Start(0))
         .map_err(|error| storage_io("failed to rewind anonymous remote file", error))?;
+    let started = Instant::now();
     let mut digest = Md5::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        if started.elapsed() >= maximum_duration {
+            return Err(operation_timed_out());
+        }
         let read = file
             .read(&mut buffer)
             .map_err(|error| storage_io("failed to read anonymous remote file", error))?;
@@ -929,6 +1022,16 @@ fn protocol_reply(message: &str) -> BrokerReply {
     }
 }
 
+fn error_reply(error: StorageError) -> BrokerReply {
+    BrokerReply {
+        response: Response::Error {
+            errno: error.errno,
+            message: error.message,
+        },
+        descriptor: None,
+    }
+}
+
 fn empty_file_metadata() -> RemoteMetadata {
     RemoteMetadata {
         file_type: RemoteFileType::File,
@@ -936,6 +1039,63 @@ fn empty_file_metadata() -> RemoteMetadata {
         modified_seconds: 0,
         modified_nanoseconds: 0,
         identity: String::new(),
+    }
+}
+
+fn file_too_large() -> StorageError {
+    StorageError::new(
+        libc::EFBIG,
+        "remote file exceeds the sandbox snapshot limit",
+    )
+}
+
+fn directory_too_large() -> StorageError {
+    StorageError::new(
+        libc::EOVERFLOW,
+        "remote directory exceeds the sandbox listing limit",
+    )
+}
+
+fn operation_timed_out() -> StorageError {
+    StorageError::new(libc::ETIMEDOUT, "remote filesystem operation timed out")
+}
+
+struct LimitedWriter<W> {
+    inner: W,
+    remaining: u64,
+    exceeded: bool,
+}
+
+impl<W> LimitedWriter<W> {
+    fn new(inner: W, maximum: u64) -> Self {
+        Self {
+            inner,
+            remaining: maximum,
+            exceeded: false,
+        }
+    }
+
+    fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+}
+
+impl<W> Write for LimitedWriter<W>
+where
+    W: Write,
+{
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.len() as u64 > self.remaining {
+            self.exceeded = true;
+            return Err(std::io::Error::from_raw_os_error(libc::EOVERFLOW));
+        }
+        let written = self.inner.write(buffer)?;
+        self.remaining = self.remaining.saturating_sub(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 

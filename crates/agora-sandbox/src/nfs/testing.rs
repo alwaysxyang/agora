@@ -20,6 +20,11 @@ pub(crate) struct MemoryStorage {
     connection_release: tokio::sync::Notify,
     yield_operations: AtomicBool,
     stat_operations: AtomicUsize,
+    reset_operations: AtomicUsize,
+    resets_blocked: AtomicBool,
+    reset_release: tokio::sync::Notify,
+    stats_blocked: AtomicBool,
+    stat_release: tokio::sync::Notify,
 }
 
 impl MemoryStorage {
@@ -68,6 +73,28 @@ impl MemoryStorage {
         self.stat_operations.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn reset_operations(&self) -> usize {
+        self.reset_operations.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn block_resets(&self) {
+        self.resets_blocked.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn release_resets(&self) {
+        self.resets_blocked.store(false, Ordering::Release);
+        self.reset_release.notify_waiters();
+    }
+
+    pub(crate) fn block_stats(&self) {
+        self.stats_blocked.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn release_stats(&self) {
+        self.stats_blocked.store(false, Ordering::Release);
+        self.stat_release.notify_waiters();
+    }
+
     pub(crate) fn fail_connection(
         &self,
         root: u32,
@@ -106,6 +133,26 @@ impl MemoryStorage {
         }
     }
 
+    async fn wait_for_stat_release(&self) {
+        loop {
+            let released = self.stat_release.notified();
+            if !self.stats_blocked.load(Ordering::Acquire) {
+                break;
+            }
+            released.await;
+        }
+    }
+
+    async fn wait_for_reset_release(&self) {
+        loop {
+            let released = self.reset_release.notified();
+            if !self.resets_blocked.load(Ordering::Acquire) {
+                break;
+            }
+            released.await;
+        }
+    }
+
     fn metadata(entry: &MemoryEntry) -> RemoteMetadata {
         RemoteMetadata {
             file_type: if entry.data.is_some() {
@@ -122,12 +169,18 @@ impl MemoryStorage {
 }
 
 impl RemoteStorage for MemoryStorage {
+    async fn reset(&self, _root: u32) {
+        self.reset_operations.fetch_add(1, Ordering::Relaxed);
+        self.wait_for_reset_release().await;
+    }
+
     async fn connect(&self, root: u32) -> StorageResult<()> {
         self.connection_result(root).await
     }
 
     async fn stat(&self, path: &RemotePath) -> StorageResult<RemoteMetadata> {
         self.stat_operations.fetch_add(1, Ordering::Relaxed);
+        self.wait_for_stat_release().await;
         self.yield_if_requested().await;
         lock(&self.entries)
             .get(&(path.root(), path.path().to_string()))
@@ -139,6 +192,7 @@ impl RemoteStorage for MemoryStorage {
         &self,
         path: &RemotePath,
         destination: &mut File,
+        max_length: u64,
     ) -> StorageResult<RemoteMetadata> {
         let entries = lock(&self.entries);
         let entry = entries
@@ -148,6 +202,12 @@ impl RemoteStorage for MemoryStorage {
             .data
             .as_deref()
             .ok_or_else(|| StorageError::new(libc::EISDIR, "path is a directory"))?;
+        if data.len() as u64 > max_length {
+            return Err(StorageError::new(
+                libc::EFBIG,
+                "remote file exceeds the sandbox snapshot limit",
+            ));
+        }
         destination
             .set_len(0)
             .and_then(|()| destination.seek(SeekFrom::Start(0)).map(|_| ()))
@@ -202,7 +262,7 @@ impl RemoteStorage for MemoryStorage {
         Ok(metadata)
     }
 
-    async fn list(&self, path: &RemotePath) -> StorageResult<Vec<RemoteEntry>> {
+    async fn list(&self, path: &RemotePath, max_entries: usize) -> StorageResult<Vec<RemoteEntry>> {
         let entries = lock(&self.entries);
         let directory = entries
             .get(&(path.root(), path.path().to_string()))
@@ -215,7 +275,7 @@ impl RemoteStorage for MemoryStorage {
         } else {
             format!("{}/", path.path())
         };
-        Ok(entries
+        let entries = entries
             .iter()
             .filter_map(|((root, child), entry)| {
                 (*root == path.root())
@@ -227,7 +287,14 @@ impl RemoteStorage for MemoryStorage {
                         metadata: Self::metadata(entry),
                     })
             })
-            .collect())
+            .collect::<Vec<_>>();
+        if entries.len() > max_entries {
+            return Err(StorageError::new(
+                libc::EOVERFLOW,
+                "remote directory exceeds the sandbox listing limit",
+            ));
+        }
+        Ok(entries)
     }
 
     async fn create_directory(&self, path: &RemotePath) -> StorageResult<()> {
@@ -399,7 +466,10 @@ mod tests {
         storage.insert_file(0, "file", b"remote");
 
         let mut downloaded = tempfile::tempfile().unwrap();
-        let baseline = storage.read_into(&path, &mut downloaded).await.unwrap();
+        let baseline = storage
+            .read_into(&path, &mut downloaded, u64::MAX)
+            .await
+            .unwrap();
         downloaded.seek(SeekFrom::Start(0)).unwrap();
         let mut contents = String::new();
         downloaded.read_to_string(&mut contents).unwrap();

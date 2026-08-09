@@ -18,6 +18,9 @@ pub(crate) type StorageResult<T> = Result<T, StorageError>;
 
 #[cfg(all(not(agora_sandbox_hook_build), any(feature = "remote-smb", test)))]
 pub(crate) trait RemoteStorage: Send + Sync + 'static {
+    /// Drops backend state after the Broker cancels an operation at its
+    /// deadline, so protocol handles from the abandoned future cannot leak.
+    fn reset(&self, root: u32) -> impl Future<Output = ()> + Send;
     fn connect(&self, root: u32) -> impl Future<Output = StorageResult<()>> + Send;
     fn stat(&self, path: &RemotePath)
     -> impl Future<Output = StorageResult<RemoteMetadata>> + Send;
@@ -25,6 +28,7 @@ pub(crate) trait RemoteStorage: Send + Sync + 'static {
         &self,
         path: &RemotePath,
         destination: &mut File,
+        max_length: u64,
     ) -> impl Future<Output = StorageResult<RemoteMetadata>> + Send;
     /// Replaces `path` only when its current identity still matches `expected`.
     /// Implementations must keep the comparison and mutation in one backend
@@ -39,6 +43,7 @@ pub(crate) trait RemoteStorage: Send + Sync + 'static {
     fn list(
         &self,
         path: &RemotePath,
+        max_entries: usize,
     ) -> impl Future<Output = StorageResult<Vec<RemoteEntry>>> + Send;
     fn create_directory(&self, path: &RemotePath)
     -> impl Future<Output = StorageResult<()>> + Send;

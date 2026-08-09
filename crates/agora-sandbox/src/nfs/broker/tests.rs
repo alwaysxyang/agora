@@ -26,6 +26,16 @@ fn assert_errno(response: Response, errno: libc::c_int) {
     );
 }
 
+#[test]
+fn checksum_honors_its_cpu_time_budget() {
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(b"data").unwrap();
+
+    let error = checksum_file(&mut file, Duration::ZERO).unwrap_err();
+
+    assert_eq!(error.errno(), libc::ETIMEDOUT);
+}
+
 #[tokio::test]
 async fn broker_replays_duplicate_open_without_allocating_another_handle() {
     let root = tempfile::tempdir().unwrap();
@@ -146,6 +156,99 @@ async fn broker_opens_remote_content_through_an_unlinked_descriptor() {
         broker.handle(Request::Close { handle }).await.response,
         Response::Success
     );
+}
+
+#[tokio::test]
+async fn broker_rejects_remote_files_above_the_snapshot_limit_before_download() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = std::sync::Arc::new(MemoryStorage::default());
+    storage.insert_file(0, "large.bin", b"12345");
+    let broker = Broker::new_with_limits(
+        storage,
+        root.path(),
+        RemoteLimits {
+            max_file_bytes: 4,
+            ..RemoteLimits::default()
+        },
+    )
+    .unwrap();
+
+    let response = broker
+        .handle(Request::Open {
+            path: path("large.bin"),
+            flags: libc::O_RDONLY,
+            mode: 0,
+        })
+        .await
+        .response;
+
+    assert_errno(response, libc::EFBIG);
+    assert_eq!(broker.handle_count_for_test().await, 0);
+}
+
+#[tokio::test]
+async fn broker_rejects_grown_snapshots_before_checksum_or_upload() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = std::sync::Arc::new(MemoryStorage::default());
+    let broker = Broker::new_with_limits(
+        std::sync::Arc::clone(&storage),
+        root.path(),
+        RemoteLimits {
+            max_file_bytes: 4,
+            ..RemoteLimits::default()
+        },
+    )
+    .unwrap();
+    let mut opened = broker
+        .handle(Request::Open {
+            path: path("large.bin"),
+            flags: libc::O_WRONLY | libc::O_CREAT,
+            mode: 0o600,
+        })
+        .await;
+    let handle = open_handle(&opened.response);
+    let mut descriptor = std::fs::File::from(opened.descriptor.take().unwrap());
+    descriptor.write_all(b"12345").unwrap();
+
+    let response = broker.handle(Request::Sync { handle }).await.response;
+
+    assert_errno(response, libc::EFBIG);
+    assert!(!storage.exists(0, "large.bin"));
+}
+
+#[tokio::test]
+async fn broker_bounds_the_total_remote_operation_duration() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = std::sync::Arc::new(MemoryStorage::default());
+    storage.insert_file(0, "blocked.txt", b"data");
+    storage.block_stats();
+    storage.block_resets();
+    let broker = Broker::new_with_limits(
+        std::sync::Arc::clone(&storage),
+        root.path(),
+        RemoteLimits {
+            operation_timeout: Duration::from_millis(10),
+            reset_timeout: Duration::from_millis(10),
+            ..RemoteLimits::default()
+        },
+    )
+    .unwrap();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(100),
+        broker.handle(Request::Stat {
+            path: path("blocked.txt"),
+        }),
+    )
+    .await;
+    storage.release_stats();
+    storage.release_resets();
+    let response = outcome
+        .expect("the Broker must enforce its own operation deadline")
+        .response;
+
+    assert_errno(response, libc::ETIMEDOUT);
+    assert_eq!(storage.reset_operations(), 1);
 }
 
 #[tokio::test]
@@ -490,6 +593,62 @@ async fn broker_streams_large_directory_lists_outside_the_control_frame() {
         panic!("expected list response");
     };
     assert!(!broker.list_payloads.lock().await.contains_key(&anchor));
+}
+
+#[tokio::test]
+async fn broker_rejects_directory_lists_above_the_entry_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = std::sync::Arc::new(MemoryStorage::default());
+    storage.insert_directory(0, "large");
+    for name in ["a", "b", "c"] {
+        storage.insert_file(0, &format!("large/{name}"), b"");
+    }
+    let broker = Broker::new_with_limits(
+        storage,
+        root.path(),
+        RemoteLimits {
+            max_directory_entries: 2,
+            ..RemoteLimits::default()
+        },
+    )
+    .unwrap();
+
+    let response = broker
+        .handle(Request::List {
+            path: path("large"),
+        })
+        .await
+        .response;
+
+    assert_errno(response, libc::EOVERFLOW);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn broker_stops_serializing_directory_lists_at_the_payload_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = std::sync::Arc::new(MemoryStorage::default());
+    storage.insert_directory(0, "large");
+    storage.insert_file(0, "large/entry", b"");
+    let broker = Broker::new_with_limits(
+        storage,
+        root.path(),
+        RemoteLimits {
+            max_directory_payload_bytes: 16,
+            ..RemoteLimits::default()
+        },
+    )
+    .unwrap();
+
+    let response = broker
+        .handle(Request::List {
+            path: path("large"),
+        })
+        .await
+        .response;
+
+    assert_errno(response, libc::EOVERFLOW);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
 
 #[tokio::test]

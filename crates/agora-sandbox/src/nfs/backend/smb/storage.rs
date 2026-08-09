@@ -20,6 +20,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
@@ -67,6 +68,12 @@ impl SmbStorage {
 }
 
 impl RemoteStorage for SmbStorage {
+    async fn reset(&self, root: u32) {
+        if let Some(root) = self.roots.get(root as usize) {
+            root.lock().await.session = None;
+        }
+    }
+
     async fn connect(&self, root: u32) -> StorageResult<()> {
         let mut root = self.root_by_index(root).await?;
         let remote_path = root.config.remote_path().to_string();
@@ -94,11 +101,12 @@ impl RemoteStorage for SmbStorage {
         &self,
         path: &RemotePath,
         destination: &mut File,
+        max_length: u64,
     ) -> StorageResult<RemoteMetadata> {
         let mut root = self.root(path).await?;
         let remote = root.path(path);
         let session = root.session().await?;
-        read_locked_file(session, &remote, destination)
+        read_locked_file(session, &remote, destination, max_length)
             .await
             .map_err(storage_error)
     }
@@ -116,7 +124,7 @@ impl RemoteStorage for SmbStorage {
         write_locked_file(session, &remote, expected, source, length).await
     }
 
-    async fn list(&self, path: &RemotePath) -> StorageResult<Vec<RemoteEntry>> {
+    async fn list(&self, path: &RemotePath, max_entries: usize) -> StorageResult<Vec<RemoteEntry>> {
         let mut root = self.root(path).await?;
         let remote = root.path(path);
         let session = root.session().await?;
@@ -125,6 +133,13 @@ impl RemoteStorage for SmbStorage {
             .list_directory(&mut session.tree, &remote)
             .await
             .map_err(storage_error)?;
+        validate_directory_entry_count(
+            entries
+                .iter()
+                .filter(|entry| entry.name != "." && entry.name != "..")
+                .count(),
+            max_entries,
+        )?;
         Ok(entries
             .into_iter()
             .filter(|entry| entry.name != "." && entry.name != "..")
@@ -186,41 +201,49 @@ impl RemoteStorage for SmbStorage {
     }
 }
 
+fn validate_directory_entry_count(count: usize, maximum: usize) -> StorageResult<()> {
+    if count > maximum {
+        return Err(StorageError::new(
+            libc::EOVERFLOW,
+            "remote directory exceeds the sandbox listing limit",
+        ));
+    }
+    Ok(())
+}
+
 async fn rename_replacing(
     session: &mut SmbSession,
     from: &str,
     to: &str,
 ) -> Result<(), smb2::Error> {
-    let request = CreateRequest {
-        requested_oplock_level: OplockLevel::None,
-        impersonation_level: ImpersonationLevel::Impersonation,
-        desired_access: FileAccessMask::new(
-            FileAccessMask::DELETE | FileAccessMask::FILE_READ_ATTRIBUTES,
-        ),
-        file_attributes: 0,
-        share_access: ShareAccess(
+    rename_path(session, from, to, true).await
+}
+
+async fn rename_path(
+    session: &mut SmbSession,
+    from: &str,
+    to: &str,
+    replace: bool,
+) -> Result<(), smb2::Error> {
+    let opened = open_path(
+        session,
+        from,
+        CreateDisposition::FileOpen,
+        FileAccessMask::new(FileAccessMask::DELETE | FileAccessMask::FILE_READ_ATTRIBUTES),
+        ShareAccess(
             ShareAccess::FILE_SHARE_READ
                 | ShareAccess::FILE_SHARE_WRITE
                 | ShareAccess::FILE_SHARE_DELETE,
         ),
-        create_disposition: CreateDisposition::FileOpen,
-        create_options: 0,
-        name: wire_path(&session.tree, from),
-        create_contexts: Vec::new(),
-    };
-    let frame = session
-        .client
-        .connection_mut()
-        .execute(Command::Create, &request, Some(session.tree.tree_id))
-        .await?;
-    expect_success(&frame, Command::Create)?;
-    let opened = CreateResponse::unpack(&mut ReadCursor::new(&frame.body))?;
+        0,
+    )
+    .await?;
     let request = SetInfoRequest {
         info_type: InfoType::File,
         file_info_class: FILE_RENAME_INFORMATION,
         additional_information: 0,
         file_id: opened.file_id,
-        buffer: build_rename_information(&smb2::encode_path(to)),
+        buffer: build_rename_information(&smb2::encode_path(to), replace),
     };
     let renamed = session
         .client
@@ -231,23 +254,17 @@ async fn rename_replacing(
             expect_success(&frame, Command::SetInfo)?;
             Ok(())
         });
-    let closed = close_handle(session, opened.file_id, false).await;
+    let _ = close_handle(session, opened.file_id, false).await;
     match renamed {
-        Ok(()) => {
-            closed?;
-            Ok(())
-        }
-        Err(error) => {
-            let _ = closed;
-            Err(error)
-        }
+        Ok(()) => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
-fn build_rename_information(target: &str) -> Vec<u8> {
+fn build_rename_information(target: &str, replace: bool) -> Vec<u8> {
     let target = target.encode_utf16().collect::<Vec<_>>();
     let mut buffer = Vec::with_capacity(20 + target.len() * 2);
-    buffer.push(1);
+    buffer.push(u8::from(replace));
     buffer.extend_from_slice(&[0; 7]);
     buffer.extend_from_slice(&0_u64.to_le_bytes());
     buffer.extend_from_slice(
@@ -261,10 +278,18 @@ fn build_rename_information(target: &str) -> Vec<u8> {
     buffer
 }
 
+fn staging_path(target: &str, identifier: &str) -> String {
+    let name = format!(".agora-write-{identifier}.tmp");
+    target
+        .rsplit_once('/')
+        .map_or(name.clone(), |(parent, _)| format!("{parent}/{name}"))
+}
+
 async fn read_locked_file(
     session: &mut SmbSession,
     path: &str,
     destination: &mut File,
+    max_length: u64,
 ) -> Result<RemoteMetadata, smb2::Error> {
     destination.set_len(0)?;
     destination.seek(SeekFrom::Start(0))?;
@@ -280,7 +305,10 @@ async fn read_locked_file(
     )
     .await?;
     let metadata = metadata_from_create(&opened);
-    let result = read_handle(session, opened.file_id, opened.end_of_file, destination).await;
+    let result = match validate_transfer_size(opened.end_of_file, max_length) {
+        Ok(()) => read_handle(session, opened.file_id, opened.end_of_file, destination).await,
+        Err(error) => Err(error),
+    };
     let closed = close_handle(session, opened.file_id, false).await;
     match result {
         Ok(()) => {
@@ -294,6 +322,13 @@ async fn read_locked_file(
     }
 }
 
+fn validate_transfer_size(length: u64, maximum: u64) -> Result<(), smb2::Error> {
+    if length > maximum {
+        return Err(std::io::Error::from_raw_os_error(libc::EFBIG).into());
+    }
+    Ok(())
+}
+
 async fn write_locked_file(
     session: &mut SmbSession,
     path: &str,
@@ -304,41 +339,55 @@ async fn write_locked_file(
     source
         .seek(SeekFrom::Start(0))
         .map_err(|error| storage_error(error.into()))?;
-    let disposition = if expected.is_some() {
-        CreateDisposition::FileOpen
-    } else {
-        CreateDisposition::FileCreate
+    let temporary = staging_path(path, &Uuid::new_v4().simple().to_string());
+    let staged = write_staged_file(session, &temporary, source, length).await;
+    let metadata = match staged {
+        Ok(metadata) => metadata,
+        Err(error) => return Err(storage_error(error)),
     };
-    let opened = match open_locked_file(
+
+    let locked = match lock_expected_target(session, path, expected).await {
+        Ok(locked) => locked,
+        Err(error) => {
+            cleanup_staging(session, &temporary).await;
+            return Err(error);
+        }
+    };
+    let published = rename_path(session, &temporary, path, expected.is_some()).await;
+    if let Some(file_id) = locked {
+        let _ = close_handle(session, file_id, false).await;
+    }
+    match published {
+        Ok(()) => Ok(metadata),
+        Err(error) => {
+            cleanup_staging(session, &temporary).await;
+            if expected.is_none() && error.kind() == ErrorKind::AlreadyExists {
+                Err(stale_file())
+            } else {
+                Err(storage_error(error))
+            }
+        }
+    }
+}
+
+async fn write_staged_file(
+    session: &mut SmbSession,
+    path: &str,
+    source: &mut File,
+    length: u64,
+) -> Result<RemoteMetadata, smb2::Error> {
+    let opened = open_file(
         session,
         path,
-        disposition,
+        CreateDisposition::FileCreate,
         FileAccessMask::new(
-            FileAccessMask::FILE_READ_ATTRIBUTES
-                | FileAccessMask::FILE_WRITE_DATA
+            FileAccessMask::FILE_WRITE_DATA
                 | FileAccessMask::FILE_WRITE_ATTRIBUTES
                 | FileAccessMask::SYNCHRONIZE,
         ),
+        ShareAccess(0),
     )
-    .await
-    {
-        Ok(opened) => opened,
-        Err(error)
-            if matches!(
-                (expected.is_some(), error.kind()),
-                (true, ErrorKind::NotFound) | (false, ErrorKind::AlreadyExists)
-            ) =>
-        {
-            return Err(stale_file());
-        }
-        Err(error) => return Err(storage_error(error)),
-    };
-    if expected.is_some_and(|expected| expected.identity != metadata_from_create(&opened).identity)
-    {
-        let _ = close_handle(session, opened.file_id, false).await;
-        return Err(stale_file());
-    }
-
+    .await?;
     let operation = async {
         write_handle(session, opened.file_id, source, length).await?;
         set_handle_length(session, opened.file_id, length).await?;
@@ -352,9 +401,42 @@ async fn write_locked_file(
         Ok(closed) => Ok(metadata_from_close(&closed)),
         Err(error) => {
             let _ = close_handle(session, opened.file_id, false).await;
-            Err(storage_error(error))
+            cleanup_staging(session, path).await;
+            Err(error)
         }
     }
+}
+
+async fn lock_expected_target(
+    session: &mut SmbSession,
+    path: &str,
+    expected: Option<&RemoteMetadata>,
+) -> StorageResult<Option<FileId>> {
+    let Some(expected) = expected else {
+        return Ok(None);
+    };
+    let opened = match open_file(
+        session,
+        path,
+        CreateDisposition::FileOpen,
+        FileAccessMask::new(FileAccessMask::FILE_READ_ATTRIBUTES | FileAccessMask::SYNCHRONIZE),
+        ShareAccess(ShareAccess::FILE_SHARE_READ | ShareAccess::FILE_SHARE_DELETE),
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Err(stale_file()),
+        Err(error) => return Err(storage_error(error)),
+    };
+    if expected.identity != metadata_from_create(&opened).identity {
+        let _ = close_handle(session, opened.file_id, false).await;
+        return Err(stale_file());
+    }
+    Ok(Some(opened.file_id))
+}
+
+async fn cleanup_staging(session: &mut SmbSession, path: &str) {
+    let _ = session.client.delete_file(&mut session.tree, path).await;
 }
 
 async fn open_locked_file(
@@ -363,17 +445,50 @@ async fn open_locked_file(
     disposition: CreateDisposition,
     desired_access: FileAccessMask,
 ) -> Result<CreateResponse, smb2::Error> {
-    let request = CreateRequest {
-        requested_oplock_level: OplockLevel::None,
-        impersonation_level: ImpersonationLevel::Impersonation,
+    open_file(
+        session,
+        path,
+        disposition,
         desired_access,
-        file_attributes: FILE_ATTRIBUTE_NORMAL,
-        share_access: ShareAccess(ShareAccess::FILE_SHARE_READ),
-        create_disposition: disposition,
-        create_options: FILE_NON_DIRECTORY_FILE,
-        name: wire_path(&session.tree, path),
-        create_contexts: Vec::new(),
-    };
+        ShareAccess(ShareAccess::FILE_SHARE_READ),
+    )
+    .await
+}
+
+async fn open_file(
+    session: &mut SmbSession,
+    path: &str,
+    disposition: CreateDisposition,
+    desired_access: FileAccessMask,
+    share_access: ShareAccess,
+) -> Result<CreateResponse, smb2::Error> {
+    open_path(
+        session,
+        path,
+        disposition,
+        desired_access,
+        share_access,
+        FILE_NON_DIRECTORY_FILE,
+    )
+    .await
+}
+
+async fn open_path(
+    session: &mut SmbSession,
+    path: &str,
+    disposition: CreateDisposition,
+    desired_access: FileAccessMask,
+    share_access: ShareAccess,
+    create_options: u32,
+) -> Result<CreateResponse, smb2::Error> {
+    let request = build_open_request(
+        &session.tree,
+        path,
+        disposition,
+        desired_access,
+        share_access,
+        create_options,
+    );
     let frame = session
         .client
         .connection_mut()
@@ -381,6 +496,27 @@ async fn open_locked_file(
         .await?;
     expect_success(&frame, Command::Create)?;
     CreateResponse::unpack(&mut ReadCursor::new(&frame.body))
+}
+
+fn build_open_request(
+    tree: &Tree,
+    path: &str,
+    disposition: CreateDisposition,
+    desired_access: FileAccessMask,
+    share_access: ShareAccess,
+    create_options: u32,
+) -> CreateRequest {
+    CreateRequest {
+        requested_oplock_level: OplockLevel::None,
+        impersonation_level: ImpersonationLevel::Impersonation,
+        desired_access,
+        file_attributes: FILE_ATTRIBUTE_NORMAL,
+        share_access,
+        create_disposition: disposition,
+        create_options,
+        name: wire_path(tree, path),
+        create_contexts: Vec::new(),
+    }
 }
 
 async fn read_handle(

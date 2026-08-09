@@ -1,5 +1,6 @@
 use crate::nfs::protocol::{
-    PROTOCOL_VERSION, Request, RequestEnvelope, RequestId, Response, ResponseEnvelope,
+    PROTOCOL_VERSION, REMOTE_CLIENT_TIMEOUT, Request, RequestEnvelope, RequestId, Response,
+    ResponseEnvelope,
 };
 use crate::nfs::transport;
 use serde::de::DeserializeOwned;
@@ -12,7 +13,6 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
-const REMOTE_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_REQUEST_ATTEMPTS: usize = 2;
 
 #[derive(Clone, Debug)]
