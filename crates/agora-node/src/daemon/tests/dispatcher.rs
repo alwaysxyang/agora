@@ -272,7 +272,7 @@ async fn reports_nonzero_agent_exit_as_failed() {
 }
 
 #[tokio::test]
-async fn daemon_skips_unsupported_and_unsubscribed_channels() {
+async fn daemon_rejects_unsupported_channels_even_without_constructor_validation() {
     let temp = tempfile::tempdir().unwrap();
     let store = SessionStore::open(temp.path().join("store.db")).unwrap();
     let scheduler = super::super::ExecutionScheduler::default();
@@ -300,7 +300,8 @@ async fn daemon_skips_unsupported_and_unsubscribed_channels() {
         commands: Arc::new(CommandRuntime::new(store, scheduler).unwrap()),
     };
 
-    daemon.run().await.unwrap();
+    let error = daemon.run().await.unwrap_err();
+    assert_eq!(error.to_string(), "local channel is not implemented: local");
 }
 
 #[tokio::test]

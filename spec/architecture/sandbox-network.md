@@ -150,7 +150,9 @@ behavior are specified in [Sandbox Filesystem And Executable Preparation](sandbo
 
 `agora-sandbox` remains one public Cargo package. Its ordinary Cargo build produces an rlib and a
 standard cdylib; the latter is a build and coverage artifact, not a runtime sidecar dependency. It
-lets injected coverage processes share Cargo's crate identity with their test binaries. The outer
+lets injected coverage processes share Cargo's crate identity with their test binaries. The
+coverage-only initializer verifies that its own symbol belongs to a dylib before activating, so an
+rlib linked into the test executable cannot initialize the same process a second time.
 `build.rs` performs one guarded inner `cargo rustc --crate-type cdylib` build in a shared nested
 target directory beneath the active Cargo target directory for the bytes embedded into consumers.
 Different outer build-script instances reuse that dependency cache while each stages its reported
@@ -432,7 +434,9 @@ which now carries only authentication and an executable path. The root command i
 process-event path because the runner launches it before any hooked descendant launch occurs.
 
 The filesystem path publishes `filesystem.open` and `filesystem.close` through local audit protocol
-version 1. Events include the logical path before overlay mapping, structured open mode, process
+version 2. Each request includes a random request ID that is retained across the client's one reconnect
+retry; the controller coalesces an in-progress duplicate and replays a bounded completed response so
+one logical publication invokes the callback and creates its event UUID at most once. Events include the logical path before overlay mapping, structured open mode, process
 identity, and the same trace chain used by process and network events. Successful opens register their
 native descriptor so close events retain the original path and mode. Audit delivery failure fails the
 intercepted operation closed; callback decisions for these audit-only events are ignored.

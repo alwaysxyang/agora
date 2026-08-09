@@ -366,27 +366,40 @@ fn with_test_runtime<T>(runtime: &ProcessHookRuntime, operation: impl FnOnce() -
     operation()
 }
 
-unsafe fn requested_executable(path: *const libc::c_char, search_path: bool) -> Option<PathBuf> {
+unsafe fn requested_executable(
+    path: *const libc::c_char,
+    search_path: bool,
+) -> Result<PathBuf, PrepareError> {
     if path.is_null() {
-        return None;
+        return Err(PrepareError::new(
+            libc::EFAULT,
+            "requested executable could not be resolved",
+        ));
     }
     let path = OsStr::from_bytes(unsafe { CStr::from_ptr(path) }.to_bytes());
     if !search_path || path.as_bytes().contains(&b'/') {
         let path = Path::new(path);
-        return Some(if path.is_absolute() {
+        return Ok(if path.is_absolute() {
             path.to_path_buf()
         } else {
-            std::env::current_dir().ok()?.join(path)
+            std::env::current_dir()
+                .map_err(PrepareError::from)?
+                .join(path)
         });
     }
     let search = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
     let current = std::env::current_dir()
         .or_else(|error| std::env::var_os("PWD").map(PathBuf::from).ok_or(error))
-        .ok()?;
+        .map_err(PrepareError::from)?;
     search_path_executable(path, &search, &current)
 }
 
-fn search_path_executable(path: &OsStr, search: &OsStr, current: &Path) -> Option<PathBuf> {
+fn search_path_executable(
+    path: &OsStr,
+    search: &OsStr,
+    current: &Path,
+) -> Result<PathBuf, PrepareError> {
+    let mut denied = false;
     for directory in std::env::split_paths(search) {
         let directory = if directory.as_os_str().is_empty() {
             current.to_path_buf()
@@ -396,14 +409,45 @@ fn search_path_executable(path: &OsStr, search: &OsStr, current: &Path) -> Optio
             current.join(directory)
         };
         let candidate = directory.join(path);
-        if candidate
-            .metadata()
-            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        {
-            return Some(candidate);
+        let metadata = match candidate.metadata() {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => {
+                denied = true;
+                continue;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                denied = true;
+                continue;
+            }
+            Err(_) => continue,
+        };
+        if metadata.permissions().mode() & 0o111 == 0 {
+            denied = true;
+            continue;
+        }
+        let candidate_c = match CString::new(candidate.as_os_str().as_bytes()) {
+            Ok(candidate) => candidate,
+            Err(_) => continue,
+        };
+        if unsafe { libc::access(candidate_c.as_ptr(), libc::X_OK) } == 0 {
+            return Ok(candidate);
+        }
+        if unsafe { *libc::__error() } == libc::EACCES {
+            denied = true;
         }
     }
-    None
+    Err(PrepareError::new(
+        if denied { libc::EACCES } else { libc::ENOENT },
+        "requested executable could not be resolved through PATH",
+    ))
 }
 
 unsafe fn prepared_executable(
@@ -414,16 +458,7 @@ unsafe fn prepared_executable(
 ) -> Result<(PreparedExecutable, TraceContext), PrepareError> {
     let runtime = ProcessHookRuntime::global()
         .ok_or_else(|| PrepareError::new(libc::EACCES, "sandbox process runtime is unavailable"))?;
-    let executable = unsafe { requested_executable(path, search_path) }.ok_or_else(|| {
-        PrepareError::new(
-            if path.is_null() {
-                libc::EFAULT
-            } else {
-                libc::ENOENT
-            },
-            "requested executable could not be resolved",
-        )
-    })?;
+    let executable = unsafe { requested_executable(path, search_path) }?;
     let trace = runtime.config.trace().child();
     let event = unsafe { process_event_request(&executable, arguments, operation, &trace) }?;
     runtime.publish(event)?;
@@ -514,6 +549,10 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
     let Some(_guard) = ProcessHookGuard::enter() else {
         return libc::EACCES;
     };
+    let remote_current_directory = match super::filesystem::prepare_child_current_directory() {
+        Ok(directory) => directory,
+        Err(error) => return PrepareError::from_anyhow(error, libc::EIO).errno,
+    };
     let (prepared, trace) = match unsafe {
         prepared_executable(
             path,
@@ -528,7 +567,6 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
     let Some(runtime) = ProcessHookRuntime::global() else {
         return libc::EACCES;
     };
-    let remote_current_directory = super::filesystem::tracked_remote_current_directory();
     let Some(environment) = (unsafe {
         ChildEnvironment::new(
             environment.cast::<*const libc::c_char>(),
@@ -571,6 +609,10 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
     let Some(_guard) = ProcessHookGuard::enter() else {
         return libc::EACCES;
     };
+    let remote_current_directory = match super::filesystem::prepare_child_current_directory() {
+        Ok(directory) => directory,
+        Err(error) => return PrepareError::from_anyhow(error, libc::EIO).errno,
+    };
     let (prepared, trace) = match unsafe {
         prepared_executable(
             file,
@@ -585,7 +627,6 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
     let Some(runtime) = ProcessHookRuntime::global() else {
         return libc::EACCES;
     };
-    let remote_current_directory = super::filesystem::tracked_remote_current_directory();
     let Some(environment) = (unsafe {
         ChildEnvironment::new(
             environment.cast::<*const libc::c_char>(),
@@ -677,6 +718,14 @@ unsafe fn execute(
         unsafe { set_errno(libc::EACCES) };
         return -1;
     };
+    let remote_current_directory = match super::filesystem::prepare_child_current_directory() {
+        Ok(directory) => directory,
+        Err(error) => {
+            let error = PrepareError::from_anyhow(error, libc::EIO);
+            unsafe { set_errno(error.errno) };
+            return -1;
+        }
+    };
     let (prepared, trace) =
         match unsafe { prepared_executable(path, search_path, arguments, operation) } {
             Ok(prepared) => prepared,
@@ -689,7 +738,6 @@ unsafe fn execute(
         unsafe { set_errno(libc::EACCES) };
         return -1;
     };
-    let remote_current_directory = super::filesystem::tracked_remote_current_directory();
     let Some(environment) = (unsafe {
         ChildEnvironment::new(
             environment,

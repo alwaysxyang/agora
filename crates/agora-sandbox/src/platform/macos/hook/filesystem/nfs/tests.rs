@@ -262,6 +262,28 @@ fn remote_current_directory_is_restored_only_from_its_broker_anchor() {
 }
 
 #[test]
+fn remote_current_directory_accepts_a_broker_anchor_padded_for_a_long_name() {
+    let filesystem = RemoteFilesystem::new(
+        "/tmp/agora-remote-runtime/nfs.sock",
+        "token",
+        vec![RemoteRoute {
+            root: 0,
+            logical_root: "/remote".to_string(),
+        }],
+    )
+    .unwrap();
+    let anchor = Path::new("/tmp/agora-remote-runtime")
+        .join("anchor-0123456789abcdef0123456789abcdefxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+
+    assert_eq!(
+        filesystem
+            .restore_current_directory(&anchor, Path::new("/remote/team/docs"))
+            .unwrap(),
+        Some(PathBuf::from("/remote/team/docs"))
+    );
+}
+
+#[test]
 fn remote_anchor_removes_its_temporary_inode_when_released() {
     let runtime = tempfile::tempdir().unwrap();
     let file = runtime

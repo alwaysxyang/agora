@@ -8,18 +8,22 @@ use crate::callback::{
 use crate::trace::TraceContext;
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
+use ring::digest::{SHA256, digest};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Mutex, Semaphore, oneshot, watch};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
 const AUDIT_MAX_CONNECTIONS: usize = 1024;
 const AUDIT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 const AUDIT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const AUDIT_REQUEST_TTL: Duration = Duration::from_secs(120);
+const AUDIT_REQUEST_CAPACITY: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub(crate) struct AuditRuntime {
@@ -65,6 +69,7 @@ impl AuditController {
             run_id,
             callback,
             callback_timeout,
+            requests: Mutex::new(AuditRequestCache::default()),
         });
         let mut tasks = JoinSet::new();
         tasks.spawn(AuditServer::new(listener, state).run(receiver));
@@ -129,6 +134,31 @@ where
     run_id: String,
     callback: C,
     callback_timeout: Duration,
+    requests: Mutex<AuditRequestCache>,
+}
+
+#[derive(Default)]
+struct AuditRequestCache {
+    entries: HashMap<String, CachedAuditRequest>,
+}
+
+enum CachedAuditRequest {
+    Pending {
+        fingerprint: [u8; 32],
+        waiters: Vec<oneshot::Sender<AuditResponse>>,
+    },
+    Completed {
+        fingerprint: [u8; 32],
+        response: AuditResponse,
+        completed_at: Instant,
+    },
+}
+
+enum AuditCacheDecision {
+    Execute,
+    Wait(oneshot::Receiver<AuditResponse>),
+    Replay(AuditResponse),
+    Reject,
 }
 
 impl<C> AuditState<C>
@@ -179,6 +209,141 @@ where
         let _ = tokio::time::timeout(self.callback_timeout, self.callback.on_event(event)).await;
         Ok(())
     }
+
+    async fn publish_once(&self, request_id: String, event: AuditEventRequest) -> AuditResponse {
+        let fingerprint = match audit_event_fingerprint(&event) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                return AuditResponse::Error {
+                    errno: libc::EPROTO,
+                    message: format!("failed to fingerprint audit request: {error}"),
+                };
+            }
+        };
+        let decision = self
+            .requests
+            .lock()
+            .await
+            .begin(request_id.clone(), fingerprint);
+        match decision {
+            AuditCacheDecision::Execute => {
+                let response = match self.publish(event).await {
+                    Ok(()) => AuditResponse::Accepted,
+                    Err(error) => AuditResponse::Error {
+                        errno: libc::EINVAL,
+                        message: format!("{error:#}"),
+                    },
+                };
+                self.requests
+                    .lock()
+                    .await
+                    .complete(request_id, response.clone(), Instant::now());
+                response
+            }
+            AuditCacheDecision::Wait(receiver) => receiver.await.unwrap_or(AuditResponse::Error {
+                errno: libc::EIO,
+                message: "audit request was cancelled".to_string(),
+            }),
+            AuditCacheDecision::Replay(response) => response,
+            AuditCacheDecision::Reject => AuditResponse::Error {
+                errno: libc::EPROTO,
+                message: "audit request ID was reused for a different event".to_string(),
+            },
+        }
+    }
+}
+
+impl AuditRequestCache {
+    fn begin(&mut self, request_id: String, fingerprint: [u8; 32]) -> AuditCacheDecision {
+        self.prune(Instant::now());
+        match self.entries.get_mut(&request_id) {
+            Some(CachedAuditRequest::Pending {
+                fingerprint: cached,
+                waiters,
+            }) if cached == &fingerprint => {
+                let (sender, receiver) = oneshot::channel();
+                waiters.push(sender);
+                AuditCacheDecision::Wait(receiver)
+            }
+            Some(CachedAuditRequest::Completed {
+                fingerprint: cached,
+                response,
+                ..
+            }) if cached == &fingerprint => AuditCacheDecision::Replay(response.clone()),
+            Some(_) => AuditCacheDecision::Reject,
+            None => {
+                self.entries.insert(
+                    request_id,
+                    CachedAuditRequest::Pending {
+                        fingerprint,
+                        waiters: Vec::new(),
+                    },
+                );
+                AuditCacheDecision::Execute
+            }
+        }
+    }
+
+    fn complete(&mut self, request_id: String, response: AuditResponse, now: Instant) {
+        let Some(CachedAuditRequest::Pending {
+            fingerprint,
+            waiters,
+        }) = self.entries.remove(&request_id)
+        else {
+            return;
+        };
+        for waiter in waiters {
+            let _ = waiter.send(response.clone());
+        }
+        self.entries.insert(
+            request_id,
+            CachedAuditRequest::Completed {
+                fingerprint,
+                response,
+                completed_at: now,
+            },
+        );
+        self.prune(now);
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.entries.retain(|_, entry| match entry {
+            CachedAuditRequest::Pending { .. } => true,
+            CachedAuditRequest::Completed { completed_at, .. } => {
+                now.saturating_duration_since(*completed_at) < AUDIT_REQUEST_TTL
+            }
+        });
+        let completed = self
+            .entries
+            .values()
+            .filter(|entry| matches!(entry, CachedAuditRequest::Completed { .. }))
+            .count();
+        if completed <= AUDIT_REQUEST_CAPACITY {
+            return;
+        }
+        let mut oldest = self
+            .entries
+            .iter()
+            .filter_map(|(request_id, entry)| match entry {
+                CachedAuditRequest::Completed { completed_at, .. } => {
+                    Some((request_id.clone(), *completed_at))
+                }
+                CachedAuditRequest::Pending { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        oldest.sort_unstable_by_key(|(_, completed_at)| *completed_at);
+        for (request_id, _) in oldest.into_iter().take(completed - AUDIT_REQUEST_CAPACITY) {
+            self.entries.remove(&request_id);
+        }
+    }
+}
+
+fn audit_event_fingerprint(event: &AuditEventRequest) -> Result<[u8; 32], serde_json::Error> {
+    let encoded = serde_json::to_vec(event)?;
+    let digest = digest(&SHA256, &encoded);
+    let mut fingerprint = [0_u8; 32];
+    fingerprint.copy_from_slice(digest.as_ref());
+    Ok(fingerprint)
 }
 
 struct AuditServer<C>
@@ -265,13 +430,7 @@ where
                 message: "invalid audit token".to_string(),
             }
         } else {
-            match state.publish(request.event).await {
-                Ok(()) => AuditResponse::Accepted,
-                Err(error) => AuditResponse::Error {
-                    errno: libc::EINVAL,
-                    message: format!("{error:#}"),
-                },
-            }
+            state.publish_once(request.request_id, request.event).await
         };
         stream.write_all(&encode_response(&response)?).await?;
         Ok(())

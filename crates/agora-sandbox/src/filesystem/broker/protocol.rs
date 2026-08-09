@@ -4,7 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 1;
+pub(crate) const PROTOCOL_VERSION: u16 = 2;
+
+pub(crate) fn valid_request_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RequestEnvelope {
@@ -37,7 +44,30 @@ pub(crate) enum Request {
         handle: String,
         range: ByteRange,
     },
+    BeginWrite {
+        handle: String,
+        write_id: String,
+        range: ByteRange,
+    },
+    FinishWrite {
+        handle: String,
+        write_id: String,
+        range: ByteRange,
+    },
+    CancelWrite {
+        handle: String,
+        write_id: String,
+    },
+    Claim {
+        request_id: String,
+    },
+    Abort {
+        handle: String,
+    },
     Retain {
+        handles: Vec<String>,
+    },
+    ReleaseRetain {
         handles: Vec<String>,
     },
     Close {

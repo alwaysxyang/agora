@@ -1,4 +1,6 @@
-use super::protocol::{PROTOCOL_VERSION, RequestEnvelope, Response, ResponseEnvelope};
+use super::protocol::{
+    PROTOCOL_VERSION, Request, RequestEnvelope, Response, ResponseEnvelope, valid_request_id,
+};
 use super::service::LocalBroker;
 use crate::filesystem::FileCipher;
 use crate::ipc;
@@ -153,7 +155,10 @@ impl Server {
                     }
                 }
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
-                _ = expiry.tick() => self.state.broker.expire_closed(),
+                _ = expiry.tick() => {
+                    self.state.broker.expire_closed();
+                    self.state.broker.expire_requests();
+                },
                 accepted = self.listener.accept() => {
                     let (stream, _) = accepted?;
                     let Ok(permit) = Arc::clone(&self.connections).try_acquire_owned() else {
@@ -190,8 +195,28 @@ impl Server {
                     errno: libc::EACCES,
                     message: "invalid local filesystem token".to_string(),
                 }
+            } else if !valid_request_id(&request.request_id)
+                || matches!(
+                    &request.request,
+                    Request::Claim { request_id } if !valid_request_id(request_id)
+                )
+                || matches!(
+                    &request.request,
+                    Request::BeginWrite { write_id, .. }
+                        | Request::FinishWrite { write_id, .. }
+                        | Request::CancelWrite { write_id, .. }
+                        if !valid_request_id(write_id)
+                )
+            {
+                Response::Error {
+                    errno: libc::EPROTO,
+                    message: "invalid local filesystem request ID".to_string(),
+                }
             } else {
-                state.broker.handle(request.request, descriptor).response
+                state
+                    .broker
+                    .handle_request(request.request_id.clone(), request.request, descriptor)
+                    .response
             };
             ipc::send(
                 &mut stream,

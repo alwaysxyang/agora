@@ -24,6 +24,9 @@ const KEY_METADATA_VERSION: u32 = 1;
 const REKEY_JOURNAL_VERSION: u32 = 1;
 const SALT_SIZE: usize = 16;
 const MAX_KEY_SIZE: usize = 64 * 1024;
+const MAX_KEY_METADATA_BYTES: usize = 64 * 1024;
+const MAX_REKEY_JOURNAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REKEY_JOURNAL_ENTRIES: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyMigrationStage {
@@ -452,12 +455,23 @@ impl EncryptedWorkspace {
 
     fn read_key_metadata(root: &Path) -> Result<KeyMetadata> {
         let path = root.join(KEY_FILE);
-        let contents = fs::read(&path).with_context(|| {
+        let mut file = File::open(&path).with_context(|| {
             format!(
-                "failed to read encrypted filesystem key metadata {}",
+                "failed to open encrypted filesystem key metadata {}",
                 path.display()
             )
         })?;
+        if file.metadata()?.len() > MAX_KEY_METADATA_BYTES as u64 {
+            bail!(
+                "encrypted filesystem key metadata exceeds {MAX_KEY_METADATA_BYTES} bytes: {}",
+                path.display()
+            );
+        }
+        let contents = super::read_control_file(
+            &mut file,
+            MAX_KEY_METADATA_BYTES,
+            &format!("encrypted filesystem key metadata {}", path.display()),
+        )?;
         serde_json::from_slice(&contents).with_context(|| {
             format!(
                 "failed to parse encrypted filesystem key metadata {}",
@@ -471,6 +485,9 @@ impl EncryptedWorkspace {
         let temporary = root.join(format!(".key.json.{}.tmp", Uuid::new_v4().simple()));
         let contents = serde_json::to_vec_pretty(metadata)
             .context("failed to serialize encrypted filesystem key metadata")?;
+        if contents.len() > MAX_KEY_METADATA_BYTES {
+            bail!("encrypted filesystem key metadata exceeds {MAX_KEY_METADATA_BYTES} bytes");
+        }
         let result = (|| {
             let mut file = OpenOptions::new()
                 .write(true)
@@ -587,8 +604,12 @@ impl EncryptedWorkspace {
             "{REKEY_JOURNAL_FILE}.{}.tmp",
             Uuid::new_v4().simple()
         ));
+        Self::validate_rekey_journal(journal)?;
         let contents = serde_json::to_vec_pretty(journal)
             .context("failed to serialize filesystem key migration journal")?;
+        if contents.len() > MAX_REKEY_JOURNAL_BYTES {
+            bail!("filesystem key migration journal exceeds {MAX_REKEY_JOURNAL_BYTES} bytes");
+        }
         let result = (|| {
             let mut file = OpenOptions::new()
                 .write(true)
@@ -608,11 +629,19 @@ impl EncryptedWorkspace {
 
     fn recover_migration(root: &Path) -> Result<()> {
         let path = root.join(REKEY_JOURNAL_FILE);
-        let contents = match fs::read(&path) {
-            Ok(contents) => contents,
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error).context("failed to read key migration journal"),
+            Err(error) => return Err(error).context("failed to open key migration journal"),
         };
+        if file.metadata()?.len() > MAX_REKEY_JOURNAL_BYTES as u64 {
+            bail!("filesystem key migration journal exceeds {MAX_REKEY_JOURNAL_BYTES} bytes");
+        }
+        let contents = super::read_control_file(
+            &mut file,
+            MAX_REKEY_JOURNAL_BYTES,
+            "filesystem key migration journal",
+        )?;
         let journal: RekeyJournal =
             serde_json::from_slice(&contents).context("failed to parse key migration journal")?;
         if journal.version != REKEY_JOURNAL_VERSION {
@@ -621,6 +650,7 @@ impl EncryptedWorkspace {
                 journal.version
             );
         }
+        Self::validate_rekey_journal(&journal)?;
         let current = Self::read_key_metadata(root)?;
         let committed = current == journal.new_key;
         if !committed && current != journal.old_key {
@@ -725,6 +755,31 @@ impl EncryptedWorkspace {
                 File::open(parent)
                     .and_then(|directory| directory.sync_all())
                     .with_context(|| format!("failed to sync directory {}", parent.display()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_rekey_journal(journal: &RekeyJournal) -> Result<()> {
+        if journal.entries.len() > MAX_REKEY_JOURNAL_ENTRIES {
+            bail!("filesystem key migration journal exceeds {MAX_REKEY_JOURNAL_ENTRIES} entries");
+        }
+        for entry in &journal.entries {
+            let paths = [
+                Some(entry.destination.as_str()),
+                entry.renamed_destination.as_deref(),
+                Some(entry.staged.as_str()),
+                Some(entry.backup.as_str()),
+            ];
+            if paths
+                .into_iter()
+                .flatten()
+                .any(|path| path.len() > super::MAX_CONTROL_PATH_BYTES)
+            {
+                bail!(
+                    "filesystem key migration journal path exceeds {} bytes",
+                    super::MAX_CONTROL_PATH_BYTES
+                );
             }
         }
         Ok(())

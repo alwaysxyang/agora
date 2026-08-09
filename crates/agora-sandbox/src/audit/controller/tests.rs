@@ -1,6 +1,7 @@
 use super::*;
 use crate::audit::protocol::encode_request;
 use crate::callback::{Decision, FileAccessMode, FileContext, FileOpenMode, ProcessContext};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 async fn controller() -> AuditController {
     AuditController::start(
@@ -23,6 +24,7 @@ async fn audit_server_drops_connections_above_its_concurrency_limit() {
         run_id: "run".to_string(),
         callback: |_| std::future::ready(Decision::Allow),
         callback_timeout: Duration::from_secs(1),
+        requests: Mutex::new(AuditRequestCache::default()),
     });
     let server = AuditServer::new(listener, state);
     let permits = (0..AUDIT_MAX_CONNECTIONS)
@@ -106,6 +108,7 @@ async fn audit_server_times_out_idle_established_connections() {
         run_id: "run".to_string(),
         callback: |_| std::future::ready(Decision::Allow),
         callback_timeout: Duration::from_secs(1),
+        requests: Mutex::new(AuditRequestCache::default()),
     });
     let task = tokio::spawn(AuditServer::handle_with_timeouts(
         server,
@@ -147,4 +150,77 @@ async fn audit_server_times_out_idle_established_connections() {
         .unwrap()
         .unwrap_err();
     assert!(error.to_string().contains("connection timed out"));
+}
+
+#[tokio::test]
+async fn duplicate_audit_request_ids_publish_one_logical_event() {
+    let published = Arc::new(AtomicUsize::new(0));
+    let callback_count = Arc::clone(&published);
+    let state = Arc::new(AuditState {
+        token: "token".to_string(),
+        sandbox_id: "sandbox".to_string(),
+        run_id: "run".to_string(),
+        callback: move |_| {
+            callback_count.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Decision::Allow)
+        },
+        callback_timeout: Duration::from_secs(1),
+        requests: Mutex::new(AuditRequestCache::default()),
+    });
+    let event = AuditEventRequest::File {
+        trace_id: "trace".to_string(),
+        process: ProcessContext {
+            pid: 1,
+            ppid: 0,
+            executable: "/bin/tool".to_string(),
+        },
+        operation: FileOperation::Open,
+        file: FileContext {
+            path: "/tmp/file".to_string(),
+            mode: FileOpenMode {
+                access: FileAccessMode::Read,
+                create: false,
+                truncate: false,
+                append: false,
+                exclusive: false,
+            },
+        },
+    };
+
+    let (first, replay) = tokio::join!(
+        state.publish_once("request".to_string(), event.clone()),
+        state.publish_once("request".to_string(), event),
+    );
+
+    assert_eq!(first, AuditResponse::Accepted);
+    assert_eq!(replay, AuditResponse::Accepted);
+    assert_eq!(published.load(Ordering::Relaxed), 1);
+
+    let different = AuditEventRequest::File {
+        trace_id: "different".to_string(),
+        process: ProcessContext {
+            pid: 1,
+            ppid: 0,
+            executable: "/bin/tool".to_string(),
+        },
+        operation: FileOperation::Open,
+        file: FileContext {
+            path: "/tmp/file".to_string(),
+            mode: FileOpenMode {
+                access: FileAccessMode::Read,
+                create: false,
+                truncate: false,
+                append: false,
+                exclusive: false,
+            },
+        },
+    };
+    assert!(matches!(
+        state.publish_once("request".to_string(), different).await,
+        AuditResponse::Error {
+            errno: libc::EPROTO,
+            ..
+        }
+    ));
+    assert_eq!(published.load(Ordering::Relaxed), 1);
 }

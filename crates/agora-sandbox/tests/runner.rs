@@ -6,7 +6,7 @@ use agora_sandbox::runner::{Sandbox, SandboxCommand, SandboxConfig};
 #[cfg(target_os = "macos")]
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, UdpSocket};
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -2631,6 +2631,30 @@ fn forked_intercepted_child_process() {
 }
 
 #[cfg(target_os = "macos")]
+#[test]
+fn unlinked_current_directory_child_process() {
+    if std::env::var_os("AGORA_SANDBOX_TEST_UNLINKED_CWD_CHILD").is_none() {
+        return;
+    }
+
+    let original = std::fs::File::open(".").unwrap();
+    let directory = PathBuf::from("managed-current-directory");
+    std::fs::create_dir(&directory).unwrap();
+    let descriptor = std::fs::File::open(&directory).unwrap();
+    assert_eq!(unsafe { libc::fchdir(descriptor.as_raw_fd()) }, 0);
+    std::fs::remove_dir(std::env::current_dir().unwrap()).unwrap();
+
+    let target = std::env::var_os("AGORA_SANDBOX_TEST_HOST_TARGET").unwrap();
+    let child = Command::new("/bin/sh")
+        .args(["-c", "printf escaped > \"$AGORA_SANDBOX_TEST_HOST_TARGET\""])
+        .env("AGORA_SANDBOX_TEST_HOST_TARGET", target)
+        .status();
+
+    assert_eq!(unsafe { libc::fchdir(original.as_raw_fd()) }, 0);
+    assert!(child.is_err() || child.is_ok_and(|status| !status.success()));
+}
+
+#[cfg(target_os = "macos")]
 fn exchange_payload(destination: std::net::SocketAddr, payload: &[u8; 6]) -> std::io::Result<()> {
     let mut stream = TcpStream::connect(destination)?;
     stream.write_all(payload)?;
@@ -3425,6 +3449,36 @@ async fn injected_hook_refreshes_process_identity_after_fork() {
         );
     }
     assert_ne!(attempts[0].connection_id, attempts[1].connection_id);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn child_creation_fails_closed_from_an_unlinked_managed_current_directory() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-unlinked-current-directory-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    let host_target = source.join("host.txt");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(&host_target, b"host").unwrap();
+    let command = SandboxCommand::new(std::env::current_exe().unwrap())
+        .arg("unlinked_current_directory_child_process")
+        .arg("--exact")
+        .arg("--nocapture")
+        .current_dir(&source)
+        .env("AGORA_SANDBOX_TEST_UNLINKED_CWD_CHILD", "1")
+        .env("AGORA_SANDBOX_TEST_HOST_TARGET", &host_target);
+
+    let outcome = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(command)
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    assert_eq!(std::fs::read(&host_target).unwrap(), b"host");
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(target_os = "macos")]

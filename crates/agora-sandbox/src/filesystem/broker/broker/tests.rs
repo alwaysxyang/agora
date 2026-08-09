@@ -90,6 +90,250 @@ fn sync_encrypts_only_reported_ranges_and_propagates_them_to_peer_handles() {
 }
 
 #[test]
+fn peer_sync_does_not_overwrite_a_reserved_plaintext_range() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("concurrent", b"abcdefgh");
+    let (first_id, first) = fixture.open(&path, b"abcdefgh", true);
+    let (second_id, second) = fixture.open(&path, b"abcdefgh", true);
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::BeginWrite {
+                    handle: second_id.clone(),
+                    write_id: "11111111111111111111111111111111".to_string(),
+                    range: ByteRange::new(4, 6).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    write_all_at(&second, b"ZZ", 4).unwrap();
+    write_all_at(&first, b"AAAAAA", 0).unwrap();
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Sync {
+                    handle: first_id,
+                    ranges: vec![ByteRange::new(0, 6).unwrap()],
+                    durable: false,
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    let mut peer = [0_u8; 8];
+    read_exact_at(&second, &mut peer, 0).unwrap();
+    assert_eq!(&peer, b"AAAAZZgh");
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::FinishWrite {
+                    handle: second_id.clone(),
+                    write_id: "11111111111111111111111111111111".to_string(),
+                    range: ByteRange::new(4, 6).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Sync {
+                    handle: second_id,
+                    ranges: vec![ByteRange::new(4, 6).unwrap()],
+                    durable: true,
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(fixture.decrypt(&path), b"AAAAZZgh");
+}
+
+#[test]
+fn cancelling_one_write_does_not_drop_another_active_reservation() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("independent-reservations", b"abcdefgh");
+    let (handle, _plaintext) = fixture.open(&path, b"abcdefgh", true);
+    for (write_id, range) in [
+        (
+            "11111111111111111111111111111111",
+            ByteRange::new(0, 2).unwrap(),
+        ),
+        (
+            "22222222222222222222222222222222",
+            ByteRange::new(4, 6).unwrap(),
+        ),
+    ] {
+        assert_eq!(
+            fixture
+                .broker
+                .handle(
+                    Request::BeginWrite {
+                        handle: handle.clone(),
+                        write_id: write_id.to_string(),
+                        range,
+                    },
+                    None,
+                )
+                .response,
+            Response::Success
+        );
+    }
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::CancelWrite {
+                    handle: handle.clone(),
+                    write_id: "11111111111111111111111111111111".to_string(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+
+    let local = lock(&fixture.broker.handles).get(&handle).unwrap().clone();
+    let assert_second_is_active = || {
+        let local = lock(&local);
+        assert_eq!(local.active_writes.len(), 1);
+        assert_eq!(
+            local.active_writes.get("22222222222222222222222222222222"),
+            Some(&ByteRange::new(4, 6).unwrap())
+        );
+    };
+    assert_second_is_active();
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Sync {
+                    handle,
+                    ranges: vec![ByteRange::new(0, 2).unwrap()],
+                    durable: false,
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_second_is_active();
+}
+
+#[test]
+fn overlapping_completed_write_waits_for_the_remaining_reservation() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("overlapping-reservations", b"abcdefgh");
+    let (handle, plaintext) = fixture.open(&path, b"abcdefgh", true);
+    for (write_id, range) in [
+        (
+            "11111111111111111111111111111111",
+            ByteRange::new(2, 6).unwrap(),
+        ),
+        (
+            "22222222222222222222222222222222",
+            ByteRange::new(4, 8).unwrap(),
+        ),
+    ] {
+        assert_eq!(
+            fixture
+                .broker
+                .handle(
+                    Request::BeginWrite {
+                        handle: handle.clone(),
+                        write_id: write_id.to_string(),
+                        range,
+                    },
+                    None,
+                )
+                .response,
+            Response::Success
+        );
+    }
+    write_all_at(&plaintext, b"WXYZ", 2).unwrap();
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::FinishWrite {
+                    handle: handle.clone(),
+                    write_id: "11111111111111111111111111111111".to_string(),
+                    range: ByteRange::new(2, 6).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    write_all_at(&plaintext, b"1234", 4).unwrap();
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Sync {
+                    handle: handle.clone(),
+                    ranges: Vec::new(),
+                    durable: false,
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(fixture.decrypt(&path), b"abWXefgh");
+    let local = lock(&fixture.broker.handles).get(&handle).unwrap().clone();
+    assert_eq!(
+        lock(&local).pending_writes.ranges,
+        vec![ByteRange::new(4, 6).unwrap()]
+    );
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::FinishWrite {
+                    handle: handle.clone(),
+                    write_id: "22222222222222222222222222222222".to_string(),
+                    range: ByteRange::new(4, 8).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Sync {
+                    handle,
+                    ranges: Vec::new(),
+                    durable: true,
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(fixture.decrypt(&path), b"abWX1234");
+}
+
+#[test]
 fn sync_ignores_ranges_beyond_eof_and_reports_plaintext_read_failures() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("range-errors", b"data");
@@ -138,6 +382,101 @@ fn broker_protocol_errors_preserve_their_message() {
 
     assert_eq!(error.errno, libc::EPROTO);
     assert_eq!(error.message, "invalid backing path");
+}
+
+#[test]
+fn request_cache_replays_and_claims_one_open_handle() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("cached-open", b"data");
+    let request = Request::Open {
+        path: BackingPath::from_path(&path),
+        writable: true,
+    };
+    let descriptor: OwnedFd = {
+        let mut plaintext = tempfile::tempfile().unwrap();
+        plaintext.write_all(b"data").unwrap();
+        plaintext.into()
+    };
+    let first = fixture.broker.handle_request(
+        "open-request".to_string(),
+        request.clone(),
+        Some(descriptor),
+    );
+    let descriptor: OwnedFd = {
+        let mut plaintext = tempfile::tempfile().unwrap();
+        plaintext.write_all(b"data").unwrap();
+        plaintext.into()
+    };
+    let replay =
+        fixture
+            .broker
+            .handle_request("open-request".to_string(), request, Some(descriptor));
+
+    assert_eq!(first.response, replay.response);
+    assert_eq!(lock(&fixture.broker.handles).len(), 1);
+    assert!(matches!(
+        fixture
+            .broker
+            .handle_request(
+                "open-request".to_string(),
+                Request::Close {
+                    handle: "different".to_string(),
+                },
+                None,
+            )
+            .response,
+        Response::Error {
+            errno: libc::EPROTO,
+            ..
+        }
+    ));
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Claim {
+                    request_id: "open-request".to_string(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    if let Some(CachedRequest::Completed { completed_at, .. }) = lock(&fixture.broker.requests)
+        .entries
+        .get_mut("open-request")
+    {
+        *completed_at = Instant::now() - REQUEST_CACHE_TTL - Duration::from_secs(1);
+    }
+    fixture.broker.expire_requests();
+    assert_eq!(lock(&fixture.broker.handles).len(), 1);
+}
+
+#[test]
+fn expired_unclaimed_open_is_aborted_without_writeback() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("abandoned-open", b"data");
+    let mut plaintext = tempfile::tempfile().unwrap();
+    plaintext.write_all(b"data").unwrap();
+    let response = fixture.broker.handle_request(
+        "abandoned-request".to_string(),
+        Request::Open {
+            path: BackingPath::from_path(&path),
+            writable: true,
+        },
+        Some(plaintext.into()),
+    );
+    assert!(matches!(response.response, Response::Open { .. }));
+    if let Some(CachedRequest::Completed { completed_at, .. }) = lock(&fixture.broker.requests)
+        .entries
+        .get_mut("abandoned-request")
+    {
+        *completed_at = Instant::now() - REQUEST_CACHE_TTL - Duration::from_secs(1);
+    }
+
+    fixture.broker.expire_requests();
+
+    assert!(lock(&fixture.broker.handles).is_empty());
 }
 
 #[test]
@@ -258,6 +597,40 @@ fn retained_handle_remains_usable_after_one_process_closes_it() {
             .response,
         Response::Success
     );
+}
+
+#[test]
+fn failed_fork_retains_can_be_released_atomically() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("failed-fork", b"data");
+    let (handle, _plaintext) = fixture.open(&path, b"data", true);
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Retain {
+                    handles: vec![handle.clone()],
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::ReleaseRetain {
+                    handles: vec![handle.clone(), handle.clone()],
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    let local = lock(&fixture.broker.handles).get(&handle).unwrap().clone();
+    assert_eq!(lock(&local).references, 1);
 }
 
 #[test]

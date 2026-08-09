@@ -1,17 +1,20 @@
 use super::protocol::{ByteRange, Request, Response};
 use crate::filesystem::{EncryptedFile, FileCipher};
+use ring::digest::{SHA256, digest};
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const CLOSED_HANDLE_TTL: Duration = Duration::from_secs(120);
 const CLOSED_HANDLE_CAPACITY: usize = 128;
+const REQUEST_CACHE_TTL: Duration = Duration::from_secs(120);
+const REQUEST_CACHE_CAPACITY: usize = 256;
 
 pub(crate) struct BrokerReply {
     pub(crate) response: Response,
@@ -22,6 +25,38 @@ pub(crate) struct LocalBroker {
     cipher: FileCipher,
     handles: Mutex<HashMap<String, Arc<Mutex<LocalHandle>>>>,
     files: Mutex<HashMap<FileIdentity, Weak<Mutex<()>>>>,
+    requests: Mutex<RequestCache>,
+}
+
+#[derive(Default)]
+struct RequestCache {
+    entries: HashMap<String, CachedRequest>,
+}
+
+enum CachedRequest {
+    Pending {
+        fingerprint: [u8; 32],
+        completion: Arc<RequestCompletion>,
+    },
+    Completed {
+        fingerprint: [u8; 32],
+        response: Response,
+        completed_at: Instant,
+        claimed: bool,
+    },
+}
+
+#[derive(Default)]
+struct RequestCompletion {
+    response: Mutex<Option<Response>>,
+    ready: Condvar,
+}
+
+enum CacheDecision {
+    Execute,
+    Wait(Arc<RequestCompletion>),
+    Replay(Response),
+    Reject,
 }
 
 struct LocalHandle {
@@ -30,6 +65,8 @@ struct LocalHandle {
     encrypted: EncryptedFile,
     writable: bool,
     potentially_dirty: RangeSet,
+    active_writes: HashMap<String, ByteRange>,
+    pending_writes: RangeSet,
     baseline: PlaintextIdentity,
     references: usize,
     closed_at: Option<Instant>,
@@ -39,6 +76,7 @@ struct LocalHandle {
 struct PeerHandle {
     handle: Arc<Mutex<LocalHandle>>,
     plaintext: File,
+    protected: RangeSet,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -56,7 +94,7 @@ struct PlaintextIdentity {
     changed_nanoseconds: i64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RangeSet {
     ranges: Vec<ByteRange>,
 }
@@ -73,7 +111,61 @@ impl LocalBroker {
             cipher,
             handles: Mutex::new(HashMap::new()),
             files: Mutex::new(HashMap::new()),
+            requests: Mutex::new(RequestCache::default()),
         })
+    }
+
+    pub(crate) fn handle_request(
+        &self,
+        request_id: String,
+        request: Request,
+        descriptor: Option<OwnedFd>,
+    ) -> BrokerReply {
+        let fingerprint = match request_fingerprint(&request) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                drop(descriptor);
+                return BrokerReply {
+                    response: Response::Error {
+                        errno: libc::EPROTO,
+                        message: format!("failed to fingerprint local filesystem request: {error}"),
+                    },
+                };
+            }
+        };
+        let decision = lock(&self.requests).begin(request_id.clone(), fingerprint);
+        match decision {
+            CacheDecision::Execute => {
+                let reply = self.handle(request, descriptor);
+                let abandoned = lock(&self.requests).complete(
+                    request_id,
+                    reply.response.clone(),
+                    Instant::now(),
+                );
+                self.abort_handles(abandoned);
+                reply
+            }
+            CacheDecision::Wait(completion) => {
+                drop(descriptor);
+                BrokerReply {
+                    response: completion.wait(),
+                }
+            }
+            CacheDecision::Replay(response) => {
+                drop(descriptor);
+                BrokerReply { response }
+            }
+            CacheDecision::Reject => {
+                drop(descriptor);
+                BrokerReply {
+                    response: Response::Error {
+                        errno: libc::EPROTO,
+                        message: "local request ID was reused for a different operation"
+                            .to_string(),
+                    },
+                }
+            }
+        }
     }
 
     pub(crate) fn handle(&self, request: Request, descriptor: Option<OwnedFd>) -> BrokerReply {
@@ -98,7 +190,7 @@ impl LocalBroker {
             .filter_map(|(id, handle)| (lock(&handle).references != 0).then_some(id))
             .collect::<Vec<_>>();
         for id in ids {
-            self.sync_handle(&id, Vec::new(), true, true)
+            self.sync_handle(&id, Vec::new(), true, true, true)
                 .map_err(BrokerError::into_io)?;
         }
         Ok(())
@@ -106,6 +198,11 @@ impl LocalBroker {
 
     pub(crate) fn expire_closed(&self) {
         self.prune_closed(Instant::now());
+    }
+
+    pub(crate) fn expire_requests(&self) {
+        let abandoned = lock(&self.requests).prune(Instant::now());
+        self.abort_handles(abandoned);
     }
 
     fn dispatch(
@@ -130,13 +227,15 @@ impl LocalBroker {
             } => {
                 Self::reject_descriptor(descriptor)?;
                 self.activate(&handle)?;
-                self.sync_handle(&handle, ranges, durable, false)?;
+                self.sync_handle(&handle, ranges, durable, false, false)?;
                 Ok(Response::Success)
             }
             Request::PotentiallyDirty { handle, range } => {
                 Self::reject_descriptor(descriptor)?;
                 self.activate(&handle)?;
                 let handle = self.lookup_handle(&handle)?;
+                let file_lock = lock(&handle).file_lock.clone();
+                let _file_guard = lock(&file_lock);
                 let mut handle = lock(&handle);
                 if !handle.writable {
                     return Err(BrokerError::new(
@@ -145,6 +244,83 @@ impl LocalBroker {
                     ));
                 }
                 handle.potentially_dirty.insert(range);
+                Ok(Response::Success)
+            }
+            Request::BeginWrite {
+                handle,
+                write_id,
+                range,
+            } => {
+                Self::reject_descriptor(descriptor)?;
+                self.activate(&handle)?;
+                let handle = self.lookup_handle(&handle)?;
+                let file_lock = lock(&handle).file_lock.clone();
+                let _file_guard = lock(&file_lock);
+                let mut handle = lock(&handle);
+                if !handle.writable {
+                    return Err(BrokerError::new(
+                        libc::EBADF,
+                        "local filesystem handle is not writable",
+                    ));
+                }
+                match handle.active_writes.get(&write_id) {
+                    Some(existing) if existing == &range => {}
+                    Some(_) => {
+                        return Err(BrokerError::protocol(
+                            "local write ID was reused for a different range",
+                        ));
+                    }
+                    None => {
+                        handle.active_writes.insert(write_id, range);
+                    }
+                }
+                Ok(Response::Success)
+            }
+            Request::FinishWrite {
+                handle,
+                write_id,
+                range,
+            } => {
+                Self::reject_descriptor(descriptor)?;
+                let handle = self.lookup_handle(&handle)?;
+                let file_lock = lock(&handle).file_lock.clone();
+                let _file_guard = lock(&file_lock);
+                let mut handle = lock(&handle);
+                if !handle.writable {
+                    return Err(BrokerError::new(
+                        libc::EBADF,
+                        "local filesystem handle is not writable",
+                    ));
+                }
+                if let Some(reserved) = handle.active_writes.get(&write_id)
+                    && (range.start < reserved.start || range.end > reserved.end)
+                {
+                    return Err(BrokerError::protocol(
+                        "completed local write exceeds its reserved range",
+                    ));
+                }
+                handle.active_writes.remove(&write_id);
+                handle.pending_writes.insert(range);
+                Ok(Response::Success)
+            }
+            Request::CancelWrite { handle, write_id } => {
+                Self::reject_descriptor(descriptor)?;
+                let handle = self.lookup_handle(&handle)?;
+                let file_lock = lock(&handle).file_lock.clone();
+                let _file_guard = lock(&file_lock);
+                lock(&handle).active_writes.remove(&write_id);
+                Ok(Response::Success)
+            }
+            Request::Claim { request_id } => {
+                Self::reject_descriptor(descriptor)?;
+                lock(&self.requests).claim(&request_id).ok_or_else(|| {
+                    BrokerError::protocol("local resource request is not available to claim")
+                })?;
+                Ok(Response::Success)
+            }
+            Request::Abort { handle } => {
+                Self::reject_descriptor(descriptor)?;
+                self.abort_handle(&handle);
                 Ok(Response::Success)
             }
             Request::Retain {
@@ -177,12 +353,45 @@ impl LocalBroker {
                 drop(handles);
                 Ok(Response::Success)
             }
+            Request::ReleaseRetain {
+                handles: mut retained,
+            } => {
+                Self::reject_descriptor(descriptor)?;
+                retained.sort_unstable();
+                retained.dedup();
+                let handles = lock(&self.handles);
+                let retained_handles = retained
+                    .iter()
+                    .map(|id| {
+                        handles
+                            .get(id)
+                            .cloned()
+                            .ok_or_else(BrokerError::bad_descriptor)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if retained_handles
+                    .iter()
+                    .any(|handle| lock(handle).references == 0)
+                {
+                    return Err(BrokerError::bad_descriptor());
+                }
+                for handle in retained_handles {
+                    let mut handle = lock(&handle);
+                    handle.references -= 1;
+                    if handle.references == 0 {
+                        handle.closed_at = Some(Instant::now());
+                    }
+                }
+                drop(handles);
+                self.prune_closed(Instant::now());
+                Ok(Response::Success)
+            }
             Request::Close { handle } => {
                 Self::reject_descriptor(descriptor)?;
                 let Some(local) = lock(&self.handles).get(&handle).cloned() else {
                     return Ok(Response::Success);
                 };
-                self.sync_handle(&handle, Vec::new(), true, true)?;
+                self.sync_handle(&handle, Vec::new(), true, true, false)?;
                 let mut local = lock(&local);
                 if local.references > 0 {
                     local.references -= 1;
@@ -253,6 +462,8 @@ impl LocalBroker {
                 encrypted,
                 writable,
                 potentially_dirty: RangeSet::default(),
+                active_writes: HashMap::new(),
+                pending_writes: RangeSet::default(),
                 baseline: PlaintextIdentity::from_metadata(&plaintext_metadata),
                 references: 1,
                 closed_at: None,
@@ -265,9 +476,10 @@ impl LocalBroker {
     fn sync_handle(
         &self,
         id: &str,
-        mut ranges: Vec<ByteRange>,
+        ranges: Vec<ByteRange>,
         durable: bool,
         include_potential: bool,
+        include_active: bool,
     ) -> Result<(), BrokerError> {
         let handle = self.lookup_handle(id)?;
         let file_lock = lock(&handle).file_lock.clone();
@@ -283,23 +495,42 @@ impl LocalBroker {
             .metadata()
             .map_err(|error| BrokerError::io("failed to inspect local plaintext file", error))?;
         let current = PlaintextIdentity::from_metadata(&metadata);
-        let potential = include_potential.then(|| handle.potentially_dirty.ranges.clone());
-        if let Some(potential) = &potential {
-            ranges.extend(potential.iter().copied());
+        for range in ranges {
+            handle.pending_writes.insert(range);
+        }
+        let mut candidates = handle.pending_writes.clone();
+        if include_potential {
+            for range in &handle.potentially_dirty.ranges {
+                candidates.insert(*range);
+            }
+        }
+        let mut active = RangeSet::from_ranges(handle.active_writes.values().copied().collect());
+        if include_active {
+            for range in &active.ranges {
+                candidates.insert(*range);
+            }
+            active = RangeSet::default();
         }
         if include_potential
-            && ranges.is_empty()
+            && candidates.ranges.is_empty()
             && current != handle.baseline
             && current.length > 0
         {
-            ranges.push(ByteRange {
+            candidates.insert(ByteRange {
                 start: 0,
                 end: current.length,
             });
         }
-        let ranges = RangeSet::from_ranges(ranges).ranges;
+        let ranges = candidates
+            .ranges
+            .iter()
+            .flat_map(|range| active.uncovered(range.start, range.end))
+            .collect::<Vec<_>>();
+        let length_stable = active.ranges.is_empty();
         let length = current.length;
-        if (!ranges.is_empty() || length != handle.encrypted.len()) && !handle.writable {
+        if (!ranges.is_empty() || (length_stable && length != handle.encrypted.len()))
+            && !handle.writable
+        {
             return Err(BrokerError::new(
                 libc::EBADF,
                 "local filesystem handle is not writable",
@@ -316,10 +547,18 @@ impl LocalBroker {
                 .plaintext
                 .try_clone()
                 .map_err(|error| BrokerError::io("failed to clone peer plaintext file", error))?;
+            let mut protected = local.pending_writes.clone();
+            for range in &local.potentially_dirty.ranges {
+                protected.insert(*range);
+            }
+            for range in local.active_writes.values() {
+                protected.insert(*range);
+            }
             drop(local);
             peers.push(PeerHandle {
                 handle: peer,
                 plaintext,
+                protected,
             });
         }
         let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
@@ -343,14 +582,20 @@ impl LocalBroker {
                         BrokerError::anyhow("failed to encrypt local file range", error)
                     })?;
                 for peer in &peers {
-                    write_all_at(&peer.plaintext, &buffer[..count], offset).map_err(|error| {
-                        BrokerError::io("failed to update peer plaintext file", error)
-                    })?;
+                    for visible in peer.protected.uncovered(offset, offset + count as u64) {
+                        let start = usize::try_from(visible.start - offset)
+                            .expect("peer range starts in the copy buffer");
+                        let end = usize::try_from(visible.end - offset)
+                            .expect("peer range ends in the copy buffer");
+                        write_all_at(&peer.plaintext, &buffer[start..end], visible.start).map_err(
+                            |error| BrokerError::io("failed to update peer plaintext file", error),
+                        )?;
+                    }
                 }
                 offset += count as u64;
             }
         }
-        if handle.encrypted.len() != length {
+        if length_stable && handle.encrypted.len() != length {
             handle.encrypted.set_len(length).map_err(|error| {
                 BrokerError::anyhow("failed to resize encrypted local file", error)
             })?;
@@ -360,14 +605,36 @@ impl LocalBroker {
                 BrokerError::anyhow("failed to sync encrypted local file", error)
             })?;
         }
-        if include_potential {
+        handle.pending_writes = handle.pending_writes.intersection(&active);
+        if include_potential && length_stable {
             handle.potentially_dirty.ranges.clear();
         }
-        handle.baseline = current;
+        if include_active {
+            handle.active_writes.clear();
+        }
+        if length_stable {
+            handle.baseline = current;
+        }
         for peer in peers {
+            if !length_stable {
+                continue;
+            }
+            let peer_length = peer
+                .plaintext
+                .metadata()
+                .map_err(|error| BrokerError::io("failed to inspect peer plaintext file", error))?
+                .len();
+            let propagated_length = if peer.protected.ranges.is_empty() {
+                length
+            } else {
+                peer_length.max(length)
+            };
             peer.plaintext
-                .set_len(length)
+                .set_len(propagated_length)
                 .map_err(|error| BrokerError::io("failed to resize peer plaintext file", error))?;
+            if !peer.protected.ranges.is_empty() {
+                continue;
+            }
             let metadata = peer
                 .plaintext
                 .metadata()
@@ -405,6 +672,16 @@ impl LocalBroker {
         }
     }
 
+    fn abort_handle(&self, handle: &str) {
+        lock(&self.handles).remove(handle);
+    }
+
+    fn abort_handles(&self, handles: Vec<String>) {
+        for handle in handles {
+            self.abort_handle(&handle);
+        }
+    }
+
     fn prune_closed(&self, now: Instant) {
         let mut handles = lock(&self.handles);
         let mut expired = Vec::new();
@@ -430,6 +707,149 @@ impl LocalBroker {
             handles.remove(&id);
         }
     }
+}
+
+impl RequestCompletion {
+    fn complete(&self, response: Response) {
+        *lock(&self.response) = Some(response);
+        self.ready.notify_all();
+    }
+
+    fn wait(&self) -> Response {
+        let mut response = lock(&self.response);
+        loop {
+            if let Some(response) = response.clone() {
+                return response;
+            }
+            response = self
+                .ready
+                .wait(response)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+impl RequestCache {
+    fn begin(&mut self, request_id: String, fingerprint: [u8; 32]) -> CacheDecision {
+        match self.entries.get(&request_id) {
+            Some(CachedRequest::Pending {
+                fingerprint: cached,
+                completion,
+            }) if cached == &fingerprint => CacheDecision::Wait(Arc::clone(completion)),
+            Some(CachedRequest::Completed {
+                fingerprint: cached,
+                response,
+                ..
+            }) if cached == &fingerprint => CacheDecision::Replay(response.clone()),
+            Some(_) => CacheDecision::Reject,
+            None => {
+                self.entries.insert(
+                    request_id,
+                    CachedRequest::Pending {
+                        fingerprint,
+                        completion: Arc::new(RequestCompletion::default()),
+                    },
+                );
+                CacheDecision::Execute
+            }
+        }
+    }
+
+    fn complete(&mut self, request_id: String, response: Response, now: Instant) -> Vec<String> {
+        let Some(CachedRequest::Pending {
+            fingerprint,
+            completion,
+        }) = self.entries.remove(&request_id)
+        else {
+            return Vec::new();
+        };
+        completion.complete(response.clone());
+        self.entries.insert(
+            request_id,
+            CachedRequest::Completed {
+                fingerprint,
+                claimed: !matches!(response, Response::Open { .. }),
+                response,
+                completed_at: now,
+            },
+        );
+        self.prune(now)
+    }
+
+    fn claim(&mut self, request_id: &str) -> Option<()> {
+        let CachedRequest::Completed {
+            response, claimed, ..
+        } = self.entries.get_mut(request_id)?
+        else {
+            return None;
+        };
+        if !matches!(response, Response::Open { .. }) {
+            return None;
+        }
+        *claimed = true;
+        Some(())
+    }
+
+    fn prune(&mut self, now: Instant) -> Vec<String> {
+        let mut remove = self
+            .entries
+            .iter()
+            .filter_map(|(request_id, entry)| match entry {
+                CachedRequest::Completed { completed_at, .. }
+                    if now.saturating_duration_since(*completed_at) >= REQUEST_CACHE_TTL =>
+                {
+                    Some(request_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let completed = self
+            .entries
+            .values()
+            .filter(|entry| matches!(entry, CachedRequest::Completed { .. }))
+            .count()
+            .saturating_sub(remove.len());
+        if completed > REQUEST_CACHE_CAPACITY {
+            let mut oldest = self
+                .entries
+                .iter()
+                .filter_map(|(request_id, entry)| match entry {
+                    CachedRequest::Completed { completed_at, .. }
+                        if !remove.contains(request_id) =>
+                    {
+                        Some((request_id.clone(), *completed_at))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            oldest.sort_unstable_by_key(|(_, completed_at)| *completed_at);
+            remove.extend(
+                oldest
+                    .into_iter()
+                    .take(completed - REQUEST_CACHE_CAPACITY)
+                    .map(|(request_id, _)| request_id),
+            );
+        }
+        remove
+            .into_iter()
+            .filter_map(|request_id| match self.entries.remove(&request_id) {
+                Some(CachedRequest::Completed {
+                    response: Response::Open { handle },
+                    claimed: false,
+                    ..
+                }) => Some(handle),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+fn request_fingerprint(request: &Request) -> Result<[u8; 32], serde_json::Error> {
+    let encoded = serde_json::to_vec(request)?;
+    let digest = digest(&SHA256, &encoded);
+    let mut fingerprint = [0_u8; 32];
+    fingerprint.copy_from_slice(digest.as_ref());
+    Ok(fingerprint)
 }
 
 impl PlaintextIdentity {
@@ -470,6 +890,53 @@ impl RangeSet {
             }
         }
         self.ranges = merged;
+    }
+
+    fn uncovered(&self, start: u64, end: u64) -> Vec<ByteRange> {
+        let mut uncovered = Vec::new();
+        let mut cursor = start;
+        for protected in &self.ranges {
+            if protected.end <= cursor {
+                continue;
+            }
+            if protected.start >= end {
+                break;
+            }
+            if cursor < protected.start {
+                uncovered.push(ByteRange {
+                    start: cursor,
+                    end: protected.start.min(end),
+                });
+            }
+            cursor = cursor.max(protected.end);
+            if cursor >= end {
+                break;
+            }
+        }
+        if cursor < end {
+            uncovered.push(ByteRange { start: cursor, end });
+        }
+        uncovered
+    }
+
+    fn intersection(&self, other: &Self) -> Self {
+        let mut intersection = Self::default();
+        for range in &self.ranges {
+            for protected in &other.ranges {
+                if protected.end <= range.start {
+                    continue;
+                }
+                if protected.start >= range.end {
+                    break;
+                }
+                let start = range.start.max(protected.start);
+                let end = range.end.min(protected.end);
+                if start < end {
+                    intersection.insert(ByteRange { start, end });
+                }
+            }
+        }
+        intersection
     }
 }
 

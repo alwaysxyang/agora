@@ -1,6 +1,15 @@
-use super::{normalize_path, resolve_existing_ancestor};
+use super::{normalize_path, read_control_file, resolve_existing_ancestor};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+
+#[test]
+fn bounded_control_file_reads_reject_excess_input() {
+    let mut input = std::io::Cursor::new(b"12345");
+
+    let error = read_control_file(&mut input, 4, "test control file").unwrap_err();
+
+    assert!(error.to_string().contains("exceeds 4 bytes"));
+}
 
 #[test]
 fn filesystem_path_helpers_normalize_and_preserve_a_missing_suffix() {

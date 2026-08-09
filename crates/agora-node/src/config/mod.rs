@@ -27,6 +27,7 @@ impl NodeConfig {
             if !channel_names.insert(name) {
                 anyhow::bail!("duplicate channel name: {name}");
             }
+            channel.validate()?;
         }
 
         let mut agent_names = HashSet::new();
@@ -206,6 +207,53 @@ impl ChannelConfig {
             ChannelConfig::Telegram(config) => &mut config.proxy,
             ChannelConfig::Local(config) | ChannelConfig::Http(config) => &mut config.proxy,
         }
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        let permission = match self {
+            ChannelConfig::Lark(config) => {
+                if config.app_id.trim().is_empty() {
+                    anyhow::bail!("lark app_id must not be empty: {}", config.name);
+                }
+                if config.secret.trim().is_empty() {
+                    anyhow::bail!("lark secret must not be empty: {}", config.name);
+                }
+                &config.permission
+            }
+            ChannelConfig::Telegram(config) => {
+                if config.token.trim().is_empty() {
+                    anyhow::bail!("telegram token must not be empty: {}", config.name);
+                }
+                &config.permission
+            }
+            ChannelConfig::Local(config) => {
+                anyhow::bail!("local channel is not implemented: {}", config.name)
+            }
+            ChannelConfig::Http(config) => {
+                anyhow::bail!("http channel is not implemented: {}", config.name)
+            }
+        };
+        if permission
+            .users
+            .iter()
+            .any(|user| user.id.trim().is_empty())
+        {
+            anyhow::bail!(
+                "channel user permission id must not be empty: {}",
+                self.name()
+            );
+        }
+        if permission
+            .groups
+            .iter()
+            .any(|group| group.id.trim().is_empty())
+        {
+            anyhow::bail!(
+                "channel group permission id must not be empty: {}",
+                self.name()
+            );
+        }
+        Ok(())
     }
 }
 

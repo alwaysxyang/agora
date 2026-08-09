@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,9 @@ const LEGACY_METADATA_VERSION: u32 = 1;
 const READABLE_METADATA_VERSION: u32 = 2;
 const METADATA_VERSION: u32 = 3;
 const METADATA_CACHE_CAPACITY: usize = 1024;
+const MAX_DIRECTORY_METADATA_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DIRECTORY_METADATA_RECORDS: usize = 100_000;
+const MAX_METADATA_NAME_BYTES: usize = 4 * 1024;
 const ENCODED_NAME_PREFIX: &str = "base64:";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -600,10 +603,18 @@ impl MetadataStore {
             }
         };
         let file_metadata = file.metadata()?;
+        if file_metadata.len() > MAX_DIRECTORY_METADATA_BYTES as u64 {
+            bail!(
+                "filesystem metadata exceeds {MAX_DIRECTORY_METADATA_BYTES} bytes: {}",
+                path.display()
+            );
+        }
         let identity = Some(SourceIdentity::from_metadata(&file_metadata));
-        let mut contents = Vec::with_capacity(usize::try_from(file_metadata.len()).unwrap_or(0));
-        file.read_to_end(&mut contents)
-            .with_context(|| format!("failed to read filesystem metadata {}", path.display()))?;
+        let contents = super::read_control_file(
+            &mut file,
+            MAX_DIRECTORY_METADATA_BYTES,
+            &format!("filesystem metadata {}", path.display()),
+        )?;
         let metadata = self.decode_metadata(&contents, &path)?;
         #[cfg(test)]
         self.parse_count.fetch_add(1, Ordering::Relaxed);
@@ -742,6 +753,7 @@ impl MetadataStore {
             attributes: Self::canonical_map(stored.attributes, version)?,
             encrypted_names: Self::canonical_map(stored.backing_names, version)?,
         };
+        Self::validate_metadata_limits(&metadata, path)?;
         Self::validate_legacy_backing_names(&metadata.encrypted_names, path)?;
         Ok(metadata)
     }
@@ -753,9 +765,21 @@ impl MetadataStore {
     ) -> Result<DirectoryMetadata> {
         let stored: StoredDirectoryMetadataV3 = serde_json::from_slice(contents)
             .with_context(|| format!("failed to parse filesystem metadata {}", path.display()))?;
+        if stored.entries.len() > MAX_DIRECTORY_METADATA_RECORDS {
+            bail!(
+                "filesystem metadata exceeds {MAX_DIRECTORY_METADATA_RECORDS} records in {}",
+                path.display()
+            );
+        }
         let mut metadata = DirectoryMetadata::default();
         let mut logical_names = HashSet::new();
         for (stored_name, record) in stored.entries {
+            if stored_name.len() > MAX_METADATA_NAME_BYTES {
+                bail!(
+                    "filesystem metadata name exceeds {MAX_METADATA_NAME_BYTES} bytes in {}",
+                    path.display()
+                );
+            }
             let encrypted = stored_name.starts_with(super::crypto::ENCRYPTED_NAME_PREFIX);
             if !encrypted && record.entry.is_none() && record.attributes.is_none() {
                 bail!(
@@ -806,6 +830,9 @@ impl MetadataStore {
             .chain(metadata.encrypted_names.keys())
             .cloned()
             .collect::<BTreeSet<_>>();
+        if names.len() > MAX_DIRECTORY_METADATA_RECORDS {
+            bail!("filesystem metadata exceeds {MAX_DIRECTORY_METADATA_RECORDS} records");
+        }
         let mut entries = BTreeMap::new();
         for logical_name in names {
             let stored_name =
@@ -817,6 +844,9 @@ impl MetadataStore {
                 } else {
                     Self::storage_name(&logical_name)?
                 };
+            if stored_name.len() > MAX_METADATA_NAME_BYTES {
+                bail!("filesystem metadata name exceeds {MAX_METADATA_NAME_BYTES} bytes");
+            }
             let record = StoredMetadataRecord {
                 entry: metadata.entries.get(&logical_name).cloned(),
                 attributes: metadata.attributes.get(&logical_name).cloned(),
@@ -825,11 +855,40 @@ impl MetadataStore {
                 bail!("duplicate filesystem metadata record {stored_name:?}");
             }
         }
-        serde_json::to_vec_pretty(&StoredDirectoryMetadataV3 {
+        let contents = serde_json::to_vec_pretty(&StoredDirectoryMetadataV3 {
             version: METADATA_VERSION,
             entries,
         })
-        .context("failed to serialize filesystem metadata")
+        .context("failed to serialize filesystem metadata")?;
+        if contents.len() > MAX_DIRECTORY_METADATA_BYTES {
+            bail!("filesystem metadata exceeds {MAX_DIRECTORY_METADATA_BYTES} bytes");
+        }
+        Ok(contents)
+    }
+
+    fn validate_metadata_limits(metadata: &DirectoryMetadata, path: &Path) -> Result<()> {
+        let names = metadata
+            .entries
+            .keys()
+            .chain(metadata.attributes.keys())
+            .chain(metadata.encrypted_names.keys())
+            .collect::<BTreeSet<_>>();
+        if names.len() > MAX_DIRECTORY_METADATA_RECORDS {
+            bail!(
+                "filesystem metadata exceeds {MAX_DIRECTORY_METADATA_RECORDS} records in {}",
+                path.display()
+            );
+        }
+        if names
+            .iter()
+            .any(|name| name.len() > MAX_METADATA_NAME_BYTES)
+        {
+            bail!(
+                "filesystem metadata name exceeds {MAX_METADATA_NAME_BYTES} bytes in {}",
+                path.display()
+            );
+        }
+        Ok(())
     }
 
     fn validate_legacy_backing_names(

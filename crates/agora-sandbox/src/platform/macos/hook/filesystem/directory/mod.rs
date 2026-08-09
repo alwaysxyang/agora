@@ -868,6 +868,11 @@ fn original_chdir() -> Option<ChdirFn> {
     function_from_interpose(&INTERPOSE_CHDIR)
 }
 
+pub(super) fn change_directory_native(path: &CStr) -> Result<()> {
+    let original = original_chdir().context("native chdir is unavailable")?;
+    native_operation_result(unsafe { original(path.as_ptr()) })
+}
+
 fn original_fchdir() -> Option<FchdirFn> {
     function_from_interpose(&INTERPOSE_FCHDIR)
 }

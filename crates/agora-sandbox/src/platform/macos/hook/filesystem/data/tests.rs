@@ -78,3 +78,13 @@ fn sequential_write_ranges_cover_concurrent_shared_offset_progress() {
         Some((0, 20))
     );
 }
+
+#[test]
+fn positional_write_reservations_remain_conservative_on_length_overflow() {
+    assert_eq!(
+        positional_write_reservation(8, usize::MAX),
+        LocalByteRange::new(8, u64::MAX).ok()
+    );
+    assert_eq!(positional_write_reservation(-1, 1), None);
+    assert_eq!(positional_write_reservation(8, 0), None);
+}

@@ -48,7 +48,7 @@ use super::{
     agora_sandbox_utimensat as sandbox_utimensat, agora_sandbox_utimes as sandbox_utimes,
     catch_filesystem_panic, configure_descriptor, error_errno, flush_at_exit, flush_before_exec,
     insert_dirty_range, intent_from_fopen_mode, sandbox_descriptor_mutation,
-    sandbox_unsupported_path_mutation, with_test_runtime,
+    sandbox_unsupported_path_mutation, truncate_reservation, with_test_runtime,
 };
 use crate::audit::AuditClient;
 use crate::filesystem::{EntryState, FileAttributes, FileLayer};
@@ -71,6 +71,14 @@ struct Fixture {
     directory: PathBuf,
     lower: PathBuf,
     runtime: FilesystemHookRuntime,
+}
+
+#[test]
+fn truncate_reservations_cover_the_changed_extent() {
+    assert_eq!(truncate_reservation(8, 3), LocalByteRange::new(3, 8).ok());
+    assert_eq!(truncate_reservation(3, 8), LocalByteRange::new(3, 8).ok());
+    assert_eq!(truncate_reservation(3, 3), None);
+    assert_eq!(truncate_reservation(3, -1), None);
 }
 
 impl Fixture {
@@ -2474,6 +2482,7 @@ fn content_mutating_fcntl_is_rejected_for_managed_descriptors() {
                 handle: "local-handle".to_string(),
                 writable: true,
                 dirty: std::sync::Mutex::new(Vec::new()),
+                mutation: std::sync::Mutex::new(()),
             });
         }
         assert_eq!(

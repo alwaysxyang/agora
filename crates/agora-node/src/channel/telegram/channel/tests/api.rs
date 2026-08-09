@@ -38,7 +38,7 @@ async fn telegram_api_uses_an_authenticated_http_proxy() {
 async fn telegram_api_gets_identity_and_polls_message_updates() {
     let server = HttpMockServer::start_json_queue([
         r#"{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}}"#,
-        r#"{"ok":true,"result":[{"update_id":201,"message":{"message_id":9,"chat":{"id":1,"type":"private"},"text":"hello"}}]}"#,
+        r#"{"ok":true,"result":[{"update_id":201,"message":{"message_id":9,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"text":"hello"}}]}"#,
     ])
     .await;
     let api = TelegramApi::with_base_url(telegram_config(), server.base_url()).unwrap();
@@ -289,12 +289,12 @@ async fn telegram_channel_returns_supported_updates_in_order_and_advances_offset
         r#"{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"Agora","username":"agora_bot"}}"#,
         r#"{"ok":true,"result":true}"#,
         r#"{"ok":true,"result":[
-            {"update_id":301,"message":{"message_id":21,"chat":{"id":1,"type":"private"},"text":"first"}},
-            {"update_id":302,"message":{"message_id":22,"chat":{"id":1,"type":"private"},"text":"   "}},
-            {"update_id":303,"message":{"message_id":23,"message_thread_id":44,"chat":{"id":-1001,"type":"supergroup"},"text":"second"}}
+            {"update_id":301,"message":{"message_id":21,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"text":"first"}},
+            {"update_id":302,"message":{"message_id":22,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"text":"   "}},
+            {"update_id":303,"message":{"message_id":23,"from":{"id":42,"is_bot":false},"message_thread_id":44,"chat":{"id":-1001,"type":"supergroup"},"text":"second"}}
         ]}"#,
         r#"{"ok":true,"result":[
-            {"update_id":304,"message":{"message_id":24,"chat":{"id":1,"type":"private"},"text":"third"}}
+            {"update_id":304,"message":{"message_id":24,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"text":"third"}}
         ]}"#,
     ])
     .await;
@@ -331,7 +331,7 @@ async fn telegram_channel_downloads_the_largest_photo_as_an_attachment() {
         ),
         ("POST", "setMyCommands") => MockResponse::json(r#"{"ok":true,"result":true}"#),
         ("POST", "getUpdates") => MockResponse::json(
-            r#"{"ok":true,"result":[{"update_id":305,"message":{"message_id":25,"chat":{"id":1,"type":"private"},"caption":"inspect","photo":[{"file_id":"small"},{"file_id":"large"}]}}]}"#,
+            r#"{"ok":true,"result":[{"update_id":305,"message":{"message_id":25,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"caption":"inspect","photo":[{"file_id":"small"},{"file_id":"large"}]}}]}"#,
         ),
         ("POST", "getFile") => MockResponse::json(
             r#"{"ok":true,"result":{"file_id":"large","file_unique_id":"unique","file_path":"photos/image.jpg"}}"#,
@@ -381,7 +381,7 @@ async fn telegram_channel_retries_an_image_update_without_advancing_its_offset()
         ),
         "setMyCommands" => MockResponse::json(r#"{"ok":true,"result":true}"#),
         "getUpdates" => MockResponse::json(
-            r#"{"ok":true,"result":[{"update_id":305,"message":{"message_id":25,"chat":{"id":1,"type":"private"},"caption":"inspect","photo":[{"file_id":"large"}]}}]}"#,
+            r#"{"ok":true,"result":[{"update_id":305,"message":{"message_id":25,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"caption":"inspect","photo":[{"file_id":"large"}]}}]}"#,
         ),
         "getFile" if attempts.fetch_add(1, Ordering::Relaxed) < 3 => MockResponse::json(
             r#"{"ok":false,"error_code":500,"description":"temporary failure"}"#,
@@ -421,8 +421,8 @@ async fn telegram_channel_skips_a_permanently_invalid_image_update() {
         "setMyCommands" => MockResponse::json(r#"{"ok":true,"result":true}"#),
         "getUpdates" => MockResponse::json(
             r#"{"ok":true,"result":[
-                {"update_id":305,"message":{"message_id":25,"chat":{"id":1,"type":"private"},"photo":[{"file_id":"invalid"}]}},
-                {"update_id":306,"message":{"message_id":26,"chat":{"id":1,"type":"private"},"text":"after invalid image"}}
+                {"update_id":305,"message":{"message_id":25,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"photo":[{"file_id":"invalid"}]}},
+                {"update_id":306,"message":{"message_id":26,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"text":"after invalid image"}}
             ]}"#,
         ),
         "getFile" => MockResponse::json(
@@ -455,8 +455,8 @@ async fn telegram_channel_stops_retrying_a_transient_image_failure() {
         "setMyCommands" => MockResponse::json(r#"{"ok":true,"result":true}"#),
         "getUpdates" => MockResponse::json(
             r#"{"ok":true,"result":[
-                {"update_id":305,"message":{"message_id":25,"chat":{"id":1,"type":"private"},"photo":[{"file_id":"temporary"}]}},
-                {"update_id":306,"message":{"message_id":26,"chat":{"id":1,"type":"private"},"text":"after retries"}}
+                {"update_id":305,"message":{"message_id":25,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"photo":[{"file_id":"temporary"}]}},
+                {"update_id":306,"message":{"message_id":26,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"text":"after retries"}}
             ]}"#,
         ),
         "getFile" => MockResponse::json(
@@ -489,8 +489,8 @@ async fn telegram_channel_skips_an_oversized_image_without_retrying() {
         "setMyCommands" => MockResponse::json(r#"{"ok":true,"result":true}"#),
         "getUpdates" => MockResponse::json(
             r#"{"ok":true,"result":[
-                {"update_id":305,"message":{"message_id":25,"chat":{"id":1,"type":"private"},"photo":[{"file_id":"oversized"}]}},
-                {"update_id":306,"message":{"message_id":26,"chat":{"id":1,"type":"private"},"text":"after oversized image"}}
+                {"update_id":305,"message":{"message_id":25,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"photo":[{"file_id":"oversized"}]}},
+                {"update_id":306,"message":{"message_id":26,"from":{"id":42,"is_bot":false},"chat":{"id":1,"type":"private"},"text":"after oversized image"}}
             ]}"#,
         ),
         "getFile" => MockResponse::json(
@@ -527,6 +527,7 @@ async fn telegram_channel_reports_command_reply_delivery_failures() {
             "update_id": 401,
             "message": {
                 "message_id": 31,
+                "from": {"id": 42, "is_bot": false},
                 "chat": {"id": 1, "type": "private"},
                 "text": "/help"
             }
@@ -685,6 +686,7 @@ async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
                                 "update_id": 502,
                                 "message": {
                                     "message_id": 32,
+                                    "from": {"id": 42, "is_bot": false},
                                     "chat": {"id": 1, "type": "private"},
                                     "text": "after stop"
                                 }
@@ -707,6 +709,7 @@ async fn telegram_run_button_interrupts_the_run_and_is_removed_after_stop() {
             "update_id": 500,
             "message": {
                 "message_id": 31,
+                "from": {"id": 42, "is_bot": false},
                 "chat": {"id": 1, "type": "private"},
                 "text": "run"
             }

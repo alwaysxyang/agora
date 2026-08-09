@@ -25,14 +25,15 @@ unsafe fn sandbox_write(
             return unsafe { original(descriptor, buffer, length) };
         };
         let before = current_offset(descriptor);
-        let result = unsafe { original(descriptor, buffer, length) };
-        if result > 0
-            && let Some(runtime) = FilesystemHookRuntime::global()
-            && let Some((start, end)) = sequential_write_range(descriptor, before, result)
-        {
-            runtime.record_local_write(descriptor, start, end);
+        let reserved = sequential_write_reservation(descriptor, before, length);
+        unsafe {
+            tracked_write(
+                descriptor,
+                reserved,
+                || original(descriptor, buffer, length),
+                |result| sequential_write_range(descriptor, before, result),
+            )
         }
-        result
     })
 }
 
@@ -59,15 +60,15 @@ unsafe fn sandbox_pwrite(
         let Some(_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, buffer, length, offset) };
         };
-        let result = unsafe { original(descriptor, buffer, length, offset) };
-        if result > 0
-            && offset >= 0
-            && let Some(runtime) = FilesystemHookRuntime::global()
-            && let Some(end) = (offset as u64).checked_add(result as u64)
-        {
-            runtime.record_local_write(descriptor, offset as u64, end);
+        let reserved = positional_write_reservation(offset, length);
+        unsafe {
+            tracked_write(
+                descriptor,
+                reserved,
+                || original(descriptor, buffer, length, offset),
+                |result| positional_write_range(offset, result),
+            )
         }
-        result
     })
 }
 
@@ -95,14 +96,15 @@ unsafe fn sandbox_writev(
             return unsafe { original(descriptor, vectors, count) };
         };
         let before = current_offset(descriptor);
-        let result = unsafe { original(descriptor, vectors, count) };
-        if result > 0
-            && let Some(runtime) = FilesystemHookRuntime::global()
-            && let Some((start, end)) = sequential_write_range(descriptor, before, result)
-        {
-            runtime.record_local_write(descriptor, start, end);
+        let reserved = sequential_write_reservation(descriptor, before, vector_write_length(count));
+        unsafe {
+            tracked_write(
+                descriptor,
+                reserved,
+                || original(descriptor, vectors, count),
+                |result| sequential_write_range(descriptor, before, result),
+            )
         }
-        result
     })
 }
 
@@ -129,15 +131,15 @@ unsafe fn sandbox_pwritev(
         let Some(_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, vectors, count, offset) };
         };
-        let result = unsafe { original(descriptor, vectors, count, offset) };
-        if result > 0
-            && offset >= 0
-            && let Some(runtime) = FilesystemHookRuntime::global()
-            && let Some(end) = (offset as u64).checked_add(result as u64)
-        {
-            runtime.record_local_write(descriptor, offset as u64, end);
+        let reserved = positional_write_reservation(offset, vector_write_length(count));
+        unsafe {
+            tracked_write(
+                descriptor,
+                reserved,
+                || original(descriptor, vectors, count, offset),
+                |result| positional_write_range(offset, result),
+            )
         }
-        result
     })
 }
 
@@ -181,6 +183,105 @@ fn sequential_write_range(
         return None;
     }
     Some((start, end))
+}
+
+fn sequential_write_reservation(
+    descriptor: libc::c_int,
+    before: Option<u64>,
+    length: usize,
+) -> Option<LocalByteRange> {
+    if length == 0 {
+        return None;
+    }
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags >= 0
+        && flags & libc::O_APPEND == 0
+        && let Some(start) = before
+        && let Some(end) = start.checked_add(length as u64)
+    {
+        return LocalByteRange::new(start, end).ok();
+    }
+    LocalByteRange::new(0, u64::MAX).ok()
+}
+
+fn positional_write_reservation(offset: libc::off_t, length: usize) -> Option<LocalByteRange> {
+    if length == 0 {
+        return None;
+    }
+    let start = u64::try_from(offset).ok()?;
+    let end = start.saturating_add(length as u64);
+    LocalByteRange::new(start, end).ok()
+}
+
+fn positional_write_range(offset: libc::off_t, written: libc::ssize_t) -> Option<(u64, u64)> {
+    let start = u64::try_from(offset).ok()?;
+    let end = start.checked_add(u64::try_from(written).ok()?)?;
+    (start < end).then_some((start, end))
+}
+
+fn vector_write_length(count: libc::c_int) -> usize {
+    if count > 0 { usize::MAX } else { 0 }
+}
+
+unsafe fn tracked_write(
+    descriptor: libc::c_int,
+    reserved: Option<LocalByteRange>,
+    operation: impl FnOnce() -> libc::ssize_t,
+    written_range: impl FnOnce(libc::ssize_t) -> Option<(u64, u64)>,
+) -> libc::ssize_t {
+    let Some(runtime) = FilesystemHookRuntime::global() else {
+        return operation();
+    };
+    let Some(open) = runtime.tracked_open(descriptor) else {
+        return operation();
+    };
+    let Some(registration) = &open.local else {
+        return operation();
+    };
+    if !registration.writable {
+        return operation();
+    }
+    let _mutation = lock(&registration.mutation);
+    let local = match runtime.local.as_ref() {
+        Some(local) => local,
+        None => {
+            unsafe { set_errno(libc::EIO) };
+            return -1;
+        }
+    };
+    let reservation = match reserved {
+        Some(range) => match local.begin_write(&registration.handle, range) {
+            Ok(reservation) => Some(reservation),
+            Err(error) => {
+                unsafe { set_errno(error.errno()) };
+                return -1;
+            }
+        },
+        None => None,
+    };
+    let result = operation();
+    if result > 0 {
+        let completed = written_range(result)
+            .and_then(|(start, end)| LocalByteRange::new(start, end).ok())
+            .or(reserved);
+        if let (Some(reservation), Some(range)) = (&reservation, completed) {
+            let _ = local.finish_write(&registration.handle, reservation, range);
+        }
+        if let Some(range) = completed {
+            runtime.record_local_write_locked(
+                descriptor,
+                &open,
+                registration,
+                range.start,
+                range.end,
+            );
+        }
+    } else if let Some(reservation) = &reservation {
+        let errno = unsafe { *libc::__error() };
+        let _ = local.cancel_write(&registration.handle, reservation);
+        unsafe { set_errno(errno) };
+    }
+    result
 }
 
 fn original_write() -> Option<WriteFn> {

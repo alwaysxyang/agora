@@ -2,13 +2,14 @@ use crate::callback::{CommandContext, FileContext, ProcessContext};
 use serde::{Deserialize, Serialize};
 use std::io;
 
-pub(super) const AUDIT_PROTOCOL_VERSION: u16 = 1;
+pub(super) const AUDIT_PROTOCOL_VERSION: u16 = 2;
 pub(super) const MAX_AUDIT_FRAME_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AuditRequest {
     pub(crate) version: u16,
     pub(crate) token: String,
+    pub(crate) request_id: String,
     pub(crate) event: AuditEventRequest,
 }
 
@@ -48,6 +49,7 @@ pub(crate) fn encode_request(token: &str, event: AuditEventRequest) -> io::Resul
     encode(&AuditRequest {
         version: AUDIT_PROTOCOL_VERSION,
         token: token.to_string(),
+        request_id: uuid::Uuid::new_v4().simple().to_string(),
         event,
     })
 }
@@ -59,6 +61,14 @@ pub(super) fn decode_request(frame: &[u8]) -> io::Result<AuditRequest> {
     }
     if request.token.is_empty() {
         return Err(invalid_data("audit token is empty"));
+    }
+    if request.request_id.len() != 32
+        || !request
+            .request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid_data("invalid audit request ID"));
     }
     Ok(request)
 }

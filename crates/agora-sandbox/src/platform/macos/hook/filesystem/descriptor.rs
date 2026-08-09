@@ -74,8 +74,17 @@ pub unsafe extern "C" fn agora_sandbox_truncate(
     unsafe { sandbox_truncate(path, length) }
 }
 
+#[cfg(test)]
 pub(super) unsafe fn sandbox_descriptor_mutation(
     descriptor: libc::c_int,
+    operation: impl FnOnce(libc::c_int) -> libc::c_int,
+) -> libc::c_int {
+    unsafe { sandbox_descriptor_mutation_with_truncate(descriptor, None, operation) }
+}
+
+unsafe fn sandbox_descriptor_mutation_with_truncate(
+    descriptor: libc::c_int,
+    truncate: Option<libc::off_t>,
     operation: impl FnOnce(libc::c_int) -> libc::c_int,
 ) -> libc::c_int {
     let Some(_guard) = FilesystemHookGuard::enter() else {
@@ -99,6 +108,55 @@ pub(super) unsafe fn sandbox_descriptor_mutation(
         if open.layer == FileLayer::Lower {
             unsafe { set_errno(libc::ENOTSUP) };
             return -1;
+        }
+        if let (Some(length), Some(registration)) = (truncate, &open.local)
+            && registration.writable
+        {
+            let reservation = u64::try_from(status.st_size)
+                .ok()
+                .and_then(|current| truncate_reservation(current, length));
+            let _mutation = lock(&registration.mutation);
+            let local = match runtime.local.as_ref() {
+                Some(local) => local,
+                None => {
+                    unsafe { set_errno(libc::EIO) };
+                    return -1;
+                }
+            };
+            let active = match reservation {
+                Some(range) => match local.begin_write(&registration.handle, range) {
+                    Ok(active) => Some(active),
+                    Err(error) => {
+                        unsafe { set_errno(error.errno()) };
+                        return -1;
+                    }
+                },
+                None => None,
+            };
+            let result = operation(descriptor);
+            if result != 0 {
+                let errno = unsafe { *libc::__error() };
+                if let Some(active) = &active {
+                    let _ = local.cancel_write(&registration.handle, active);
+                }
+                unsafe { set_errno(errno) };
+                return result;
+            }
+            let logical = open.logical();
+            let attributes =
+                runtime.refresh_attributes(descriptor, logical.to_string_lossy().as_ref());
+            if let Some(range) = reservation {
+                if let Some(active) = &active {
+                    let _ = local.finish_write(&registration.handle, active, range);
+                }
+                insert_dirty_range(&mut lock(&registration.dirty), range);
+            }
+            let writeback =
+                runtime.commit_local_open_file_locked(descriptor, &open, registration, false);
+            if let Err(error) = attributes.and(writeback) {
+                return unsafe { fail(&error, -1) };
+            }
+            return result;
         }
         let result = operation(descriptor);
         if result == 0 {
@@ -127,41 +185,37 @@ pub(super) unsafe fn sandbox_descriptor_mutation(
     result
 }
 
-macro_rules! descriptor_filesystem_hook {
-    (
-        $sandbox:ident, $export:ident, $original:ident, $descriptor:ident,
-        ($($argument:ident: $argument_type:ty),* $(,)?),
-        ($($call_argument:expr),* $(,)?)
-    ) => {
-        unsafe fn $sandbox($($argument: $argument_type),*) -> libc::c_int {
-            catch_filesystem_panic(-1, || match $original() {
-                Some(original) => unsafe {
-                    sandbox_descriptor_mutation($descriptor, |$descriptor| {
-                        original($($call_argument),*)
-                    })
-                },
-                None => unsafe {
-                    set_errno(libc::ENOSYS);
-                    -1
-                },
-            })
-        }
-
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn $export($($argument: $argument_type),*) -> libc::c_int {
-            unsafe { $sandbox($($argument),*) }
-        }
-    }
+pub(super) fn truncate_reservation(
+    current_length: u64,
+    requested_length: libc::off_t,
+) -> Option<LocalByteRange> {
+    let requested_length = u64::try_from(requested_length).ok()?;
+    let start = current_length.min(requested_length);
+    let end = current_length.max(requested_length);
+    LocalByteRange::new(start, end).ok()
 }
 
-descriptor_filesystem_hook!(
-    sandbox_ftruncate,
-    agora_sandbox_ftruncate,
-    original_ftruncate,
-    descriptor,
-    (descriptor: libc::c_int, length: libc::off_t),
-    (descriptor, length)
-);
+unsafe fn sandbox_ftruncate(descriptor: libc::c_int, length: libc::off_t) -> libc::c_int {
+    catch_filesystem_panic(-1, || match original_ftruncate() {
+        Some(original) => unsafe {
+            sandbox_descriptor_mutation_with_truncate(descriptor, Some(length), |descriptor| {
+                original(descriptor, length)
+            })
+        },
+        None => unsafe {
+            set_errno(libc::ENOSYS);
+            -1
+        },
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_ftruncate(
+    descriptor: libc::c_int,
+    length: libc::off_t,
+) -> libc::c_int {
+    unsafe { sandbox_ftruncate(descriptor, length) }
+}
 
 unsafe fn sandbox_close(descriptor: libc::c_int, original: Option<CloseFn>) -> libc::c_int {
     catch_filesystem_panic(-1, || {

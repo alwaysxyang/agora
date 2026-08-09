@@ -348,7 +348,12 @@ impl RemoteFilesystem {
         path.file_name()
             .and_then(|name| name.as_bytes().strip_prefix(b"anchor-"))
             .is_some_and(|identifier| {
-                identifier.len() == 32 && identifier.iter().all(u8::is_ascii_hexdigit)
+                let Some((uuid, padding)) = identifier.split_at_checked(32) else {
+                    return false;
+                };
+                uuid.iter()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+                    && padding.iter().all(|byte| *byte == b'x')
             })
     }
 

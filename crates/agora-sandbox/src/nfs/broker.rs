@@ -5,6 +5,7 @@ use crate::nfs::protocol::{
     Request, RequestId, Response,
 };
 use md5::{Digest, Md5};
+use ring::digest::{SHA256, digest};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -79,11 +80,11 @@ struct RequestCache {
 
 enum CachedRequest {
     Pending {
-        request: Request,
+        fingerprint: [u8; 32],
         waiters: Vec<oneshot::Sender<Response>>,
     },
     Completed {
-        request: Request,
+        fingerprint: [u8; 32],
         response: Response,
         completed_at: Instant,
         claimed: bool,
@@ -140,11 +141,19 @@ where
         request_id: RequestId,
         request: Request,
     ) -> BrokerReply {
+        let fingerprint = match request_fingerprint(&request) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                return protocol_reply(&format!(
+                    "failed to fingerprint remote filesystem request: {error}"
+                ));
+            }
+        };
         let decision = self
             .requests
             .lock()
             .await
-            .begin(request_id.clone(), request.clone());
+            .begin(request_id.clone(), fingerprint);
         match decision {
             CacheDecision::Execute => {
                 let reply = self.handle(request).await;
@@ -910,27 +919,27 @@ fn path_is_at_or_below(path: &RemotePath, parent: &RemotePath) -> bool {
 }
 
 impl RequestCache {
-    fn begin(&mut self, request_id: RequestId, request: Request) -> CacheDecision {
+    fn begin(&mut self, request_id: RequestId, fingerprint: [u8; 32]) -> CacheDecision {
         match self.entries.get_mut(&request_id) {
             Some(CachedRequest::Pending {
-                request: cached,
+                fingerprint: cached,
                 waiters,
-            }) if cached == &request => {
+            }) if cached == &fingerprint => {
                 let (sender, receiver) = oneshot::channel();
                 waiters.push(sender);
                 CacheDecision::Wait(receiver)
             }
             Some(CachedRequest::Completed {
-                request: cached,
+                fingerprint: cached,
                 response,
                 ..
-            }) if cached == &request => CacheDecision::Replay(response.clone()),
+            }) if cached == &fingerprint => CacheDecision::Replay(response.clone()),
             Some(_) => CacheDecision::Reject,
             None => {
                 self.entries.insert(
                     request_id,
                     CachedRequest::Pending {
-                        request,
+                        fingerprint,
                         waiters: Vec::new(),
                     },
                 );
@@ -940,7 +949,10 @@ impl RequestCache {
     }
 
     fn complete(&mut self, request_id: RequestId, response: Response) -> Vec<AbandonedResource> {
-        let Some(CachedRequest::Pending { request, waiters }) = self.entries.remove(&request_id)
+        let Some(CachedRequest::Pending {
+            fingerprint,
+            waiters,
+        }) = self.entries.remove(&request_id)
         else {
             return Vec::new();
         };
@@ -950,7 +962,7 @@ impl RequestCache {
         self.entries.insert(
             request_id,
             CachedRequest::Completed {
-                request,
+                fingerprint,
                 claimed: !response_has_resource(&response),
                 response,
                 completed_at: Instant::now(),
@@ -1036,6 +1048,14 @@ impl RequestCache {
             })
             .collect()
     }
+}
+
+fn request_fingerprint(request: &Request) -> Result<[u8; 32], serde_json::Error> {
+    let encoded = serde_json::to_vec(request)?;
+    let digest = digest(&SHA256, &encoded);
+    let mut fingerprint = [0_u8; 32];
+    fingerprint.copy_from_slice(digest.as_ref());
+    Ok(fingerprint)
 }
 
 fn response_has_resource(response: &Response) -> bool {

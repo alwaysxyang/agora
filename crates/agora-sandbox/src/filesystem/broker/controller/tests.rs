@@ -50,7 +50,17 @@ async fn controller_serves_the_complete_local_client_lifecycle() {
     let descriptor = plaintext.as_raw_fd();
     let handle = tokio::task::spawn_blocking(move || {
         let opened = client.open(&backing, descriptor, true).unwrap();
+        let write = client
+            .begin_write(&opened.handle, ByteRange::new(0, 6).unwrap())
+            .unwrap();
         plaintext.write_all_at(b"after!", 0).unwrap();
+        client
+            .finish_write(&opened.handle, &write, ByteRange::new(0, 6).unwrap())
+            .unwrap();
+        let cancelled = client
+            .begin_write(&opened.handle, ByteRange::new(0, 1).unwrap())
+            .unwrap();
+        client.cancel_write(&opened.handle, &cancelled).unwrap();
         client
             .potentially_dirty(&opened.handle, ByteRange::new(0, 6).unwrap())
             .unwrap();
@@ -183,7 +193,7 @@ async fn server_shutdown_waits_for_an_accepted_request() {
             &RequestEnvelope {
                 version: PROTOCOL_VERSION,
                 token,
-                request_id: "accepted-during-shutdown".to_string(),
+                request_id: "0".repeat(32),
                 request: Request::Close {
                     handle: "missing".to_string(),
                 },
@@ -217,6 +227,10 @@ async fn controller_rejects_wrong_tokens_versions_and_unexpected_descriptors() {
 
     let socket = controller.runtime().socket().to_path_buf();
     let token = controller.runtime().token().to_string();
+    let invalid_id_socket = socket.clone();
+    let invalid_id_token = token.clone();
+    let invalid_write_socket = socket.clone();
+    let invalid_write_token = token.clone();
     let response = tokio::task::spawn_blocking(move || {
         let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
         ipc::send(
@@ -230,6 +244,62 @@ async fn controller_rejects_wrong_tokens_versions_and_unexpected_descriptors() {
                 },
             },
             Some(tempfile::tempfile().unwrap().as_raw_fd()),
+        )
+        .unwrap();
+        ipc::receive::<ResponseEnvelope>(&mut stream).unwrap().0
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        response.response,
+        Response::Error {
+            errno: libc::EPROTO,
+            ..
+        }
+    ));
+
+    let response = tokio::task::spawn_blocking(move || {
+        let mut stream = std::os::unix::net::UnixStream::connect(invalid_id_socket).unwrap();
+        ipc::send(
+            &mut stream,
+            &RequestEnvelope {
+                version: PROTOCOL_VERSION,
+                token: invalid_id_token,
+                request_id: "not-a-request-id".to_string(),
+                request: Request::Close {
+                    handle: "missing".to_string(),
+                },
+            },
+            None,
+        )
+        .unwrap();
+        ipc::receive::<ResponseEnvelope>(&mut stream).unwrap().0
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        response.response,
+        Response::Error {
+            errno: libc::EPROTO,
+            ..
+        }
+    ));
+
+    let response = tokio::task::spawn_blocking(move || {
+        let mut stream = std::os::unix::net::UnixStream::connect(invalid_write_socket).unwrap();
+        ipc::send(
+            &mut stream,
+            &RequestEnvelope {
+                version: PROTOCOL_VERSION,
+                token: invalid_write_token,
+                request_id: "11111111111111111111111111111111".to_string(),
+                request: Request::BeginWrite {
+                    handle: "missing".to_string(),
+                    write_id: "invalid".to_string(),
+                    range: ByteRange::new(0, 1).unwrap(),
+                },
+            },
+            None,
         )
         .unwrap();
         ipc::receive::<ResponseEnvelope>(&mut stream).unwrap().0

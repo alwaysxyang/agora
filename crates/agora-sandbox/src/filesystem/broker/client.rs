@@ -21,10 +21,15 @@ pub(crate) struct LocalOpen {
     pub(crate) handle: String,
 }
 
+pub(crate) struct LocalWrite {
+    id: String,
+}
+
 #[derive(Debug)]
 pub(crate) struct LocalClientError {
     errno: libc::c_int,
     message: String,
+    retryable: bool,
 }
 
 impl LocalClient {
@@ -41,19 +46,31 @@ impl LocalClient {
         descriptor: RawFd,
         writable: bool,
     ) -> Result<LocalOpen, LocalClientError> {
-        match self.request(
+        let request_id = uuid::Uuid::new_v4().simple().to_string();
+        let response = self.request_with_id(
+            request_id.clone(),
             Request::Open {
                 path: BackingPath::from_path(path),
                 writable,
             },
             Some(descriptor),
-            1,
-        )? {
-            Response::Open { handle } => Ok(LocalOpen { handle }),
-            _ => Err(LocalClientError::protocol(
+            IDEMPOTENT_ATTEMPTS,
+        )?;
+        let Response::Open { handle } = response else {
+            return Err(LocalClientError::protocol(
                 "local filesystem open returned an unexpected response",
-            )),
+            ));
+        };
+        if let Err(error) = self.success(Request::Claim { request_id }, IDEMPOTENT_ATTEMPTS) {
+            let _ = self.success(
+                Request::Abort {
+                    handle: handle.clone(),
+                },
+                IDEMPOTENT_ATTEMPTS,
+            );
+            return Err(error);
         }
+        Ok(LocalOpen { handle })
     }
 
     pub(crate) fn sync(
@@ -86,12 +103,59 @@ impl LocalClient {
         )
     }
 
+    pub(crate) fn begin_write(
+        &self,
+        handle: &str,
+        range: ByteRange,
+    ) -> Result<LocalWrite, LocalClientError> {
+        let write_id = uuid::Uuid::new_v4().simple().to_string();
+        self.success(
+            Request::BeginWrite {
+                handle: handle.to_string(),
+                write_id: write_id.clone(),
+                range,
+            },
+            IDEMPOTENT_ATTEMPTS,
+        )?;
+        Ok(LocalWrite { id: write_id })
+    }
+
+    pub(crate) fn finish_write(
+        &self,
+        handle: &str,
+        write: &LocalWrite,
+        range: ByteRange,
+    ) -> Result<(), LocalClientError> {
+        self.success(
+            Request::FinishWrite {
+                handle: handle.to_string(),
+                write_id: write.id.clone(),
+                range,
+            },
+            IDEMPOTENT_ATTEMPTS,
+        )
+    }
+
+    pub(crate) fn cancel_write(
+        &self,
+        handle: &str,
+        write: &LocalWrite,
+    ) -> Result<(), LocalClientError> {
+        self.success(
+            Request::CancelWrite {
+                handle: handle.to_string(),
+                write_id: write.id.clone(),
+            },
+            IDEMPOTENT_ATTEMPTS,
+        )
+    }
+
     pub(crate) fn close(&self, handle: &str) -> Result<(), LocalClientError> {
         self.success(
             Request::Close {
                 handle: handle.to_string(),
             },
-            1,
+            IDEMPOTENT_ATTEMPTS,
         )
     }
 
@@ -99,7 +163,14 @@ impl LocalClient {
         if handles.is_empty() {
             return Ok(());
         }
-        self.success(Request::Retain { handles }, 1)
+        self.success(Request::Retain { handles }, IDEMPOTENT_ATTEMPTS)
+    }
+
+    pub(crate) fn release_retained(&self, handles: Vec<String>) -> Result<(), LocalClientError> {
+        if handles.is_empty() {
+            return Ok(());
+        }
+        self.success(Request::ReleaseRetain { handles }, IDEMPOTENT_ATTEMPTS)
     }
 
     fn success(&self, request: Request, attempts: usize) -> Result<(), LocalClientError> {
@@ -118,11 +189,22 @@ impl LocalClient {
         attempts: usize,
     ) -> Result<Response, LocalClientError> {
         let request_id = uuid::Uuid::new_v4().simple().to_string();
+        self.request_with_id(request_id, request, descriptor, attempts)
+    }
+
+    fn request_with_id(
+        &self,
+        request_id: String,
+        request: Request,
+        descriptor: Option<RawFd>,
+        attempts: usize,
+    ) -> Result<Response, LocalClientError> {
         let mut last = None;
         for _ in 0..attempts {
             match self.request_once(request_id.clone(), request.clone(), descriptor) {
                 Ok(response) => return Ok(response),
-                Err(error) => last = Some(error),
+                Err(error) if error.retryable => last = Some(error),
+                Err(error) => return Err(error),
             }
         }
         Err(last.expect("local request attempts is non-zero"))
@@ -135,13 +217,13 @@ impl LocalClient {
         descriptor: Option<RawFd>,
     ) -> Result<Response, LocalClientError> {
         let mut stream = UnixStream::connect(&self.socket).map_err(|error| {
-            LocalClientError::io("failed to connect to local filesystem broker", error)
+            LocalClientError::io("failed to connect to local filesystem broker", error, true)
         })?;
         stream
             .set_read_timeout(Some(CLIENT_TIMEOUT))
             .and_then(|()| stream.set_write_timeout(Some(CLIENT_TIMEOUT)))
             .map_err(|error| {
-                LocalClientError::io("failed to configure local filesystem broker", error)
+                LocalClientError::io("failed to configure local filesystem broker", error, false)
             })?;
         ipc::send(
             &mut stream,
@@ -153,10 +235,12 @@ impl LocalClient {
             },
             descriptor,
         )
-        .map_err(|error| LocalClientError::io("failed to send local filesystem request", error))?;
+        .map_err(|error| {
+            LocalClientError::io("failed to send local filesystem request", error, true)
+        })?;
         let (response, descriptor) =
             ipc::receive::<ResponseEnvelope>(&mut stream).map_err(|error| {
-                LocalClientError::io("failed to receive local filesystem response", error)
+                LocalClientError::io("failed to receive local filesystem response", error, true)
             })?;
         if descriptor.is_some() {
             return Err(LocalClientError::protocol(
@@ -169,7 +253,11 @@ impl LocalClient {
             ));
         }
         match response.response {
-            Response::Error { errno, message } => Err(LocalClientError { errno, message }),
+            Response::Error { errno, message } => Err(LocalClientError {
+                errno,
+                message,
+                retryable: false,
+            }),
             response => Ok(response),
         }
     }
@@ -180,13 +268,15 @@ impl LocalClientError {
         Self {
             errno: libc::EPROTO,
             message: message.into(),
+            retryable: false,
         }
     }
 
-    fn io(context: &str, error: std::io::Error) -> Self {
+    fn io(context: &str, error: std::io::Error, retryable: bool) -> Self {
         Self {
             errno: error.raw_os_error().unwrap_or(libc::EIO),
             message: format!("{context}: {error}"),
+            retryable,
         }
     }
 

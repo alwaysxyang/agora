@@ -20,6 +20,24 @@ fn metadata_store_creates_and_validates_directory_markers() {
 }
 
 #[test]
+fn metadata_store_rejects_oversized_control_files_before_reading_them() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.join(".metadata"))
+        .unwrap()
+        .set_len((super::MAX_DIRECTORY_METADATA_BYTES + 1) as u64)
+        .unwrap();
+    store.invalidate().unwrap();
+
+    let error = store.state(Path::new("/entry")).unwrap_err();
+
+    assert!(error.to_string().contains("metadata exceeds"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn metadata_store_rejects_a_directory_as_a_marker() {
     let root = tempfile();
     let store = MetadataStore::new(&root).unwrap();

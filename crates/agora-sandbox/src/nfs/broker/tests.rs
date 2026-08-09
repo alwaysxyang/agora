@@ -1206,26 +1206,28 @@ async fn request_cache_waiters_capacity_and_tombstones_are_bounded() {
         path: path("file.txt"),
         mode: libc::R_OK,
     };
+    let fingerprint = request_fingerprint(&request).unwrap();
     assert!(matches!(
-        cache.begin(id.clone(), request.clone()),
+        cache.begin(id.clone(), fingerprint),
         CacheDecision::Execute
     ));
-    let CacheDecision::Wait(waiter) = cache.begin(id.clone(), request.clone()) else {
+    let CacheDecision::Wait(waiter) = cache.begin(id.clone(), fingerprint) else {
         panic!("duplicate pending request must wait");
     };
     assert!(cache.complete(id.clone(), Response::Success).is_empty());
     assert_eq!(waiter.await.unwrap(), Response::Success);
     assert!(matches!(
-        cache.begin(id.clone(), request.clone()),
+        cache.begin(id.clone(), fingerprint),
         CacheDecision::Replay(Response::Success)
     ));
     assert!(matches!(
         cache.begin(
             id,
-            Request::Access {
+            request_fingerprint(&Request::Access {
                 path: path("different"),
                 mode: libc::R_OK,
-            }
+            })
+            .unwrap()
         ),
         CacheDecision::Reject
     ));
@@ -1241,7 +1243,7 @@ async fn request_cache_waiters_capacity_and_tombstones_are_bounded() {
         cache.entries.insert(
             request_id(10_000 + value as u128),
             CachedRequest::Completed {
-                request: request.clone(),
+                fingerprint,
                 response: Response::Success,
                 completed_at: Instant::now() + Duration::from_nanos(value as u64),
                 claimed: true,

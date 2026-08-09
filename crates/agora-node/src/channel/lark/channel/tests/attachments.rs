@@ -193,3 +193,50 @@ async fn rejects_lark_post_images_above_the_cumulative_attachment_limit() {
 
     assert!(error.to_string().contains("maximum 4 bytes"));
 }
+
+#[tokio::test]
+async fn rejects_excessive_lark_image_counts_before_downloading() {
+    let mut event = match LarkEvent::from_lark_event_payload(
+        r#"{
+            "schema": "2.0",
+            "header": {"event_id": "evt_many_images", "event_type": "im.message.receive_v1"},
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_123"}},
+                "message": {
+                    "message_id": "om_many_images",
+                    "chat_id": "oc_123",
+                    "chat_type": "group",
+                    "message_type": "post",
+                    "content": "{\"title\":\"\",\"content\":[[{\"tag\":\"text\",\"text\":\"images\"}]]}"
+                }
+            }
+        }"#,
+    )
+    .unwrap()
+    {
+        LarkEvent::Message(event) => event,
+        _ => panic!("receive event should contain a message"),
+    };
+    event.image_keys = (0..17).map(|index| format!("image-{index}")).collect();
+    let api = LarkApi::with_base_url(
+        LarkChannelConfig {
+            name: "lark-test".to_string(),
+            app_id: "app-id".to_string(),
+            secret: "secret".to_string(),
+            permission: Default::default(),
+            proxy: None,
+        },
+        "http://127.0.0.1:1".to_string(),
+    )
+    .unwrap();
+    let channel = LarkChannel::with_api(api);
+
+    let error = channel.task_from_event(event).await.unwrap_err();
+
+    assert!(error.to_string().contains("at most 16 images"));
+    assert!(
+        error
+            .downcast_ref::<LarkImageDownloadError>()
+            .is_some_and(LarkImageDownloadError::is_permanent)
+    );
+}

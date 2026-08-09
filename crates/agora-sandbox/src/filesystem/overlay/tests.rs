@@ -699,6 +699,27 @@ fn encrypted_writeback_rejects_invalid_or_stale_lease_destinations() {
         None
     );
 
+    let oversized = tempfile::tempfile().unwrap();
+    oversized
+        .set_len((super::super::MAX_CONTROL_PATH_BYTES + 1) as u64)
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .publish_encrypted(&mut plaintext, &oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("write lease path exceeds")
+    );
+
+    let oversized_destination = PathBuf::from("x".repeat(super::super::MAX_CONTROL_PATH_BYTES + 1));
+    assert!(
+        OverlayStore::write_write_lease_destination(&empty, &oversized_destination)
+            .unwrap_err()
+            .to_string()
+            .contains("write lease path exceeds")
+    );
+
     let outside = fixture.directory.join("outside");
     let outside_lease = tempfile::tempfile().unwrap();
     OverlayStore::write_write_lease_destination(&outside_lease, &outside).unwrap();
@@ -1149,6 +1170,23 @@ fn interrupted_unlink_recovery_never_reveals_the_lower_file() {
             .join(crate::filesystem::namespace::NAMESPACE_JOURNAL_FILE)
             .exists()
     );
+}
+
+#[test]
+fn namespace_recovery_rejects_an_oversized_journal_before_reading_it() {
+    let fixture = Fixture::new();
+    let journal = fixture
+        .store
+        .root()
+        .join(crate::filesystem::namespace::NAMESPACE_JOURNAL_FILE);
+    std::fs::File::create(&journal)
+        .unwrap()
+        .set_len((super::MAX_NAMESPACE_JOURNAL_BYTES + 1) as u64)
+        .unwrap();
+
+    let error = fixture.store.read_namespace_journal().unwrap_err();
+
+    assert!(error.to_string().contains("journal exceeds"));
 }
 
 #[test]

@@ -25,8 +25,10 @@ use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
+use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 const NATIVE_PASSTHROUGH_ROOTS: &[&str] = &["/dev"];
 const INHERITED_LOCAL_DESCRIPTOR_VERSION: u8 = 1;
@@ -40,10 +42,12 @@ thread_local! {
     static TEST_FILESYSTEM_RUNTIME: Cell<*const FilesystemHookRuntime> = const { Cell::new(std::ptr::null()) };
 }
 
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
 static FILESYSTEM_FORK_BARRIER_REGISTRATION: Once = Once::new();
 static mut FILESYSTEM_FORK_BARRIER: libc::pthread_rwlock_t = libc::PTHREAD_RWLOCK_INITIALIZER;
 
-pub(super) fn initialize_process() {
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
+pub(super) fn initialize_process() -> Result<()> {
     FILESYSTEM_FORK_BARRIER_REGISTRATION.call_once(|| unsafe {
         libc::pthread_atfork(
             Some(lock_filesystem_before_fork),
@@ -51,8 +55,13 @@ pub(super) fn initialize_process() {
             Some(reset_filesystem_after_fork),
         );
     });
+    if config::global().is_some() && FilesystemHookRuntime::global().is_none() {
+        anyhow::bail!("failed to initialize the filesystem hook runtime");
+    }
+    Ok(())
 }
 
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
 unsafe extern "C" fn lock_filesystem_before_fork() {
     FORK_IN_PROGRESS.with(|forking| forking.set(true));
     unsafe {
@@ -60,6 +69,7 @@ unsafe extern "C" fn lock_filesystem_before_fork() {
     }
 }
 
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
 unsafe extern "C" fn unlock_filesystem_after_fork() {
     unsafe {
         libc::pthread_rwlock_unlock(&raw mut FILESYSTEM_FORK_BARRIER);
@@ -67,6 +77,7 @@ unsafe extern "C" fn unlock_filesystem_after_fork() {
     FORK_IN_PROGRESS.with(|forking| forking.set(false));
 }
 
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
 unsafe extern "C" fn reset_filesystem_after_fork() {
     unsafe {
         std::ptr::write(
@@ -211,6 +222,7 @@ struct LocalRegistration {
     handle: String,
     writable: bool,
     dirty: Mutex<Vec<LocalByteRange>>,
+    mutation: Mutex<()>,
 }
 
 type MetadataMapping = (
@@ -844,6 +856,7 @@ impl FilesystemHookRuntime {
                         handle: opened.handle,
                         writable,
                         dirty: Mutex::new(Vec::new()),
+                        mutation: Mutex::new(()),
                     });
                 }
                 Ok(())
@@ -929,9 +942,9 @@ impl FilesystemHookRuntime {
         lock(&self.open_files).get(&descriptor).cloned()
     }
 
-    pub(super) fn retain_local_files_after_fork(&self) -> Result<()> {
+    pub(super) fn retain_local_files_before_fork(&self) -> Result<Vec<String>> {
         let Some(local) = &self.local else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let mut handles = lock(&self.open_files)
             .values()
@@ -946,7 +959,15 @@ impl FilesystemHookRuntime {
         }));
         handles.sort_unstable();
         handles.dedup();
-        local.retain(handles)?;
+        local.retain(handles.clone())?;
+        Ok(handles)
+    }
+
+    pub(super) fn release_local_files_after_failed_fork(&self, handles: Vec<String>) -> Result<()> {
+        let Some(local) = &self.local else {
+            return Ok(());
+        };
+        local.release_retained(handles)?;
         Ok(())
     }
 
@@ -1059,6 +1080,7 @@ impl FilesystemHookRuntime {
                             handle: inherited.handle,
                             writable: inherited.writable,
                             dirty: Mutex::new(Vec::new()),
+                            mutation: Mutex::new(()),
                         }),
                         remote: None,
                         layer: FileLayer::Upper,
@@ -1093,13 +1115,14 @@ impl FilesystemHookRuntime {
         Ok(())
     }
 
-    fn record_local_write(&self, descriptor: libc::c_int, start: u64, end: u64) {
-        let Some(open) = self.tracked_open(descriptor) else {
-            return;
-        };
-        let Some(registration) = &open.local else {
-            return;
-        };
+    fn record_local_write_locked(
+        &self,
+        descriptor: libc::c_int,
+        open: &OpenFile,
+        registration: &LocalRegistration,
+        start: u64,
+        end: u64,
+    ) {
         if !registration.writable || start >= end {
             return;
         }
@@ -1107,7 +1130,7 @@ impl FilesystemHookRuntime {
             return;
         };
         insert_dirty_range(&mut lock(&registration.dirty), range);
-        let _ = self.commit_open_file(descriptor, &open, false);
+        let _ = self.commit_local_open_file_locked(descriptor, open, registration, false);
     }
 
     fn commit_open_file(
@@ -1117,18 +1140,8 @@ impl FilesystemHookRuntime {
         durable: bool,
     ) -> Result<()> {
         if let Some(registration) = &open.local {
-            let local = self
-                .local
-                .as_ref()
-                .context("local filesystem runtime is unavailable")?;
-            let mut dirty = lock(&registration.dirty);
-            local.sync(&registration.handle, dirty.clone(), durable)?;
-            dirty.clear();
-            return if descriptor >= 0 {
-                self.refresh_open_attributes(descriptor, open)
-            } else {
-                Ok(())
-            };
+            let _mutation = lock(&registration.mutation);
+            return self.commit_local_open_file_locked(descriptor, open, registration, durable);
         }
         if let Some(registration) = &open.remote {
             let remote = self
@@ -1215,6 +1228,27 @@ impl FilesystemHookRuntime {
                 })?;
         }
         Ok(())
+    }
+
+    fn commit_local_open_file_locked(
+        &self,
+        descriptor: libc::c_int,
+        open: &OpenFile,
+        registration: &LocalRegistration,
+        durable: bool,
+    ) -> Result<()> {
+        let local = self
+            .local
+            .as_ref()
+            .context("local filesystem runtime is unavailable")?;
+        let mut dirty = lock(&registration.dirty);
+        local.sync(&registration.handle, dirty.clone(), durable)?;
+        dirty.clear();
+        if descriptor >= 0 {
+            self.refresh_open_attributes(descriptor, open)
+        } else {
+            Ok(())
+        }
     }
 
     fn refresh_attributes(&self, descriptor: libc::c_int, path: &str) -> Result<()> {
@@ -1547,6 +1581,23 @@ impl FilesystemHookRuntime {
         self.synchronize_current_directory()
     }
 
+    fn prepare_child_current_directory(&self) -> Result<Option<PathBuf>> {
+        let current = {
+            let current = lock(&self.current_directory);
+            (current.logical.clone(), current.remote)
+        };
+        if Self::native_current_directory(&self.filesystem).is_err() {
+            let requested = CString::new(current.0.as_os_str().as_bytes())
+                .context("logical current directory contains NUL")?;
+            let (mapped, logical, remote, anchor) =
+                self.prepare_change_directory(requested.as_ptr())?;
+            directory::change_directory_native(mapped.as_c_str())?;
+            self.set_current_directory_state(logical, remote, anchor);
+        }
+        let current = lock(&self.current_directory);
+        Ok(current.remote.then(|| current.logical.clone()))
+    }
+
     fn descriptor_logical_path(&self, descriptor: libc::c_int) -> Option<PathBuf> {
         self.tracked_open(descriptor)
             .map(|open| open.logical())
@@ -1678,11 +1729,15 @@ pub(super) fn tracked_current_directory() -> Option<PathBuf> {
     FilesystemHookRuntime::global().map(|runtime| lock(&runtime.current_directory).logical.clone())
 }
 
-pub(super) fn tracked_remote_current_directory() -> Option<PathBuf> {
-    FilesystemHookRuntime::global().and_then(|runtime| {
-        let current = lock(&runtime.current_directory);
-        current.remote.then(|| current.logical.clone())
-    })
+pub(super) fn prepare_child_current_directory() -> Result<Option<PathBuf>> {
+    if config::global().is_none() {
+        return Ok(None);
+    }
+    let _guard = FilesystemHookGuard::enter()
+        .context("filesystem hook is unavailable while preparing a child process")?;
+    let runtime = FilesystemHookRuntime::global()
+        .context("filesystem hook runtime is unavailable while preparing a child process")?;
+    runtime.prepare_child_current_directory()
 }
 
 pub(super) fn inherited_local_descriptors() -> Option<String> {
@@ -1704,6 +1759,7 @@ pub(super) fn flush_before_exec() -> Result<()> {
     runtime.commit_all_open_files()
 }
 
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
 pub(super) fn flush_at_exit() {
     let Some(_guard) = FilesystemHookGuard::enter() else {
         return;

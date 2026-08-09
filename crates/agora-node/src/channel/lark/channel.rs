@@ -14,10 +14,13 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const GROUP_SESSION_CAPACITY: usize = 4096;
+const LARK_MAX_IMAGES_PER_MESSAGE: usize = 16;
+const LARK_EVENT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Default)]
 struct GroupSessions {
@@ -75,6 +78,7 @@ pub(super) enum LarkEvent {
 pub(super) struct LarkDelivery {
     event: LarkEvent,
     acknowledgement: oneshot::Sender<u16>,
+    deadline: tokio::time::Instant,
 }
 
 impl LarkDelivery {
@@ -84,9 +88,14 @@ impl LarkDelivery {
             Self {
                 event,
                 acknowledgement,
+                deadline: tokio::time::Instant::now() + LARK_EVENT_ADMISSION_TIMEOUT,
             },
             acknowledged,
         )
+    }
+
+    pub(super) fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
     }
 
     pub(super) fn into_parts(self) -> (LarkEvent, oneshot::Sender<u16>) {
@@ -149,6 +158,15 @@ impl LarkConversation {
 }
 
 impl LarkEvent {
+    pub(super) fn id(&self) -> Option<&str> {
+        match self {
+            Self::Message(event) => Some(&event.id),
+            Self::CardAction(event) => Some(&event.id),
+            Self::Interrupt(event) => Some(&event.id),
+            Self::Ignore { .. } => None,
+        }
+    }
+
     pub(super) fn from_lark_event_payload(payload: impl AsRef<[u8]>) -> Result<Self> {
         let value: Value = serde_json::from_slice(payload.as_ref())
             .context("lark event payload is not valid json")?;
@@ -594,6 +612,11 @@ impl LarkChannel {
     ) -> Result<LarkTask> {
         let mut content = TaskContent::new(event.input());
         let mut remaining_bytes = maximum_bytes;
+        if event.image_keys().len() > LARK_MAX_IMAGES_PER_MESSAGE {
+            return Err(anyhow::Error::new(LarkImageDownloadError::permanent(
+                format!("lark messages may contain at most {LARK_MAX_IMAGES_PER_MESSAGE} images"),
+            )));
+        }
         if !event.image_keys().is_empty() {
             let token = self
                 .api
@@ -740,16 +763,22 @@ impl Channel for LarkChannel {
             let Some(delivery) = self.receiver().next_delivery().await? else {
                 return Ok(None);
             };
+            let deadline = delivery.deadline();
             let (event, acknowledgement) = delivery.into_parts();
-            match self.handle_event(event).await {
-                Ok(Some(task)) => {
+            let admitted = tokio::time::timeout_at(deadline, self.handle_event(event)).await;
+            match admitted {
+                Err(_) => {
+                    let _ = acknowledgement.send(500);
+                    return Err(anyhow!("lark event admission timed out"));
+                }
+                Ok(Ok(Some(task))) => {
                     let _ = acknowledgement.send(200);
                     return Ok(Some(task));
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     let _ = acknowledgement.send(200);
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     let permanent = error
                         .downcast_ref::<LarkImageDownloadError>()
                         .is_some_and(LarkImageDownloadError::is_permanent);

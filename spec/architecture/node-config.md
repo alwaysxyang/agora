@@ -315,6 +315,9 @@ The daemon should reject invalid config before starting the channel:
 
 - Channel `name` must be present and unique.
 - Channel `type` must be present.
+- Only the implemented `lark` and `telegram` channel types are accepted; reserved `local` and `http` configurations fail startup rather than being silently ignored.
+- Lark `app_id` and `secret`, and Telegram `token`, must be non-empty after trimming whitespace.
+- Every configured channel permission user id and group id must be non-empty after trimming whitespace.
 - Agent `name` must be present and unique.
 - `isolate` must be `none` or `session`.
 - When `workspace` is omitted, the daemon must resolve the default under the current user's home directory.

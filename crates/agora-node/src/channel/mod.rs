@@ -291,7 +291,12 @@ impl ConfiguredChannel {
             ChannelConfig::Telegram(config) => {
                 Ok(Some(Self::Telegram(TelegramChannel::new(config)?)))
             }
-            ChannelConfig::Local(_) | ChannelConfig::Http(_) => Ok(None),
+            ChannelConfig::Local(config) => {
+                bail!("local channel is not implemented: {}", config.name)
+            }
+            ChannelConfig::Http(config) => {
+                bail!("http channel is not implemented: {}", config.name)
+            }
         }
     }
 }

@@ -18,7 +18,12 @@ mod vfs;
 mod workspace;
 
 use anyhow::{Context, Result, bail};
+#[cfg(target_os = "macos")]
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+
+#[cfg(target_os = "macos")]
+const MAX_CONTROL_PATH_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FilesystemMode {
@@ -75,6 +80,26 @@ pub(crate) fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf> {
             }
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn read_control_file(
+    reader: &mut impl Read,
+    maximum_bytes: usize,
+    description: &str,
+) -> Result<Vec<u8>> {
+    let limit = u64::try_from(maximum_bytes)
+        .unwrap_or(u64::MAX - 1)
+        .saturating_add(1);
+    let mut contents = Vec::with_capacity(maximum_bytes.min(8 * 1024));
+    reader
+        .take(limit)
+        .read_to_end(&mut contents)
+        .with_context(|| format!("failed to read {description}"))?;
+    if contents.len() > maximum_bytes {
+        bail!("{description} exceeds {maximum_bytes} bytes");
+    }
+    Ok(contents)
 }
 
 #[cfg(target_os = "macos")]

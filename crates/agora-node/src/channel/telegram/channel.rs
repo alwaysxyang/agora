@@ -495,11 +495,7 @@ impl TelegramUpdate {
         let mentioned_bot = message.mentions_bot(bot_username);
         let text = message.normalized_text(bot_username)?;
         let image_file_id = message.photo.last().map(|photo| photo.file_id.clone());
-        let sender_id = message
-            .from
-            .as_ref()
-            .map(|sender| sender.id.to_string())
-            .unwrap_or_default();
+        let sender_id = message.from.as_ref()?.id.to_string();
         let group_id = (!message.chat.is_private()).then(|| message.chat.id.to_string());
         let session_id = match message.message_thread_id {
             Some(thread_id) => {

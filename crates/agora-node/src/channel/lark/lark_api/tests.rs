@@ -137,6 +137,85 @@ async fn websocket_once_forwards_events_and_answers_ack_ping_and_close() {
 }
 
 #[tokio::test]
+async fn websocket_ping_is_answered_while_event_admission_is_pending() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let websocket_url = format!("ws://{}/?service_id=1001", listener.local_addr().unwrap());
+    let endpoint = HttpMockServer::start({
+        let websocket_url = websocket_url.clone();
+        move |_| {
+            MockResponse::json(format!(
+                r#"{{"code":0,"msg":"ok","data":{{"URL":"{websocket_url}","ClientConfig":{{"PingInterval":3600}}}}}}"#
+            ))
+        }
+    })
+    .await;
+    let (pong_sent, pong_received) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        socket
+            .send(WebSocketMessage::Binary(
+                event_frame(message_event_payload()).encode_to_vec().into(),
+            ))
+            .await
+            .unwrap();
+        socket
+            .send(WebSocketMessage::Ping(vec![1, 2, 3].into()))
+            .await
+            .unwrap();
+
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                WebSocketMessage::Pong(_) => {
+                    pong_sent.send(()).unwrap();
+                    break;
+                }
+                WebSocketMessage::Binary(payload) => {
+                    let frame = LarkFrame::decode(payload).unwrap();
+                    if frame.method == LARK_FRAME_TYPE_DATA {
+                        panic!("event was acknowledged before admission completed");
+                    }
+                }
+                _ => {}
+            }
+        }
+        loop {
+            let WebSocketMessage::Binary(payload) = socket.next().await.unwrap().unwrap() else {
+                continue;
+            };
+            let frame = LarkFrame::decode(payload).unwrap();
+            if frame.method == LARK_FRAME_TYPE_DATA {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&frame.payload).unwrap()["code"],
+                    200
+                );
+                break;
+            }
+        }
+        socket.send(WebSocketMessage::Close(None)).await.unwrap();
+    });
+    let api = LarkApi::with_base_url(config(), endpoint.base_url()).unwrap();
+    let (sender, mut receiver) = mpsc::channel::<LarkDelivery>(1);
+    let mut connected = false;
+    let client = tokio::spawn(async move {
+        api.run_websocket_once(sender, &mut connected)
+            .await
+            .unwrap();
+        connected
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), pong_received)
+        .await
+        .expect("websocket pong was blocked by event admission")
+        .unwrap();
+    let (_, acknowledgement) = receiver.recv().await.unwrap().into_parts();
+    acknowledgement.send(200).unwrap();
+
+    assert!(client.await.unwrap());
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn websocket_once_uses_the_configured_proxy_for_http_and_websocket() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_address = listener.local_addr().unwrap();
@@ -295,7 +374,7 @@ async fn websocket_frame_routing_handles_control_unknown_ignore_invalid_and_clos
         .unwrap();
     assert_eq!(
         serde_json::from_slice::<Value>(&ack.payload).unwrap()["code"],
-        500
+        200
     );
 
     let message = event_frame(message_event_payload());
@@ -315,11 +394,60 @@ async fn websocket_frame_routing_handles_control_unknown_ignore_invalid_and_clos
     );
 
     drop(receiver);
+    let closed_receiver_message = event_frame(
+        String::from_utf8(message_event_payload())
+            .unwrap()
+            .replace("evt_1", "evt_closed")
+            .into_bytes(),
+    );
     assert!(
-        api.handle_websocket_binary(&message.encode_to_vec(), &sender)
+        api.handle_websocket_binary(&closed_receiver_message.encode_to_vec(), &sender)
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn duplicate_lark_events_share_one_admission_and_acknowledgement() {
+    let api = LarkApi::with_base_url(config(), "http://127.0.0.1:1".to_string()).unwrap();
+    let (sender, mut receiver) = mpsc::channel(2);
+    let message = event_frame(message_event_payload()).encode_to_vec();
+    let mut first = Box::pin(api.handle_websocket_binary(&message, &sender));
+    let delivery = tokio::select! {
+        result = &mut first => panic!("first event completed before admission: {result:?}"),
+        delivery = receiver.recv() => delivery.unwrap(),
+    };
+    let mut duplicate = Box::pin(api.handle_websocket_binary(&message, &sender));
+
+    tokio::select! {
+        result = &mut duplicate => panic!("duplicate completed before the original: {result:?}"),
+        delivery = receiver.recv() => panic!("duplicate event was admitted: {delivery:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+    }
+    let (_, acknowledgement) = delivery.into_parts();
+    acknowledgement.send(200).unwrap();
+
+    for ack in [
+        first.await.unwrap().unwrap(),
+        duplicate.await.unwrap().unwrap(),
+    ] {
+        assert_eq!(
+            serde_json::from_slice::<Value>(&ack.payload).unwrap()["code"],
+            200
+        );
+    }
+    assert!(receiver.try_recv().is_err());
+
+    let replay = api
+        .handle_websocket_binary(&message, &sender)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&replay.payload).unwrap()["code"],
+        200
+    );
+    assert!(receiver.try_recv().is_err());
 }
 
 #[tokio::test]

@@ -396,8 +396,18 @@ fn requested_executable_resolves_direct_and_path_based_programs() {
             .unwrap()
             .ends_with("sh")
     );
-    assert!(unsafe { requested_executable(missing.as_ptr(), true) }.is_none());
-    assert!(unsafe { requested_executable(std::ptr::null(), false) }.is_none());
+    assert_eq!(
+        unsafe { requested_executable(missing.as_ptr(), true) }
+            .unwrap_err()
+            .errno,
+        libc::ENOENT
+    );
+    assert_eq!(
+        unsafe { requested_executable(std::ptr::null(), false) }
+            .unwrap_err()
+            .errno,
+        libc::EFAULT
+    );
 }
 
 #[test]
@@ -417,8 +427,16 @@ fn path_search_skips_non_executable_files() {
     let search = std::env::join_paths([&blocked, &executable]).unwrap();
 
     assert_eq!(
-        search_path_executable(OsStr::new("tool"), &search, root.path()),
-        Some(executable.join("tool"))
+        search_path_executable(OsStr::new("tool"), &search, root.path()).unwrap(),
+        executable.join("tool")
+    );
+
+    let denied = std::env::join_paths([&blocked]).unwrap();
+    assert_eq!(
+        search_path_executable(OsStr::new("tool"), &denied, root.path())
+            .unwrap_err()
+            .errno,
+        libc::EACCES
     );
 }
 
@@ -772,7 +790,7 @@ fn prepared_execution_distinguishes_null_and_missing_programs() {
     assert_eq!(missing_error.errno, libc::ENOENT);
     assert_eq!(
         missing_error.to_string(),
-        "requested executable could not be resolved"
+        "requested executable could not be resolved through PATH"
     );
 }
 

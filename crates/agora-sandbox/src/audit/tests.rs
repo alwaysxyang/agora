@@ -57,6 +57,7 @@ fn audit_protocol_round_trips_requests_and_responses() {
 
     assert_eq!(request.version, AUDIT_PROTOCOL_VERSION);
     assert_eq!(request.token, "token");
+    assert_eq!(request.request_id.len(), 32);
     assert_eq!(request.event, process_request());
 
     let encoded = encode_response(&AuditResponse::Accepted).unwrap();
@@ -78,6 +79,7 @@ fn audit_protocol_rejects_empty_tokens_and_invalid_frames() {
     let unsupported = serde_json::to_vec(&AuditRequest {
         version: AUDIT_PROTOCOL_VERSION + 1,
         token: "token".to_string(),
+        request_id: "0".repeat(32),
         event: process_request(),
     })
     .unwrap();
@@ -86,10 +88,20 @@ fn audit_protocol_rejects_empty_tokens_and_invalid_frames() {
     let empty_token = serde_json::to_vec(&AuditRequest {
         version: AUDIT_PROTOCOL_VERSION,
         token: String::new(),
+        request_id: "0".repeat(32),
         event: process_request(),
     })
     .unwrap();
     assert!(decode_request(&empty_token).is_err());
+
+    let invalid_request_id = serde_json::to_vec(&AuditRequest {
+        version: AUDIT_PROTOCOL_VERSION,
+        token: "token".to_string(),
+        request_id: "invalid".to_string(),
+        event: process_request(),
+    })
+    .unwrap();
+    assert!(decode_request(&invalid_request_id).is_err());
 
     let mut oversized = process_request();
     let AuditEventRequest::Process { command, .. } = &mut oversized else {

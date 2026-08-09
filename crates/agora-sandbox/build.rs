@@ -20,6 +20,7 @@ fn main() {
 
 fn run() -> Result<()> {
     println!("cargo:rustc-check-cfg=cfg({HOOK_CFG})");
+    println!("cargo:rustc-check-cfg=cfg(coverage)");
     println!("cargo:rerun-if-env-changed={INNER_BUILD}");
     println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
     let inner_build = env::var_os(INNER_BUILD).is_some();

@@ -4,6 +4,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+static CONFIG: OnceLock<Result<Option<HookConfig>, String>> = OnceLock::new();
+
 const TOKEN: &str = "AGORA_SANDBOX_TOKEN";
 const PROXY_IPV4: &str = "AGORA_SANDBOX_PROXY_IPV4";
 const PROXY_IPV6: &str = "AGORA_SANDBOX_PROXY_IPV6";
@@ -385,8 +387,9 @@ impl HookConfig {
     }
 }
 
-pub(super) fn initialize() {
-    if global().is_some() {
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
+pub(super) fn initialize() -> Result<(), String> {
+    if global_result()?.is_some() {
         for key in [
             FILESYSTEM_ROOT,
             FILESYSTEM_MODE,
@@ -402,11 +405,23 @@ pub(super) fn initialize() {
             unsafe { std::env::remove_var(key) };
         }
     }
+    Ok(())
 }
 
 pub(super) fn global() -> Option<&'static HookConfig> {
-    static CONFIG: OnceLock<Option<HookConfig>> = OnceLock::new();
+    global_result().ok().flatten()
+}
+
+fn global_result() -> Result<Option<&'static HookConfig>, String> {
     CONFIG
-        .get_or_init(|| HookConfig::from_environment().ok())
+        .get_or_init(|| {
+            if std::env::var_os(TOKEN).is_none() {
+                Ok(None)
+            } else {
+                HookConfig::from_environment().map(Some)
+            }
+        })
         .as_ref()
+        .map(Option::as_ref)
+        .map_err(Clone::clone)
 }

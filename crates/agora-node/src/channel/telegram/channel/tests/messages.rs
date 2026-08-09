@@ -101,6 +101,7 @@ fn normalizes_photo_caption() {
             "update_id": 103,
             "message": {
                 "message_id": 9,
+                "from": {"id": 1, "is_bot": false},
                 "chat": {"id": 1, "type": "private"},
                 "caption": "analyze this image",
                 "photo": [
@@ -124,6 +125,7 @@ fn accepts_a_photo_without_a_caption() {
             "update_id": 104,
             "message": {
                 "message_id": 10,
+                "from": {"id": 1, "is_bot": false},
                 "chat": {"id": 1, "type": "private"},
                 "photo": [{"file_id": "photo-1"}]
             }
@@ -143,8 +145,26 @@ fn ignores_messages_without_text_or_photos() {
             "update_id": 104,
             "message": {
                 "message_id": 10,
+                "from": {"id": 1, "is_bot": false},
                 "chat": {"id": 1, "type": "private"},
                 "text": "   "
+            }
+        }"#,
+    )
+    .unwrap();
+
+    assert!(update.into_task("agora_bot").is_none());
+}
+
+#[test]
+fn ignores_messages_without_an_authenticated_sender() {
+    let update = TelegramUpdate::from_json(
+        r#"{
+            "update_id": 109,
+            "message": {
+                "message_id": 15,
+                "chat": {"id": 1, "type": "private"},
+                "text": "hello"
             }
         }"#,
     )
@@ -160,6 +180,7 @@ fn normalizes_commands_addressed_to_this_bot() {
             "update_id": 105,
             "message": {
                 "message_id": 11,
+                "from": {"id": 1, "is_bot": false},
                 "chat": {"id": -1001, "type": "group"},
                 "text": "/stop@Agora_Bot codex-dev"
             }
@@ -202,6 +223,7 @@ fn ignores_commands_addressed_to_another_bot() {
             "update_id": 106,
             "message": {
                 "message_id": 12,
+                "from": {"id": 1, "is_bot": false},
                 "chat": {"id": -1001, "type": "group"},
                 "text": "/reset@another_bot"
             }
@@ -228,6 +250,7 @@ fn configured_task_forwards_telegram_task_fields() {
             "update_id": 108,
             "message": {
                 "message_id": 14,
+                "from": {"id": 7, "is_bot": false},
                 "chat": {"id": 7, "type": "private"},
                 "text": "hello"
             }

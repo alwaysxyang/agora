@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 const LOCK_DESCRIPTOR_POOL_CAPACITY: usize = 16;
 const NAMESPACE_JOURNAL_VERSION: u32 = 1;
+const MAX_NAMESPACE_JOURNAL_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct NamespaceJournal {
@@ -1897,8 +1898,14 @@ impl OverlayStore {
 
     fn write_namespace_journal(&self, journal: &NamespaceJournal) -> Result<()> {
         let path = self.canonical_root.join(namespace::NAMESPACE_JOURNAL_FILE);
+        Self::validate_namespace_journal(journal)?;
         let contents = serde_json::to_vec(journal)
             .context("failed to serialize filesystem namespace journal")?;
+        if contents.len() > MAX_NAMESPACE_JOURNAL_BYTES {
+            anyhow::bail!(
+                "filesystem namespace journal exceeds {MAX_NAMESPACE_JOURNAL_BYTES} bytes"
+            );
+        }
         if let Some(cipher) = &self.cipher {
             let mut plaintext = tempfile::tempfile()
                 .context("failed to create anonymous filesystem namespace journal")?;
@@ -1935,16 +1942,37 @@ impl OverlayStore {
             return Ok(None);
         }
         let contents = if let Some(cipher) = &self.cipher {
+            let encrypted = cipher
+                .open_file(&path)
+                .context("failed to inspect encrypted filesystem namespace journal")?;
+            if encrypted.len() > MAX_NAMESPACE_JOURNAL_BYTES as u64 {
+                anyhow::bail!(
+                    "filesystem namespace journal exceeds {MAX_NAMESPACE_JOURNAL_BYTES} bytes"
+                );
+            }
             let mut plaintext = tempfile::tempfile()
                 .context("failed to create anonymous filesystem namespace journal")?;
             cipher
                 .decrypt(&path, &mut plaintext)
                 .context("failed to decrypt filesystem namespace journal")?;
-            let mut contents = Vec::new();
-            plaintext.read_to_end(&mut contents)?;
-            contents
+            super::read_control_file(
+                &mut plaintext,
+                MAX_NAMESPACE_JOURNAL_BYTES,
+                "filesystem namespace journal",
+            )?
         } else {
-            fs::read(&path).context("failed to read filesystem namespace journal")?
+            let mut file =
+                File::open(&path).context("failed to open filesystem namespace journal")?;
+            if file.metadata()?.len() > MAX_NAMESPACE_JOURNAL_BYTES as u64 {
+                anyhow::bail!(
+                    "filesystem namespace journal exceeds {MAX_NAMESPACE_JOURNAL_BYTES} bytes"
+                );
+            }
+            super::read_control_file(
+                &mut file,
+                MAX_NAMESPACE_JOURNAL_BYTES,
+                "filesystem namespace journal",
+            )?
         };
         let journal: NamespaceJournal = serde_json::from_slice(&contents)
             .context("failed to parse filesystem namespace journal")?;
@@ -1954,7 +1982,42 @@ impl OverlayStore {
                 journal.version
             );
         }
+        Self::validate_namespace_journal(&journal)?;
         Ok(Some(journal))
+    }
+
+    fn validate_namespace_journal(journal: &NamespaceJournal) -> Result<()> {
+        let paths = match &journal.operation {
+            NamespaceOperation::Unlink {
+                logical,
+                destination,
+                lease,
+            } => vec![logical, destination]
+                .into_iter()
+                .chain(lease.iter())
+                .collect::<Vec<_>>(),
+            NamespaceOperation::Rename {
+                from,
+                to,
+                from_destination,
+                to_destination,
+                target_backup,
+                ..
+            } => vec![from, to, from_destination, to_destination]
+                .into_iter()
+                .chain(target_backup.iter())
+                .collect::<Vec<_>>(),
+        };
+        if paths
+            .into_iter()
+            .any(|path| path.len() > super::MAX_CONTROL_PATH_BYTES)
+        {
+            anyhow::bail!(
+                "filesystem namespace journal path exceeds {} bytes",
+                super::MAX_CONTROL_PATH_BYTES
+            );
+        }
+        Ok(())
     }
 
     fn recover_namespace_operation_locked(&self) -> Result<()> {
@@ -2197,8 +2260,15 @@ impl OverlayStore {
     }
 
     fn read_write_lease_destination(lease: &File) -> Result<Option<PathBuf>> {
-        let length = usize::try_from(lease.metadata()?.len())
-            .context("encrypted filesystem write lease path is too long")?;
+        let length = lease.metadata()?.len();
+        if length > super::MAX_CONTROL_PATH_BYTES as u64 {
+            anyhow::bail!(
+                "encrypted filesystem write lease path exceeds {} bytes",
+                super::MAX_CONTROL_PATH_BYTES
+            );
+        }
+        let length =
+            usize::try_from(length).context("encrypted filesystem write lease path is too long")?;
         if length == 0 {
             return Ok(None);
         }
@@ -2211,11 +2281,24 @@ impl OverlayStore {
             }
             offset += read;
         }
+        let mut excess = [0_u8; 1];
+        if lease.read_at(&mut excess, length as u64)? != 0 {
+            anyhow::bail!(
+                "encrypted filesystem write lease path exceeds {} bytes",
+                super::MAX_CONTROL_PATH_BYTES
+            );
+        }
         Ok(Some(PathBuf::from(OsString::from_vec(contents))))
     }
 
     fn write_write_lease_destination(lease: &File, destination: &Path) -> Result<()> {
         let contents = destination.as_os_str().as_bytes();
+        if contents.len() > super::MAX_CONTROL_PATH_BYTES {
+            anyhow::bail!(
+                "encrypted filesystem write lease path exceeds {} bytes",
+                super::MAX_CONTROL_PATH_BYTES
+            );
+        }
         lease.set_len(0)?;
         let mut offset = 0;
         while offset < contents.len() {

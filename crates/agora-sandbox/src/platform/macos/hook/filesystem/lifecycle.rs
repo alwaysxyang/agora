@@ -9,17 +9,28 @@ pub unsafe extern "C" fn agora_sandbox_fork() -> libc::pid_t {
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
+        let retained = {
+            let Some(_guard) = FilesystemHookGuard::enter() else {
+                return unsafe { original() };
+            };
+            match FilesystemHookRuntime::global() {
+                Some(runtime) => match runtime.retain_local_files_before_fork() {
+                    Ok(handles) => handles,
+                    Err(error) => return unsafe { fail(&error, -1) },
+                },
+                None => Vec::new(),
+            }
+        };
         let result = unsafe { original() };
-        if result != 0 {
-            return result;
+        if result < 0 && !retained.is_empty() {
+            let errno = unsafe { *libc::__error() };
+            if let Some(_guard) = FilesystemHookGuard::enter()
+                && let Some(runtime) = FilesystemHookRuntime::global()
+            {
+                let _ = runtime.release_local_files_after_failed_fork(retained);
+            }
+            unsafe { set_errno(errno) };
         }
-        let Some(_guard) = FilesystemHookGuard::enter() else {
-            return result;
-        };
-        let Some(runtime) = FilesystemHookRuntime::global() else {
-            return result;
-        };
-        let _ = runtime.retain_local_files_after_fork();
         result
     })
 }

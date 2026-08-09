@@ -11,9 +11,10 @@ use reqwest::header::CONTENT_TYPE;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_tungstenite::{client_async_tls, connect_async};
 
@@ -32,6 +33,10 @@ const LARK_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 10;
 const LARK_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 60;
 const LARK_PATCH_MAX_ATTEMPTS: usize = 3;
 const LARK_PATCH_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(100);
+const LARK_MAX_IN_FLIGHT_EVENTS: usize = 64;
+const LARK_EVENT_CACHE_CAPACITY: usize = 4096;
+const LARK_EVENT_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const LARK_PENDING_EVENT_TTL: Duration = Duration::from_secs(2 * 60);
 
 #[derive(Clone)]
 pub(super) struct LarkApi {
@@ -41,6 +46,128 @@ pub(super) struct LarkApi {
     client: Client,
     base_url: String,
     proxy: Option<crate::config::HttpProxy>,
+    event_cache: Arc<Mutex<LarkEventCache>>,
+}
+
+#[derive(Default)]
+struct LarkEventCache {
+    entries: HashMap<String, LarkEventCacheEntry>,
+    next_generation: u64,
+}
+
+enum LarkEventCacheEntry {
+    Pending {
+        generation: u64,
+        started_at: Instant,
+        waiters: Vec<oneshot::Sender<u16>>,
+    },
+    Completed {
+        status_code: u16,
+        expires_at: Instant,
+    },
+}
+
+enum LarkEventCacheDecision {
+    Execute(u64),
+    Wait(oneshot::Receiver<u16>),
+    Replay(u16),
+    Overloaded,
+}
+
+impl LarkEventCache {
+    fn acquire(&mut self, event_id: &str) -> LarkEventCacheDecision {
+        let now = Instant::now();
+        self.entries.retain(|_, entry| match entry {
+            LarkEventCacheEntry::Pending { started_at, .. } => {
+                now.duration_since(*started_at) < LARK_PENDING_EVENT_TTL
+            }
+            LarkEventCacheEntry::Completed { expires_at, .. } => *expires_at > now,
+        });
+
+        if let Some(entry) = self.entries.get_mut(event_id) {
+            return match entry {
+                LarkEventCacheEntry::Pending { waiters, .. } => {
+                    let (sender, receiver) = oneshot::channel();
+                    waiters.push(sender);
+                    LarkEventCacheDecision::Wait(receiver)
+                }
+                LarkEventCacheEntry::Completed { status_code, .. } => {
+                    LarkEventCacheDecision::Replay(*status_code)
+                }
+            };
+        }
+
+        if self.entries.len() >= LARK_EVENT_CACHE_CAPACITY {
+            let oldest_completed = self
+                .entries
+                .iter()
+                .filter_map(|(event_id, entry)| match entry {
+                    LarkEventCacheEntry::Completed { expires_at, .. } => {
+                        Some((event_id.clone(), *expires_at))
+                    }
+                    LarkEventCacheEntry::Pending { .. } => None,
+                })
+                .min_by_key(|(_, expires_at)| *expires_at)
+                .map(|(event_id, _)| event_id);
+            if let Some(event_id) = oldest_completed {
+                self.entries.remove(&event_id);
+            }
+        }
+        if self.entries.len() >= LARK_EVENT_CACHE_CAPACITY {
+            return LarkEventCacheDecision::Overloaded;
+        }
+
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.entries.insert(
+            event_id.to_string(),
+            LarkEventCacheEntry::Pending {
+                generation,
+                started_at: now,
+                waiters: Vec::new(),
+            },
+        );
+        LarkEventCacheDecision::Execute(generation)
+    }
+
+    fn complete(&mut self, event_id: &str, generation: u64, status_code: u16) {
+        let Some(entry) = self.entries.remove(event_id) else {
+            return;
+        };
+        let LarkEventCacheEntry::Pending {
+            generation: pending_generation,
+            started_at,
+            waiters,
+        } = entry
+        else {
+            self.entries.insert(event_id.to_string(), entry);
+            return;
+        };
+        if pending_generation != generation {
+            self.entries.insert(
+                event_id.to_string(),
+                LarkEventCacheEntry::Pending {
+                    generation: pending_generation,
+                    started_at,
+                    waiters,
+                },
+            );
+            return;
+        }
+
+        for waiter in waiters {
+            let _ = waiter.send(status_code);
+        }
+        if status_code == 200 {
+            self.entries.insert(
+                event_id.to_string(),
+                LarkEventCacheEntry::Completed {
+                    status_code,
+                    expires_at: Instant::now() + LARK_EVENT_CACHE_TTL,
+                },
+            );
+        }
+    }
 }
 
 pub(super) struct LarkImageResource {
@@ -62,7 +189,7 @@ impl LarkImageDownloadError {
         }
     }
 
-    fn permanent(message: impl Into<String>) -> Self {
+    pub(super) fn permanent(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             permanent: true,
@@ -113,6 +240,7 @@ impl LarkApi {
             client,
             base_url,
             proxy: config.proxy,
+            event_cache: Arc::new(Mutex::new(LarkEventCache::default())),
         })
     }
 
@@ -193,20 +321,56 @@ impl LarkApi {
         *connected = true;
         logger::info!("lark websocket connected channel={}", self.name);
         let mut ping_interval = tokio::time::interval(Duration::from_secs(ping_interval_seconds));
+        let in_flight = Arc::new(Semaphore::new(LARK_MAX_IN_FLIGHT_EVENTS));
+        let (acknowledgements, mut acknowledged) =
+            mpsc::channel::<Result<LarkFrame>>(LARK_MAX_IN_FLIGHT_EVENTS);
 
         loop {
             tokio::select! {
+                acknowledgement = acknowledged.recv() => {
+                    let acknowledgement = acknowledgement
+                        .expect("lark acknowledgement sender is retained while connected")?;
+                    socket
+                        .send(WebSocketMessage::Binary(
+                            acknowledgement.encode_to_vec().into(),
+                        ))
+                        .await
+                        .context("send lark websocket ack failed")?;
+                }
                 message = socket.next() => {
                     let Some(message) = message else {
                         return Ok(());
                     };
                     match message.context("read lark websocket message failed")? {
                         WebSocketMessage::Binary(payload) => {
-                            if let Some(ack) = self.handle_websocket_binary(&payload, &events).await? {
-                                socket
-                                    .send(WebSocketMessage::Binary(ack.encode_to_vec().into()))
-                                    .await
-                                    .context("send lark websocket ack failed")?;
+                            let frame = LarkFrame::decode(payload)
+                                .context("decode lark websocket frame failed")?;
+                            if frame.method == LARK_FRAME_TYPE_DATA
+                                && frame.header("type") == Some(LARK_MESSAGE_TYPE_EVENT)
+                            {
+                                let Ok(permit) = Arc::clone(&in_flight).try_acquire_owned() else {
+                                    let ack = frame.into_ack(500, 0)?;
+                                    socket
+                                        .send(WebSocketMessage::Binary(ack.encode_to_vec().into()))
+                                        .await
+                                        .context("send overloaded lark websocket ack failed")?;
+                                    continue;
+                                };
+                                let api = self.clone();
+                                let events = events.clone();
+                                let acknowledgements = acknowledgements.clone();
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    match api.handle_data_frame(frame, &events).await {
+                                        Ok(Some(acknowledgement)) => {
+                                            let _ = acknowledgements.send(Ok(acknowledgement)).await;
+                                        }
+                                        Ok(None) => {}
+                                        Err(error) => {
+                                            let _ = acknowledgements.send(Err(error)).await;
+                                        }
+                                    }
+                                });
                             }
                         }
                         WebSocketMessage::Ping(payload) => {
@@ -281,6 +445,7 @@ impl LarkApi {
         })
     }
 
+    #[cfg(test)]
     async fn handle_websocket_binary(
         &self,
         payload: &[u8],
@@ -309,22 +474,59 @@ impl LarkApi {
                 event
                 @ (LarkEvent::Message(_) | LarkEvent::CardAction(_) | LarkEvent::Interrupt(_)),
             ) => {
-                let (delivery, acknowledged) = LarkDelivery::new(event);
-                events
-                    .send(delivery)
-                    .await
-                    .map_err(|_| anyhow!("agora lark receiver closed"))?;
-                acknowledged.await.unwrap_or(500)
+                let event_id = event
+                    .id()
+                    .expect("deliverable lark events always carry an event id")
+                    .to_string();
+                let decision = {
+                    let mut cache = self.event_cache.lock().await;
+                    cache.acquire(&event_id)
+                };
+                match decision {
+                    LarkEventCacheDecision::Execute(generation) => {
+                        let admitted = self.deliver_event(event, events).await;
+                        let status_code = admitted.as_ref().copied().unwrap_or(500);
+                        self.event_cache
+                            .lock()
+                            .await
+                            .complete(&event_id, generation, status_code);
+                        admitted?
+                    }
+                    LarkEventCacheDecision::Wait(acknowledged) => acknowledged.await.unwrap_or(500),
+                    LarkEventCacheDecision::Replay(status_code) => status_code,
+                    LarkEventCacheDecision::Overloaded => 500,
+                }
             }
             Ok(LarkEvent::Ignore { .. }) => 200,
             Err(err) => {
                 logger::error!("ignore invalid lark event payload: {}", err);
-                500
+                200
             }
         };
         Ok(Some(
             frame.into_ack(status_code, started.elapsed().as_millis())?,
         ))
+    }
+
+    async fn deliver_event(
+        &self,
+        event: LarkEvent,
+        events: &mpsc::Sender<LarkDelivery>,
+    ) -> Result<u16> {
+        let (delivery, acknowledged) = LarkDelivery::new(event);
+        let deadline = delivery.deadline();
+        match tokio::time::timeout_at(deadline, async {
+            events
+                .send(delivery)
+                .await
+                .map_err(|_| anyhow!("agora lark receiver closed"))?;
+            Ok(acknowledged.await.unwrap_or(500))
+        })
+        .await
+        {
+            Ok(status_code) => status_code,
+            Err(_) => Ok(500),
+        }
     }
 
     pub(super) async fn tenant_access_token(&self) -> Result<String> {

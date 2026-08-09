@@ -247,8 +247,36 @@ fn node_config_rejects_ambiguous_or_invalid_runtime_entries() {
             "channel name must not be empty",
         ),
         (
-            r#"{"channels":[{"type":"local","name":"same"},{"type":"http","name":"same"}],"agents":[]}"#,
+            r#"{"channels":[{"type":"lark","name":"same","app_id":"id","secret":"secret"},{"type":"telegram","name":"same","token":"token"}],"agents":[]}"#,
             "duplicate channel name: same",
+        ),
+        (
+            r#"{"channels":[{"type":"lark","name":"lark","app_id":"","secret":"secret"}],"agents":[]}"#,
+            "lark app_id must not be empty: lark",
+        ),
+        (
+            r#"{"channels":[{"type":"lark","name":"lark","app_id":"id","secret":" "}],"agents":[]}"#,
+            "lark secret must not be empty: lark",
+        ),
+        (
+            r#"{"channels":[{"type":"telegram","name":"telegram","token":""}],"agents":[]}"#,
+            "telegram token must not be empty: telegram",
+        ),
+        (
+            r#"{"channels":[{"type":"telegram","name":"telegram","token":"token","permission":{"users":[{"id":" "}]}}],"agents":[]}"#,
+            "channel user permission id must not be empty: telegram",
+        ),
+        (
+            r#"{"channels":[{"type":"lark","name":"lark","app_id":"id","secret":"secret","permission":{"groups":[{"id":""}]}}],"agents":[]}"#,
+            "channel group permission id must not be empty: lark",
+        ),
+        (
+            r#"{"channels":[{"type":"local","name":"local"}],"agents":[]}"#,
+            "local channel is not implemented: local",
+        ),
+        (
+            r#"{"channels":[{"type":"http","name":"http"}],"agents":[]}"#,
+            "http channel is not implemented: http",
         ),
         (
             r#"{"channels":[],"agents":[{"name":"","isolate":"none","workspace":"/tmp/work","type":"custom","path":"agent","subscribe":[]}]}"#,
@@ -286,14 +314,14 @@ fn node_config_rejects_ambiguous_or_invalid_runtime_entries() {
 fn node_config_accepts_unique_entries_and_existing_subscriptions() {
     let config: NodeConfig = serde_json::from_str(
         r#"{
-            "channels":[{"type":"local","name":"local"}],
+            "channels":[{"type":"lark","name":"lark","app_id":"id","secret":"secret"}],
             "agents":[{
                 "name":"agent",
                 "isolate":"none",
                 "workspace":"/tmp/work",
                 "type":"custom",
                 "path":"agent",
-                "subscribe":[{"channel":"local"}]
+                "subscribe":[{"channel":"lark"}]
             }]
         }"#,
     )

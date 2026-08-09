@@ -694,6 +694,30 @@ fn migration_helpers_reject_external_paths_and_inconsistent_journals() {
     std::fs::remove_dir_all(workdir).unwrap();
 }
 
+#[test]
+fn encrypted_control_files_are_size_bounded_before_parsing() {
+    let workdir = temporary_directory("oversized-control-files");
+    let root = workdir.join("fs");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::File::create(root.join(".key.json"))
+        .unwrap()
+        .set_len((super::MAX_KEY_METADATA_BYTES + 1) as u64)
+        .unwrap();
+
+    let key_error = EncryptedWorkspace::read_key_metadata(&root).unwrap_err();
+
+    assert!(key_error.to_string().contains("metadata exceeds"));
+    std::fs::File::create(root.join(".rekey.json"))
+        .unwrap()
+        .set_len((super::MAX_REKEY_JOURNAL_BYTES + 1) as u64)
+        .unwrap();
+
+    let journal_error = EncryptedWorkspace::recover_migration(&root).unwrap_err();
+
+    assert!(journal_error.to_string().contains("journal exceeds"));
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
 fn directory_tree_has_no_rekey_files(root: &std::path::Path) -> bool {
     rekey_files(root).is_empty()
 }

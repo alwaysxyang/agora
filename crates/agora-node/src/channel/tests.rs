@@ -38,15 +38,17 @@ fn channel_value_objects_expose_buttons_statuses_replies_and_callbacks() {
 }
 
 #[test]
-fn configured_channels_ignore_unimplemented_types_and_keep_configured_names() {
+fn configured_channels_reject_unimplemented_types_and_keep_configured_names() {
     assert!(
         ConfiguredChannel::from_config(ChannelConfig::Local(NamedChannelConfig {
             name: "local".to_string(),
             permission: Default::default(),
             proxy: None,
         }))
+        .err()
         .unwrap()
-        .is_none()
+        .to_string()
+        .contains("not implemented")
     );
     assert!(
         ConfiguredChannel::from_config(ChannelConfig::Http(NamedChannelConfig {
@@ -54,8 +56,10 @@ fn configured_channels_ignore_unimplemented_types_and_keep_configured_names() {
             permission: Default::default(),
             proxy: None,
         }))
+        .err()
         .unwrap()
-        .is_none()
+        .to_string()
+        .contains("not implemented")
     );
 
     let lark = ConfiguredChannel::from_config(ChannelConfig::Lark(LarkChannelConfig {
