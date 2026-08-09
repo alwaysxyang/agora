@@ -952,6 +952,24 @@ fn default_tls_ca_reuses_a_complete_pair_and_replaces_a_partial_pair() {
         std::fs::read(&replaced.private_key).unwrap(),
         first_private_key
     );
+
+    let replaced_certificate = std::fs::read(&replaced.certificate).unwrap();
+    let replaced_private_key = std::fs::read(&replaced.private_key).unwrap();
+    std::fs::write(&replaced.private_key, b"corrupt private key").unwrap();
+    let recovered = config.tls_ca_for_workdir().unwrap().unwrap();
+    assert_ne!(
+        std::fs::read(&recovered.certificate).unwrap(),
+        replaced_certificate
+    );
+    assert_ne!(
+        std::fs::read(&recovered.private_key).unwrap(),
+        replaced_private_key
+    );
+    assert!(
+        std::fs::read(&recovered.private_key)
+            .unwrap()
+            .starts_with(b"-----BEGIN PRIVATE KEY-----")
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

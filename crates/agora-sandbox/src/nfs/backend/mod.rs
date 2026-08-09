@@ -3,6 +3,8 @@ use crate::nfs::protocol::{RemoteEntry, RemoteMetadata, RemotePath};
 #[cfg(all(not(agora_sandbox_hook_build), any(feature = "remote-smb", test)))]
 use std::fmt;
 #[cfg(all(not(agora_sandbox_hook_build), any(feature = "remote-smb", test)))]
+use std::fs::File;
+#[cfg(all(not(agora_sandbox_hook_build), any(feature = "remote-smb", test)))]
 use std::future::Future;
 
 mod smb;
@@ -19,18 +21,20 @@ pub(crate) trait RemoteStorage: Send + Sync + 'static {
     fn connect(&self, root: u32) -> impl Future<Output = StorageResult<()>> + Send;
     fn stat(&self, path: &RemotePath)
     -> impl Future<Output = StorageResult<RemoteMetadata>> + Send;
-    fn read(
+    fn read_into(
         &self,
         path: &RemotePath,
-    ) -> impl Future<Output = StorageResult<(Vec<u8>, RemoteMetadata)>> + Send;
+        destination: &mut File,
+    ) -> impl Future<Output = StorageResult<RemoteMetadata>> + Send;
     /// Replaces `path` only when its current identity still matches `expected`.
     /// Implementations must keep the comparison and mutation in one backend
     /// critical section so an external writer cannot race between them.
-    fn write_if_unchanged(
+    fn write_from_if_unchanged(
         &self,
         path: &RemotePath,
         expected: Option<&RemoteMetadata>,
-        data: &[u8],
+        source: &mut File,
+        length: u64,
     ) -> impl Future<Output = StorageResult<RemoteMetadata>> + Send;
     fn list(
         &self,

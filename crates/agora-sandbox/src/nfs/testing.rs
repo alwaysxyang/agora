@@ -1,6 +1,8 @@
 use crate::nfs::backend::{RemoteStorage, StorageError, StorageResult};
 use crate::nfs::protocol::{RemoteEntry, RemoteFileType, RemoteMetadata, RemotePath};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -133,25 +135,49 @@ impl RemoteStorage for MemoryStorage {
             .ok_or_else(StorageError::not_found)
     }
 
-    async fn read(&self, path: &RemotePath) -> StorageResult<(Vec<u8>, RemoteMetadata)> {
+    async fn read_into(
+        &self,
+        path: &RemotePath,
+        destination: &mut File,
+    ) -> StorageResult<RemoteMetadata> {
         let entries = lock(&self.entries);
         let entry = entries
             .get(&(path.root(), path.path().to_string()))
             .ok_or_else(StorageError::not_found)?;
         let data = entry
             .data
-            .clone()
+            .as_deref()
             .ok_or_else(|| StorageError::new(libc::EISDIR, "path is a directory"))?;
-        Ok((data, Self::metadata(entry)))
+        destination
+            .set_len(0)
+            .and_then(|()| destination.seek(SeekFrom::Start(0)).map(|_| ()))
+            .and_then(|()| destination.write_all(data))
+            .map_err(|error| memory_io("failed to stream memory file", error))?;
+        Ok(Self::metadata(entry))
     }
 
-    async fn write_if_unchanged(
+    async fn write_from_if_unchanged(
         &self,
         path: &RemotePath,
         expected: Option<&RemoteMetadata>,
-        data: &[u8],
+        source: &mut File,
+        length: u64,
     ) -> StorageResult<RemoteMetadata> {
         self.yield_if_requested().await;
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| memory_io("failed to rewind memory file", error))?;
+        let mut data = Vec::new();
+        source
+            .take(length)
+            .read_to_end(&mut data)
+            .map_err(|error| memory_io("failed to stream memory file", error))?;
+        if data.len() as u64 != length {
+            return Err(StorageError::new(
+                libc::EIO,
+                "memory file ended before its declared length",
+            ));
+        }
         let mut entries = lock(&self.entries);
         let key = (path.root(), path.path().to_string());
         let current = entries.get(&key).map(Self::metadata);
@@ -168,7 +194,7 @@ impl RemoteStorage for MemoryStorage {
         }
         let generation = entries.get(&key).map_or(1, |entry| entry.generation + 1);
         let entry = MemoryEntry {
-            data: Some(data.to_vec()),
+            data: Some(data),
             generation,
         };
         let metadata = Self::metadata(&entry);
@@ -275,6 +301,13 @@ impl RemoteStorage for MemoryStorage {
     }
 }
 
+fn memory_io(context: &str, error: std::io::Error) -> StorageError {
+    StorageError::new(
+        error.raw_os_error().unwrap_or(libc::EIO),
+        format!("{context}: {error}"),
+    )
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -284,6 +317,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file_with_contents(contents: &[u8]) -> File {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(contents).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file
+    }
 
     fn assert_errno<T>(result: StorageResult<T>, expected: libc::c_int) {
         match result {
@@ -336,15 +376,42 @@ mod tests {
         let path = RemotePath::new(0, "file").unwrap();
         let expected = storage.stat(&path).await.unwrap();
         storage.replace(0, "file", b"outside");
+        let mut source = file_with_contents(b"sandbox");
         assert_errno(
             storage
-                .write_if_unchanged(&path, Some(&expected), b"sandbox")
+                .write_from_if_unchanged(&path, Some(&expected), &mut source, 7)
                 .await,
             libc::ESTALE,
         );
+        let mut source = file_with_contents(b"sandbox");
         assert_errno(
-            storage.write_if_unchanged(&path, None, b"sandbox").await,
+            storage
+                .write_from_if_unchanged(&path, None, &mut source, 7)
+                .await,
             libc::ESTALE,
         );
+    }
+
+    #[tokio::test]
+    async fn memory_storage_transfers_file_contents_through_streams() {
+        let storage = MemoryStorage::default();
+        let path = RemotePath::new(0, "file").unwrap();
+        storage.insert_file(0, "file", b"remote");
+
+        let mut downloaded = tempfile::tempfile().unwrap();
+        let baseline = storage.read_into(&path, &mut downloaded).await.unwrap();
+        downloaded.seek(SeekFrom::Start(0)).unwrap();
+        let mut contents = String::new();
+        downloaded.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "remote");
+
+        let mut uploaded = tempfile::tempfile().unwrap();
+        uploaded.write_all(b"sandbox").unwrap();
+        uploaded.seek(SeekFrom::Start(0)).unwrap();
+        storage
+            .write_from_if_unchanged(&path, Some(&baseline), &mut uploaded, 7)
+            .await
+            .unwrap();
+        assert_eq!(storage.data(0, "file").unwrap(), b"sandbox");
     }
 }

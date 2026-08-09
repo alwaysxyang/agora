@@ -1,8 +1,7 @@
 //! Network filesystem protocol tests.
 
 use super::{
-    PROTOCOL_VERSION, RemoteEntry, RemoteFileType, RemoteMetadata, RemotePath, Request,
-    RequestEnvelope, RequestId, Response, ResponseEnvelope,
+    PROTOCOL_VERSION, RemotePath, Request, RequestEnvelope, RequestId, Response, ResponseEnvelope,
 };
 
 #[test]
@@ -24,16 +23,6 @@ fn protocol_round_trip_preserves_remote_operations() {
         version: PROTOCOL_VERSION,
         request_id: request.request_id.clone(),
         response: Response::List {
-            entries: vec![RemoteEntry {
-                name: "file.txt".to_string(),
-                metadata: RemoteMetadata {
-                    file_type: RemoteFileType::File,
-                    size: 12,
-                    modified_seconds: 100,
-                    modified_nanoseconds: 7,
-                    identity: "identity".to_string(),
-                },
-            }],
             anchor: "anchor-opaque".to_string(),
         },
     };

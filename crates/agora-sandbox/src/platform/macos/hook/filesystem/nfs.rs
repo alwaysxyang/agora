@@ -1,5 +1,5 @@
 use crate::filesystem::FileAttributes;
-use crate::nfs::client::{RemoteClient, RemoteClientError};
+use crate::nfs::client::{RemoteClient, RemoteClientError, decode_json_descriptor};
 use crate::nfs::protocol::{
     RemoteEntry, RemoteFileType, RemoteMetadata, RemotePath, RemoteRoute, Request, Response,
 };
@@ -210,11 +210,18 @@ impl RemoteFilesystem {
     }
 
     fn list(&self, path: &RoutedPath) -> Result<(Vec<RemoteEntry>, String)> {
-        let reply = self.request(Request::List {
+        let mut reply = self.request(Request::List {
             path: path.remote.clone(),
         })?;
         match reply.response {
-            Response::List { entries, anchor } => Ok((validate_entries(entries)?, anchor)),
+            Response::List { anchor } => {
+                let descriptor = reply.descriptor.take().ok_or_else(|| {
+                    protocol_error("remote list response did not include a descriptor")
+                })?;
+                let entries = decode_json_descriptor(descriptor)
+                    .map_err(|_| protocol_error("remote list payload is invalid"))?;
+                Ok((validate_entries(entries)?, anchor))
+            }
             _ => Err(protocol_error(
                 "remote list returned an unexpected response",
             )),

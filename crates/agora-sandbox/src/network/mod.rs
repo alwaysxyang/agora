@@ -13,6 +13,10 @@ pub fn generate_tls_ca(certificate: impl AsRef<Path>, private_key: impl AsRef<Pa
     tls::certificate::generate_ca(certificate.as_ref(), private_key.as_ref())
 }
 
+pub(crate) fn validate_tls_ca(certificate_pem: &[u8], private_key_pem: &[u8]) -> Result<()> {
+    TlsAuthority::from_pem(certificate_pem, private_key_pem, 1).map(|_| ())
+}
+
 use crate::callback::{
     Callback, Decision, DomainSource, EVENT_SCHEMA_VERSION, Event, EventMetrics, EventResult,
     EventStatus, EventType, NetworkContext, NetworkEvent, NetworkProtocol, ProcessContext, Proxy,

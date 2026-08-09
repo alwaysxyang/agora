@@ -2,7 +2,7 @@ use super::*;
 use crate::nfs::backend::RemoteStorage;
 use crate::nfs::protocol::{RemotePath, Request, RequestId, Response};
 use crate::nfs::testing::MemoryStorage;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 fn path(value: &str) -> RemotePath {
     RemotePath::new(0, value).unwrap()
@@ -236,9 +236,12 @@ async fn storage_compare_and_write_is_atomic_with_respect_to_its_version() {
     storage.insert_file(0, "shared.txt", b"original");
     let expected = storage.stat(&path("shared.txt")).await.unwrap();
     storage.replace(0, "shared.txt", b"outside change");
+    let mut source = tempfile::tempfile().unwrap();
+    source.write_all(b"sandbox change").unwrap();
+    source.seek(SeekFrom::Start(0)).unwrap();
 
     let error = storage
-        .write_if_unchanged(&path("shared.txt"), Some(&expected), b"sandbox change")
+        .write_from_if_unchanged(&path("shared.txt"), Some(&expected), &mut source, 14)
         .await
         .unwrap_err();
 
@@ -385,9 +388,15 @@ async fn broker_handles_directory_and_namespace_operations() {
     let broker = Broker::new(std::sync::Arc::clone(&storage), root.path()).unwrap();
 
     let list = broker.handle(Request::List { path: path("docs") }).await;
-    let Response::List { entries, anchor } = list.response else {
+    let Response::List { anchor } = list.response else {
         panic!("expected list response");
     };
+    let entries: Vec<crate::nfs::protocol::RemoteEntry> =
+        crate::nfs::client::decode_json_descriptor(
+            list.descriptor
+                .expect("list response must include a descriptor"),
+        )
+        .unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "a.txt");
     assert!(!anchor.contains("docs"));
@@ -432,6 +441,55 @@ async fn broker_handles_directory_and_namespace_operations() {
             .response,
         Response::Success
     );
+}
+
+#[tokio::test]
+async fn broker_streams_large_directory_lists_outside_the_control_frame() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = std::sync::Arc::new(MemoryStorage::default());
+    storage.insert_directory(0, "large");
+    for index in 0..6_000 {
+        storage.insert_file(0, &format!("large/{index:05}-{}", "x".repeat(180)), b"");
+    }
+    let broker = Broker::new(storage, root.path()).unwrap();
+
+    let request_id = request_id(250);
+    let request = Request::List {
+        path: path("large"),
+    };
+    let reply = broker
+        .handle_request(request_id.clone(), request.clone())
+        .await;
+
+    assert!(serde_json::to_vec(&reply.response).unwrap().len() < crate::ipc::MAX_FRAME_SIZE);
+    let response = reply.response.clone();
+    let descriptor = reply
+        .descriptor
+        .expect("large directory list must use a bulk descriptor");
+    let entries: Vec<crate::nfs::protocol::RemoteEntry> =
+        crate::nfs::client::decode_json_descriptor(descriptor).unwrap();
+    assert_eq!(entries.len(), 6_000);
+    assert!(entries.iter().all(|entry| entry.name.len() == 186));
+
+    let replay = broker.handle_request(request_id.clone(), request).await;
+    assert_eq!(replay.response, response);
+    let replayed: Vec<crate::nfs::protocol::RemoteEntry> =
+        crate::nfs::client::decode_json_descriptor(
+            replay
+                .descriptor
+                .expect("a replayed list must include a fresh descriptor"),
+        )
+        .unwrap();
+    assert_eq!(replayed, entries);
+
+    assert_eq!(
+        broker.handle(Request::Claim { request_id }).await.response,
+        Response::Success
+    );
+    let Response::List { anchor } = response else {
+        panic!("expected list response");
+    };
+    assert!(!broker.list_payloads.lock().await.contains_key(&anchor));
 }
 
 #[tokio::test]
@@ -920,8 +978,8 @@ async fn request_cache_waiters_capacity_and_tombstones_are_bounded() {
             .complete(request_id(201), Response::Success)
             .is_empty()
     );
-    assert!(!cache.claim(&request_id(201)));
-    assert!(!cache.claim(&request_id(200)));
+    assert!(cache.claim(&request_id(201)).is_none());
+    assert!(cache.claim(&request_id(200)).is_none());
 
     for value in 0..=REQUEST_CACHE_CAPACITY {
         cache.entries.insert(

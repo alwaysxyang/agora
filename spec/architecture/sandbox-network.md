@@ -75,7 +75,7 @@ agora-sandbox run -c sandbox.json \
   "filesystem": {
     "local": {
       "encrypt": "encrypted",
-      "key": "filesystem-key"
+      "key": "REPLACE_WITH_A_HIGH_ENTROPY_RANDOM_SECRET"
     },
     "nfs": [
       {

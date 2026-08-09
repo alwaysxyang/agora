@@ -33,6 +33,7 @@ where
     handles: Mutex<HashMap<String, Arc<Mutex<RemoteHandle>>>>,
     requests: Mutex<RequestCache>,
     closed_handles: Mutex<HandleTombstones>,
+    list_payloads: Mutex<HashMap<String, File>>,
     root_mutations: Mutex<HashMap<u32, Arc<Mutex<()>>>>,
 }
 
@@ -96,6 +97,7 @@ where
             handles: Mutex::new(HashMap::new()),
             requests: Mutex::new(RequestCache::default()),
             closed_handles: Mutex::new(HandleTombstones::default()),
+            list_payloads: Mutex::new(HashMap::new()),
             root_mutations: Mutex::new(HashMap::new()),
         })
     }
@@ -232,19 +234,38 @@ where
     }
 
     async fn claim_request(&self, request_id: &RequestId) -> StorageResult<()> {
-        if self.requests.lock().await.claim(request_id) {
-            Ok(())
-        } else {
-            Err(StorageError::new(
-                libc::EPROTO,
-                "remote open request is not available to claim",
-            ))
+        let list_payload = self
+            .requests
+            .lock()
+            .await
+            .claim(request_id)
+            .ok_or_else(|| {
+                StorageError::new(
+                    libc::EPROTO,
+                    "remote resource request is not available to claim",
+                )
+            })?;
+        if let Some(anchor) = list_payload {
+            self.list_payloads.lock().await.remove(&anchor);
         }
+        Ok(())
     }
 
     async fn reply_for_response(&self, response: Response) -> BrokerReply {
         let descriptor = match &response {
             Response::Open { handle, .. } => match self.application_descriptor(handle).await {
+                Ok(descriptor) => Some(descriptor),
+                Err(error) => {
+                    return BrokerReply {
+                        response: Response::Error {
+                            errno: error.errno,
+                            message: error.message,
+                        },
+                        descriptor: None,
+                    };
+                }
+            },
+            Response::List { anchor } => match self.list_descriptor(anchor).await {
                 Ok(descriptor) => Some(descriptor),
                 Err(error) => {
                     return BrokerReply {
@@ -281,9 +302,21 @@ where
         Ok(descriptor.into())
     }
 
+    async fn list_descriptor(&self, anchor: &str) -> StorageResult<OwnedFd> {
+        self.list_payloads
+            .lock()
+            .await
+            .get(anchor)
+            .ok_or_else(|| StorageError::new(libc::EPROTO, "remote list payload is unavailable"))?
+            .try_clone()
+            .map(Into::into)
+            .map_err(|error| storage_io("failed to duplicate remote list payload", error))
+    }
+
     async fn discard_abandoned_resources(&self, resources: Vec<AbandonedResource>) {
         let mut open = self.handles.lock().await;
         let mut closed = self.closed_handles.lock().await;
+        let mut list_payloads = self.list_payloads.lock().await;
         for resource in resources {
             match resource {
                 AbandonedResource::Handle(handle) => {
@@ -292,6 +325,7 @@ where
                     }
                 }
                 AbandonedResource::Anchor(anchor) => {
+                    list_payloads.remove(&anchor);
                     let path = self.staging.join(anchor);
                     let removed = std::fs::remove_file(&path)
                         .or_else(|file_error| std::fs::remove_dir(&path).map_err(|_| file_error));
@@ -368,10 +402,11 @@ where
             ));
         }
         let force_publish = existing.is_none() || flags & libc::O_TRUNC != 0;
-        let (data, mut metadata, baseline) = if force_publish {
+        let mut temporary = tempfile::NamedTempFile::new_in(&self.staging)
+            .map_err(|error| storage_io("failed to create anonymous remote file", error))?;
+        let (mut metadata, baseline) = if force_publish {
             let metadata = existing.clone().unwrap_or_else(empty_file_metadata);
             (
-                Vec::new(),
                 RemoteMetadata {
                     size: 0,
                     ..metadata
@@ -379,11 +414,21 @@ where
                 existing,
             )
         } else {
-            let (data, metadata) = self.storage.read(&path).await?;
-            (data, metadata.clone(), Some(metadata))
+            let metadata = self
+                .storage
+                .read_into(&path, temporary.as_file_mut())
+                .await?;
+            (metadata.clone(), Some(metadata))
         };
-        let mut temporary = tempfile::NamedTempFile::new_in(&self.staging)
-            .map_err(|error| storage_io("failed to create anonymous remote file", error))?;
+        temporary
+            .flush()
+            .map_err(|error| storage_io("failed to flush anonymous remote file", error))?;
+        metadata.size = temporary
+            .as_file()
+            .metadata()
+            .map_err(|error| storage_io("failed to inspect anonymous remote file", error))?
+            .len();
+        let checksum = checksum_file(temporary.as_file_mut())?;
         let retained = temporary
             .reopen()
             .map_err(|error| storage_io("failed to retain anonymous remote file", error))?;
@@ -398,18 +443,11 @@ where
             .map_err(|error| storage_io("failed to open anonymous remote file", error))?;
         std::fs::remove_file(temporary.path())
             .map_err(|error| storage_io("failed to unlink anonymous remote file", error))?;
-        temporary
-            .write_all(&data)
-            .map_err(|error| storage_io("failed to populate anonymous remote file", error))?;
-        temporary
-            .flush()
-            .map_err(|error| storage_io("failed to flush anonymous remote file", error))?;
         drop(temporary);
         set_close_on_exec(&application)?;
         let replay = application
             .try_clone()
             .map_err(|error| storage_io("failed to retain remote descriptor", error))?;
-        metadata.size = data.len() as u64;
         let handle = Uuid::new_v4().simple().to_string();
         self.handles.lock().await.insert(
             handle.clone(),
@@ -420,7 +458,7 @@ where
                 publishable: writable || force_publish,
                 unlinked: false,
                 force_publish,
-                checksum: Md5::digest(&data).into(),
+                checksum,
                 baseline,
             })),
         );
@@ -476,10 +514,29 @@ where
 
     async fn list(&self, path: RemotePath) -> StorageResult<BrokerReply> {
         let entries = self.storage.list(&path).await?;
+        let mut payload = tempfile::tempfile_in(&self.staging)
+            .map_err(|error| storage_io("failed to create remote list payload", error))?;
+        serde_json::to_writer(&mut payload, &entries).map_err(|error| {
+            StorageError::new(
+                libc::EIO,
+                format!("failed to serialize remote list: {error}"),
+            )
+        })?;
+        payload
+            .flush()
+            .and_then(|()| payload.seek(SeekFrom::Start(0)).map(|_| ()))
+            .map_err(|error| storage_io("failed to prepare remote list payload", error))?;
         let anchor = self.anchor(&path, RemoteFileType::Directory).await?;
+        let descriptor = payload
+            .try_clone()
+            .map_err(|error| storage_io("failed to duplicate remote list payload", error))?;
+        self.list_payloads
+            .lock()
+            .await
+            .insert(anchor.clone(), payload);
         Ok(BrokerReply {
-            response: Response::List { entries, anchor },
-            descriptor: None,
+            response: Response::List { anchor },
+            descriptor: Some(descriptor.into()),
         })
     }
 
@@ -546,17 +603,22 @@ where
         snapshot
             .seek(SeekFrom::Start(0))
             .map_err(|error| storage_io("failed to rewind anonymous remote file", error))?;
-        let mut data = Vec::new();
-        snapshot
-            .read_to_end(&mut data)
-            .map_err(|error| storage_io("failed to read anonymous remote file", error))?;
-        let checksum: [u8; 16] = Md5::digest(&data).into();
+        let length = snapshot
+            .metadata()
+            .map_err(|error| storage_io("failed to inspect anonymous remote file", error))?
+            .len();
+        let checksum = checksum_file(&mut snapshot)?;
         if !handle.force_publish && checksum == handle.checksum {
             return Ok(handle.baseline.clone());
         }
         let metadata = self
             .storage
-            .write_if_unchanged(&handle.path, handle.baseline.as_ref(), &data)
+            .write_from_if_unchanged(
+                &handle.path,
+                handle.baseline.as_ref(),
+                &mut snapshot,
+                length,
+            )
             .await?;
         handle.baseline = Some(metadata.clone());
         handle.checksum = checksum;
@@ -644,6 +706,25 @@ where
     }
 }
 
+fn checksum_file(file: &mut File) -> StorageResult<[u8; 16]> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| storage_io("failed to rewind anonymous remote file", error))?;
+    let mut digest = Md5::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| storage_io("failed to read anonymous remote file", error))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| storage_io("failed to rewind anonymous remote file", error))?;
+    Ok(digest.finalize().into())
+}
+
 fn retarget_path(path: &RemotePath, from: &RemotePath, to: &RemotePath) -> Option<RemotePath> {
     if path.root() != from.root() || from.root() != to.root() {
         return None;
@@ -720,18 +801,21 @@ impl RequestCache {
         self.prune(Instant::now())
     }
 
-    fn claim(&mut self, request_id: &RequestId) -> bool {
+    fn claim(&mut self, request_id: &RequestId) -> Option<Option<String>> {
         let Some(CachedRequest::Completed {
             response, claimed, ..
         }) = self.entries.get_mut(request_id)
         else {
-            return false;
+            return None;
         };
         if !response_has_resource(response) {
-            return false;
+            return None;
         }
         *claimed = true;
-        true
+        Some(match response {
+            Response::List { anchor } => Some(anchor.clone()),
+            _ => None,
+        })
     }
 
     fn expire(&mut self) -> Vec<AbandonedResource> {
@@ -803,7 +887,7 @@ fn response_has_resource(response: &Response) -> bool {
 fn response_resource(response: &Response) -> Option<AbandonedResource> {
     match response {
         Response::Open { handle, .. } => Some(AbandonedResource::Handle(handle.clone())),
-        Response::Stat { anchor, .. } | Response::List { anchor, .. } => {
+        Response::Stat { anchor, .. } | Response::List { anchor } => {
             Some(AbandonedResource::Anchor(anchor.clone()))
         }
         _ => None,

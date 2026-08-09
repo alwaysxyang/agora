@@ -59,6 +59,25 @@ fn ca_generation_rejects_one_path_for_both_outputs() {
 }
 
 #[test]
+fn ca_generation_failure_does_not_truncate_an_existing_certificate() {
+    let directory =
+        std::env::temp_dir().join(format!("agora-sandbox-failed-ca-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let certificate = directory.join("ca.pem");
+    let invalid_private_key = directory.join("key-directory");
+    std::fs::write(&certificate, b"existing certificate").unwrap();
+    std::fs::create_dir(&invalid_private_key).unwrap();
+
+    assert!(generate_ca(&certificate, &invalid_private_key).is_err());
+    assert_eq!(
+        std::fs::read(&certificate).unwrap(),
+        b"existing certificate"
+    );
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn authority_rejects_malformed_ca_material() {
     let error = TlsAuthority::from_pem(b"not a certificate", b"not a key", 4).unwrap_err();
 

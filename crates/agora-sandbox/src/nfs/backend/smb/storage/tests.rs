@@ -1,7 +1,8 @@
 use super::{
     FILE_ATTRIBUTE_DIRECTORY, SmbRoot, SmbStorage, build_rename_information, configured_storage,
     expect_success, metadata_from_close, metadata_from_create, metadata_from_file, remote_path,
-    smb_errno, stale_file, storage_error, validate_remote_root, wire_path,
+    smb_errno, stale_file, storage_error, validate_read_response_size, validate_remote_root,
+    wire_path,
 };
 use crate::nfs::SmbRemoteConfig;
 use crate::nfs::backend::{RemoteStorage, StorageResult};
@@ -83,6 +84,14 @@ fn smb_connection_probe_requires_the_configured_remote_path_to_be_a_directory() 
 }
 
 #[test]
+fn smb_reads_reject_empty_and_oversized_responses() {
+    validate_read_response_size(64, 64, 64).unwrap();
+    assert!(validate_read_response_size(64, 64, 0).is_err());
+    assert!(validate_read_response_size(64, 64, 65).is_err());
+    assert!(validate_read_response_size(64, 4, 5).is_err());
+}
+
+#[test]
 fn smb_errors_map_to_posix_errno_without_string_matching() {
     let missing = smb2::Error::Protocol {
         status: NtStatus::OBJECT_NAME_NOT_FOUND,
@@ -109,12 +118,15 @@ fn smb_rename_information_requests_atomic_target_replacement() {
 async fn smb_storage_rejects_unknown_roots_before_network_access() {
     let storage = SmbStorage::new(&[]);
     let path = RemotePath::new(0, "file.txt").unwrap();
+    let mut file = tempfile::tempfile().unwrap();
 
     assert_errno(storage.connect(0).await, libc::EINVAL);
     assert_errno(storage.stat(&path).await, libc::EINVAL);
-    assert_errno(storage.read(&path).await, libc::EINVAL);
+    assert_errno(storage.read_into(&path, &mut file).await, libc::EINVAL);
     assert_errno(
-        storage.write_if_unchanged(&path, None, b"data").await,
+        storage
+            .write_from_if_unchanged(&path, None, &mut file, 0)
+            .await,
         libc::EINVAL,
     );
     assert_errno(storage.list(&path).await, libc::EINVAL);
@@ -146,13 +158,14 @@ async fn smb_storage_propagates_connection_failures_for_every_remote_operation()
     let storage = SmbStorage::new(&[config]);
     let path = RemotePath::new(0, "file.txt").unwrap();
     let renamed = RemotePath::new(0, "renamed.txt").unwrap();
+    let mut file = tempfile::tempfile().unwrap();
 
     assert!(storage.connect(0).await.is_err());
     assert!(storage.stat(&path).await.is_err());
-    assert!(storage.read(&path).await.is_err());
+    assert!(storage.read_into(&path, &mut file).await.is_err());
     assert!(
         storage
-            .write_if_unchanged(&path, None, b"data")
+            .write_from_if_unchanged(&path, None, &mut file, 0)
             .await
             .is_err()
     );

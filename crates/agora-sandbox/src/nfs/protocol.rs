@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 2;
+pub(crate) const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RequestEnvelope {
@@ -106,7 +106,6 @@ pub(crate) enum Response {
         anchor: String,
     },
     List {
-        entries: Vec<RemoteEntry>,
         anchor: String,
     },
     Error {

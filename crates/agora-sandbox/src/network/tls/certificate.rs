@@ -7,7 +7,7 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::IpAddr;
 #[cfg(unix)]
@@ -50,8 +50,8 @@ pub(in crate::network) fn generate_ca(
         .self_signed(&key)
         .context("failed to generate TLS CA certificate")?;
 
-    write_ca_file(certificate_path, certificate.pem().as_bytes())?;
     write_ca_file(private_key_path, key.serialize_pem().as_bytes())?;
+    write_ca_file(certificate_path, certificate.pem().as_bytes())?;
     Ok(())
 }
 
@@ -63,21 +63,38 @@ fn write_ca_file(path: &Path, contents: &[u8]) -> Result<()> {
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create TLS CA directory {}", parent.display()))?;
 
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("failed to open TLS CA file {}", path.display()))?;
-    file.write_all(contents)
-        .with_context(|| format!("failed to write TLS CA file {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to sync TLS CA file {}", path.display()))?;
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to secure TLS CA file {}", path.display()))?;
-    Ok(())
+    let temporary = parent.join(format!(".agora-ca-{}.tmp", uuid::Uuid::new_v4().simple()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary).with_context(|| {
+            format!(
+                "failed to create temporary TLS CA file for {}",
+                path.display()
+            )
+        })?;
+        file.write_all(contents)
+            .with_context(|| format!("failed to write TLS CA file {}", path.display()))?;
+        #[cfg(unix)]
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to secure TLS CA file {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync TLS CA file {}", path.display()))?;
+        drop(file);
+        fs::rename(&temporary, path)
+            .with_context(|| format!("failed to publish TLS CA file {}", path.display()))?;
+        #[cfg(unix)]
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("failed to sync TLS CA directory {}", parent.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub(in crate::network) struct TlsAuthority {

@@ -4,7 +4,7 @@ use crate::filesystem::broker::protocol::{
     BackingPath, ByteRange, Request, RequestEnvelope, Response, ResponseEnvelope,
 };
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 
 fn cipher() -> FileCipher {
@@ -76,6 +76,127 @@ async fn controller_serves_the_complete_local_client_lifecycle() {
     restored.read_to_string(&mut contents).unwrap();
     assert_eq!(contents, "after!");
     assert!(!runtime.join("local-filesystem.sock").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_drains_service_work_before_the_final_flush() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fs");
+    std::fs::create_dir(&root).unwrap();
+    let cipher = cipher();
+    let backing = root.join("content");
+    let mut source = tempfile::tempfile().unwrap();
+    source.write_all(b"before").unwrap();
+    cipher.encrypt(&mut source, &backing).unwrap();
+
+    let mut plaintext = tempfile::tempfile().unwrap();
+    plaintext.write_all(b"before").unwrap();
+    let descriptor: OwnedFd = plaintext.try_clone().unwrap().into();
+    let broker = Arc::new(LocalBroker::new(&root, cipher.clone()).unwrap());
+    let response = broker.handle(
+        Request::Open {
+            path: BackingPath::from_path(&backing),
+            writable: true,
+        },
+        Some(descriptor),
+    );
+    let Response::Open { handle } = response.response else {
+        panic!("unexpected open response: {:?}", response.response);
+    };
+
+    let (shutdown, mut receiver) = watch::channel(false);
+    let mut tasks = JoinSet::new();
+    let task_broker = Arc::clone(&broker);
+    tasks.spawn(async move {
+        receiver.changed().await.unwrap();
+        plaintext.write_all_at(b"after!", 0).unwrap();
+        assert_eq!(
+            task_broker
+                .handle(
+                    Request::PotentiallyDirty {
+                        handle,
+                        range: ByteRange::new(0, 6).unwrap(),
+                    },
+                    None,
+                )
+                .response,
+            Response::Success
+        );
+        Ok(())
+    });
+    let controller = LocalController {
+        runtime: LocalRuntime {
+            socket: directory.path().join("unused.sock"),
+            token: "token".to_string(),
+        },
+        broker,
+        shutdown,
+        tasks,
+    };
+
+    controller.shutdown().await.unwrap();
+
+    let mut restored = tempfile::tempfile().unwrap();
+    cipher.decrypt(&backing, &mut restored).unwrap();
+    restored.seek(SeekFrom::Start(0)).unwrap();
+    let mut contents = String::new();
+    restored.read_to_string(&mut contents).unwrap();
+    assert_eq!(contents, "after!");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_shutdown_waits_for_an_accepted_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fs");
+    std::fs::create_dir(&root).unwrap();
+    let socket = directory.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let token = "token".to_string();
+    let state = Arc::new(ServerState {
+        token: token.clone(),
+        broker: Arc::new(LocalBroker::new(&root, cipher()).unwrap()),
+    });
+    let server = Server::new(listener, state);
+    let connections = Arc::clone(&server.connections);
+    let (shutdown, receiver) = watch::channel(false);
+    let mut task = tokio::spawn(server.run(receiver));
+    let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while connections.available_permits() == MAX_CONNECTIONS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    shutdown.send(true).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut task)
+            .await
+            .is_err()
+    );
+
+    let response = tokio::task::spawn_blocking(move || {
+        let mut stream = stream;
+        ipc::send(
+            &mut stream,
+            &RequestEnvelope {
+                version: PROTOCOL_VERSION,
+                token,
+                request_id: "accepted-during-shutdown".to_string(),
+                request: Request::Close {
+                    handle: "missing".to_string(),
+                },
+            },
+            None,
+        )
+        .unwrap();
+        ipc::receive::<ResponseEnvelope>(&mut stream).unwrap().0
+    })
+    .await
+    .unwrap();
+    assert_eq!(response.response, Response::Success);
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

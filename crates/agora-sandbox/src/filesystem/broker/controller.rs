@@ -90,10 +90,6 @@ impl LocalController {
     }
 
     pub(crate) async fn shutdown(mut self) -> Result<()> {
-        let broker = Arc::clone(&self.broker);
-        tokio::task::spawn_blocking(move || broker.flush_all())
-            .await
-            .context("local filesystem final flush task failed")??;
         let _ = self.shutdown.send(true);
         let mut first = None;
         while let Some(result) = self.tasks.join_next().await {
@@ -104,6 +100,10 @@ impl LocalController {
                 _ => {}
             }
         }
+        let broker = Arc::clone(&self.broker);
+        tokio::task::spawn_blocking(move || broker.flush_all())
+            .await
+            .context("local filesystem final flush task failed")??;
         let _ = std::fs::remove_file(&self.runtime.socket);
         match first {
             Some(error) => Err(error),
@@ -168,7 +168,6 @@ impl Server {
                 }
             }
         }
-        tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         Ok(())
     }

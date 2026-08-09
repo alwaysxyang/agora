@@ -15,6 +15,8 @@ use smb2::types::status::NtStatus;
 use smb2::types::{Command, FileId, OplockLevel};
 use smb2::{ClientConfig, ErrorKind, SmbClient, Tree};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -88,25 +90,30 @@ impl RemoteStorage for SmbStorage {
         Ok(metadata_from_file(&info))
     }
 
-    async fn read(&self, path: &RemotePath) -> StorageResult<(Vec<u8>, RemoteMetadata)> {
-        let mut root = self.root(path).await?;
-        let remote = root.path(path);
-        let session = root.session().await?;
-        read_locked_file(session, &remote)
-            .await
-            .map_err(storage_error)
-    }
-
-    async fn write_if_unchanged(
+    async fn read_into(
         &self,
         path: &RemotePath,
-        expected: Option<&RemoteMetadata>,
-        data: &[u8],
+        destination: &mut File,
     ) -> StorageResult<RemoteMetadata> {
         let mut root = self.root(path).await?;
         let remote = root.path(path);
         let session = root.session().await?;
-        write_locked_file(session, &remote, expected, data).await
+        read_locked_file(session, &remote, destination)
+            .await
+            .map_err(storage_error)
+    }
+
+    async fn write_from_if_unchanged(
+        &self,
+        path: &RemotePath,
+        expected: Option<&RemoteMetadata>,
+        source: &mut File,
+        length: u64,
+    ) -> StorageResult<RemoteMetadata> {
+        let mut root = self.root(path).await?;
+        let remote = root.path(path);
+        let session = root.session().await?;
+        write_locked_file(session, &remote, expected, source, length).await
     }
 
     async fn list(&self, path: &RemotePath) -> StorageResult<Vec<RemoteEntry>> {
@@ -257,7 +264,10 @@ fn build_rename_information(target: &str) -> Vec<u8> {
 async fn read_locked_file(
     session: &mut SmbSession,
     path: &str,
-) -> Result<(Vec<u8>, RemoteMetadata), smb2::Error> {
+    destination: &mut File,
+) -> Result<RemoteMetadata, smb2::Error> {
+    destination.set_len(0)?;
+    destination.seek(SeekFrom::Start(0))?;
     let opened = open_locked_file(
         session,
         path,
@@ -270,12 +280,12 @@ async fn read_locked_file(
     )
     .await?;
     let metadata = metadata_from_create(&opened);
-    let result = read_handle(session, opened.file_id, opened.end_of_file).await;
+    let result = read_handle(session, opened.file_id, opened.end_of_file, destination).await;
     let closed = close_handle(session, opened.file_id, false).await;
     match result {
-        Ok(data) => {
+        Ok(()) => {
             closed?;
-            Ok((data, metadata))
+            Ok(metadata)
         }
         Err(error) => {
             let _ = closed;
@@ -288,8 +298,12 @@ async fn write_locked_file(
     session: &mut SmbSession,
     path: &str,
     expected: Option<&RemoteMetadata>,
-    data: &[u8],
+    source: &mut File,
+    length: u64,
 ) -> StorageResult<RemoteMetadata> {
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| storage_error(error.into()))?;
     let disposition = if expected.is_some() {
         CreateDisposition::FileOpen
     } else {
@@ -326,8 +340,8 @@ async fn write_locked_file(
     }
 
     let operation = async {
-        write_handle(session, opened.file_id, data).await?;
-        set_handle_length(session, opened.file_id, data.len() as u64).await?;
+        write_handle(session, opened.file_id, source, length).await?;
+        set_handle_length(session, opened.file_id, length).await?;
         flush_handle(session, opened.file_id).await?;
         close_handle(session, opened.file_id, true)
             .await?
@@ -373,13 +387,12 @@ async fn read_handle(
     session: &mut SmbSession,
     file_id: FileId,
     length: u64,
-) -> Result<Vec<u8>, smb2::Error> {
-    let capacity = usize::try_from(length)
-        .map_err(|_| smb2::Error::invalid_data("SMB file is too large for this process"))?;
-    let mut data = Vec::with_capacity(capacity);
+    destination: &mut File,
+) -> Result<(), smb2::Error> {
     let mut offset = 0_u64;
     while offset < length {
-        let chunk = (length - offset).min(TRANSFER_CHUNK_SIZE as u64) as u32;
+        let remaining = length - offset;
+        let chunk = remaining.min(TRANSFER_CHUNK_SIZE as u64) as u32;
         let request = ReadRequest {
             padding: 0x50,
             flags: 0,
@@ -397,37 +410,60 @@ async fn read_handle(
             .execute(Command::Read, &request, Some(session.tree.tree_id))
             .await?;
         if frame.header.status == NtStatus::END_OF_FILE {
-            break;
+            return Err(smb2::Error::invalid_data(
+                "SMB file ended before its advertised length",
+            ));
         }
         expect_success(&frame, Command::Read)?;
         let response = ReadResponse::unpack(&mut ReadCursor::new(&frame.body))?;
-        if response.data.is_empty() {
-            break;
-        }
-        offset += response.data.len() as u64;
-        data.extend_from_slice(&response.data);
+        offset += validate_read_response_size(chunk, remaining, response.data.len())?;
+        destination.write_all(&response.data)?;
     }
-    Ok(data)
+    Ok(())
+}
+
+fn validate_read_response_size(
+    requested: u32,
+    remaining: u64,
+    received: usize,
+) -> Result<u64, smb2::Error> {
+    let received = u64::try_from(received)
+        .map_err(|_| smb2::Error::invalid_data("SMB read response is too large"))?;
+    if received == 0 {
+        return Err(smb2::Error::invalid_data(
+            "SMB read returned no data before the advertised end of file",
+        ));
+    }
+    if received > u64::from(requested) || received > remaining {
+        return Err(smb2::Error::invalid_data(
+            "SMB read response exceeds the requested length",
+        ));
+    }
+    Ok(received)
 }
 
 async fn write_handle(
     session: &mut SmbSession,
     file_id: FileId,
-    data: &[u8],
+    source: &mut File,
+    length: u64,
 ) -> Result<(), smb2::Error> {
-    let mut offset = 0_usize;
-    while offset < data.len() {
-        let end = (offset + TRANSFER_CHUNK_SIZE).min(data.len());
+    let mut offset = 0_u64;
+    let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
+    while offset < length {
+        let chunk = usize::try_from((length - offset).min(TRANSFER_CHUNK_SIZE as u64))
+            .map_err(|_| smb2::Error::invalid_data("SMB write chunk is too large"))?;
+        source.read_exact(&mut buffer[..chunk])?;
         let request = WriteRequest {
             data_offset: 0x70,
-            offset: offset as u64,
+            offset,
             file_id,
             channel: 0,
             remaining_bytes: 0,
             write_channel_info_offset: 0,
             write_channel_info_length: 0,
             flags: 0,
-            data: data[offset..end].to_vec(),
+            data: buffer[..chunk].to_vec(),
         };
         let frame = session
             .client
@@ -436,12 +472,12 @@ async fn write_handle(
             .await?;
         expect_success(&frame, Command::Write)?;
         let response = WriteResponse::unpack(&mut ReadCursor::new(&frame.body))?;
-        if response.count as usize != end - offset {
+        if response.count as usize != chunk {
             return Err(smb2::Error::invalid_data(
                 "SMB write returned a short count",
             ));
         }
-        offset = end;
+        offset += chunk as u64;
     }
     Ok(())
 }

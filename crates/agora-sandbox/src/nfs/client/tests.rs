@@ -354,6 +354,17 @@ fn client_rejects_response_version_id_and_descriptor_mismatches() {
     );
     assert_eq!(
         super::response_result(
+            Response::List {
+                anchor: "anchor".to_string(),
+            },
+            None,
+        )
+        .unwrap_err()
+        .errno(),
+        libc::EPROTO
+    );
+    assert_eq!(
+        super::response_result(
             Response::Success,
             Some(tempfile::tempfile().unwrap().into()),
         )

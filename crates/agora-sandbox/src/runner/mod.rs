@@ -309,11 +309,30 @@ impl SandboxConfig {
         if self.network.tls == TlsMode::Off {
             return Ok(None);
         }
+        let managed = self.tls_ca.is_none();
         let ca = self.tls_ca.clone().unwrap_or_else(|| TlsCaFiles {
             certificate: self.workdir.join(DEFAULT_TLS_CA_CERTIFICATE),
             private_key: self.workdir.join(DEFAULT_TLS_CA_PRIVATE_KEY),
         });
-        if !ca.certificate.is_file() || !ca.private_key.is_file() {
+        let missing = !ca.certificate.is_file() || !ca.private_key.is_file();
+        let invalid_managed_pair = if managed && !missing {
+            let certificate = std::fs::read(&ca.certificate).with_context(|| {
+                format!(
+                    "failed to read TLS CA certificate {}",
+                    ca.certificate.display()
+                )
+            })?;
+            let private_key = std::fs::read(&ca.private_key).with_context(|| {
+                format!(
+                    "failed to read TLS CA private key {}",
+                    ca.private_key.display()
+                )
+            })?;
+            crate::network::validate_tls_ca(&certificate, &private_key).is_err()
+        } else {
+            false
+        };
+        if missing || invalid_managed_pair {
             crate::network::generate_tls_ca(&ca.certificate, &ca.private_key)?;
         }
         Ok(Some(ca))

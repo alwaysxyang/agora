@@ -2,8 +2,12 @@ use crate::nfs::protocol::{
     PROTOCOL_VERSION, Request, RequestEnvelope, RequestId, Response, ResponseEnvelope,
 };
 use crate::nfs::transport;
+use serde::de::DeserializeOwned;
 use std::fmt;
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -41,7 +45,7 @@ impl RemoteClient {
         let reply = self.request_with_id(request_id.clone(), request)?;
         let resource = match &reply.response {
             Response::Open { handle, .. } => Some((Some(handle.clone()), None)),
-            Response::Stat { anchor, .. } | Response::List { anchor, .. } => {
+            Response::Stat { anchor, .. } | Response::List { anchor } => {
                 Some((None, Some(anchor.clone())))
             }
             _ => None,
@@ -140,6 +144,32 @@ pub(crate) struct RemoteReply {
     pub(crate) descriptor: Option<OwnedFd>,
 }
 
+pub(crate) fn decode_json_descriptor<T>(descriptor: OwnedFd) -> serde_json::Result<T>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_reader(BufReader::new(DescriptorReader {
+        file: descriptor.into(),
+        offset: 0,
+    }))
+}
+
+struct DescriptorReader {
+    file: File,
+    offset: u64,
+}
+
+impl Read for DescriptorReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.file.read_at(buffer, self.offset)?;
+        self.offset = self
+            .offset
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("remote descriptor offset overflowed"))?;
+        Ok(read)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct RemoteClientError {
     errno: libc::c_int,
@@ -188,7 +218,7 @@ fn response_result(
     if let Response::Error { errno, message } = response {
         return Err(RemoteClientError::new(errno, message));
     }
-    let expects_descriptor = matches!(response, Response::Open { .. });
+    let expects_descriptor = matches!(response, Response::Open { .. } | Response::List { .. });
     if expects_descriptor != descriptor.is_some() {
         return Err(RemoteClientError::new(
             libc::EPROTO,
