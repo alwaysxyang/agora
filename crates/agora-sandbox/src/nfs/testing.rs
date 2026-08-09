@@ -20,11 +20,15 @@ pub(crate) struct MemoryStorage {
     connection_release: tokio::sync::Notify,
     yield_operations: AtomicBool,
     stat_operations: AtomicUsize,
+    list_visits: AtomicUsize,
     reset_operations: AtomicUsize,
     resets_blocked: AtomicBool,
     reset_release: tokio::sync::Notify,
     stats_blocked: AtomicBool,
     stat_release: tokio::sync::Notify,
+    reads_blocked: AtomicBool,
+    read_started: tokio::sync::Notify,
+    read_release: tokio::sync::Notify,
 }
 
 impl MemoryStorage {
@@ -73,6 +77,10 @@ impl MemoryStorage {
         self.stat_operations.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn list_visits(&self) -> usize {
+        self.list_visits.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn reset_operations(&self) -> usize {
         self.reset_operations.load(Ordering::Relaxed)
     }
@@ -93,6 +101,19 @@ impl MemoryStorage {
     pub(crate) fn release_stats(&self) {
         self.stats_blocked.store(false, Ordering::Release);
         self.stat_release.notify_waiters();
+    }
+
+    pub(crate) fn block_reads(&self) {
+        self.reads_blocked.store(true, Ordering::Release);
+    }
+
+    pub(crate) async fn wait_until_read_started(&self) {
+        self.read_started.notified().await;
+    }
+
+    pub(crate) fn release_reads(&self) {
+        self.reads_blocked.store(false, Ordering::Release);
+        self.read_release.notify_waiters();
     }
 
     pub(crate) fn fail_connection(
@@ -153,6 +174,17 @@ impl MemoryStorage {
         }
     }
 
+    async fn wait_for_read_release(&self) {
+        self.read_started.notify_one();
+        loop {
+            let released = self.read_release.notified();
+            if !self.reads_blocked.load(Ordering::Acquire) {
+                break;
+            }
+            released.await;
+        }
+    }
+
     fn metadata(entry: &MemoryEntry) -> RemoteMetadata {
         RemoteMetadata {
             file_type: if entry.data.is_some() {
@@ -194,6 +226,7 @@ impl RemoteStorage for MemoryStorage {
         destination: &mut File,
         max_length: u64,
     ) -> StorageResult<RemoteMetadata> {
+        self.wait_for_read_release().await;
         let entries = lock(&self.entries);
         let entry = entries
             .get(&(path.root(), path.path().to_string()))
@@ -262,7 +295,11 @@ impl RemoteStorage for MemoryStorage {
         Ok(metadata)
     }
 
-    async fn list(&self, path: &RemotePath, max_entries: usize) -> StorageResult<Vec<RemoteEntry>> {
+    async fn list(
+        &self,
+        path: &RemotePath,
+        emit: &mut (impl FnMut(RemoteEntry) -> StorageResult<()> + Send),
+    ) -> StorageResult<()> {
         let entries = lock(&self.entries);
         let directory = entries
             .get(&(path.root(), path.path().to_string()))
@@ -275,26 +312,21 @@ impl RemoteStorage for MemoryStorage {
         } else {
             format!("{}/", path.path())
         };
-        let entries = entries
-            .iter()
-            .filter_map(|((root, child), entry)| {
-                (*root == path.root())
-                    .then(|| child.strip_prefix(&prefix))
-                    .flatten()
-                    .filter(|suffix| !suffix.is_empty() && !suffix.contains('/'))
-                    .map(|name| RemoteEntry {
-                        name: name.to_string(),
-                        metadata: Self::metadata(entry),
-                    })
-            })
-            .collect::<Vec<_>>();
-        if entries.len() > max_entries {
-            return Err(StorageError::new(
-                libc::EOVERFLOW,
-                "remote directory exceeds the sandbox listing limit",
-            ));
+        for ((root, child), entry) in entries.iter() {
+            let Some(name) = (*root == path.root())
+                .then(|| child.strip_prefix(&prefix))
+                .flatten()
+                .filter(|suffix| !suffix.is_empty() && !suffix.contains('/'))
+            else {
+                continue;
+            };
+            self.list_visits.fetch_add(1, Ordering::Relaxed);
+            emit(RemoteEntry {
+                name: name.to_string(),
+                metadata: Self::metadata(entry),
+            })?;
         }
-        Ok(entries)
+        Ok(())
     }
 
     async fn create_directory(&self, path: &RemotePath) -> StorageResult<()> {

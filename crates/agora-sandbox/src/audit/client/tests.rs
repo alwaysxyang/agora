@@ -114,6 +114,23 @@ fn audit_client_reuses_one_connection_for_multiple_events() {
 }
 
 #[test]
+fn audit_client_reconnects_once_after_an_idle_peer_closes() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        drop(accept_request(&listener).unwrap());
+        drop(accept_request(&listener).unwrap());
+    });
+    let client = AuditClient::new(address, "token");
+
+    client.publish(file_request("/first")).unwrap();
+    client.publish(file_request("/after-idle-close")).unwrap();
+
+    server.join().unwrap();
+    CONNECTIONS.with(|connections| connections.borrow_mut().clear());
+}
+
+#[test]
 fn audit_client_replaces_a_connection_cached_by_another_process() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let address = listener.local_addr().unwrap();

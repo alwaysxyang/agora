@@ -241,6 +241,7 @@ async fn stopping_a_card_run_advances_the_next_queued_task() {
     let replies = Arc::new(Mutex::new(Vec::new()));
     let channel = CommandTestChannel {
         tasks: VecDeque::new(),
+        received: None,
         events: Arc::clone(&events),
         contexts: Arc::clone(&contexts),
         interrupts: Arc::clone(&interrupts),

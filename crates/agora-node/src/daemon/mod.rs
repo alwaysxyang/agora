@@ -15,7 +15,9 @@ use anyhow::{Result, bail};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::oneshot;
 use tokio::task::{JoinError, JoinSet};
+use uuid::Uuid;
 
 mod command;
 mod execution;
@@ -107,7 +109,13 @@ impl AgentDispatcher {
             runs.spawn(async move {
                 let mut ahead = execution.ahead();
                 while ahead > 0 {
-                    output.queued(ahead).await?;
+                    tokio::select! {
+                        result = output.queued(ahead) => result?,
+                        cancellation = control.cancelled() => {
+                            drop(execution);
+                            return output.cancelled(cancellation).await;
+                        }
+                    }
                     ahead = tokio::select! {
                         ahead = execution.changed() => ahead?,
                         cancellation = control.cancelled() => {
@@ -116,10 +124,17 @@ impl AgentDispatcher {
                         }
                     };
                 }
-                output.started().await?;
+                tokio::select! {
+                    result = output.started() => result?,
+                    cancellation = control.cancelled() => {
+                        drop(execution);
+                        return output.cancelled(cancellation).await;
+                    }
+                }
                 let result = dispatcher
-                    .execute_agent(&key, &agent, agent_task, control, &mut output)
+                    .execute_agent(&key, &agent, agent_task, control.clone(), &mut output)
                     .await;
+                drop(execution);
                 match result {
                     Ok(AgentRunOutcome::Completed(outcome)) if outcome.exit_code() == 0 => {
                         output.completed(outcome.exit_code()).await
@@ -327,27 +342,43 @@ impl Daemon {
         commands: Arc<CommandRuntime>,
     ) -> Result<()>
     where
-        C: Channel + Send + Sync + 'static,
+        C: Channel + Clone + Send + Sync + 'static,
         C::Task: Send + Sync + 'static,
         C::Run: Send + Sync + 'static,
     {
-        let mut runs = JoinSet::new();
+        let mut routes = JoinSet::new();
+        let mut route_tail = None;
         loop {
             tokio::select! {
                 received = channel.recv() => match received {
                     Ok(Some(task)) => {
-                        if let Err(err) = Self::route_channel_task(
-                            &channel,
-                            &agents,
-                            &dispatcher,
-                            &commands,
-                            task,
-                            &mut runs,
-                        )
-                        .await
-                        {
-                            logger::error!("channel task failed channel={}: {}", channel.name(), err);
-                        }
+                        let task_channel = channel.clone();
+                        let task_agents = agents.clone();
+                        let task_dispatcher = dispatcher.clone();
+                        let task_commands = Arc::clone(&commands);
+                        let predecessor = route_tail.take();
+                        let (admitted, successor) = oneshot::channel();
+                        route_tail = Some(successor);
+                        routes.spawn(async move {
+                            if let Some(predecessor) = predecessor {
+                                let _ = predecessor.await;
+                            }
+                            let mut agent_runs = JoinSet::new();
+                            let route_result = Self::route_channel_task(
+                                &task_channel,
+                                &task_agents,
+                                &task_dispatcher,
+                                &task_commands,
+                                task,
+                                &mut agent_runs,
+                            )
+                            .await;
+                            let _ = admitted.send(());
+                            while let Some(result) = agent_runs.join_next().await {
+                                AgentDispatcher::log_run_result(result);
+                            }
+                            route_result
+                        });
                     }
                     Ok(None) => {
                         logger::error!("channel ended channel={}", channel.name());
@@ -358,7 +389,7 @@ impl Daemon {
                         tokio::time::sleep(CHANNEL_RETRY_DELAY).await;
                     }
                 },
-                result = runs.join_next(), if !runs.is_empty() => {
+                result = routes.join_next(), if !routes.is_empty() => {
                     if let Some(result) = result {
                         AgentDispatcher::log_run_result(result);
                     }
@@ -403,6 +434,7 @@ impl Daemon {
 
 struct AgentRunOutput<R> {
     run: R,
+    run_id: String,
 }
 
 impl<R> AgentRunOutput<R>
@@ -410,13 +442,16 @@ where
     R: ChannelRun + Send + Sync,
 {
     fn new(run: R) -> Self {
-        Self { run }
+        Self {
+            run,
+            run_id: Uuid::new_v4().to_string(),
+        }
     }
 
     async fn started(&self) -> Result<()> {
         self.run
             .publish(RunEvent::Started {
-                run_id: "local-run".to_string(),
+                run_id: self.run_id.clone(),
             })
             .await
     }

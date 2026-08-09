@@ -60,6 +60,7 @@ async fn reset_stops_the_scope_deletes_the_session_and_starts_fresh_next_time() 
     let replies = Arc::new(Mutex::new(Vec::new()));
     let channel = CommandTestChannel {
         tasks: VecDeque::new(),
+        received: None,
         events: Arc::new(Mutex::new(Vec::new())),
         contexts: Arc::new(Mutex::new(Vec::new())),
         interrupts: Arc::new(Mutex::new(Vec::new())),
@@ -145,6 +146,7 @@ async fn reset_preserves_the_mapping_when_backend_deletion_fails() {
     let replies = Arc::new(Mutex::new(Vec::new()));
     let channel = CommandTestChannel {
         tasks: VecDeque::new(),
+        received: None,
         events: Arc::new(Mutex::new(Vec::new())),
         contexts: Arc::new(Mutex::new(Vec::new())),
         interrupts: Arc::new(Mutex::new(Vec::new())),

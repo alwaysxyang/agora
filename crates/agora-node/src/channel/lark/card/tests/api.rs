@@ -1,4 +1,7 @@
 use super::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 #[tokio::test]
 async fn lark_card_coalesces_intermediate_updates_and_flushes_completion() {
@@ -131,6 +134,117 @@ async fn lark_card_flushes_queue_and_all_non_success_terminal_states() {
             .count(),
         2
     );
+}
+
+#[tokio::test]
+async fn lark_card_refreshes_the_token_once_after_unauthorized() {
+    let token_requests = Arc::new(AtomicUsize::new(0));
+    let reply_requests = Arc::new(AtomicUsize::new(0));
+    let token_counter = Arc::clone(&token_requests);
+    let reply_counter = Arc::clone(&reply_requests);
+    let server = HttpMockServer::start(move |request| {
+        if request.path.ends_with("tenant_access_token/internal") {
+            let token = token_counter.fetch_add(1, Ordering::SeqCst) + 1;
+            MockResponse::json(format!(
+                r#"{{"code":0,"msg":"ok","tenant_access_token":"token-{token}"}}"#
+            ))
+        } else if request.path.ends_with("/reply") {
+            reply_counter.fetch_add(1, Ordering::SeqCst);
+            if request.header("authorization") == Some("Bearer token-1") {
+                MockResponse::json(r#"{"code":401,"msg":"expired"}"#).with_status(401)
+            } else {
+                MockResponse::json(r#"{"code":0,"msg":"ok","data":{"message_id":"om_reply"}}"#)
+            }
+        } else {
+            MockResponse::json(r#"{"code":0,"msg":"ok"}"#)
+        }
+    })
+    .await;
+    let api = LarkApi::with_base_url(
+        LarkChannelConfig {
+            name: "lark-token-refresh".to_string(),
+            app_id: "app-id".to_string(),
+            secret: "secret".to_string(),
+            permission: Default::default(),
+            proxy: None,
+        },
+        server.base_url(),
+    )
+    .unwrap();
+    let card = LarkAgentCard::new(
+        LarkReplyTarget {
+            message_id: "om_source".to_string(),
+        },
+        "codex-dev".to_string(),
+        None,
+        LarkConversation::Private,
+        api,
+    );
+
+    card.publish(RunEvent::Started {
+        run_id: "run-refresh".to_string(),
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(token_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(reply_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn lark_card_does_not_hold_its_state_lock_during_http() {
+    let server = HttpMockServer::start(|request| {
+        let response = if request.path.ends_with("tenant_access_token/internal") {
+            MockResponse::json(r#"{"code":0,"msg":"ok","tenant_access_token":"token"}"#)
+        } else if request.path.ends_with("/reply") {
+            MockResponse::json(r#"{"code":0,"msg":"ok","data":{"message_id":"om_reply"}}"#)
+        } else {
+            MockResponse::json(r#"{"code":0,"msg":"ok"}"#)
+        };
+        response.with_delay(Duration::from_millis(200))
+    })
+    .await;
+    let api = LarkApi::with_base_url(
+        LarkChannelConfig {
+            name: "lark-unlocked-http".to_string(),
+            app_id: "app-id".to_string(),
+            secret: "secret".to_string(),
+            permission: Default::default(),
+            proxy: None,
+        },
+        server.base_url(),
+    )
+    .unwrap();
+    let card = LarkAgentCard::new(
+        LarkReplyTarget {
+            message_id: "om_source".to_string(),
+        },
+        "codex-dev".to_string(),
+        None,
+        LarkConversation::Private,
+        api,
+    );
+    let publishing = {
+        let card = card.clone();
+        tokio::spawn(async move {
+            card.publish(RunEvent::Started {
+                run_id: "run-lock".to_string(),
+            })
+            .await
+        })
+    };
+    server.wait_for_method_count("POST", 2).await;
+
+    tokio::time::timeout(
+        Duration::from_millis(50),
+        card.publish(RunEvent::Output(OutputEvent::Thinking {
+            text: "still responsive".to_string(),
+        })),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    publishing.await.unwrap().unwrap();
 }
 
 #[tokio::test]

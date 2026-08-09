@@ -83,6 +83,41 @@ fn parses_lark_post_text_and_image_references() {
 }
 
 #[test]
+fn lark_post_preserves_node_and_paragraph_boundaries() {
+    let (text, images) = LarkMessageEvent::flatten_post_content(&serde_json::json!({
+        "content": [
+            [
+                {"tag": "text", "text": "run"},
+                {"tag": "text", "text": "tests"}
+            ],
+            [{"tag": "text", "text": "then report"}]
+        ]
+    }));
+
+    assert_eq!(text, "run tests\nthen report");
+    assert!(images.is_empty());
+}
+
+#[test]
+fn lark_messages_without_a_sender_identity_are_rejected() {
+    let error = LarkEvent::from_lark_event_payload(
+        r#"{
+            "header": {"event_id": "evt_missing_sender", "event_type": "im.message.receive_v1"},
+            "event": {"message": {
+                "message_id": "om_missing_sender",
+                "chat_id": "oc_123",
+                "chat_type": "p2p",
+                "message_type": "text",
+                "content": "{\"text\":\"hello\"}"
+            }}
+        }"#,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("sender.sender_id"));
+}
+
+#[test]
 fn accepts_a_standalone_lark_image_message() {
     let LarkEvent::Message(event) = LarkEvent::from_lark_event_payload(
         r#"{

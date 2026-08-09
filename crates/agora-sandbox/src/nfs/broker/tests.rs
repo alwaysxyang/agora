@@ -26,14 +26,41 @@ fn assert_errno(response: Response, errno: libc::c_int) {
     );
 }
 
-#[test]
-fn checksum_honors_its_cpu_time_budget() {
+#[tokio::test]
+async fn checksum_honors_its_cpu_time_budget() {
     let mut file = tempfile::tempfile().unwrap();
     file.write_all(b"data").unwrap();
 
-    let error = checksum_file(&mut file, Duration::ZERO).unwrap_err();
+    let error = checksum_file(file, Instant::now()).await.unwrap_err();
 
     assert_eq!(error.errno(), libc::ETIMEDOUT);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn checksum_does_not_block_the_async_runtime_worker() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let file = tempfile::tempfile().unwrap();
+    file.set_len(8 * 1024 * 1024).unwrap();
+    let completed = std::sync::Arc::new(AtomicBool::new(false));
+    let observed = std::sync::Arc::clone(&completed);
+
+    let (checksum, ()) = tokio::join!(
+        async {
+            let checksum = checksum_file(file, Instant::now() + Duration::from_secs(1)).await;
+            completed.store(true, Ordering::Release);
+            checksum
+        },
+        async {
+            tokio::task::yield_now().await;
+            assert!(
+                !observed.load(Ordering::Acquire),
+                "checksum work must execute outside the async runtime worker"
+            );
+        }
+    );
+
+    checksum.unwrap();
 }
 
 #[tokio::test]
@@ -109,6 +136,7 @@ async fn broker_rejects_reusing_a_request_id_for_a_different_operation() {
             request_id(5),
             Request::Stat {
                 path: path("one.txt"),
+                name_capacity: 0,
             },
         )
         .await;
@@ -117,6 +145,7 @@ async fn broker_rejects_reusing_a_request_id_for_a_different_operation() {
             request_id(5),
             Request::Stat {
                 path: path("two.txt"),
+                name_capacity: 0,
             },
         )
         .await
@@ -164,7 +193,7 @@ async fn broker_rejects_remote_files_above_the_snapshot_limit_before_download() 
     let storage = std::sync::Arc::new(MemoryStorage::default());
     storage.insert_file(0, "large.bin", b"12345");
     let broker = Broker::new_with_limits(
-        storage,
+        std::sync::Arc::clone(&storage),
         root.path(),
         RemoteLimits {
             max_file_bytes: 4,
@@ -238,6 +267,7 @@ async fn broker_bounds_the_total_remote_operation_duration() {
         Duration::from_millis(100),
         broker.handle(Request::Stat {
             path: path("blocked.txt"),
+            name_capacity: 0,
         }),
     )
     .await;
@@ -415,6 +445,53 @@ async fn broker_serializes_version_check_and_writeback_per_root() {
 }
 
 #[tokio::test]
+async fn broker_registers_an_open_snapshot_before_namespace_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = std::sync::Arc::new(MemoryStorage::default());
+    storage.insert_file(0, "shared.txt", b"original");
+    storage.block_reads();
+    let broker =
+        std::sync::Arc::new(Broker::new(std::sync::Arc::clone(&storage), root.path()).unwrap());
+
+    let opening = {
+        let broker = std::sync::Arc::clone(&broker);
+        tokio::spawn(async move {
+            broker
+                .handle(Request::Open {
+                    path: path("shared.txt"),
+                    flags: libc::O_RDWR,
+                    mode: 0,
+                })
+                .await
+        })
+    };
+    storage.wait_until_read_started().await;
+
+    let removing = {
+        let broker = std::sync::Arc::clone(&broker);
+        tokio::spawn(async move {
+            broker
+                .handle(Request::Remove {
+                    path: path("shared.txt"),
+                    directory: false,
+                })
+                .await
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(
+        !removing.is_finished(),
+        "remove must wait until open has registered its snapshot"
+    );
+
+    storage.release_reads();
+    let opened = opening.await.unwrap();
+    assert!(matches!(opened.response, Response::Open { .. }));
+    assert_eq!(removing.await.unwrap().response, Response::Success);
+}
+
+#[tokio::test]
 async fn broker_does_not_publish_an_unchanged_writable_snapshot() {
     let root = tempfile::tempdir().unwrap();
     let storage = std::sync::Arc::new(MemoryStorage::default());
@@ -490,7 +567,12 @@ async fn broker_handles_directory_and_namespace_operations() {
     storage.insert_file(0, "docs/a.txt", b"a");
     let broker = Broker::new(std::sync::Arc::clone(&storage), root.path()).unwrap();
 
-    let list = broker.handle(Request::List { path: path("docs") }).await;
+    let list = broker
+        .handle(Request::List {
+            path: path("docs"),
+            name_capacity: 80,
+        })
+        .await;
     let Response::List { anchor } = list.response else {
         panic!("expected list response");
     };
@@ -503,6 +585,7 @@ async fn broker_handles_directory_and_namespace_operations() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "a.txt");
     assert!(!anchor.contains("docs"));
+    assert!(anchor.len() >= 80);
     assert!(root.path().join(anchor).is_dir());
     assert_eq!(
         broker
@@ -559,6 +642,7 @@ async fn broker_streams_large_directory_lists_outside_the_control_frame() {
     let request_id = request_id(250);
     let request = Request::List {
         path: path("large"),
+        name_capacity: 0,
     };
     let reply = broker
         .handle_request(request_id.clone(), request.clone())
@@ -604,7 +688,7 @@ async fn broker_rejects_directory_lists_above_the_entry_limit() {
         storage.insert_file(0, &format!("large/{name}"), b"");
     }
     let broker = Broker::new_with_limits(
-        storage,
+        std::sync::Arc::clone(&storage),
         root.path(),
         RemoteLimits {
             max_directory_entries: 2,
@@ -616,11 +700,16 @@ async fn broker_rejects_directory_lists_above_the_entry_limit() {
     let response = broker
         .handle(Request::List {
             path: path("large"),
+            name_capacity: 0,
         })
         .await
         .response;
 
     assert_errno(response, libc::EOVERFLOW);
+    assert!(
+        storage.list_visits() <= 3,
+        "the backend must stop after observing max_entries + 1 entries"
+    );
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
 
@@ -643,6 +732,7 @@ async fn broker_stops_serializing_directory_lists_at_the_payload_limit() {
     let response = broker
         .handle(Request::List {
             path: path("large"),
+            name_capacity: 0,
         })
         .await
         .response;
@@ -1013,6 +1103,7 @@ async fn broker_reclaims_unclaimed_open_and_anchor_resources() {
             stat_id.clone(),
             Request::Stat {
                 path: path("file.txt"),
+                name_capacity: 0,
             },
         )
         .await;
@@ -1042,7 +1133,13 @@ async fn broker_reclaims_unclaimed_open_and_anchor_resources() {
 
     let anchor_id = request_id(101);
     let listed = broker
-        .handle_request(anchor_id.clone(), Request::List { path: path("") })
+        .handle_request(
+            anchor_id.clone(),
+            Request::List {
+                path: path(""),
+                name_capacity: 0,
+            },
+        )
         .await;
     let Response::List { anchor, .. } = listed.response else {
         panic!("expected list response");

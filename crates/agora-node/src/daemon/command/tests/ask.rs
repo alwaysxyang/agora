@@ -122,6 +122,7 @@ async fn disabled_agents_do_not_receive_new_tasks_or_open_run_cards() {
     let contexts = Arc::new(Mutex::new(Vec::new()));
     let channel = CommandTestChannel {
         tasks: VecDeque::new(),
+        received: None,
         events: Arc::new(Mutex::new(Vec::new())),
         contexts: Arc::clone(&contexts),
         interrupts: Arc::new(Mutex::new(Vec::new())),
@@ -159,6 +160,7 @@ async fn targeted_ask_runs_only_the_named_agent_even_when_it_is_disabled() {
     let replies = Arc::new(Mutex::new(Vec::new()));
     let channel = CommandTestChannel {
         tasks: VecDeque::new(),
+        received: None,
         events: Arc::clone(&events),
         contexts: Arc::clone(&contexts),
         interrupts: Arc::new(Mutex::new(Vec::new())),
@@ -205,6 +207,7 @@ async fn targeted_ask_rejects_an_agent_that_is_not_subscribed() {
     let replies = Arc::new(Mutex::new(Vec::new()));
     let channel = CommandTestChannel {
         tasks: VecDeque::new(),
+        received: None,
         events: Arc::new(Mutex::new(Vec::new())),
         contexts: Arc::clone(&contexts),
         interrupts: Arc::new(Mutex::new(Vec::new())),

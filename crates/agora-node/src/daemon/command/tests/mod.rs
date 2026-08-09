@@ -17,6 +17,7 @@ use crate::task::{ChannelTaskInput, CommandRequest, OutputEvent, TaskAttachment,
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::future::pending;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, timeout};
 
@@ -155,8 +156,10 @@ impl ChannelRun for CommandTestRun {
     }
 }
 
+#[derive(Clone)]
 struct CommandTestChannel {
     tasks: VecDeque<CommandTestTask>,
+    received: Option<Arc<AtomicUsize>>,
     events: Arc<Mutex<Vec<RunEvent>>>,
     contexts: Arc<Mutex<Vec<String>>>,
     interrupts: Arc<Mutex<Vec<InterruptCallback>>>,
@@ -167,6 +170,7 @@ impl CommandTestChannel {
     fn new(replies: Arc<Mutex<Vec<ChannelReply>>>) -> Self {
         Self {
             tasks: VecDeque::new(),
+            received: None,
             events: Arc::new(Mutex::new(Vec::new())),
             contexts: Arc::new(Mutex::new(Vec::new())),
             interrupts: Arc::new(Mutex::new(Vec::new())),
@@ -185,6 +189,9 @@ impl Channel for CommandTestChannel {
 
     async fn recv(&mut self) -> Result<Option<Self::Task>> {
         if let Some(task) = self.tasks.pop_front() {
+            if let Some(received) = &self.received {
+                received.fetch_add(1, Ordering::Release);
+            }
             Ok(Some(task))
         } else {
             pending().await

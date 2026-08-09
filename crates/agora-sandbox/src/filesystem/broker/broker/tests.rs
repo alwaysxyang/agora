@@ -111,8 +111,8 @@ fn sync_ignores_ranges_beyond_eof_and_reports_plaintext_read_failures() {
     );
 
     {
-        let mut handles = lock(&fixture.broker.handles);
-        let local = handles.get_mut(&handle).unwrap();
+        let local = lock(&fixture.broker.handles).get(&handle).unwrap().clone();
+        let mut local = lock(&local);
         local.plaintext = File::open(fixture.root.path()).unwrap();
         local.baseline = PlaintextIdentity::from_metadata(&local.plaintext.metadata().unwrap());
     }
@@ -518,12 +518,32 @@ fn dirty_ranges_are_merged_and_expired_handles_are_reclaimed() {
     );
     assert_eq!(fixture.decrypt(&path), b"0abcdef789");
 
-    let mut handles = lock(&fixture.broker.handles);
-    let closed = handles.get_mut(&handle).unwrap();
+    let closed = lock(&fixture.broker.handles).get(&handle).unwrap().clone();
+    let mut closed = lock(&closed);
     closed.closed_at = Some(Instant::now() - CLOSED_HANDLE_TTL - Duration::from_secs(1));
-    drop(handles);
+    drop(closed);
     fixture.broker.expire_closed();
     assert!(!lock(&fixture.broker.handles).contains_key(&handle));
+}
+
+#[test]
+fn closed_handle_retention_is_bounded_before_the_ttl_expires() {
+    const EXPECTED_LIMIT: usize = 128;
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("bounded", b"data");
+
+    for _ in 0..=EXPECTED_LIMIT {
+        let (handle, _plaintext) = fixture.open(&path, b"data", false);
+        assert_eq!(
+            fixture
+                .broker
+                .handle(Request::Close { handle }, None)
+                .response,
+            Response::Success
+        );
+    }
+
+    assert!(lock(&fixture.broker.handles).len() <= EXPECTED_LIMIT);
 }
 
 #[test]
@@ -531,10 +551,8 @@ fn retain_overflow_is_atomic_and_internal_error_helpers_preserve_context() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("overflow", b"data");
     let (handle, _plaintext) = fixture.open(&path, b"data", true);
-    lock(&fixture.broker.handles)
-        .get_mut(&handle)
-        .unwrap()
-        .references = usize::MAX;
+    let local = lock(&fixture.broker.handles).get(&handle).unwrap().clone();
+    lock(&local).references = usize::MAX;
 
     assert_error(
         fixture
@@ -548,13 +566,7 @@ fn retain_overflow_is_atomic_and_internal_error_helpers_preserve_context() {
             .response,
         libc::EOVERFLOW,
     );
-    assert_eq!(
-        lock(&fixture.broker.handles)
-            .get(&handle)
-            .unwrap()
-            .references,
-        usize::MAX
-    );
+    assert_eq!(lock(&local).references, usize::MAX);
 
     let error = BrokerError::io("context", std::io::Error::other("failure"));
     assert_eq!(error.errno, libc::EIO);

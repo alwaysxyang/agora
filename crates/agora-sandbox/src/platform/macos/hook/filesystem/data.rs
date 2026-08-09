@@ -24,10 +24,11 @@ unsafe fn sandbox_write(
         let Some(_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, buffer, length) };
         };
+        let before = current_offset(descriptor);
         let result = unsafe { original(descriptor, buffer, length) };
         if result > 0
             && let Some(runtime) = FilesystemHookRuntime::global()
-            && let Some((start, end)) = sequential_write_range(descriptor, result)
+            && let Some((start, end)) = sequential_write_range(descriptor, before, result)
         {
             runtime.record_local_write(descriptor, start, end);
         }
@@ -93,10 +94,11 @@ unsafe fn sandbox_writev(
         let Some(_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, vectors, count) };
         };
+        let before = current_offset(descriptor);
         let result = unsafe { original(descriptor, vectors, count) };
         if result > 0
             && let Some(runtime) = FilesystemHookRuntime::global()
-            && let Some((start, end)) = sequential_write_range(descriptor, result)
+            && let Some((start, end)) = sequential_write_range(descriptor, before, result)
         {
             runtime.record_local_write(descriptor, start, end);
         }
@@ -149,12 +151,36 @@ pub unsafe extern "C" fn agora_sandbox_pwritev(
     unsafe { sandbox_pwritev(descriptor, vectors, count, offset) }
 }
 
-fn sequential_write_range(descriptor: libc::c_int, written: libc::ssize_t) -> Option<(u64, u64)> {
-    let end = unsafe { libc::lseek(descriptor, 0, libc::SEEK_CUR) };
-    if end < 0 || written < 0 || end < written as libc::off_t {
+fn current_offset(descriptor: libc::c_int) -> Option<u64> {
+    let offset = unsafe { libc::lseek(descriptor, 0, libc::SEEK_CUR) };
+    u64::try_from(offset).ok()
+}
+
+fn sequential_write_range(
+    descriptor: libc::c_int,
+    before: Option<u64>,
+    written: libc::ssize_t,
+) -> Option<(u64, u64)> {
+    let written = u64::try_from(written).ok()?;
+    let after = current_offset(descriptor);
+    let after_start = after.and_then(|after| after.checked_sub(written));
+    let before_end = before.and_then(|before| before.checked_add(written));
+    let start = match (before, after_start) {
+        (Some(before), Some(after)) => before.min(after),
+        (Some(before), None) => before,
+        (None, Some(after)) => after,
+        (None, None) => return None,
+    };
+    let end = match (before_end, after) {
+        (Some(before), Some(after)) => before.max(after),
+        (Some(before), None) => before,
+        (None, Some(after)) => after,
+        (None, None) => return None,
+    };
+    if start >= end {
         return None;
     }
-    Some(((end - written as libc::off_t) as u64, end as u64))
+    Some((start, end))
 }
 
 fn original_write() -> Option<WriteFn> {

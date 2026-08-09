@@ -5,12 +5,13 @@ use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const CLOSED_HANDLE_TTL: Duration = Duration::from_secs(120);
+const CLOSED_HANDLE_CAPACITY: usize = 128;
 
 pub(crate) struct BrokerReply {
     pub(crate) response: Response,
@@ -19,7 +20,8 @@ pub(crate) struct BrokerReply {
 pub(crate) struct LocalBroker {
     root: PathBuf,
     cipher: FileCipher,
-    handles: Mutex<HashMap<String, LocalHandle>>,
+    handles: Mutex<HashMap<String, Arc<Mutex<LocalHandle>>>>,
+    files: Mutex<HashMap<FileIdentity, Weak<Mutex<()>>>>,
 }
 
 struct LocalHandle {
@@ -31,6 +33,12 @@ struct LocalHandle {
     baseline: PlaintextIdentity,
     references: usize,
     closed_at: Option<Instant>,
+    file_lock: Arc<Mutex<()>>,
+}
+
+struct PeerHandle {
+    handle: Arc<Mutex<LocalHandle>>,
+    plaintext: File,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -64,6 +72,7 @@ impl LocalBroker {
             root: root.canonicalize()?,
             cipher,
             handles: Mutex::new(HashMap::new()),
+            files: Mutex::new(HashMap::new()),
         })
     }
 
@@ -80,27 +89,23 @@ impl LocalBroker {
     }
 
     pub(crate) fn flush_all(&self) -> std::io::Result<()> {
-        let mut handles = lock(&self.handles);
-        let ids = handles
+        let handles = lock(&self.handles)
             .iter()
-            .filter(|(_, handle)| handle.references != 0)
-            .map(|(id, _)| id.clone())
+            .map(|(id, handle)| (id.clone(), Arc::clone(handle)))
+            .collect::<Vec<_>>();
+        let ids = handles
+            .into_iter()
+            .filter_map(|(id, handle)| (lock(&handle).references != 0).then_some(id))
             .collect::<Vec<_>>();
         for id in ids {
-            Self::sync_locked(&mut handles, &id, Vec::new(), true, true)
+            self.sync_handle(&id, Vec::new(), true, true)
                 .map_err(BrokerError::into_io)?;
         }
         Ok(())
     }
 
     pub(crate) fn expire_closed(&self) {
-        let now = Instant::now();
-        lock(&self.handles).retain(|_, handle| {
-            handle.references != 0
-                || handle
-                    .closed_at
-                    .is_some_and(|closed| now.duration_since(closed) < CLOSED_HANDLE_TTL)
-        });
+        self.prune_closed(Instant::now());
     }
 
     fn dispatch(
@@ -124,18 +129,15 @@ impl LocalBroker {
                 durable,
             } => {
                 Self::reject_descriptor(descriptor)?;
-                let mut handles = lock(&self.handles);
-                Self::activate(&mut handles, &handle)?;
-                Self::sync_locked(&mut handles, &handle, ranges, durable, false)?;
+                self.activate(&handle)?;
+                self.sync_handle(&handle, ranges, durable, false)?;
                 Ok(Response::Success)
             }
             Request::PotentiallyDirty { handle, range } => {
                 Self::reject_descriptor(descriptor)?;
-                let mut handles = lock(&self.handles);
-                Self::activate(&mut handles, &handle)?;
-                let handle = handles
-                    .get_mut(&handle)
-                    .ok_or_else(BrokerError::bad_descriptor)?;
+                self.activate(&handle)?;
+                let handle = self.lookup_handle(&handle)?;
+                let mut handle = lock(&handle);
                 if !handle.writable {
                     return Err(BrokerError::new(
                         libc::EBADF,
@@ -151,36 +153,45 @@ impl LocalBroker {
                 Self::reject_descriptor(descriptor)?;
                 retained.sort_unstable();
                 retained.dedup();
-                let mut handles = lock(&self.handles);
-                for id in &retained {
-                    let handle = handles.get(id).ok_or_else(BrokerError::bad_descriptor)?;
+                let handles = lock(&self.handles);
+                let retained_handles = retained
+                    .iter()
+                    .map(|id| {
+                        handles
+                            .get(id)
+                            .cloned()
+                            .ok_or_else(BrokerError::bad_descriptor)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                for handle in &retained_handles {
+                    let handle = lock(handle);
                     handle.references.checked_add(1).ok_or_else(|| {
                         BrokerError::new(libc::EOVERFLOW, "local filesystem reference overflow")
                     })?;
                 }
-                for id in retained {
-                    let handle = handles.get_mut(&id).expect("retained handle was checked");
+                for handle in retained_handles {
+                    let mut handle = lock(&handle);
                     handle.references += 1;
                     handle.closed_at = None;
                 }
+                drop(handles);
                 Ok(Response::Success)
             }
             Request::Close { handle } => {
                 Self::reject_descriptor(descriptor)?;
-                let mut handles = lock(&self.handles);
-                if !handles.contains_key(&handle) {
+                let Some(local) = lock(&self.handles).get(&handle).cloned() else {
                     return Ok(Response::Success);
+                };
+                self.sync_handle(&handle, Vec::new(), true, true)?;
+                let mut local = lock(&local);
+                if local.references > 0 {
+                    local.references -= 1;
                 }
-                Self::sync_locked(&mut handles, &handle, Vec::new(), true, true)?;
-                let handle = handles
-                    .get_mut(&handle)
-                    .expect("local handle existed before close");
-                if handle.references > 0 {
-                    handle.references -= 1;
+                if local.references == 0 {
+                    local.closed_at = Some(Instant::now());
                 }
-                if handle.references == 0 {
-                    handle.closed_at = Some(Instant::now());
-                }
+                drop(local);
+                self.prune_closed(Instant::now());
                 Ok(Response::Success)
             }
         }
@@ -222,10 +233,21 @@ impl LocalBroker {
             device: metadata.dev(),
             inode: metadata.ino(),
         };
+        let file_lock = {
+            let mut files = lock(&self.files);
+            files.retain(|_, file| file.strong_count() != 0);
+            if let Some(file) = files.get(&identity).and_then(Weak::upgrade) {
+                file
+            } else {
+                let file = Arc::new(Mutex::new(()));
+                files.insert(identity, Arc::downgrade(&file));
+                file
+            }
+        };
         let id = Uuid::new_v4().simple().to_string();
         lock(&self.handles).insert(
             id.clone(),
-            LocalHandle {
+            Arc::new(Mutex::new(LocalHandle {
                 identity,
                 plaintext,
                 encrypted,
@@ -234,21 +256,28 @@ impl LocalBroker {
                 baseline: PlaintextIdentity::from_metadata(&plaintext_metadata),
                 references: 1,
                 closed_at: None,
-            },
+                file_lock,
+            })),
         );
         Ok(Response::Open { handle: id })
     }
 
-    fn sync_locked(
-        handles: &mut HashMap<String, LocalHandle>,
+    fn sync_handle(
+        &self,
         id: &str,
         mut ranges: Vec<ByteRange>,
         durable: bool,
         include_potential: bool,
     ) -> Result<(), BrokerError> {
-        let handle = handles
-            .get_mut(id)
-            .ok_or_else(BrokerError::bad_descriptor)?;
+        let handle = self.lookup_handle(id)?;
+        let file_lock = lock(&handle).file_lock.clone();
+        let _file_guard = lock(&file_lock);
+        let peer_handles = lock(&self.handles)
+            .iter()
+            .filter(|(other_id, _)| other_id.as_str() != id)
+            .map(|(_, peer)| Arc::clone(peer))
+            .collect::<Vec<_>>();
+        let mut handle = lock(&handle);
         let metadata = handle
             .plaintext
             .metadata()
@@ -277,7 +306,22 @@ impl LocalBroker {
             ));
         }
         let identity = handle.identity;
-        let mut updates = Vec::new();
+        let mut peers = Vec::new();
+        for peer in peer_handles {
+            let local = lock(&peer);
+            if local.identity != identity || local.references == 0 {
+                continue;
+            }
+            let plaintext = local
+                .plaintext
+                .try_clone()
+                .map_err(|error| BrokerError::io("failed to clone peer plaintext file", error))?;
+            drop(local);
+            peers.push(PeerHandle {
+                handle: peer,
+                plaintext,
+            });
+        }
         let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
         for range in ranges {
             let start = range.start.min(length);
@@ -298,7 +342,11 @@ impl LocalBroker {
                     .map_err(|error| {
                         BrokerError::anyhow("failed to encrypt local file range", error)
                     })?;
-                updates.push((offset, buffer[..count].to_vec()));
+                for peer in &peers {
+                    write_all_at(&peer.plaintext, &buffer[..count], offset).map_err(|error| {
+                        BrokerError::io("failed to update peer plaintext file", error)
+                    })?;
+                }
                 offset += count as u64;
             }
         }
@@ -316,37 +364,35 @@ impl LocalBroker {
             handle.potentially_dirty.ranges.clear();
         }
         handle.baseline = current;
-        for (other_id, other) in handles.iter_mut() {
-            if other_id == id || other.identity != identity || other.references == 0 {
-                continue;
-            }
-            other
-                .plaintext
+        for peer in peers {
+            peer.plaintext
                 .set_len(length)
                 .map_err(|error| BrokerError::io("failed to resize peer plaintext file", error))?;
-            for (offset, data) in &updates {
-                write_all_at(&other.plaintext, data, *offset).map_err(|error| {
-                    BrokerError::io("failed to update peer plaintext file", error)
-                })?;
-            }
-            let metadata = other
+            let metadata = peer
                 .plaintext
                 .metadata()
                 .map_err(|error| BrokerError::io("failed to inspect peer plaintext file", error))?;
-            other.baseline = PlaintextIdentity::from_metadata(&metadata);
+            lock(&peer.handle).baseline = PlaintextIdentity::from_metadata(&metadata);
         }
         Ok(())
     }
 
-    fn activate(handles: &mut HashMap<String, LocalHandle>, id: &str) -> Result<(), BrokerError> {
-        let handle = handles
-            .get_mut(id)
-            .ok_or_else(BrokerError::bad_descriptor)?;
+    fn activate(&self, id: &str) -> Result<(), BrokerError> {
+        let handles = lock(&self.handles);
+        let handle = handles.get(id).ok_or_else(BrokerError::bad_descriptor)?;
+        let mut handle = lock(handle);
         if handle.references == 0 {
             handle.references = 1;
             handle.closed_at = None;
         }
         Ok(())
+    }
+
+    fn lookup_handle(&self, id: &str) -> Result<Arc<Mutex<LocalHandle>>, BrokerError> {
+        lock(&self.handles)
+            .get(id)
+            .cloned()
+            .ok_or_else(BrokerError::bad_descriptor)
     }
 
     fn reject_descriptor(descriptor: Option<OwnedFd>) -> Result<(), BrokerError> {
@@ -356,6 +402,32 @@ impl LocalBroker {
             ))
         } else {
             Ok(())
+        }
+    }
+
+    fn prune_closed(&self, now: Instant) {
+        let mut handles = lock(&self.handles);
+        let mut expired = Vec::new();
+        let mut retained = Vec::new();
+        for (id, handle) in handles.iter() {
+            let (references, closed_at) = {
+                let local = lock(handle);
+                (local.references, local.closed_at)
+            };
+            if references != 0 {
+                continue;
+            }
+            if closed_at.is_none_or(|closed| now.duration_since(closed) >= CLOSED_HANDLE_TTL) {
+                expired.push(id.clone());
+            } else {
+                retained.push((id.clone(), closed_at));
+            }
+        }
+        retained.sort_unstable_by_key(|(_, closed_at)| *closed_at);
+        let excess = retained.len().saturating_sub(CLOSED_HANDLE_CAPACITY);
+        expired.extend(retained.into_iter().take(excess).map(|(id, _)| id));
+        for id in expired {
+            handles.remove(&id);
         }
     }
 }

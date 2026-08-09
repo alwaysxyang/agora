@@ -169,6 +169,7 @@ where
 
     pub(crate) async fn handle(&self, request: Request) -> BrokerReply {
         let started = Instant::now();
+        let deadline = started + self.limits.operation_timeout;
         let root =
             match tokio::time::timeout(self.limits.operation_timeout, self.request_root(&request))
                 .await
@@ -180,7 +181,7 @@ where
             .limits
             .operation_timeout
             .saturating_sub(started.elapsed());
-        let result = tokio::time::timeout(remaining, self.dispatch(request)).await;
+        let result = tokio::time::timeout(remaining, self.dispatch(request, deadline)).await;
         let result = match result {
             Ok(result) => result,
             Err(_) => {
@@ -198,8 +199,8 @@ where
     async fn request_root(&self, request: &Request) -> Option<u32> {
         match request {
             Request::Open { path, .. }
-            | Request::Stat { path }
-            | Request::List { path }
+            | Request::Stat { path, .. }
+            | Request::List { path, .. }
             | Request::Access { path, .. }
             | Request::CreateDirectory { path, .. }
             | Request::Remove { path, .. } => Some(path.root()),
@@ -212,11 +213,17 @@ where
         }
     }
 
-    async fn dispatch(&self, request: Request) -> StorageResult<BrokerReply> {
+    async fn dispatch(&self, request: Request, deadline: Instant) -> StorageResult<BrokerReply> {
         match request {
-            Request::Open { path, flags, mode } => self.open(path, flags, mode).await,
-            Request::Stat { path } => self.stat(path).await,
-            Request::List { path } => self.list(path).await,
+            Request::Open { path, flags, mode } => self.open(path, flags, mode, deadline).await,
+            Request::Stat {
+                path,
+                name_capacity,
+            } => self.stat(path, name_capacity).await,
+            Request::List {
+                path,
+                name_capacity,
+            } => self.list(path, name_capacity).await,
             Request::Access { path, mode } => {
                 if mode & !(libc::R_OK | libc::W_OK | libc::X_OK) != 0 {
                     return Err(StorageError::new(libc::EINVAL, "invalid access mode"));
@@ -231,14 +238,14 @@ where
                 Ok(success())
             }
             Request::Sync { handle } => {
-                let metadata = self.sync(&handle).await?;
+                let metadata = self.sync(&handle, deadline).await?;
                 Ok(BrokerReply {
                     response: Response::Synced { metadata },
                     descriptor: None,
                 })
             }
             Request::Close { handle } => {
-                self.close(&handle).await?;
+                self.close(&handle, deadline).await?;
                 Ok(success())
             }
             Request::Abort { handle } => {
@@ -415,6 +422,7 @@ where
         path: RemotePath,
         flags: libc::c_int,
         _mode: u32,
+        deadline: Instant,
     ) -> StorageResult<BrokerReply> {
         let access = flags & libc::O_ACCMODE;
         let (readable, writable) = match access {
@@ -429,6 +437,7 @@ where
                 "O_TRUNC requires write access",
             ));
         }
+        let _mutation = self.lock_root(path.root()).await;
         let existing = match self.storage.stat(&path).await {
             Ok(metadata) => Some(metadata),
             Err(error) if error.errno() == libc::ENOENT => None,
@@ -499,7 +508,13 @@ where
             .metadata()
             .map_err(|error| storage_io("failed to inspect anonymous remote file", error))?
             .len();
-        let checksum = checksum_file(temporary.as_file_mut(), self.limits.operation_timeout)?;
+        let checksum = checksum_file(
+            temporary.as_file().try_clone().map_err(|error| {
+                storage_io("failed to clone remote snapshot for checksum", error)
+            })?,
+            deadline,
+        )
+        .await?;
         let retained = temporary
             .reopen()
             .map_err(|error| storage_io("failed to retain anonymous remote file", error))?;
@@ -544,7 +559,7 @@ where
         path: RemotePath,
         metadata: RemoteMetadata,
     ) -> StorageResult<BrokerReply> {
-        let anchor = self.anchor(&path, RemoteFileType::Directory).await?;
+        let anchor = self.anchor(&path, RemoteFileType::Directory, 0).await?;
         let physical = self.staging.join(&anchor);
         let application = File::open(&physical)
             .map_err(|error| storage_io("failed to open remote directory anchor", error))?;
@@ -574,45 +589,55 @@ where
         })
     }
 
-    async fn stat(&self, path: RemotePath) -> StorageResult<BrokerReply> {
+    async fn stat(&self, path: RemotePath, name_capacity: u16) -> StorageResult<BrokerReply> {
         let metadata = self.storage.stat(&path).await?;
-        let anchor = self.anchor(&path, metadata.file_type).await?;
+        let anchor = self
+            .anchor(&path, metadata.file_type, name_capacity)
+            .await?;
         Ok(BrokerReply {
             response: Response::Stat { metadata, anchor },
             descriptor: None,
         })
     }
 
-    async fn list(&self, path: RemotePath) -> StorageResult<BrokerReply> {
-        let entries = self
-            .storage
-            .list(&path, self.limits.max_directory_entries)
-            .await?;
-        if entries.len() > self.limits.max_directory_entries {
-            return Err(directory_too_large());
-        }
+    async fn list(&self, path: RemotePath, name_capacity: u16) -> StorageResult<BrokerReply> {
         let mut payload = tempfile::tempfile_in(&self.staging)
             .map_err(|error| storage_io("failed to create remote list payload", error))?;
-        let (serialized, exceeded) = {
+        {
             let mut limited =
                 LimitedWriter::new(&mut payload, self.limits.max_directory_payload_bytes);
-            let serialized = serde_json::to_writer(&mut limited, &entries);
-            (serialized, limited.exceeded())
-        };
-        if let Err(error) = serialized {
-            if exceeded {
-                return Err(directory_too_large());
+            limited
+                .write_all(b"[")
+                .map_err(|error| list_payload_error(error, limited.exceeded()))?;
+            let mut count = 0_usize;
+            {
+                let mut emit = |entry: crate::nfs::protocol::RemoteEntry| {
+                    if count == self.limits.max_directory_entries {
+                        return Err(directory_too_large());
+                    }
+                    if count != 0 {
+                        limited
+                            .write_all(b",")
+                            .map_err(|error| list_payload_error(error, limited.exceeded()))?;
+                    }
+                    serde_json::to_writer(&mut limited, &entry)
+                        .map_err(|error| list_payload_error(error.into(), limited.exceeded()))?;
+                    count += 1;
+                    Ok(())
+                };
+                self.storage.list(&path, &mut emit).await?;
             }
-            return Err(StorageError::new(
-                libc::EIO,
-                format!("failed to serialize remote list: {error}"),
-            ));
+            limited
+                .write_all(b"]")
+                .map_err(|error| list_payload_error(error, limited.exceeded()))?;
         }
         payload
             .flush()
             .and_then(|()| payload.seek(SeekFrom::Start(0)).map(|_| ()))
             .map_err(|error| storage_io("failed to prepare remote list payload", error))?;
-        let anchor = self.anchor(&path, RemoteFileType::Directory).await?;
+        let anchor = self
+            .anchor(&path, RemoteFileType::Directory, name_capacity)
+            .await?;
         let descriptor = payload
             .try_clone()
             .map_err(|error| storage_io("failed to duplicate remote list payload", error))?;
@@ -626,9 +651,18 @@ where
         })
     }
 
-    async fn anchor(&self, path: &RemotePath, file_type: RemoteFileType) -> StorageResult<String> {
+    async fn anchor(
+        &self,
+        path: &RemotePath,
+        file_type: RemoteFileType,
+        name_capacity: u16,
+    ) -> StorageResult<String> {
         let _ = path;
-        let anchor = format!("anchor-{}", Uuid::new_v4().simple());
+        let mut anchor = format!("anchor-{}", Uuid::new_v4().simple());
+        anchor.extend(std::iter::repeat_n(
+            'x',
+            usize::from(name_capacity).saturating_sub(anchor.len()),
+        ));
         let physical = self.staging.join(&anchor);
         match file_type {
             RemoteFileType::File => {
@@ -648,7 +682,7 @@ where
         Ok(anchor)
     }
 
-    async fn sync(&self, id: &str) -> StorageResult<Option<RemoteMetadata>> {
+    async fn sync(&self, id: &str, deadline: Instant) -> StorageResult<Option<RemoteMetadata>> {
         let handle = self
             .handles
             .lock()
@@ -656,22 +690,24 @@ where
             .get(id)
             .cloned()
             .ok_or_else(|| StorageError::new(libc::EBADF, "unknown remote handle"))?;
-        self.sync_handle(&handle).await
+        self.sync_handle(&handle, deadline).await
     }
 
     async fn sync_handle(
         &self,
         handle: &Arc<Mutex<RemoteHandle>>,
+        deadline: Instant,
     ) -> StorageResult<Option<RemoteMetadata>> {
         let root = handle.lock().await.path.root();
         let _mutation = self.lock_root(root).await;
         let mut handle = handle.lock().await;
-        self.sync_locked(&mut handle).await
+        self.sync_locked(&mut handle, deadline).await
     }
 
     async fn sync_locked(
         &self,
         handle: &mut RemoteHandle,
+        deadline: Instant,
     ) -> StorageResult<Option<RemoteMetadata>> {
         if handle.unlinked {
             return Ok(None);
@@ -696,7 +732,13 @@ where
         if length > self.limits.max_file_bytes {
             return Err(file_too_large());
         }
-        let checksum = checksum_file(&mut snapshot, self.limits.operation_timeout)?;
+        let checksum = checksum_file(
+            snapshot.try_clone().map_err(|error| {
+                storage_io("failed to clone remote snapshot for checksum", error)
+            })?,
+            deadline,
+        )
+        .await?;
         if !handle.force_publish && checksum == handle.checksum {
             return Ok(handle.baseline.clone());
         }
@@ -715,13 +757,13 @@ where
         Ok(Some(metadata))
     }
 
-    async fn close(&self, id: &str) -> StorageResult<()> {
+    async fn close(&self, id: &str, deadline: Instant) -> StorageResult<()> {
         let handle = match self.handles.lock().await.get(id).cloned() {
             Some(handle) => handle,
             None if self.closed_handles.lock().await.contains(id) => return Ok(()),
             None => return Err(StorageError::new(libc::EBADF, "unknown remote handle")),
         };
-        self.sync_handle(&handle).await?;
+        self.sync_handle(&handle, deadline).await?;
         let mut handles = self.handles.lock().await;
         if handles
             .get(id)
@@ -795,14 +837,37 @@ where
     }
 }
 
-fn checksum_file(file: &mut File, maximum_duration: Duration) -> StorageResult<[u8; 16]> {
+fn list_payload_error(error: std::io::Error, exceeded: bool) -> StorageError {
+    if exceeded {
+        directory_too_large()
+    } else {
+        storage_io("failed to serialize remote list", error)
+    }
+}
+
+async fn checksum_file(file: File, deadline: Instant) -> StorageResult<[u8; 16]> {
+    let maximum_duration = remaining_until(deadline)?;
+    let worker = tokio::task::spawn_blocking(move || {
+        let mut file = file;
+        checksum_file_blocking(&mut file, deadline)
+    });
+    match tokio::time::timeout(maximum_duration, worker).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(StorageError::new(
+            libc::EIO,
+            format!("remote checksum worker failed: {error}"),
+        )),
+        Err(_) => Err(operation_timed_out()),
+    }
+}
+
+fn checksum_file_blocking(file: &mut File, deadline: Instant) -> StorageResult<[u8; 16]> {
     file.seek(SeekFrom::Start(0))
         .map_err(|error| storage_io("failed to rewind anonymous remote file", error))?;
-    let started = Instant::now();
     let mut digest = Md5::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        if started.elapsed() >= maximum_duration {
+        if Instant::now() >= deadline {
             return Err(operation_timed_out());
         }
         let read = file
@@ -1058,6 +1123,13 @@ fn directory_too_large() -> StorageError {
 
 fn operation_timed_out() -> StorageError {
     StorageError::new(libc::ETIMEDOUT, "remote filesystem operation timed out")
+}
+
+fn remaining_until(deadline: Instant) -> StorageResult<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(operation_timed_out)
 }
 
 struct LimitedWriter<W> {

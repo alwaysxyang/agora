@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 const AUDIT_MAX_CONNECTIONS: usize = 1024;
 const AUDIT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
+const AUDIT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub(crate) struct AuditRuntime {
@@ -227,16 +228,26 @@ where
         Ok(())
     }
 
-    async fn handle(mut stream: TcpStream, state: Arc<AuditState<C>>) -> Result<()> {
-        let first = tokio::time::timeout(AUDIT_HANDSHAKE_TIMEOUT, read_frame(&mut stream))
+    async fn handle(stream: TcpStream, state: Arc<AuditState<C>>) -> Result<()> {
+        Self::handle_with_timeouts(stream, state, AUDIT_HANDSHAKE_TIMEOUT, AUDIT_IDLE_TIMEOUT).await
+    }
+
+    async fn handle_with_timeouts(
+        mut stream: TcpStream,
+        state: Arc<AuditState<C>>,
+        handshake_timeout: Duration,
+        idle_timeout: Duration,
+    ) -> Result<()> {
+        let first = tokio::time::timeout(handshake_timeout, read_frame(&mut stream))
             .await
             .context("sandbox audit handshake timed out")??;
         Self::publish_frame(&mut stream, &state, first).await?;
         loop {
-            let frame = match read_frame(&mut stream).await {
-                Ok(frame) => frame,
-                Err(error) if disconnected(&error) => return Ok(()),
-                Err(error) => return Err(error),
+            let frame = match tokio::time::timeout(idle_timeout, read_frame(&mut stream)).await {
+                Ok(Ok(frame)) => frame,
+                Err(_) => anyhow::bail!("sandbox audit connection timed out"),
+                Ok(Err(error)) if disconnected(&error) => return Ok(()),
+                Ok(Err(error)) => return Err(error),
             };
             Self::publish_frame(&mut stream, &state, frame).await?;
         }

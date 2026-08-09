@@ -1424,6 +1424,7 @@ fn managed_fts_streams_do_not_require_current_directory_resynchronization() {
     super::fts_streams().lock().unwrap().insert(
         stream as usize,
         super::FtsStreamState {
+            compare: None,
             mappings: Vec::new(),
             presented: Vec::new(),
             traversal_paths: Vec::new(),
@@ -2441,6 +2442,78 @@ fn fcntl_descriptor_duplicates_share_encrypted_writeback_state() {
         assert_eq!(libc::read(reopened, contents.as_mut_ptr().cast(), 12), 12);
         assert_eq!(&contents, b"first second");
         assert_eq!(sandbox_close(reopened), 0);
+    });
+}
+
+#[test]
+fn content_mutating_fcntl_is_rejected_for_managed_descriptors() {
+    const F_SETSIZE: libc::c_int = 43;
+    let fixture = Fixture::new();
+    let runtime = FilesystemHookRuntime::new_encrypted(
+        fixture.directory.join("fcntl-mutation-workdir/fs"),
+        b"test-key",
+        b"0123456789abcdef",
+    )
+    .unwrap();
+    let logical = fixture.lower.join("fcntl-mutation.txt");
+    let path = Fixture::c_path(&logical);
+
+    with_test_runtime(&runtime, || unsafe {
+        let descriptor = super::agora_sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(descriptor >= 0);
+        assert_eq!(libc::write(descriptor, b"contents".as_ptr().cast(), 8), 8);
+        {
+            let mut files = super::lock(&runtime.open_files);
+            Arc::get_mut(files.get_mut(&descriptor).unwrap())
+                .unwrap()
+                .local = Some(super::LocalRegistration {
+                handle: "local-handle".to_string(),
+                writable: true,
+                dirty: std::sync::Mutex::new(Vec::new()),
+            });
+        }
+        assert_eq!(
+            super::agora_sandbox_fcntl_shim(descriptor, F_SETSIZE, 2_i64),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        Arc::get_mut(
+            super::lock(&runtime.open_files)
+                .get_mut(&descriptor)
+                .unwrap(),
+        )
+        .unwrap()
+        .local = None;
+        assert_eq!(sandbox_close(descriptor), 0);
+
+        let reopened = super::agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(reopened >= 0);
+        let mut contents = [0_u8; 8];
+        assert_eq!(libc::read(reopened, contents.as_mut_ptr().cast(), 8), 8);
+        assert_eq!(&contents, b"contents");
+        assert_eq!(sandbox_close(reopened), 0);
+    });
+}
+
+#[test]
+fn content_mutating_fcntl_validation_allows_plain_descriptors() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("fcntl-plain.txt");
+    let path = Fixture::c_path(&logical);
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = super::agora_sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(descriptor >= 0);
+        assert_eq!(super::agora_sandbox_validate_content_fcntl(descriptor), 0);
+        assert_eq!(sandbox_close(descriptor), 0);
     });
 }
 

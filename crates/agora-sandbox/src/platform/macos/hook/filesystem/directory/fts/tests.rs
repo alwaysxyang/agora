@@ -7,6 +7,7 @@ use std::os::unix::net::UnixListener;
 
 fn stream_state(mappings: Vec<FtsRootMapping>) -> FtsStreamState {
     FtsStreamState {
+        compare: None,
         mappings,
         presented: Vec::new(),
         traversal_paths: Vec::new(),
@@ -19,6 +20,19 @@ fn mapping(physical: &str, logical: &str, resolved: &str) -> FtsRootMapping {
         physical: physical.as_bytes().to_vec(),
         logical: logical.as_bytes().to_vec(),
         resolved: resolved.as_bytes().to_vec(),
+    }
+}
+
+unsafe extern "C" fn compare_entry_names(
+    left: *const *const DarwinFtsEntry,
+    right: *const *const DarwinFtsEntry,
+) -> libc::c_int {
+    let left = unsafe { CStr::from_ptr((**left).fts_name.as_ptr()) }.to_bytes();
+    let right = unsafe { CStr::from_ptr((**right).fts_name.as_ptr()) }.to_bytes();
+    match left.cmp(right) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
     }
 }
 
@@ -192,6 +206,22 @@ fn stream_presentation_uses_access_path_fallback_and_rejects_longer_names() {
     state.present(std::ptr::null_mut()).unwrap();
     state.present(untouched.pointer()).unwrap();
     assert!(state.presented.is_empty());
+}
+
+#[test]
+fn fts_comparator_observes_logical_names() {
+    let mut left = TestEntry::new("/physical/encoded-a", "/physical/encoded-a", "encoded-a");
+    let mut right = TestEntry::new("/physical/encoded-b", "/physical/encoded-b", "encoded-b");
+    let mappings = vec![
+        mapping("/physical/encoded-a", "/logical/z", "/logical/z"),
+        mapping("/physical/encoded-b", "/logical/a", "/logical/a"),
+    ];
+    let _guard = FtsCompareGuard::enter(Some(compare_entry_names), &mappings).unwrap();
+    let left = left.pointer().cast_const();
+    let right = right.pointer().cast_const();
+
+    assert_eq!(unsafe { compare_entry_names(&left, &right) }, -1);
+    assert_eq!(unsafe { logical_fts_compare(&left, &right) }, 1);
 }
 
 #[test]

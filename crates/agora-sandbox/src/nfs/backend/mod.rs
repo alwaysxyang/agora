@@ -43,8 +43,8 @@ pub(crate) trait RemoteStorage: Send + Sync + 'static {
     fn list(
         &self,
         path: &RemotePath,
-        max_entries: usize,
-    ) -> impl Future<Output = StorageResult<Vec<RemoteEntry>>> + Send;
+        emit: &mut (impl FnMut(RemoteEntry) -> StorageResult<()> + Send),
+    ) -> impl Future<Output = StorageResult<()>> + Send;
     fn create_directory(&self, path: &RemotePath)
     -> impl Future<Output = StorageResult<()>> + Send;
     fn remove(

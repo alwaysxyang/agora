@@ -17,6 +17,7 @@ use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -145,6 +146,29 @@ impl ChildArguments {
             if !current.is_null() && !(unsafe { *current }).is_null() {
                 current = unsafe { current.add(1) };
             }
+        }
+        if !current.is_null() {
+            while !(unsafe { *current }).is_null() {
+                values.push(CString::new(unsafe { CStr::from_ptr(*current) }.to_bytes()).ok()?);
+                current = unsafe { current.add(1) };
+            }
+        }
+        let mut pointers = values
+            .iter()
+            .map(|value| value.as_ptr().cast_mut())
+            .collect::<Vec<_>>();
+        pointers.push(std::ptr::null_mut());
+        Some(Self { values, pointers })
+    }
+
+    unsafe fn shell_fallback(arguments: *const *const libc::c_char, script: &CStr) -> Option<Self> {
+        let mut values = vec![
+            CString::new("sh").ok()?,
+            CString::new(script.to_bytes()).ok()?,
+        ];
+        let mut current = arguments;
+        if !current.is_null() && !(unsafe { *current }).is_null() {
+            current = unsafe { current.add(1) };
         }
         if !current.is_null() {
             while !(unsafe { *current }).is_null() {
@@ -356,21 +380,26 @@ unsafe fn requested_executable(path: *const libc::c_char, search_path: bool) -> 
         });
     }
     let search = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
-    let current = || {
-        std::env::current_dir()
-            .or_else(|error| std::env::var_os("PWD").map(PathBuf::from).ok_or(error))
-            .ok()
-    };
-    for directory in std::env::split_paths(&search) {
+    let current = std::env::current_dir()
+        .or_else(|error| std::env::var_os("PWD").map(PathBuf::from).ok_or(error))
+        .ok()?;
+    search_path_executable(path, &search, &current)
+}
+
+fn search_path_executable(path: &OsStr, search: &OsStr, current: &Path) -> Option<PathBuf> {
+    for directory in std::env::split_paths(search) {
         let directory = if directory.as_os_str().is_empty() {
-            current()?
+            current.to_path_buf()
         } else if directory.is_absolute() {
             directory
         } else {
-            current()?.join(directory)
+            current.join(directory)
         };
         let candidate = directory.join(path);
-        if candidate.is_file() {
+        if candidate
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        {
             return Some(candidate);
         }
     }
@@ -672,7 +701,7 @@ unsafe fn execute(
         unsafe { set_errno(libc::EACCES) };
         return -1;
     };
-    let Some(arguments) = (unsafe { ChildArguments::new(arguments, &prepared) }) else {
+    let Some(child_arguments) = (unsafe { ChildArguments::new(arguments, &prepared) }) else {
         unsafe { set_errno(libc::EACCES) };
         return -1;
     };
@@ -681,9 +710,32 @@ unsafe fn execute(
         unsafe { set_errno(error.errno) };
         return -1;
     }
-    unsafe {
+    let result = unsafe {
         original(
             prepared.program.as_ptr(),
+            child_arguments.as_exec_ptr(),
+            environment.as_exec_ptr(),
+        )
+    };
+    if !search_path || result != -1 || unsafe { *libc::__error() } != libc::ENOEXEC {
+        return result;
+    }
+    let shell = match runtime.prepare_executable(Path::new("/bin/sh")) {
+        Ok(shell) => shell,
+        Err(error) => {
+            unsafe { set_errno(error.errno) };
+            return -1;
+        }
+    };
+    let Some(arguments) =
+        (unsafe { ChildArguments::shell_fallback(arguments, prepared.program.as_c_str()) })
+    else {
+        unsafe { set_errno(libc::EACCES) };
+        return -1;
+    };
+    unsafe {
+        original(
+            shell.program.as_ptr(),
             arguments.as_exec_ptr(),
             environment.as_exec_ptr(),
         )

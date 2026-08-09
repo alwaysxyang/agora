@@ -16,6 +16,7 @@ fn client_rejects_a_missing_controller_socket() {
     let error = client
         .request(Request::Stat {
             path: RemotePath::new(0, "file").unwrap(),
+            name_capacity: 0,
         })
         .unwrap_err();
 
@@ -52,6 +53,7 @@ fn client_times_out_when_the_broker_stops_responding() {
     let error = client
         .request(Request::Stat {
             path: RemotePath::new(0, "file").unwrap(),
+            name_capacity: 0,
         })
         .unwrap_err();
 
@@ -93,6 +95,7 @@ fn client_retries_an_ambiguous_request_with_the_same_request_id() {
     let reply = client
         .request(Request::Stat {
             path: RemotePath::new(0, "file").unwrap(),
+            name_capacity: 0,
         })
         .unwrap();
 
@@ -289,6 +292,7 @@ fn failed_anchor_claim_removes_the_unaccepted_anchor() {
         client
             .request(Request::Stat {
                 path: RemotePath::new(0, "file").unwrap(),
+                name_capacity: 0,
             })
             .unwrap_err()
             .errno(),

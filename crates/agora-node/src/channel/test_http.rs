@@ -87,6 +87,11 @@ impl MockResponse {
         self.include_content_length = false;
         self
     }
+
+    pub(super) fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
 }
 
 type ResponseHandler = dyn Fn(&RecordedRequest) -> MockResponse + Send + Sync;

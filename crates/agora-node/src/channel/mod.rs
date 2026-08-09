@@ -278,6 +278,7 @@ impl ChannelRun for ConfiguredRun {
     }
 }
 
+#[derive(Clone)]
 pub enum ConfiguredChannel {
     Lark(LarkChannel),
     Telegram(TelegramChannel),

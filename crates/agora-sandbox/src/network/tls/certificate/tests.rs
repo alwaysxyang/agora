@@ -1,5 +1,6 @@
 use super::{TlsAuthority, generate_ca, normalize_identity};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use std::net::{IpAddr, Ipv4Addr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -199,7 +200,7 @@ fn subject_alt_names(der: &[u8]) -> Vec<String> {
 }
 
 fn ca_der(certificate: &str) -> Vec<u8> {
-    rustls_pemfile::certs(&mut certificate.as_bytes())
+    CertificateDer::pem_slice_iter(certificate.as_bytes())
         .next()
         .unwrap()
         .unwrap()

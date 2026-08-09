@@ -320,6 +320,46 @@ fn startup_recovers_interrupted_key_migration_before_opening_the_workspace() {
 }
 
 #[test]
+fn migration_recovery_restores_a_dangling_symlink_backup() {
+    let workdir = temporary_directory("migration-dangling-symlink");
+    let workspace = EncryptedWorkspace::start(&workdir, b"old-key").unwrap();
+    let root = workspace.root().to_path_buf();
+    let destination = root.join("link");
+    let backup = root.join(".agora-rekey-old-link");
+    let staged = root.join(".agora-rekey-link.tmp");
+    let old_key = EncryptedWorkspace::read_key_metadata(&root).unwrap();
+    let new_key = EncryptedWorkspace::new_key_metadata(b"new-key").unwrap();
+    drop(workspace);
+
+    std::os::unix::fs::symlink("missing-target", &backup).unwrap();
+    std::os::unix::fs::symlink("new-missing-target", &destination).unwrap();
+    EncryptedWorkspace::write_journal(
+        &root,
+        &RekeyJournal {
+            version: REKEY_JOURNAL_VERSION,
+            old_key,
+            new_key,
+            entries: vec![RekeyEntry {
+                destination: EncryptedWorkspace::encode_relative_path(&root, &destination).unwrap(),
+                renamed_destination: None,
+                staged: EncryptedWorkspace::encode_relative_path(&root, &staged).unwrap(),
+                backup: EncryptedWorkspace::encode_relative_path(&root, &backup).unwrap(),
+            }],
+        },
+    )
+    .unwrap();
+
+    EncryptedWorkspace::recover_migration(&root).unwrap();
+
+    assert_eq!(
+        std::fs::read_link(&destination).unwrap(),
+        PathBuf::from("missing-target")
+    );
+    assert!(std::fs::symlink_metadata(&backup).is_err());
+    std::fs::remove_dir_all(workdir).unwrap();
+}
+
+#[test]
 fn encrypted_workspace_rejects_existing_plaintext_data() {
     let workdir = temporary_directory("plaintext");
     std::fs::create_dir_all(workdir.join("fs/project")).unwrap();

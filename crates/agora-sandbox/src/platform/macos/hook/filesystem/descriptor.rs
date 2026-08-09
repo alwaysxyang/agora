@@ -409,6 +409,28 @@ pub extern "C" fn agora_sandbox_fcntl_setfd_argument(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_validate_content_fcntl(descriptor: libc::c_int) -> libc::c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return 0;
+        };
+        if runtime
+            .tracked_open(descriptor)
+            .is_some_and(|open| open.local.is_some())
+        {
+            unsafe { set_errno(libc::ENOTSUP) };
+            -1
+        } else {
+            0
+        }
+    }))
+    .unwrap_or_else(|_| {
+        unsafe { set_errno(libc::EIO) };
+        -1
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn agora_sandbox_original_fcntl() -> *const libc::c_void {
     INTERPOSE_FCNTL.replacee
 }

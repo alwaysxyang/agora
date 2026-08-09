@@ -203,6 +203,7 @@ impl RemoteFilesystem {
     fn stat_reply(&self, path: &RoutedPath) -> Result<(RemoteMetadata, String)> {
         let reply = self.request(Request::Stat {
             path: path.remote.clone(),
+            name_capacity: logical_name_capacity(&path.logical)?,
         })?;
         match reply.response {
             Response::Stat { metadata, anchor } => Ok((metadata, anchor)),
@@ -215,6 +216,7 @@ impl RemoteFilesystem {
     fn list(&self, path: &RoutedPath) -> Result<(Vec<RemoteEntry>, RemoteAnchor)> {
         let mut reply = self.request(Request::List {
             path: path.remote.clone(),
+            name_capacity: logical_name_capacity(&path.logical)?,
         })?;
         match reply.response {
             Response::List { anchor } => {
@@ -363,6 +365,15 @@ impl RemoteFilesystem {
     fn request(&self, request: Request) -> Result<crate::nfs::client::RemoteReply> {
         self.client.request(request).map_err(client_error)
     }
+}
+
+fn logical_name_capacity(path: &Path) -> Result<u16> {
+    u16::try_from(
+        path.file_name()
+            .map(|name| name.as_bytes().len())
+            .unwrap_or_default(),
+    )
+    .context("remote logical file name is too long")
 }
 
 impl RemoteOpen {

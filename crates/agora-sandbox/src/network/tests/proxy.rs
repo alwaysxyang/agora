@@ -9,7 +9,7 @@ use crate::protocol::{
     encode_connect_request,
 };
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose};
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, pem::PemObject};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -891,7 +891,7 @@ async fn auto_tls_passes_plaintext_through_unchanged() {
 
 fn interception_authority() -> (TlsAuthority, CertificateDer<'static>) {
     let (certificate, key) = test_ca_pem();
-    let root = rustls_pemfile::certs(&mut certificate.as_bytes())
+    let root = CertificateDer::pem_slice_iter(certificate.as_bytes())
         .next()
         .unwrap()
         .unwrap();

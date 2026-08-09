@@ -3,7 +3,8 @@ use super::{
     PreparedExecutable, ProcessHookGuard, ProcessHookRuntime, TRUNCATED_ARGUMENTS,
     agora_sandbox_execv, agora_sandbox_execve, agora_sandbox_execvp, agora_sandbox_posix_spawn,
     agora_sandbox_posix_spawnp, current_environment, execute, io_errno, prepared_executable,
-    process_event_request, requested_executable, resolve_current_directory, with_test_runtime,
+    process_event_request, requested_executable, resolve_current_directory, search_path_executable,
+    with_test_runtime,
 };
 use crate::audit::AuditEventRequest;
 use crate::callback::ProcessOperation;
@@ -11,7 +12,7 @@ use crate::execution::{EXECUTION_PROTOCOL_VERSION, decode_prepare_request};
 use crate::platform::hook::config::HookConfig;
 use crate::trace::TraceContext;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
@@ -235,6 +236,16 @@ fn child_arguments_replace_a_script_with_its_prepared_interpreter() {
         .map(|value| value.to_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(values, ["/usr/local/bin/codex", "--version"]);
+
+    let fallback =
+        unsafe { ChildArguments::shell_fallback(pointers.as_ptr(), c"/tmp/prepared-script") }
+            .unwrap();
+    let values = fallback
+        .values
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["sh", "/tmp/prepared-script", "--version"]);
 }
 
 #[test]
@@ -387,6 +398,28 @@ fn requested_executable_resolves_direct_and_path_based_programs() {
     );
     assert!(unsafe { requested_executable(missing.as_ptr(), true) }.is_none());
     assert!(unsafe { requested_executable(std::ptr::null(), false) }.is_none());
+}
+
+#[test]
+fn path_search_skips_non_executable_files() {
+    let root = tempfile::tempdir().unwrap();
+    let blocked = root.path().join("blocked");
+    let executable = root.path().join("executable");
+    std::fs::create_dir(&blocked).unwrap();
+    std::fs::create_dir(&executable).unwrap();
+    std::fs::write(blocked.join("tool"), b"blocked").unwrap();
+    std::fs::write(executable.join("tool"), b"executable").unwrap();
+    std::fs::set_permissions(
+        executable.join("tool"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let search = std::env::join_paths([&blocked, &executable]).unwrap();
+
+    assert_eq!(
+        search_path_executable(OsStr::new("tool"), &search, root.path()),
+        Some(executable.join("tool"))
+    );
 }
 
 #[test]
@@ -796,18 +829,10 @@ fn process_exec_interposers_prepare_before_native_exec_failure() {
     let path = CString::new("/bin/true").unwrap();
     let file = CString::new("true").unwrap();
 
-    for operation in [
-        ProcessOperation::Execve,
-        ProcessOperation::Execv,
-        ProcessOperation::Execvp,
-    ] {
+    for operation in [ProcessOperation::Execve, ProcessOperation::Execv] {
         let (runtime, server) =
             runtime_with_response(response(0, invalid.as_os_str().as_encoded_bytes()));
-        let requested = if operation == ProcessOperation::Execvp {
-            &file
-        } else {
-            &path
-        };
+        let requested = &path;
         let arguments = [requested.as_ptr(), std::ptr::null()];
         unsafe { *libc::__error() = 0 };
         let result = with_test_runtime(&runtime, || unsafe {
@@ -820,9 +845,6 @@ fn process_exec_interposers_prepare_before_native_exec_failure() {
                 ProcessOperation::Execv => {
                     agora_sandbox_execv(requested.as_ptr(), arguments.as_ptr())
                 }
-                ProcessOperation::Execvp => {
-                    agora_sandbox_execvp(requested.as_ptr(), arguments.as_ptr())
-                }
                 _ => unreachable!(),
             }
         });
@@ -830,15 +852,29 @@ fn process_exec_interposers_prepare_before_native_exec_failure() {
         assert_eq!(unsafe { *libc::__error() }, libc::ENOEXEC);
 
         let request = decode_prepare_request(&server.join().unwrap()).unwrap();
-        assert_eq!(
-            request.executable,
-            if operation == ProcessOperation::Execvp {
-                Path::new("/usr/bin/true")
-            } else {
-                Path::new("/bin/true")
-            }
-        );
+        assert_eq!(request.executable, Path::new("/bin/true"));
     }
+
+    let (runtime, server) = runtime_with_responses(vec![
+        response(0, invalid.as_os_str().as_encoded_bytes()),
+        response(0, invalid.as_os_str().as_encoded_bytes()),
+    ]);
+    let arguments = [file.as_ptr(), std::ptr::null()];
+    unsafe { *libc::__error() = 0 };
+    let result = with_test_runtime(&runtime, || unsafe {
+        agora_sandbox_execvp(file.as_ptr(), arguments.as_ptr())
+    });
+    assert_eq!(result, -1);
+    assert_eq!(unsafe { *libc::__error() }, libc::ENOEXEC);
+    let requests = server.join().unwrap();
+    assert_eq!(
+        decode_prepare_request(&requests[0]).unwrap().executable,
+        Path::new("/usr/bin/true")
+    );
+    assert_eq!(
+        decode_prepare_request(&requests[1]).unwrap().executable,
+        Path::new("/bin/sh")
+    );
 
     std::fs::remove_dir_all(directory).unwrap();
 }

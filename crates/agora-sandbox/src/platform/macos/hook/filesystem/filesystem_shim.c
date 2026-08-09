@@ -10,6 +10,7 @@ extern const void *agora_sandbox_original_fcntl(void);
 extern void agora_sandbox_track_fcntl_duplicate(int source, int destination);
 extern int agora_sandbox_commit_synced_descriptor(int descriptor);
 extern int agora_sandbox_fcntl_setfd_argument(int descriptor, int flags);
+extern int agora_sandbox_validate_content_fcntl(int descriptor);
 
 typedef int (*open_fn)(const char *, int, ...);
 typedef int (*openat_fn)(int, const char *, int, ...);
@@ -112,6 +113,9 @@ int agora_sandbox_fcntl_shim(int descriptor, int command, ...) {
             break;
         }
         case F_SETSIZE: {
+            if (agora_sandbox_validate_content_fcntl(descriptor) < 0) {
+                return -1;
+            }
             va_list arguments;
             va_start(arguments, command);
             off_t argument = va_arg(arguments, off_t);
@@ -119,6 +123,19 @@ int agora_sandbox_fcntl_shim(int descriptor, int command, ...) {
             result = original_fcntl(descriptor, command, argument);
             break;
         }
+#ifdef F_PUNCHHOLE
+        case F_PUNCHHOLE: {
+            if (agora_sandbox_validate_content_fcntl(descriptor) < 0) {
+                return -1;
+            }
+            va_list arguments;
+            va_start(arguments, command);
+            void *argument = va_arg(arguments, void *);
+            va_end(arguments);
+            result = original_fcntl(descriptor, command, argument);
+            break;
+        }
+#endif
         default: {
             va_list arguments;
             va_start(arguments, command);

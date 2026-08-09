@@ -1,5 +1,6 @@
 use super::*;
-use crate::callback::Decision;
+use crate::audit::protocol::encode_request;
+use crate::callback::{Decision, FileAccessMode, FileContext, FileOpenMode, ProcessContext};
 
 async fn controller() -> AuditController {
     AuditController::start(
@@ -91,4 +92,59 @@ async fn audit_controller_reports_empty_successful_and_panicked_task_sets() {
         Ok(())
     });
     assert!(shutdown.shutdown().await.is_err());
+}
+
+#[tokio::test]
+async fn audit_server_times_out_idle_established_connections() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(address).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let state = Arc::new(AuditState {
+        token: "token".to_string(),
+        sandbox_id: "sandbox".to_string(),
+        run_id: "run".to_string(),
+        callback: |_| std::future::ready(Decision::Allow),
+        callback_timeout: Duration::from_secs(1),
+    });
+    let task = tokio::spawn(AuditServer::handle_with_timeouts(
+        server,
+        state,
+        Duration::from_secs(1),
+        Duration::from_millis(20),
+    ));
+    let event = AuditEventRequest::File {
+        trace_id: "trace".to_string(),
+        process: ProcessContext {
+            pid: 1,
+            ppid: 0,
+            executable: "/bin/tool".to_string(),
+        },
+        operation: FileOperation::Open,
+        file: FileContext {
+            path: "/tmp/file".to_string(),
+            mode: FileOpenMode {
+                access: FileAccessMode::Read,
+                create: false,
+                truncate: false,
+                append: false,
+                exclusive: false,
+            },
+        },
+    };
+    client
+        .write_all(&encode_request("token", event).unwrap())
+        .await
+        .unwrap();
+    let mut prefix = [0_u8; 4];
+    client.read_exact(&mut prefix).await.unwrap();
+    let mut response = vec![0_u8; frame_length(prefix).unwrap()];
+    client.read_exact(&mut response).await.unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("connection timed out"));
 }

@@ -269,6 +269,52 @@ async fn receiver_rejects_ack_when_attachment_normalization_fails() {
 }
 
 #[tokio::test]
+async fn receiver_acknowledges_permanent_attachment_failures() {
+    let server = HttpMockServer::start(|request| {
+        if request.path.ends_with("tenant_access_token/internal") {
+            MockResponse::json(r#"{"code":0,"msg":"ok","tenant_access_token":"token"}"#)
+        } else {
+            MockResponse::json("missing").with_status(404)
+        }
+    })
+    .await;
+    let api = LarkApi::with_base_url(
+        LarkChannelConfig {
+            name: "lark-permanent-attachment-test".to_string(),
+            app_id: "app-id".to_string(),
+            secret: "secret".to_string(),
+            permission: Default::default(),
+            proxy: None,
+        },
+        server.base_url(),
+    )
+    .unwrap();
+    let mut event = message("post");
+    event.image_keys = vec!["img-missing".to_string()];
+    let mut channel = LarkChannel::with_api(api);
+    let (receiver, acknowledged) = acknowledged_event_receiver(LarkEvent::Message(event));
+    channel.receiver = Some(receiver);
+
+    assert!(channel.recv().await.is_err());
+    assert_eq!(acknowledged.await.unwrap(), 200);
+}
+
+#[test]
+fn group_session_cache_is_bounded() {
+    let mut sessions = GroupSessions::default();
+    for index in 0..=GROUP_SESSION_CAPACITY {
+        sessions.insert(format!("chat-{index}"), true);
+    }
+
+    assert_eq!(sessions.entries.len(), GROUP_SESSION_CAPACITY);
+    assert_eq!(sessions.get("chat-0"), None);
+    assert_eq!(
+        sessions.get(&format!("chat-{GROUP_SESSION_CAPACITY}")),
+        Some(true)
+    );
+}
+
+#[tokio::test]
 async fn receiver_silently_discards_unmentioned_denied_lark_messages() {
     let (api, server) = permission_api().await;
     let mut channel = LarkChannel::with_api_and_permission(

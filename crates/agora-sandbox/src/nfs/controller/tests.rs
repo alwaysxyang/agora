@@ -51,6 +51,7 @@ async fn raw_response(
                 request_id: RequestId::new("0123456789abcdef0123456789abcdef").unwrap(),
                 request: Request::Stat {
                     path: RemotePath::new(0, "file.txt").unwrap(),
+                    name_capacity: 0,
                 },
             },
             include_descriptor.then_some(descriptor.as_raw_fd()),
@@ -195,6 +196,7 @@ async fn controller_rejects_an_invalid_token_before_storage_access() {
     let error = tokio::task::spawn_blocking(move || {
         client.request(Request::Stat {
             path: RemotePath::new(0, "file.txt").unwrap(),
+            name_capacity: 0,
         })
     })
     .await

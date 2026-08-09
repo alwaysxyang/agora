@@ -1,19 +1,24 @@
 use super::SmbRemoteConfig;
 use crate::nfs::backend::{RemoteStorage, StorageError, StorageResult};
 use crate::nfs::protocol::{RemoteEntry, RemoteFileType, RemoteMetadata, RemotePath};
+use md5::{Digest, Md5};
 use smb2::msg::close::{CloseRequest, CloseResponse, SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB};
 use smb2::msg::create::{
     CreateDisposition, CreateRequest, CreateResponse, ImpersonationLevel, ShareAccess,
 };
 use smb2::msg::flush::FlushRequest;
+use smb2::msg::query_directory::{
+    FileInformationClass, QueryDirectoryFlags, QueryDirectoryRequest, QueryDirectoryResponse,
+};
+use smb2::msg::query_info::{InfoType as QueryInfoType, QueryInfoRequest, QueryInfoResponse};
 use smb2::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
 use smb2::msg::set_info::{InfoType, SetInfoRequest};
 use smb2::msg::write::{WriteRequest, WriteResponse};
 use smb2::pack::{ReadCursor, Unpack};
 use smb2::types::flags::FileAccessMask;
 use smb2::types::status::NtStatus;
-use smb2::types::{Command, FileId, OplockLevel};
-use smb2::{ClientConfig, ErrorKind, SmbClient, Tree};
+use smb2::types::{Command, CreditCharge, FileId, OplockLevel};
+use smb2::{ClientConfig, CompoundOp, ErrorKind, SmbClient, Tree};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -25,9 +30,13 @@ use uuid::Uuid;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+const FILE_INTERNAL_INFORMATION: u8 = 6;
 const FILE_END_OF_FILE_INFORMATION: u8 = 20;
 const FILE_RENAME_INFORMATION: u8 = 10;
+const FILE_DISPOSITION_INFORMATION: u8 = 13;
 const TRANSFER_CHUNK_SIZE: usize = 64 * 1024;
+const WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct SmbStorage {
     roots: Vec<Mutex<SmbRoot>>,
@@ -88,13 +97,20 @@ impl RemoteStorage for SmbStorage {
     async fn stat(&self, path: &RemotePath) -> StorageResult<RemoteMetadata> {
         let mut root = self.root(path).await?;
         let remote = root.path(path);
-        let session = root.session().await?;
-        let info = session
-            .client
-            .stat(&mut session.tree, &remote)
-            .await
-            .map_err(storage_error)?;
-        Ok(metadata_from_file(&info))
+        for attempt in 0..2 {
+            let result = {
+                let session = root.session().await?;
+                stat_locked_path(session, &remote)
+                    .await
+                    .map_err(storage_error)
+            };
+            if attempt == 0 && result.as_ref().is_err_and(is_connection_failure) {
+                root.session = None;
+                continue;
+            }
+            return result;
+        }
+        unreachable!()
     }
 
     async fn read_into(
@@ -105,10 +121,20 @@ impl RemoteStorage for SmbStorage {
     ) -> StorageResult<RemoteMetadata> {
         let mut root = self.root(path).await?;
         let remote = root.path(path);
-        let session = root.session().await?;
-        read_locked_file(session, &remote, destination, max_length)
-            .await
-            .map_err(storage_error)
+        for attempt in 0..2 {
+            let result = {
+                let session = root.session().await?;
+                read_locked_file(session, &remote, destination, max_length)
+                    .await
+                    .map_err(storage_error)
+            };
+            if attempt == 0 && result.as_ref().is_err_and(is_connection_failure) {
+                root.session = None;
+                continue;
+            }
+            return result;
+        }
+        unreachable!()
     }
 
     async fn write_from_if_unchanged(
@@ -120,41 +146,49 @@ impl RemoteStorage for SmbStorage {
     ) -> StorageResult<RemoteMetadata> {
         let mut root = self.root(path).await?;
         let remote = root.path(path);
-        let session = root.session().await?;
-        write_locked_file(session, &remote, expected, source, length).await
+        let mut operation = WriteOperation::new(&remote);
+        for attempt in 0..2 {
+            let result = {
+                let session = root.session().await?;
+                write_locked_file(session, &remote, expected, source, length, &mut operation).await
+            };
+            if attempt == 0 && result.as_ref().is_err_and(is_connection_failure) {
+                root.session = None;
+                continue;
+            }
+            return result;
+        }
+        unreachable!()
     }
 
-    async fn list(&self, path: &RemotePath, max_entries: usize) -> StorageResult<Vec<RemoteEntry>> {
+    async fn list(
+        &self,
+        path: &RemotePath,
+        emit: &mut (impl FnMut(RemoteEntry) -> StorageResult<()> + Send),
+    ) -> StorageResult<()> {
         let mut root = self.root(path).await?;
         let remote = root.path(path);
-        let session = root.session().await?;
-        let entries = session
-            .client
-            .list_directory(&mut session.tree, &remote)
-            .await
-            .map_err(storage_error)?;
-        validate_directory_entry_count(
-            entries
-                .iter()
-                .filter(|entry| entry.name != "." && entry.name != "..")
-                .count(),
-            max_entries,
-        )?;
-        Ok(entries
-            .into_iter()
-            .filter(|entry| entry.name != "." && entry.name != "..")
-            .map(|entry| {
-                let file_type = if entry.is_directory {
-                    RemoteFileType::Directory
-                } else {
-                    RemoteFileType::File
+        for attempt in 0..2 {
+            let mut emitted = 0_usize;
+            let result = {
+                let mut counting_emit = |entry| {
+                    emit(entry)?;
+                    emitted += 1;
+                    Ok(())
                 };
-                RemoteEntry {
-                    name: entry.name,
-                    metadata: metadata(file_type, entry.size, entry.modified),
-                }
-            })
-            .collect())
+                let session = root.session().await?;
+                list_directory_stream(session, &remote, &mut counting_emit).await
+            };
+            if attempt == 0 && emitted == 0 && result.as_ref().is_err_and(is_connection_failure) {
+                root.session = None;
+                continue;
+            }
+            if result.as_ref().is_err_and(is_connection_failure) {
+                root.session = None;
+            }
+            return result;
+        }
+        unreachable!()
     }
 
     async fn create_directory(&self, path: &RemotePath) -> StorageResult<()> {
@@ -194,21 +228,220 @@ impl RemoteStorage for SmbStorage {
         let mut root = self.root(from).await?;
         let from = root.path(from);
         let to = root.path(to);
-        let session = root.session().await?;
-        rename_replacing(session, &from, &to)
-            .await
-            .map_err(storage_error)
+        let mut source_attempt = 0;
+        let source = loop {
+            let result = {
+                let session = root.session().await?;
+                stat_locked_path(session, &from)
+                    .await
+                    .map_err(storage_error)
+            };
+            if source_attempt == 0 && result.as_ref().is_err_and(is_connection_failure) {
+                root.session = None;
+                source_attempt += 1;
+                continue;
+            }
+            break result?;
+        };
+        for attempt in 0..2 {
+            let result = {
+                let session = root.session().await?;
+                rename_replacing(session, &from, &to)
+                    .await
+                    .map_err(storage_error)
+            };
+            if attempt == 0 && result.as_ref().is_err_and(is_connection_failure) {
+                root.session = None;
+                let resolved = {
+                    let session = root.session().await?;
+                    resolve_ambiguous_rename(session, &from, &to, &source).await
+                };
+                match resolved {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            return result;
+        }
+        unreachable!()
     }
 }
 
-fn validate_directory_entry_count(count: usize, maximum: usize) -> StorageResult<()> {
-    if count > maximum {
+fn is_connection_failure(error: &StorageError) -> bool {
+    matches!(
+        error.errno(),
+        libc::ENETDOWN
+            | libc::ETIMEDOUT
+            | libc::ECONNRESET
+            | libc::ECONNABORTED
+            | libc::ENOTCONN
+            | libc::EPIPE
+            | libc::EIO
+    )
+}
+
+async fn resolve_ambiguous_rename(
+    session: &mut SmbSession,
+    from: &str,
+    to: &str,
+    source: &RemoteMetadata,
+) -> StorageResult<bool> {
+    match stat_locked_path(session, from).await {
+        Ok(current) if same_file_object(&current, source) => return Ok(false),
+        Ok(_) => return Err(stale_file()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(storage_error(error)),
+    }
+    match stat_locked_path(session, to).await {
+        Ok(current) if same_file_object(&current, source) => Ok(true),
+        Ok(_) => Err(stale_file()),
+        Err(error) => Err(storage_error(error)),
+    }
+}
+
+async fn list_directory_stream(
+    session: &mut SmbSession,
+    path: &str,
+    emit: &mut (impl FnMut(RemoteEntry) -> StorageResult<()> + Send),
+) -> StorageResult<()> {
+    let opened = open_path(
+        session,
+        path,
+        CreateDisposition::FileOpen,
+        FileAccessMask::new(FileAccessMask::FILE_READ_DATA | FileAccessMask::SYNCHRONIZE),
+        ShareAccess(
+            ShareAccess::FILE_SHARE_READ
+                | ShareAccess::FILE_SHARE_WRITE
+                | ShareAccess::FILE_SHARE_DELETE,
+        ),
+        FILE_DIRECTORY_FILE,
+    )
+    .await
+    .map_err(storage_error)?;
+    let output_buffer_length = session
+        .client
+        .params()
+        .map_or(64 * 1024, |params| params.max_transact_size.min(64 * 1024))
+        .max(1024);
+    let result = async {
+        let mut restart = true;
+        loop {
+            let request = QueryDirectoryRequest {
+                file_information_class: FileInformationClass::FileBothDirectoryInformation,
+                flags: QueryDirectoryFlags(if restart {
+                    QueryDirectoryFlags::RESTART_SCANS
+                } else {
+                    0
+                }),
+                file_index: 0,
+                file_id: opened.file_id,
+                output_buffer_length,
+                file_name: "*".to_string(),
+            };
+            let frame = session
+                .client
+                .connection_mut()
+                .execute_with_credits(
+                    Command::QueryDirectory,
+                    &request,
+                    Some(session.tree.tree_id),
+                    CreditCharge((u64::from(output_buffer_length).div_ceil(65_536)) as u16),
+                )
+                .await
+                .map_err(storage_error)?;
+            if frame.header.status == NtStatus::NO_MORE_FILES {
+                return Ok(());
+            }
+            expect_success(&frame, Command::QueryDirectory).map_err(storage_error)?;
+            let response = QueryDirectoryResponse::unpack(&mut ReadCursor::new(&frame.body))
+                .map_err(storage_error)?;
+            emit_directory_page(&response.output_buffer, emit)?;
+            restart = false;
+        }
+    }
+    .await;
+    let closed = close_handle(session, opened.file_id, false)
+        .await
+        .map(|_| ())
+        .map_err(storage_error);
+    match result {
+        Ok(()) => closed,
+        Err(error) => Err(error),
+    }
+}
+
+fn emit_directory_page(
+    data: &[u8],
+    emit: &mut impl FnMut(RemoteEntry) -> StorageResult<()>,
+) -> StorageResult<()> {
+    if data.is_empty() {
         return Err(StorageError::new(
-            libc::EOVERFLOW,
-            "remote directory exceeds the sandbox listing limit",
+            libc::EPROTO,
+            "SMB returned an empty directory page",
         ));
     }
-    Ok(())
+    let mut offset = 0_usize;
+    loop {
+        let entry_data = data.get(offset..).ok_or_else(|| {
+            StorageError::new(libc::EPROTO, "SMB directory offset exceeds its page")
+        })?;
+        if entry_data.len() < 94 {
+            return Err(StorageError::new(
+                libc::EPROTO,
+                "SMB directory entry is shorter than its fixed header",
+            ));
+        }
+        let mut cursor = ReadCursor::new(entry_data);
+        let next = cursor.read_u32_le().map_err(storage_error)? as usize;
+        let _file_index = cursor.read_u32_le().map_err(storage_error)?;
+        let created = smb2::pack::FileTime::unpack(&mut cursor).map_err(storage_error)?;
+        let _accessed = smb2::pack::FileTime::unpack(&mut cursor).map_err(storage_error)?;
+        let modified = smb2::pack::FileTime::unpack(&mut cursor).map_err(storage_error)?;
+        let _changed = smb2::pack::FileTime::unpack(&mut cursor).map_err(storage_error)?;
+        let size = cursor.read_u64_le().map_err(storage_error)?;
+        let _allocated = cursor.read_u64_le().map_err(storage_error)?;
+        let attributes = cursor.read_u32_le().map_err(storage_error)?;
+        let name_length = cursor.read_u32_le().map_err(storage_error)? as usize;
+        let _ea_size = cursor.read_u32_le().map_err(storage_error)?;
+        let _short_name_length = cursor.read_u8().map_err(storage_error)?;
+        let _reserved = cursor.read_u8().map_err(storage_error)?;
+        cursor.skip(24).map_err(storage_error)?;
+        let name = smb2::decode_name(&cursor.read_utf16_le(name_length).map_err(storage_error)?)
+            .into_owned();
+        if name != "." && name != ".." && !is_smb_control_entry(&name) {
+            let file_type = if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                RemoteFileType::Directory
+            } else {
+                RemoteFileType::File
+            };
+            let mut entry_metadata = metadata(file_type, size, modified);
+            entry_metadata.identity = format!("{}:{}", entry_metadata.identity, created.0);
+            emit(RemoteEntry {
+                name,
+                metadata: entry_metadata,
+            })?;
+        }
+        if next == 0 {
+            return Ok(());
+        }
+        if next < 94
+            || offset
+                .checked_add(next)
+                .is_none_or(|next| next >= data.len())
+        {
+            return Err(StorageError::new(
+                libc::EPROTO,
+                "SMB directory entry has an invalid next offset",
+            ));
+        }
+        offset += next;
+    }
+}
+
+fn is_smb_control_entry(name: &str) -> bool {
+    (name.starts_with(".agora-write-") && name.ends_with(".tmp"))
+        || (name.starts_with(".agora-lock-") && name.ends_with(".lck"))
 }
 
 async fn rename_replacing(
@@ -285,6 +518,18 @@ fn staging_path(target: &str, identifier: &str) -> String {
         .map_or(name.clone(), |(parent, _)| format!("{parent}/{name}"))
 }
 
+fn write_lock_path(target: &str) -> String {
+    let digest = Md5::digest(target.as_bytes());
+    let identifier = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let name = format!(".agora-lock-{identifier}.lck");
+    target
+        .rsplit_once('/')
+        .map_or(name.clone(), |(parent, _)| format!("{parent}/{name}"))
+}
+
 async fn read_locked_file(
     session: &mut SmbSession,
     path: &str,
@@ -304,7 +549,14 @@ async fn read_locked_file(
         ),
     )
     .await?;
-    let metadata = metadata_from_create(&opened);
+    let file_index = match query_file_index(session, opened.file_id).await {
+        Ok(file_index) => file_index,
+        Err(error) => {
+            let _ = close_handle(session, opened.file_id, false).await;
+            return Err(error);
+        }
+    };
+    let metadata = metadata_from_create(&opened, file_index);
     let result = match validate_transfer_size(opened.end_of_file, max_length) {
         Ok(()) => read_handle(session, opened.file_id, opened.end_of_file, destination).await,
         Err(error) => Err(error),
@@ -335,30 +587,61 @@ async fn write_locked_file(
     expected: Option<&RemoteMetadata>,
     source: &mut File,
     length: u64,
+    operation: &mut WriteOperation,
 ) -> StorageResult<RemoteMetadata> {
+    if let Some(staged) = operation.staged.as_ref() {
+        match stat_locked_path(session, path).await {
+            Ok(current) if same_file_object(&current, staged) => return Ok(current),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(storage_error(error)),
+        }
+        cleanup_staging(session, &operation.temporary).await;
+    } else {
+        // A previous attempt may have created the sibling before its response was lost.
+        cleanup_staging(session, &operation.temporary).await;
+    }
     source
         .seek(SeekFrom::Start(0))
         .map_err(|error| storage_error(error.into()))?;
-    let temporary = staging_path(path, &Uuid::new_v4().simple().to_string());
+    let temporary = operation.temporary.clone();
     let staged = write_staged_file(session, &temporary, source, length).await;
     let metadata = match staged {
         Ok(metadata) => metadata,
         Err(error) => return Err(storage_error(error)),
+    };
+    operation.staged = Some(metadata.clone());
+
+    let write_lock = match acquire_write_lock(session, path).await {
+        Ok(write_lock) => write_lock,
+        Err(error) => {
+            cleanup_staging(session, &temporary).await;
+            return Err(error);
+        }
     };
 
     let locked = match lock_expected_target(session, path, expected).await {
         Ok(locked) => locked,
         Err(error) => {
             cleanup_staging(session, &temporary).await;
+            release_write_lock(session, write_lock).await?;
             return Err(error);
         }
     };
-    let published = rename_path(session, &temporary, path, expected.is_some()).await;
+    let verified = verify_expected_target(session, path, expected).await;
+    let published = match verified {
+        Ok(()) => rename_path(session, &temporary, path, expected.is_some()).await,
+        Err(error) => Err(error),
+    };
     if let Some(file_id) = locked {
-        let _ = close_handle(session, file_id, false).await;
+        close_transaction_handle(session, file_id, "expected target").await?;
     }
-    match published {
-        Ok(()) => Ok(metadata),
+    let result = match published {
+        Ok(()) => match stat_locked_path(session, path).await {
+            Ok(published) if same_file_object(&published, &metadata) => Ok(published),
+            Ok(_) => Err(stale_file()),
+            Err(error) => Err(storage_error(error)),
+        },
         Err(error) => {
             cleanup_staging(session, &temporary).await;
             if expected.is_none() && error.kind() == ErrorKind::AlreadyExists {
@@ -367,6 +650,140 @@ async fn write_locked_file(
                 Err(storage_error(error))
             }
         }
+    };
+    release_write_lock(session, write_lock).await?;
+    result
+}
+
+struct WriteOperation {
+    temporary: String,
+    staged: Option<RemoteMetadata>,
+}
+
+impl WriteOperation {
+    fn new(path: &str) -> Self {
+        Self {
+            temporary: staging_path(path, &Uuid::new_v4().simple().to_string()),
+            staged: None,
+        }
+    }
+}
+
+fn same_file_object(left: &RemoteMetadata, right: &RemoteMetadata) -> bool {
+    left.identity.rsplit(':').next() == right.identity.rsplit(':').next()
+}
+
+async fn acquire_write_lock(session: &mut SmbSession, target: &str) -> StorageResult<FileId> {
+    let path = write_lock_path(target);
+    let deadline = tokio::time::Instant::now() + WRITE_LOCK_TIMEOUT;
+    loop {
+        match create_write_lock(session, &path).await {
+            Ok(file_id) => return Ok(file_id),
+            Err(error) if write_lock_is_busy(&error) && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) if write_lock_is_busy(&error) => {
+                return Err(StorageError::new(
+                    libc::EBUSY,
+                    "timed out waiting for the remote write transaction lock",
+                ));
+            }
+            Err(error) => return Err(storage_error(error)),
+        }
+    }
+}
+
+fn write_lock_is_busy(error: &smb2::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::AlreadyExists | ErrorKind::SharingViolation
+    ) || error.status() == Some(NtStatus::DELETE_PENDING)
+}
+
+async fn create_write_lock(session: &mut SmbSession, path: &str) -> Result<FileId, smb2::Error> {
+    let create = build_open_request(
+        &session.tree,
+        path,
+        CreateDisposition::FileCreate,
+        FileAccessMask::new(FileAccessMask::DELETE | FileAccessMask::SYNCHRONIZE),
+        ShareAccess(0),
+        FILE_NON_DIRECTORY_FILE,
+    );
+    let disposition = SetInfoRequest {
+        info_type: InfoType::File,
+        file_info_class: FILE_DISPOSITION_INFORMATION,
+        additional_information: 0,
+        file_id: FileId::SENTINEL,
+        buffer: vec![1],
+    };
+    let operations = [
+        CompoundOp::new(Command::Create, &create, Some(session.tree.tree_id)),
+        CompoundOp::new(Command::SetInfo, &disposition, Some(session.tree.tree_id)),
+    ];
+    let responses = session
+        .client
+        .connection_mut()
+        .execute_compound(&operations)
+        .await?;
+    if responses.len() != operations.len() {
+        return Err(smb2::Error::invalid_data(
+            "SMB write lock returned an incomplete compound response",
+        ));
+    }
+    let mut responses = responses.into_iter();
+    let created = responses
+        .next()
+        .expect("compound response length was checked")?;
+    expect_success(&created, Command::Create)?;
+    let opened = CreateResponse::unpack(&mut ReadCursor::new(&created.body))?;
+    let disposition = responses
+        .next()
+        .expect("compound response length was checked");
+    match disposition.and_then(|frame| expect_success(&frame, Command::SetInfo)) {
+        Ok(()) => Ok(opened.file_id),
+        Err(error) => {
+            let _ = close_handle(session, opened.file_id, false).await;
+            cleanup_staging(session, path).await;
+            Err(error)
+        }
+    }
+}
+
+async fn release_write_lock(session: &mut SmbSession, file_id: FileId) -> StorageResult<()> {
+    close_transaction_handle(session, file_id, "write lock").await
+}
+
+async fn close_transaction_handle(
+    session: &mut SmbSession,
+    file_id: FileId,
+    description: &str,
+) -> StorageResult<()> {
+    close_handle(session, file_id, false)
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            StorageError::new(
+                libc::EIO,
+                format!("failed to close SMB {description}: {error}"),
+            )
+        })
+}
+
+async fn verify_expected_target(
+    session: &mut SmbSession,
+    path: &str,
+    expected: Option<&RemoteMetadata>,
+) -> Result<(), smb2::Error> {
+    match (expected, stat_locked_path(session, path).await) {
+        (Some(expected), Ok(current)) if current.identity == expected.identity => Ok(()),
+        (None, Err(error)) if error.kind() == ErrorKind::NotFound => Ok(()),
+        (Some(_), Err(error)) if error.kind() == ErrorKind::NotFound => Err(smb2::Error::Io(
+            std::io::Error::from_raw_os_error(libc::ESTALE),
+        )),
+        (Some(_), Ok(_)) | (None, Ok(_)) => Err(smb2::Error::Io(
+            std::io::Error::from_raw_os_error(libc::ESTALE),
+        )),
+        (_, Err(error)) => Err(error),
     }
 }
 
@@ -388,6 +805,14 @@ async fn write_staged_file(
         ShareAccess(0),
     )
     .await?;
+    let file_index = match query_file_index(session, opened.file_id).await {
+        Ok(file_index) => file_index,
+        Err(error) => {
+            let _ = close_handle(session, opened.file_id, false).await;
+            cleanup_staging(session, path).await;
+            return Err(error);
+        }
+    };
     let operation = async {
         write_handle(session, opened.file_id, source, length).await?;
         set_handle_length(session, opened.file_id, length).await?;
@@ -398,7 +823,7 @@ async fn write_staged_file(
     }
     .await;
     match operation {
-        Ok(closed) => Ok(metadata_from_close(&closed)),
+        Ok(closed) => Ok(metadata_from_close(&closed, file_index)),
         Err(error) => {
             let _ = close_handle(session, opened.file_id, false).await;
             cleanup_staging(session, path).await;
@@ -428,11 +853,76 @@ async fn lock_expected_target(
         Err(error) if error.kind() == ErrorKind::NotFound => return Err(stale_file()),
         Err(error) => return Err(storage_error(error)),
     };
-    if expected.identity != metadata_from_create(&opened).identity {
+    let file_index = match query_file_index(session, opened.file_id).await {
+        Ok(file_index) => file_index,
+        Err(error) => {
+            let _ = close_handle(session, opened.file_id, false).await;
+            return Err(storage_error(error));
+        }
+    };
+    if expected.identity != metadata_from_create(&opened, file_index).identity {
         let _ = close_handle(session, opened.file_id, false).await;
         return Err(stale_file());
     }
     Ok(Some(opened.file_id))
+}
+
+async fn stat_locked_path(
+    session: &mut SmbSession,
+    path: &str,
+) -> Result<RemoteMetadata, smb2::Error> {
+    let opened = open_path(
+        session,
+        path,
+        CreateDisposition::FileOpen,
+        FileAccessMask::new(FileAccessMask::FILE_READ_ATTRIBUTES | FileAccessMask::SYNCHRONIZE),
+        ShareAccess(
+            ShareAccess::FILE_SHARE_READ
+                | ShareAccess::FILE_SHARE_WRITE
+                | ShareAccess::FILE_SHARE_DELETE,
+        ),
+        0,
+    )
+    .await?;
+    let result = query_file_index(session, opened.file_id)
+        .await
+        .map(|file_index| metadata_from_create(&opened, file_index));
+    let closed = close_handle(session, opened.file_id, false).await;
+    match result {
+        Ok(metadata) => {
+            closed?;
+            Ok(metadata)
+        }
+        Err(error) => {
+            let _ = closed;
+            Err(error)
+        }
+    }
+}
+
+async fn query_file_index(session: &mut SmbSession, file_id: FileId) -> Result<u64, smb2::Error> {
+    let request = QueryInfoRequest {
+        info_type: QueryInfoType::File,
+        file_info_class: FILE_INTERNAL_INFORMATION,
+        output_buffer_length: 8,
+        additional_information: 0,
+        flags: 0,
+        file_id,
+        input_buffer: Vec::new(),
+    };
+    let frame = session
+        .client
+        .connection_mut()
+        .execute(Command::QueryInfo, &request, Some(session.tree.tree_id))
+        .await?;
+    expect_success(&frame, Command::QueryInfo)?;
+    let response = QueryInfoResponse::unpack(&mut ReadCursor::new(&frame.body))?;
+    let bytes: [u8; 8] = response
+        .output_buffer
+        .as_slice()
+        .try_into()
+        .map_err(|_| smb2::Error::invalid_data("SMB file identity is not eight bytes"))?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 async fn cleanup_staging(session: &mut SmbSession, path: &str) {
@@ -761,6 +1251,7 @@ fn remote_path(base: &str, path: &RemotePath) -> String {
     }
 }
 
+#[cfg(test)]
 fn metadata_from_file(info: &smb2::FileInfo) -> RemoteMetadata {
     let mut metadata = metadata(
         if info.is_directory {
@@ -786,21 +1277,25 @@ fn validate_remote_root(result: Result<smb2::FileInfo, smb2::Error>) -> StorageR
     Ok(())
 }
 
-fn metadata_from_create(response: &CreateResponse) -> RemoteMetadata {
+fn metadata_from_create(response: &CreateResponse, file_index: u64) -> RemoteMetadata {
     metadata_with_creation(
         response.file_attributes,
         response.end_of_file,
         response.last_write_time,
         response.creation_time,
+        response.change_time,
+        file_index,
     )
 }
 
-fn metadata_from_close(response: &CloseResponse) -> RemoteMetadata {
+fn metadata_from_close(response: &CloseResponse, file_index: u64) -> RemoteMetadata {
     metadata_with_creation(
         response.file_attributes,
         response.end_of_file,
         response.last_write_time,
         response.creation_time,
+        response.change_time,
+        file_index,
     )
 }
 
@@ -809,6 +1304,8 @@ fn metadata_with_creation(
     size: u64,
     modified: smb2::pack::FileTime,
     created: smb2::pack::FileTime,
+    changed: smb2::pack::FileTime,
+    file_index: u64,
 ) -> RemoteMetadata {
     let mut metadata = metadata(
         if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
@@ -819,7 +1316,10 @@ fn metadata_with_creation(
         size,
         modified,
     );
-    metadata.identity = format!("{}:{}", metadata.identity, created.0);
+    metadata.identity = format!(
+        "{}:{}:{}:{file_index}",
+        metadata.identity, created.0, changed.0
+    );
     metadata
 }
 

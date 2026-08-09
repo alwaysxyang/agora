@@ -1,6 +1,6 @@
 use super::LarkReplyTarget;
 use super::card::{LarkAgentCard, LarkReplyCard};
-use super::lark_api::LarkApi;
+use super::lark_api::{LarkApi, LarkImageDownloadError};
 use crate::channel::permission::{AccessContext, PermissionGate};
 use crate::channel::{
     Channel, ChannelReply, ChannelRun, ChannelRunContext, ChannelTask, InterruptCallbacks, RunEvent,
@@ -13,9 +13,41 @@ use agora_core::logger;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+
+const GROUP_SESSION_CAPACITY: usize = 4096;
+
+#[derive(Clone, Default)]
+struct GroupSessions {
+    entries: HashMap<String, bool>,
+    insertion_order: VecDeque<String>,
+}
+
+impl GroupSessions {
+    fn insert(&mut self, session_id: String, group: bool) {
+        if !self.entries.contains_key(&session_id) {
+            while self.entries.len() >= GROUP_SESSION_CAPACITY {
+                let Some(expired) = self.insertion_order.pop_front() else {
+                    break;
+                };
+                self.entries.remove(&expired);
+            }
+            self.insertion_order.push_back(session_id.clone());
+        }
+        self.entries.insert(session_id, group);
+    }
+
+    fn get(&self, session_id: &str) -> Option<bool> {
+        self.entries.get(session_id).copied()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub(super) struct LarkMessageEvent {
@@ -216,7 +248,8 @@ impl LarkMessageEvent {
             .or_else(|| value.pointer("/event/sender/sender_id/user_id"))
             .or_else(|| value.pointer("/event/sender/sender_id/union_id"))
             .and_then(Value::as_str)
-            .unwrap_or_default()
+            .filter(|sender_id| !sender_id.is_empty())
+            .ok_or_else(|| anyhow!("lark message event missing event.sender.sender_id"))?
             .to_string();
         let message_type = Self::required_str(message, "message_type")?.to_string();
         let raw_content = Self::required_str(message, "content")?;
@@ -317,21 +350,27 @@ impl LarkMessageEvent {
     }
 
     fn flatten_post_content(value: &Value) -> (String, Vec<String>) {
-        let items = value
+        let lines = value
             .get("content")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(Value::as_array)
-            .flat_map(|line| line.iter())
             .collect::<Vec<_>>();
-        let text = items
+        let text = lines
             .iter()
-            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .map(|line| {
+                line.iter()
+                    .filter_map(|item| item.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|line| !line.is_empty())
             .collect::<Vec<_>>()
-            .join("");
-        let image_keys = items
+            .join("\n");
+        let image_keys = lines
             .iter()
+            .flat_map(|line| line.iter())
             .filter_map(|item| item.get("image_key").and_then(Value::as_str))
             .map(str::to_string)
             .collect();
@@ -418,9 +457,22 @@ pub struct LarkChannel {
     api: LarkApi,
     permission: PermissionGate,
     bot_open_id: Option<String>,
-    group_sessions: HashMap<String, bool>,
+    group_sessions: GroupSessions,
     interrupts: InterruptCallbacks,
     receiver: Option<LarkWebSocketReceiver>,
+}
+
+impl Clone for LarkChannel {
+    fn clone(&self) -> Self {
+        Self {
+            api: self.api.clone(),
+            permission: self.permission.clone(),
+            bot_open_id: self.bot_open_id.clone(),
+            group_sessions: GroupSessions::default(),
+            interrupts: self.interrupts.clone(),
+            receiver: None,
+        }
+    }
 }
 
 impl LarkChannel {
@@ -430,7 +482,7 @@ impl LarkChannel {
             api: LarkApi::new(config)?,
             permission,
             bot_open_id: None,
-            group_sessions: HashMap::new(),
+            group_sessions: GroupSessions::default(),
             interrupts: InterruptCallbacks::default(),
             receiver: None,
         })
@@ -461,7 +513,7 @@ impl LarkChannel {
             api,
             permission: PermissionGate::new(permission),
             bot_open_id: None,
-            group_sessions: HashMap::new(),
+            group_sessions: GroupSessions::default(),
             interrupts: InterruptCallbacks::default(),
             receiver: None,
         }
@@ -495,7 +547,7 @@ impl LarkChannel {
         conversation: Option<LarkConversation>,
     ) -> Option<LarkConversation> {
         conversation.or_else(|| {
-            self.group_sessions.get(session_id).copied().map(|group| {
+            self.group_sessions.get(session_id).map(|group| {
                 if group {
                     LarkConversation::Group
                 } else {
@@ -553,8 +605,11 @@ impl LarkChannel {
                     .api
                     .download_message_image(&token, &event.message_id, image_key, remaining_bytes)
                     .await
-                    .map_err(|err| {
-                        anyhow!("download lark message image failed: {image_key}: {err}")
+                    .map_err(|error| {
+                        let message = error.to_string();
+                        anyhow::Error::new(error).context(format!(
+                            "download lark message image failed: {image_key}: {message}"
+                        ))
                     })?;
                 remaining_bytes -= image.data.len();
                 let file_name = format!(
@@ -695,7 +750,10 @@ impl Channel for LarkChannel {
                     let _ = acknowledgement.send(200);
                 }
                 Err(error) => {
-                    let _ = acknowledgement.send(500);
+                    let permanent = error
+                        .downcast_ref::<LarkImageDownloadError>()
+                        .is_some_and(LarkImageDownloadError::is_permanent);
+                    let _ = acknowledgement.send(if permanent { 200 } else { 500 });
                     return Err(error);
                 }
             }

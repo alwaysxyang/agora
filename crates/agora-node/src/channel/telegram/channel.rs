@@ -35,6 +35,20 @@ pub struct TelegramChannel {
     bot_username: Option<String>,
 }
 
+impl Clone for TelegramChannel {
+    fn clone(&self) -> Self {
+        Self {
+            api: self.api.clone(),
+            permission: self.permission.clone(),
+            interrupts: self.interrupts.clone(),
+            pending: VecDeque::new(),
+            next_offset: None,
+            image_retry: None,
+            bot_username: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TelegramRun {
     message: TelegramRichMessage,

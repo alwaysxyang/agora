@@ -26,7 +26,6 @@ shell-words = { workspace = true }
 smb2 = { workspace = true, optional = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
-rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
 ring = { workspace = true }

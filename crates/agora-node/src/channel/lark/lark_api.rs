@@ -7,8 +7,8 @@ use agora_core::logger;
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
-use reqwest::Client;
 use reqwest::header::CONTENT_TYPE;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -47,6 +47,57 @@ pub(super) struct LarkImageResource {
     pub(super) media_type: String,
     pub(super) data: Vec<u8>,
 }
+
+#[derive(Debug)]
+pub(super) struct LarkImageDownloadError {
+    message: String,
+    permanent: bool,
+}
+
+impl LarkImageDownloadError {
+    fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            permanent: false,
+        }
+    }
+
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            permanent: true,
+        }
+    }
+
+    pub(super) fn is_permanent(&self) -> bool {
+        self.permanent
+    }
+}
+
+impl std::fmt::Display for LarkImageDownloadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LarkImageDownloadError {}
+
+#[derive(Debug)]
+pub(super) struct LarkHttpStatusError(StatusCode);
+
+impl LarkHttpStatusError {
+    pub(super) fn is_unauthorized(&self) -> bool {
+        self.0 == StatusCode::UNAUTHORIZED
+    }
+}
+
+impl std::fmt::Display for LarkHttpStatusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "lark HTTP request failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for LarkHttpStatusError {}
 
 impl LarkApi {
     pub(super) fn new(config: LarkChannelConfig) -> Result<Self> {
@@ -313,7 +364,7 @@ impl LarkApi {
         message_id: &str,
         image_key: &str,
         maximum_bytes: usize,
-    ) -> Result<LarkImageResource> {
+    ) -> std::result::Result<LarkImageResource, LarkImageDownloadError> {
         let response = self
             .client
             .get(format!(
@@ -324,10 +375,20 @@ impl LarkApi {
             .bearer_auth(token)
             .send()
             .await
-            .context("download lark message image failed")?;
+            .map_err(|error| LarkImageDownloadError::transient(error.to_string()))?;
         let status = response.status();
         if !status.is_success() {
-            return Err(anyhow!("download lark message image http failed: {status}"));
+            let message = format!("download lark message image http failed: {status}");
+            return Err(
+                if status.is_client_error()
+                    && status != StatusCode::REQUEST_TIMEOUT
+                    && status != StatusCode::TOO_MANY_REQUESTS
+                {
+                    LarkImageDownloadError::permanent(message)
+                } else {
+                    LarkImageDownloadError::transient(message)
+                },
+            );
         }
         let media_type = response
             .headers()
@@ -338,7 +399,14 @@ impl LarkApi {
             .to_string();
         let data = http::read_body_limited(response, maximum_bytes)
             .await
-            .map_err(|err| anyhow!("read lark message image failed: {err}"))?;
+            .map_err(|error| {
+                let message = format!("read lark message image failed: {error}");
+                if error.is_limit_exceeded() {
+                    LarkImageDownloadError::permanent(message)
+                } else {
+                    LarkImageDownloadError::transient(message)
+                }
+            })?;
         Ok(LarkImageResource { media_type, data })
     }
 
@@ -388,9 +456,11 @@ impl LarkApi {
                 reply_in_thread: true,
             })
             .send()
-            .await?
-            .json::<SendCardResponse>()
             .await?;
+        if !response.status().is_success() {
+            return Err(LarkHttpStatusError(response.status()).into());
+        }
+        let response = response.json::<SendCardResponse>().await?;
         response.into_result()
     }
 
@@ -420,6 +490,9 @@ impl LarkApi {
                         && (response.status().is_server_error()
                             || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS) => {}
                 Ok(response) => {
+                    if !response.status().is_success() {
+                        return Err(LarkHttpStatusError(response.status()).into());
+                    }
                     return response.json::<LarkEmptyResponse>().await?.into_result();
                 }
                 Err(error) if attempt < LARK_PATCH_MAX_ATTEMPTS => {

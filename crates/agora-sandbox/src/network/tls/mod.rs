@@ -13,7 +13,7 @@ use super::inspection::TlsClientHello;
 use super::relay::{RelayOutcome, relay_bidirectional};
 use anyhow::{Context, Result, bail};
 pub(super) use io::PrefixedIo;
-use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -145,7 +145,7 @@ pub(crate) fn native_root_certificates() -> Result<Vec<CertificateDer<'static>>>
 fn load_pem_root_certificates(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     let contents = std::fs::read(path)
         .with_context(|| format!("failed to read fallback TLS roots from {path}"))?;
-    let certificates = rustls_pemfile::certs(&mut contents.as_slice())
+    let certificates = CertificateDer::pem_slice_iter(&contents)
         .collect::<std::result::Result<Vec<_>, _>>()
         .with_context(|| format!("failed to parse fallback TLS roots from {path}"))?;
     if certificates.is_empty() {

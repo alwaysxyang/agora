@@ -277,7 +277,7 @@ The daemon should keep these identifiers distinct:
 - `external_session_id`: the source channel's original conversation, sender, thread, or job grouping id.
 - `isolation_scope`: either the configured agent-wide shared scope or a channel-qualified session scope.
 
-A single session can contain many tasks. A single task usually creates one run, but retries can create multiple runs for the same task.
+A single session can contain many tasks. A single task usually creates one run, but retries can create multiple runs for the same task. Every `AgentRunOutput` generates a fresh UUID run id at construction and publishes it in that run's `Started` event; subsequent events use the same `ChannelRun` instance. Run ids are never a hard-coded placeholder or derived from the task or session id.
 
 The channel `session_id` and backend Codex thread id are separate concepts. For `none`, the agent name selects one persistent backend session mapping and one FIFO across every channel conversation. For `session`, channel session identity, together with `channel.name` and `agent.name`, selects a persistent backend session mapping. Consequently, a session-isolated agent can maintain many independent Codex conversations, while repeated tasks from the same channel session resume the same conversation. All conversations still execute in the configured `workspace`.
 

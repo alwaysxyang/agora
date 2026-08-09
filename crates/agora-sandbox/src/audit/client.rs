@@ -61,17 +61,30 @@ impl AuditClient {
                         },
                     );
                 }
-                let result = Self::publish_on(
-                    &mut connections
-                        .get_mut(&self.endpoint)
-                        .expect("audit connection was inserted")
-                        .stream,
-                    &request,
-                );
-                if result.as_ref().is_err_and(AuditError::disconnects) {
+                for retry in [false, true] {
+                    let result = Self::publish_on(
+                        &mut connections
+                            .get_mut(&self.endpoint)
+                            .expect("audit connection was inserted")
+                            .stream,
+                        &request,
+                    );
+                    if !result.as_ref().is_err_and(AuditError::disconnects) {
+                        return result;
+                    }
                     connections.remove(&self.endpoint);
+                    if retry {
+                        return result;
+                    }
+                    connections.insert(
+                        self.endpoint.clone(),
+                        AuditConnection {
+                            pid,
+                            stream: Self::connect(self.endpoint.control)?,
+                        },
+                    );
                 }
-                result
+                unreachable!()
             })
             .unwrap_or_else(|_| {
                 let mut stream = Self::connect(self.endpoint.control)?;

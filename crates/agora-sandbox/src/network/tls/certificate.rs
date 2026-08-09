@@ -3,7 +3,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, PublicKeyData,
 };
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, pem::PemObject};
 use rustls::sign::CertifiedKey;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -276,7 +276,7 @@ impl CertificateCache {
 }
 
 fn parse_ca_certificate(pem: &[u8]) -> Result<CertificateDer<'static>> {
-    let mut certificates = rustls_pemfile::certs(&mut &*pem)
+    let mut certificates = CertificateDer::pem_slice_iter(pem)
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to parse TLS CA certificate PEM")?;
     if certificates.len() != 1 {

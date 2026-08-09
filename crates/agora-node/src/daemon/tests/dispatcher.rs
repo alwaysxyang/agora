@@ -1,6 +1,57 @@
 use super::*;
 use crate::agent::AgentOutput;
 use std::os::unix::fs::PermissionsExt;
+use std::time::Duration;
+use tokio::sync::Notify;
+
+#[derive(Clone)]
+struct BlockingTerminalRun {
+    terminal: Arc<Notify>,
+}
+
+impl ChannelRun for BlockingTerminalRun {
+    async fn publish(&self, event: RunEvent) -> Result<()> {
+        if matches!(
+            event,
+            RunEvent::Completed { .. }
+                | RunEvent::Failed { .. }
+                | RunEvent::Stopped
+                | RunEvent::Interrupted
+        ) {
+            self.terminal.notify_waiters();
+            std::future::pending().await
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct BlockingTerminalChannel {
+    terminal: Arc<Notify>,
+}
+
+impl Channel for BlockingTerminalChannel {
+    type Task = TestTask;
+    type Run = BlockingTerminalRun;
+
+    fn name(&self) -> &str {
+        "terminal"
+    }
+
+    async fn recv(&mut self) -> Result<Option<Self::Task>> {
+        Ok(None)
+    }
+
+    async fn open_run(&self, _task: &Self::Task, _context: ChannelRunContext) -> Result<Self::Run> {
+        Ok(BlockingTerminalRun {
+            terminal: Arc::clone(&self.terminal),
+        })
+    }
+
+    async fn reply(&self, _task: &Self::Task, _reply: ChannelReply) -> Result<()> {
+        Ok(())
+    }
+}
 
 #[test]
 fn selects_all_agents_subscribed_to_channel() {
@@ -65,6 +116,40 @@ async fn opens_one_channel_run_for_each_agent() {
     assert_eq!(contexts.len(), 2);
     assert_eq!(contexts[0].agent.name, "codex-dev");
     assert_eq!(contexts[1].agent.name, "review-bot");
+}
+
+#[tokio::test]
+async fn terminal_publication_does_not_hold_the_execution_queue_ticket() {
+    let temp = tempfile::tempdir().unwrap();
+    let dispatcher =
+        AgentDispatcher::new(SessionStore::open(temp.path().join("terminal-ticket.db")).unwrap());
+    let scheduler = dispatcher.scheduler.clone();
+    let terminal = Arc::new(Notify::new());
+    let channel = BlockingTerminalChannel {
+        terminal: Arc::clone(&terminal),
+    };
+    let run = tokio::spawn(async move {
+        dispatcher
+            .dispatch_channel_task(
+                &channel,
+                vec![ConfiguredAgent::from_config(custom_agent("custom")).unwrap()],
+                TestTask,
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), terminal.notified())
+        .await
+        .unwrap();
+    let next = scheduler.enqueue(super::super::ExecutionScope::new(
+        "terminal",
+        "session-1",
+        SessionKey::new("custom", IsolationScope::Shared),
+    ));
+
+    assert_eq!(next.ahead(), 0);
+    drop(next);
+    run.abort();
 }
 
 #[tokio::test]
@@ -262,6 +347,7 @@ async fn agent_run_output_publishes_every_terminal_state() {
     let mut output = AgentRunOutput::new(RecordingRun {
         events: Arc::clone(&events),
     });
+    let run_id = output.run_id.clone();
 
     output.queued(2).await.unwrap();
     output.started().await.unwrap();
@@ -287,7 +373,7 @@ async fn agent_run_output_publishes_every_terminal_state() {
         [
             RunEvent::Queued { ahead: 2 },
             RunEvent::Started {
-                run_id: "local-run".to_string(),
+                run_id: run_id.clone(),
             },
             RunEvent::Output(OutputEvent::Thinking {
                 text: "checking".to_string(),
@@ -300,6 +386,12 @@ async fn agent_run_output_publishes_every_terminal_state() {
             RunEvent::Interrupted,
         ]
     );
+    assert!(uuid::Uuid::parse_str(&run_id).is_ok());
+
+    let another = AgentRunOutput::new(RecordingRun {
+        events: Arc::new(Mutex::new(Vec::new())),
+    });
+    assert_ne!(another.run_id, run_id);
 
     let failing = AgentRunOutput::new(FailingRun);
     assert!(failing.interrupted().await.is_err());

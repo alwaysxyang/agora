@@ -1,6 +1,7 @@
 use super::crypto::FileCipher;
 use super::metadata::{EntryState, MetadataStore};
 use super::namespace;
+use super::overlay::OverlayStore;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -180,6 +181,9 @@ impl EncryptedWorkspace {
         if old_cipher.key_id() != metadata.key_id {
             bail!("sandbox filesystem key is incorrect");
         }
+        if Self::path_entry_exists(&root.join(namespace::NAMESPACE_JOURNAL_FILE))? {
+            drop(OverlayStore::encrypted(&root, old_cipher.clone())?);
+        }
         let new_salt = Self::random_salt()?;
         let new_cipher = FileCipher::derive(new_passphrase, &new_salt)?;
         let new_metadata = KeyMetadata {
@@ -284,6 +288,8 @@ impl EncryptedWorkspace {
             return Err(error);
         }
 
+        Self::sync_parent_directories(entries.iter().map(|entry| entry.staged.as_path()))?;
+
         let journal_entries = entries
             .iter()
             .map(|entry| {
@@ -326,12 +332,14 @@ impl EncryptedWorkspace {
                         entry.destination.display()
                     )
                 })?;
+                Self::sync_parent(&entry.destination)?;
                 fs::rename(&entry.staged, &entry.renamed_destination).with_context(|| {
                     format!(
                         "failed to publish re-encrypted filesystem file {}",
                         entry.renamed_destination.display()
                     )
                 })?;
+                Self::sync_parent(&entry.renamed_destination)?;
             }
             on_progress(KeyMigrationStage::UpdatingMetadata);
             Self::write_key_metadata(&root, &new_metadata)?;
@@ -471,7 +479,8 @@ impl EncryptedWorkspace {
                 .open(&temporary)?;
             std::io::Write::write_all(&mut file, &contents)?;
             file.sync_all()?;
-            fs::rename(&temporary, &path)
+            fs::rename(&temporary, &path)?;
+            Self::sync_parent(&path)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
@@ -562,6 +571,7 @@ impl EncryptedWorkspace {
             || name == KEY_FILE.as_bytes()
             || name == VFS_LOCK_FILE.as_bytes()
             || name == REKEY_JOURNAL_FILE.as_bytes()
+            || name == namespace::NAMESPACE_JOURNAL_FILE.as_bytes()
             || name == DIRECTORY_METADATA_FILE.as_bytes()
             || name.starts_with(b".key.json.")
             || name.starts_with(b".rekey.json.")
@@ -587,7 +597,8 @@ impl EncryptedWorkspace {
                 .open(&temporary)?;
             std::io::Write::write_all(&mut file, &contents)?;
             file.sync_all()?;
-            fs::rename(&temporary, &path)
+            fs::rename(&temporary, &path)?;
+            Self::sync_parent(&path)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
@@ -628,18 +639,26 @@ impl EncryptedWorkspace {
             if committed {
                 Self::remove_file_if_exists(&backup)?;
                 Self::remove_file_if_exists(&staged)?;
+                Self::sync_parent_directories([backup.as_path(), staged.as_path()])?;
             } else {
-                if backup.exists() {
+                if Self::path_entry_exists(&backup)? {
                     Self::remove_file_if_exists(&renamed_destination)?;
                     fs::rename(&backup, &destination).with_context(|| {
                         format!("failed to restore encrypted file {}", destination.display())
                     })?;
+                    Self::sync_parent_directories([
+                        renamed_destination.as_path(),
+                        destination.as_path(),
+                    ])?;
                 }
                 Self::remove_file_if_exists(&staged)?;
+                Self::sync_parent(&staged)?;
             }
         }
-        fs::remove_file(&path)
-            .with_context(|| format!("failed to remove key migration journal {}", path.display()))
+        fs::remove_file(&path).with_context(|| {
+            format!("failed to remove key migration journal {}", path.display())
+        })?;
+        Self::sync_parent(&path)
     }
 
     fn encode_relative_path(root: &Path, path: &Path) -> Result<String> {
@@ -676,6 +695,39 @@ impl EncryptedWorkspace {
             Err(error) => Err(error)
                 .with_context(|| format!("failed to remove migration file {}", path.display())),
         }
+    }
+
+    fn path_entry_exists(path: &Path) -> Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to inspect migration file {}", path.display())),
+        }
+    }
+
+    fn sync_parent(path: &Path) -> Result<()> {
+        let parent = path
+            .parent()
+            .context("filesystem migration path has no parent")?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("failed to sync directory {}", parent.display()))
+    }
+
+    fn sync_parent_directories<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<()> {
+        let mut synced = HashSet::new();
+        for path in paths {
+            let parent = path
+                .parent()
+                .context("filesystem migration path has no parent")?;
+            if synced.insert(parent.to_path_buf()) {
+                File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .with_context(|| format!("failed to sync directory {}", parent.display()))?;
+            }
+        }
+        Ok(())
     }
 }
 

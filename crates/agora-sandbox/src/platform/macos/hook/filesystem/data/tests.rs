@@ -60,7 +60,21 @@ fn sequential_write_ranges_reject_invalid_descriptors_and_offsets() {
     let path = directory.path().join("ranges");
     let file = std::fs::File::create(path).unwrap();
 
-    assert_eq!(sequential_write_range(-1, 1), None);
-    assert_eq!(sequential_write_range(file.as_raw_fd(), -1), None);
-    assert_eq!(sequential_write_range(file.as_raw_fd(), 1), None);
+    assert_eq!(sequential_write_range(-1, None, 1), None);
+    assert_eq!(sequential_write_range(file.as_raw_fd(), None, -1), None);
+    assert_eq!(sequential_write_range(file.as_raw_fd(), None, 1), None);
+}
+
+#[test]
+fn sequential_write_ranges_cover_concurrent_shared_offset_progress() {
+    let file = tempfile::tempfile().unwrap();
+    let descriptor = file.as_raw_fd();
+    unsafe {
+        assert_eq!(libc::lseek(descriptor, 20, libc::SEEK_SET), 20);
+    }
+
+    assert_eq!(
+        sequential_write_range(descriptor, Some(0), 10),
+        Some((0, 20))
+    );
 }

@@ -1,9 +1,9 @@
 use super::{
     FILE_ATTRIBUTE_DIRECTORY, SmbRoot, SmbStorage, build_open_request, build_rename_information,
-    configured_storage, expect_success, metadata_from_close, metadata_from_create,
-    metadata_from_file, remote_path, smb_errno, staging_path, stale_file, storage_error,
-    validate_directory_entry_count, validate_read_response_size, validate_remote_root,
-    validate_transfer_size, wire_path,
+    configured_storage, expect_success, is_smb_control_entry, metadata_from_close,
+    metadata_from_create, metadata_from_file, remote_path, same_file_object, smb_errno,
+    staging_path, stale_file, storage_error, validate_read_response_size, validate_remote_root,
+    validate_transfer_size, wire_path, write_lock_path,
 };
 use crate::nfs::SmbRemoteConfig;
 use crate::nfs::backend::{RemoteStorage, StorageResult};
@@ -103,15 +103,6 @@ fn smb_rejects_an_opened_file_that_exceeds_the_transfer_limit() {
 }
 
 #[test]
-fn smb_rejects_a_directory_before_building_a_second_oversized_entry_vector() {
-    validate_directory_entry_count(2, 2).unwrap();
-    assert_eq!(
-        validate_directory_entry_count(3, 2).unwrap_err().errno(),
-        libc::EOVERFLOW
-    );
-}
-
-#[test]
 fn smb_errors_map_to_posix_errno_without_string_matching() {
     let missing = smb2::Error::Protocol {
         status: NtStatus::OBJECT_NAME_NOT_FOUND,
@@ -170,6 +161,46 @@ fn smb_writeback_stages_to_an_opaque_sibling() {
     );
 }
 
+#[test]
+fn smb_writeback_lock_is_stable_opaque_and_scoped_to_the_parent() {
+    let first = write_lock_path("folder/report.docx");
+    let second = write_lock_path("folder/report.docx");
+    let other = write_lock_path("folder/other.docx");
+
+    assert_eq!(first, second);
+    assert_ne!(first, other);
+    assert!(first.starts_with("folder/.agora-lock-"));
+    assert!(!first.contains("report"));
+}
+
+#[test]
+fn smb_listing_hides_only_reserved_transaction_artifacts() {
+    assert!(is_smb_control_entry(".agora-write-abc.tmp"));
+    assert!(is_smb_control_entry(".agora-lock-abc.lck"));
+    assert!(!is_smb_control_entry(".agora-write-not-a-temp"));
+    assert!(!is_smb_control_entry("report.docx"));
+}
+
+#[test]
+fn smb_publication_verification_uses_the_server_file_index() {
+    let metadata = |identity: &str| crate::nfs::protocol::RemoteMetadata {
+        file_type: RemoteFileType::File,
+        size: 1,
+        modified_seconds: 0,
+        modified_nanoseconds: 0,
+        identity: identity.to_string(),
+    };
+
+    assert!(same_file_object(
+        &metadata("file:1:100:200:300:42"),
+        &metadata("file:1:101:200:301:42")
+    ));
+    assert!(!same_file_object(
+        &metadata("file:1:100:200:300:42"),
+        &metadata("file:1:100:200:300:43")
+    ));
+}
+
 #[tokio::test]
 async fn smb_storage_rejects_unknown_roots_before_network_access() {
     let storage = SmbStorage::new(&[]);
@@ -188,7 +219,8 @@ async fn smb_storage_rejects_unknown_roots_before_network_access() {
             .await,
         libc::EINVAL,
     );
-    assert_errno(storage.list(&path, usize::MAX).await, libc::EINVAL);
+    let mut emit = |_| Ok(());
+    assert_errno(storage.list(&path, &mut emit).await, libc::EINVAL);
     assert_errno(storage.create_directory(&path).await, libc::EINVAL);
     assert_errno(storage.remove(&path, false).await, libc::EINVAL);
     assert_errno(
@@ -228,7 +260,8 @@ async fn smb_storage_propagates_connection_failures_for_every_remote_operation()
             .await
             .is_err()
     );
-    assert!(storage.list(&path, usize::MAX).await.is_err());
+    let mut emit = |_| Ok(());
+    assert!(storage.list(&path, &mut emit).await.is_err());
     assert!(storage.create_directory(&path).await.is_err());
     assert!(storage.remove(&path, false).await.is_err());
     assert!(storage.remove(&path, true).await.is_err());
@@ -280,11 +313,11 @@ fn smb_create_and_close_metadata_preserve_type_size_and_creation_identity() {
         file_id: FileId::default(),
         create_contexts: Vec::new(),
     };
-    let metadata = metadata_from_create(&created);
+    let metadata = metadata_from_create(&created, 0x1234);
     assert_eq!(metadata.file_type, RemoteFileType::Directory);
     assert_eq!(metadata.size, 7);
     assert_eq!(metadata.modified_seconds, 0);
-    assert_eq!(metadata.identity, "directory:7:102:100");
+    assert_eq!(metadata.identity, "directory:7:102:100:103:4660");
 
     let closed = CloseResponse {
         flags: 0,
@@ -296,10 +329,10 @@ fn smb_create_and_close_metadata_preserve_type_size_and_creation_identity() {
         end_of_file: 11,
         file_attributes: 0,
     };
-    let metadata = metadata_from_close(&closed);
+    let metadata = metadata_from_close(&closed, 0x5678);
     assert_eq!(metadata.file_type, RemoteFileType::File);
     assert_eq!(metadata.size, 11);
-    assert_eq!(metadata.identity, "file:11:202:200");
+    assert_eq!(metadata.identity, "file:11:202:200:203:22136");
 }
 
 #[test]

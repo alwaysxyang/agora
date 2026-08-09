@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 3;
+pub(crate) const PROTOCOL_VERSION: u16 = 4;
 #[cfg(not(agora_sandbox_hook_build))]
 pub(crate) const MAX_REMOTE_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub(crate) const MAX_REMOTE_DIRECTORY_ENTRIES: usize = 100_000;
@@ -67,9 +67,11 @@ pub(crate) enum Request {
     },
     Stat {
         path: RemotePath,
+        name_capacity: u16,
     },
     List {
         path: RemotePath,
+        name_capacity: u16,
     },
     Access {
         path: RemotePath,

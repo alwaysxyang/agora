@@ -138,13 +138,15 @@ Current status:
   controller, then delivered through the same callback as network events with the shared trace
   chain. File events retain the logical pre-overlay path and structured open mode from open through
   close. A run terminates residual members of its process group but retains prepared copies.
-- The filesystem VFS owns overlay namespace, short publication locking, per-backing namespace
-  leases, and logical Unix mode authorization. In encrypted mode, an independent authenticated
-  parent-side filesystem Broker owns the open content containers and duplicate anonymous plaintext
-  descriptors. The libc hook selects real or effective credentials, reports completed write ranges
-  and writable mapping lifecycles, and adapts results without duplicating permission or encryption
-  policy. Synchronous workspace and key-migration storage work runs on blocking workers behind the
-  public asynchronous runner API.
+- The filesystem VFS owns overlay namespace, short publication locking, a durable recoverable
+  unlink/rename journal, per-backing namespace leases, and logical Unix mode authorization. In
+  encrypted mode, an independent authenticated parent-side filesystem Broker owns the open content
+  containers and duplicate anonymous plaintext descriptors. It serializes synchronization per
+  ciphertext inode, propagates peer ranges with fixed-size buffers, and bounds closed fork-retention
+  handles. The libc hook selects real or effective credentials, reports conservative completed write
+  ranges and writable mapping lifecycles, and adapts results without duplicating permission or
+  encryption policy. Synchronous workspace and key-migration storage work runs on blocking workers
+  behind the public asynchronous runner API.
 - The `nfs` module owns protocol-backed network filesystem roots. Its generic storage trait and
   authenticated per-run Broker are independent of the hook; SMB2/3 is the first backend under
   `nfs/backend/smb`. `nfs/backend/mod.rs` exposes only the protocol-neutral storage boundary to
@@ -158,8 +160,12 @@ Current status:
   mount. The parent owns backend credentials and sessions, while the hook receives only route ids,
   a socket path, and a per-run token and operates through anonymous regular-file descriptors and
   short-lived opaque empty directory anchors. Remote requests use replayable request IDs and
-  explicit resource claims. The generic Broker owns file, directory, and operation limits; a
-  timed-out backend operation resets only its configured root's session state. The local encrypted
+  explicit resource claims. Directory enumeration crosses the SMB, generic Broker, and hook
+  boundaries incrementally through bounded query pages and a descriptor-backed stream. The generic
+  Broker owns file, directory, and one absolute operation deadline; a timed-out backend operation
+  resets only its configured root's session state. SMB writeback uses an opaque staged sibling,
+  cooperative per-target lock, baseline identity check, and atomic replace; transport ambiguity
+  reconnects the private backend session before resolution or retry. The local encrypted
   Broker and NFS Broker share only private IPC
   framing; their protocols, handles, and synchronization policies remain independent. A Broker
   failure is monitored alongside the other run services.

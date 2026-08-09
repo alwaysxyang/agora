@@ -1,4 +1,7 @@
-use super::{OverlayStore, StagedWrite, WriteReservation};
+use super::{
+    BackingIdentity, NAMESPACE_JOURNAL_VERSION, NamespaceJournal, NamespaceOperation, OverlayStore,
+    StagedWrite, WriteReservation,
+};
 use crate::filesystem::{EntryState, FileAttributes, FileCipher, Materializer};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt as _;
@@ -1112,6 +1115,93 @@ fn rename_and_mkdir_never_change_lower_paths() {
         0o750
     );
     assert!(!directory.exists());
+}
+
+#[test]
+fn interrupted_unlink_recovery_never_reveals_the_lower_file() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("unlink-recovery");
+    std::fs::write(&logical, b"lower").unwrap();
+    let destination = fixture.store.prepare_write(&logical, false).unwrap();
+    std::fs::write(&destination, b"upper").unwrap();
+    let journal = NamespaceJournal {
+        version: NAMESPACE_JOURNAL_VERSION,
+        operation: NamespaceOperation::Unlink {
+            logical: OverlayStore::encode_journal_path(&logical),
+            destination: fixture.store.encode_backing_path(&destination).unwrap(),
+            lease: None,
+        },
+    };
+    fixture.store.write_namespace_journal(&journal).unwrap();
+    std::fs::remove_file(&destination).unwrap();
+
+    fixture.store.recover_namespace_operation_locked().unwrap();
+
+    assert_eq!(
+        fixture.store.state(&logical).unwrap(),
+        Some(EntryState::Whiteout)
+    );
+    assert!(fixture.store.prepare_read(&logical).is_err());
+    assert!(
+        !fixture
+            .store
+            .root()
+            .join(crate::filesystem::namespace::NAMESPACE_JOURNAL_FILE)
+            .exists()
+    );
+}
+
+#[test]
+fn interrupted_rename_recovery_completes_the_namespace_transaction() {
+    let fixture = Fixture::new();
+    let source = fixture.lower.join("rename-recovery-source");
+    let target = fixture.lower.join("rename-recovery-target");
+    std::fs::write(&source, b"lower source").unwrap();
+    std::fs::write(&target, b"lower target").unwrap();
+    let source_destination = fixture.store.prepare_write(&source, false).unwrap();
+    let target_destination = fixture.store.prepare_write(&target, false).unwrap();
+    std::fs::write(&source_destination, b"upper source").unwrap();
+    std::fs::write(&target_destination, b"upper target").unwrap();
+    let target_backup = target_destination.with_file_name(".agora-namespace-target-test.tmp");
+    let source_identity =
+        BackingIdentity::from_metadata(&source_destination.symlink_metadata().unwrap());
+    let journal = NamespaceJournal {
+        version: NAMESPACE_JOURNAL_VERSION,
+        operation: NamespaceOperation::Rename {
+            from: OverlayStore::encode_journal_path(&source),
+            to: OverlayStore::encode_journal_path(&target),
+            from_destination: fixture
+                .store
+                .encode_backing_path(&source_destination)
+                .unwrap(),
+            to_destination: fixture
+                .store
+                .encode_backing_path(&target_destination)
+                .unwrap(),
+            target_backup: Some(fixture.store.encode_backing_path(&target_backup).unwrap()),
+            source_identity,
+            source_lease_identity: None,
+            regular: true,
+            attributes: fixture.store.metadata.attributes(&source).unwrap(),
+        },
+    };
+    fixture.store.write_namespace_journal(&journal).unwrap();
+    std::fs::rename(&target_destination, &target_backup).unwrap();
+    std::fs::rename(&source_destination, &target_destination).unwrap();
+
+    fixture.store.recover_namespace_operation_locked().unwrap();
+
+    assert!(fixture.store.prepare_read(&source).is_err());
+    assert_eq!(
+        std::fs::read(fixture.store.prepare_read(&target).unwrap()).unwrap(),
+        b"upper source"
+    );
+    assert!(!target_backup.exists());
+    assert_eq!(
+        fixture.store.state(&source).unwrap(),
+        Some(EntryState::Whiteout)
+    );
+    assert_eq!(fixture.store.state(&target).unwrap(), Some(EntryState::Cow));
 }
 
 #[test]

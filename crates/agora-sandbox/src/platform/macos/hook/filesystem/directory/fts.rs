@@ -40,6 +40,7 @@ const DARWIN_VNODE_TYPE_DIRECTORY: u32 = 2;
 thread_local! {
     static ACTIVE_FTS_STREAM: Cell<usize> = const { Cell::new(0) };
     static FTS_BULK_CURSORS: RefCell<HashMap<libc::c_int, FtsBulkCursor>> = RefCell::new(HashMap::new());
+    static FTS_COMPARE_CONTEXTS: RefCell<Vec<FtsCompareContext>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -90,6 +91,7 @@ struct FtsBulkCursor {
     next: usize,
 }
 
+#[derive(Clone)]
 pub(in crate::platform::hook::filesystem) struct FtsRootMapping {
     physical: Vec<u8>,
     logical: Vec<u8>,
@@ -108,6 +110,7 @@ pub(in crate::platform::hook::filesystem) struct PresentedFtsEntry {
 }
 
 pub(in crate::platform::hook::filesystem) struct FtsStreamState {
+    pub(in crate::platform::hook::filesystem) compare: Option<FtsCompareFn>,
     pub(in crate::platform::hook::filesystem) mappings: Vec<FtsRootMapping>,
     pub(in crate::platform::hook::filesystem) presented: Vec<PresentedFtsEntry>,
     pub(in crate::platform::hook::filesystem) traversal_paths: Vec<CString>,
@@ -280,6 +283,162 @@ impl FtsStreamState {
             Some(logical)
         })
     }
+}
+
+#[derive(Clone)]
+struct FtsCompareContext {
+    compare: FtsCompareFn,
+    mappings: Vec<FtsRootMapping>,
+}
+
+struct FtsCompareGuard;
+
+impl FtsCompareGuard {
+    fn enter(compare: Option<FtsCompareFn>, mappings: &[FtsRootMapping]) -> Option<Self> {
+        let compare = compare?;
+        if mappings.is_empty() {
+            return None;
+        }
+        FTS_COMPARE_CONTEXTS.with(|contexts| {
+            contexts.borrow_mut().push(FtsCompareContext {
+                compare,
+                mappings: mappings.to_vec(),
+            });
+        });
+        Some(Self)
+    }
+
+    fn for_stream(stream: *mut libc::c_void) -> Option<Self> {
+        let streams = lock(fts_streams());
+        let state = streams.get(&(stream as usize))?;
+        Self::enter(state.compare, &state.mappings)
+    }
+}
+
+impl Drop for FtsCompareGuard {
+    fn drop(&mut self) {
+        FTS_COMPARE_CONTEXTS.with(|contexts| {
+            contexts.borrow_mut().pop();
+        });
+    }
+}
+
+struct FtsEntryShadow {
+    storage: Box<[u64]>,
+    _path: CString,
+    _access_path: CString,
+}
+
+impl FtsEntryShadow {
+    unsafe fn new(
+        entry: *const DarwinFtsEntry,
+        mappings: &[FtsRootMapping],
+    ) -> Result<Option<Self>> {
+        let path = unsafe { CStr::from_ptr((*entry).fts_path) }.to_bytes();
+        let access_path = unsafe { CStr::from_ptr((*entry).fts_accpath) }.to_bytes();
+        let Some(logical_path) = translate_fts_path(mappings, path)
+            .or_else(|| translate_fts_path(mappings, access_path))
+        else {
+            return Ok(None);
+        };
+        let logical_access_path =
+            translate_fts_path(mappings, access_path).unwrap_or_else(|| logical_path.clone());
+        let original_name = unsafe {
+            std::slice::from_raw_parts(
+                (*entry).fts_name.as_ptr().cast::<u8>(),
+                usize::from((*entry).fts_namelen),
+            )
+        };
+        let logical_name = if original_name == path
+            || original_name == logical_basename(path)
+            || original_name == access_path
+            || original_name == logical_basename(access_path)
+        {
+            logical_basename(&logical_path).to_vec()
+        } else {
+            original_name.to_vec()
+        };
+        let path =
+            CString::new(logical_path).context("logical FTS comparator path contains NUL")?;
+        let access_path = CString::new(logical_access_path)
+            .context("logical FTS comparator access path contains NUL")?;
+        let bytes = std::mem::offset_of!(DarwinFtsEntry, fts_name)
+            .checked_add(logical_name.len())
+            .and_then(|size| size.checked_add(1))
+            .context("logical FTS comparator entry is too large")?;
+        let words = bytes.div_ceil(std::mem::size_of::<u64>());
+        let mut storage = vec![0_u64; words].into_boxed_slice();
+        let shadow = storage.as_mut_ptr().cast::<DarwinFtsEntry>();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                entry.cast::<u8>(),
+                shadow.cast::<u8>(),
+                std::mem::offset_of!(DarwinFtsEntry, fts_name),
+            );
+            (*shadow).fts_path = path.as_ptr().cast_mut();
+            (*shadow).fts_accpath = access_path.as_ptr().cast_mut();
+            (*shadow).fts_pathlen = u16::try_from(path.as_bytes().len())?;
+            (*shadow).fts_namelen = u16::try_from(logical_name.len())?;
+            std::ptr::copy_nonoverlapping(
+                logical_name.as_ptr().cast::<libc::c_char>(),
+                (*shadow).fts_name.as_mut_ptr(),
+                logical_name.len(),
+            );
+            *(*shadow).fts_name.as_mut_ptr().add(logical_name.len()) = 0;
+        }
+        Ok(Some(Self {
+            storage,
+            _path: path,
+            _access_path: access_path,
+        }))
+    }
+
+    fn pointer(&self) -> *const DarwinFtsEntry {
+        self.storage.as_ptr().cast()
+    }
+}
+
+unsafe extern "C" fn logical_fts_compare(
+    left: *const *const DarwinFtsEntry,
+    right: *const *const DarwinFtsEntry,
+) -> libc::c_int {
+    let Some(context) = FTS_COMPARE_CONTEXTS.with(|contexts| contexts.borrow().last().cloned())
+    else {
+        return 0;
+    };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let left_entry = *left;
+        let right_entry = *right;
+        if left_entry.is_null() || right_entry.is_null() {
+            return (context.compare)(left, right);
+        }
+        let left_shadow = FtsEntryShadow::new(left_entry, &context.mappings)
+            .ok()
+            .flatten();
+        let right_shadow = FtsEntryShadow::new(right_entry, &context.mappings)
+            .ok()
+            .flatten();
+        let left_logical = left_shadow
+            .as_ref()
+            .map_or(left_entry, FtsEntryShadow::pointer);
+        let right_logical = right_shadow
+            .as_ref()
+            .map_or(right_entry, FtsEntryShadow::pointer);
+        (context.compare)(&left_logical, &right_logical)
+    }))
+    .unwrap_or_else(|_| unsafe { (context.compare)(left, right) })
+}
+
+fn translate_fts_path(mappings: &[FtsRootMapping], path: &[u8]) -> Option<Vec<u8>> {
+    mappings.iter().find_map(|mapping| {
+        let suffix = path.strip_prefix(mapping.physical.as_slice())?;
+        if !suffix.is_empty() && !suffix.starts_with(b"/") {
+            return None;
+        }
+        let mut logical = mapping.logical.clone();
+        logical.extend_from_slice(suffix);
+        Some(logical)
+    })
 }
 
 pub(in crate::platform::hook::filesystem) fn active_fts_logical_path(
@@ -513,6 +672,7 @@ fn fts_read_virtual_entry_for_test(
     lock(fts_streams()).insert(
         stream as usize,
         FtsStreamState {
+            compare: None,
             mappings: vec![FtsRootMapping {
                 physical: physical_root.as_os_str().as_bytes().to_vec(),
                 logical: logical_root.as_os_str().as_bytes().to_vec(),
@@ -866,12 +1026,24 @@ unsafe fn sandbox_fts_open(
             .map(|path| path.as_ptr().cast_mut())
             .collect::<Vec<_>>();
         mapped_argv.push(std::ptr::null_mut());
-        let stream = unsafe { original(mapped_argv.as_ptr(), options | FTS_NOCHDIR, compare) };
+        mappings.sort_by_key(|mapping| std::cmp::Reverse(mapping.physical.len()));
+        let translated_compare = compare
+            .filter(|_| !mappings.is_empty())
+            .map(|_| logical_fts_compare as FtsCompareFn)
+            .or(compare);
+        let _compare_guard = FtsCompareGuard::enter(compare, &mappings);
+        let stream = unsafe {
+            original(
+                mapped_argv.as_ptr(),
+                options | FTS_NOCHDIR,
+                translated_compare,
+            )
+        };
         if !stream.is_null() {
-            mappings.sort_by_key(|mapping| std::cmp::Reverse(mapping.physical.len()));
             lock(fts_streams()).insert(
                 stream as usize,
                 FtsStreamState {
+                    compare,
                     mappings,
                     presented: Vec::new(),
                     traversal_paths: Vec::new(),
@@ -991,6 +1163,7 @@ unsafe fn sandbox_fts_children(
         drop(guard);
         unsafe { set_errno(0) };
         let mut head = {
+            let _compare = FtsCompareGuard::for_stream(stream);
             let _bulk = FtsVirtualBulk::enter(stream);
             unsafe { original(stream, options) }
         };
@@ -1108,6 +1281,7 @@ unsafe fn sandbox_fts_read(stream: *mut libc::c_void) -> *mut DarwinFtsEntry {
         drop(guard);
         loop {
             unsafe { set_errno(0) };
+            let _compare = FtsCompareGuard::for_stream(stream);
             let _bulk = FtsVirtualBulk::enter(stream);
             let entry = unsafe { original(stream) };
             let original_errno = unsafe { *libc::__error() };

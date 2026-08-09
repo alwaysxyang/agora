@@ -1,6 +1,6 @@
 use super::LarkReplyTarget;
 use super::channel::LarkConversation;
-use super::lark_api::LarkApi;
+use super::lark_api::{LarkApi, LarkHttpStatusError};
 use crate::channel::permission::PermissionDenial;
 use crate::channel::{
     ChannelAgentStatus, ChannelButton, ChannelButtonStyle, ChannelReply, ChannelRun,
@@ -9,7 +9,7 @@ use crate::channel::{
 use crate::i18n::{self, RunStatus};
 use crate::task::{OutputEvent, ProgressStatus, TokenUsage};
 use agora_core::logger;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 const MAX_ANSWER_BYTES: usize = 20 * 1024;
 const MAX_PROCESS_ELEMENTS: usize = 160;
 const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
+const TENANT_TOKEN_CACHE_TTL: Duration = Duration::from_secs(50 * 60);
 
 pub(super) struct LarkAgentCard {
     inner: Arc<LarkAgentCardInner>,
@@ -37,16 +38,23 @@ struct LarkAgentCardInner {
     api: LarkApi,
     _interrupt: Option<InterruptRegistration>,
     state: Mutex<LarkAgentCardState>,
+    flush: Mutex<()>,
 }
 
 struct LarkAgentCardState {
-    token: Option<String>,
+    token: Option<CachedToken>,
     message_id: Option<String>,
     content: LarkCardContent,
     version: u64,
     sent_version: u64,
     last_update: Option<Instant>,
     flush_scheduled: bool,
+}
+
+#[derive(Clone)]
+struct CachedToken {
+    value: String,
+    expires_at: Instant,
 }
 
 pub(super) struct LarkCardContent {
@@ -1025,6 +1033,7 @@ impl LarkAgentCard {
                     last_update: None,
                     flush_scheduled: false,
                 }),
+                flush: Mutex::new(()),
             }),
         }
     }
@@ -1100,35 +1109,85 @@ impl LarkAgentCard {
     }
 
     async fn flush_latest(&self) -> Result<()> {
-        let mut state = self.inner.state.lock().await;
-        if state.version == state.sent_version {
-            return Ok(());
-        }
-        if state.token.is_none() {
-            state.token = Some(self.inner.api.tenant_access_token().await?);
-        }
-        let token = state
-            .token
-            .clone()
-            .ok_or_else(|| anyhow!("lark tenant token initialization failed"))?;
-        let card = state.content.build_card();
-        let version = state.version;
-        if let Some(message_id) = state.message_id.clone() {
-            self.inner
-                .api
-                .patch_card(&token, &message_id, &card)
-                .await?;
-        } else {
-            state.message_id = Some(
+        let _flush = self.inner.flush.lock().await;
+        let (message_id, card, version) = {
+            let state = self.inner.state.lock().await;
+            if state.version == state.sent_version {
+                return Ok(());
+            }
+            (
+                state.message_id.clone(),
+                state.content.build_card(),
+                state.version,
+            )
+        };
+
+        let mut refreshed = false;
+        let published_message_id = loop {
+            let token = self.token().await?;
+            let result = if let Some(message_id) = message_id.as_deref() {
+                self.inner
+                    .api
+                    .patch_card(&token, message_id, &card)
+                    .await
+                    .map(|()| None)
+            } else {
                 self.inner
                     .api
                     .reply_card(&token, &self.inner.target, &card)
-                    .await?,
-            );
+                    .await
+                    .map(Some)
+            };
+            match result {
+                Err(error)
+                    if !refreshed
+                        && error
+                            .downcast_ref::<LarkHttpStatusError>()
+                            .is_some_and(LarkHttpStatusError::is_unauthorized) =>
+                {
+                    self.invalidate_token(&token).await;
+                    refreshed = true;
+                }
+                result => break result?,
+            }
+        };
+
+        let mut state = self.inner.state.lock().await;
+        if state.message_id.is_none() {
+            state.message_id = published_message_id;
         }
-        state.sent_version = version;
+        state.sent_version = state.sent_version.max(version);
         state.last_update = Some(Instant::now());
         Ok(())
+    }
+
+    async fn token(&self) -> Result<String> {
+        {
+            let state = self.inner.state.lock().await;
+            if let Some(token) = &state.token
+                && token.expires_at > Instant::now()
+            {
+                return Ok(token.value.clone());
+            }
+        }
+        let value = self.inner.api.tenant_access_token().await?;
+        let mut state = self.inner.state.lock().await;
+        state.token = Some(CachedToken {
+            value: value.clone(),
+            expires_at: Instant::now() + TENANT_TOKEN_CACHE_TTL,
+        });
+        Ok(value)
+    }
+
+    async fn invalidate_token(&self, value: &str) {
+        let mut state = self.inner.state.lock().await;
+        if state
+            .token
+            .as_ref()
+            .is_some_and(|token| token.value == value)
+        {
+            state.token = None;
+        }
     }
 }
 
