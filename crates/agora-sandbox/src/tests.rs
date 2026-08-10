@@ -1,5 +1,5 @@
 use super::{
-    AuditOutput, AuditState, JsonCallback, exit_status_code, parse_command, shutdown_signals,
+    JsonCallback, LogOutput, audit_record, exit_status_code, parse_command, shutdown_signals,
     signal_exit_code,
 };
 use agora_core::lifecycle::shutdown::ShutdownGuard;
@@ -127,73 +127,59 @@ fn command_parser_rejects_empty_input_and_preserves_quoted_arguments() {
 }
 
 #[test]
-fn audit_state_writes_attempts_immediately_without_terminal_duplicates() {
-    let root = std::env::temp_dir().join(format!("agora-audit-test-{}", Uuid::new_v4()));
-    let path = root.join("nested").join("audit.jsonl");
-    let mut state = AuditState::new(Some(&path)).unwrap();
-
-    state
-        .on_event(&Event::Network(event(
+fn audit_records_only_network_attempts_with_destination_details() {
+    assert!(
+        audit_record(&Event::Network(event(
             EventType::NetworkConnectAttempt,
             None,
             false,
         )))
-        .unwrap();
-    state
-        .on_event(&Event::Network(event(
+        .is_none()
+    );
+    assert!(
+        audit_record(&Event::Network(event(
             EventType::NetworkConnectDenied,
             Some("connection"),
             true,
         )))
-        .unwrap();
-    state
-        .on_event(&Event::Network(event(
-            EventType::NetworkConnectAttempt,
-            Some("connection"),
-            true,
-        )))
-        .unwrap();
-    state
-        .on_event(&Event::Network(event(
+        .is_none()
+    );
+    let record = audit_record(&Event::Network(event(
+        EventType::NetworkConnectAttempt,
+        Some("connection"),
+        true,
+    )))
+    .unwrap();
+    assert!(
+        audit_record(&Event::Network(event(
             EventType::NetworkConnectFailed,
             Some("connection"),
             true,
         )))
-        .unwrap();
+        .is_none()
+    );
 
-    let output = std::fs::read_to_string(&path).unwrap();
-    assert_eq!(output.lines().count(), 1);
-    assert!(output.contains("example.com"));
-    assert!(output.contains("203.0.113.10"));
-    std::fs::remove_dir_all(root).unwrap();
+    let record = serde_json::to_value(record).unwrap();
+    assert_eq!(record["type"], "network");
+    assert_eq!(record["domain"], "example.com");
+    assert_eq!(record["destination_ip"], "203.0.113.10");
 }
 
 #[test]
-fn audit_state_writes_process_network_and_filesystem_records_to_the_same_stream() {
-    let root = std::env::temp_dir().join(format!("agora-audit-events-{}", Uuid::new_v4()));
-    let path = root.join("audit.jsonl");
-    let mut state = AuditState::new(Some(&path)).unwrap();
-
-    state.on_event(&Event::Process(process_event())).unwrap();
-    state
-        .on_event(&Event::File(file_event(EventType::FilesystemOpen)))
-        .unwrap();
-    state
-        .on_event(&Event::File(file_event(EventType::FilesystemClose)))
-        .unwrap();
-    state
-        .on_event(&Event::Network(event(
+fn audit_records_process_network_and_filesystem_events() {
+    let records = [
+        Event::Process(process_event()),
+        Event::File(file_event(EventType::FilesystemOpen)),
+        Event::File(file_event(EventType::FilesystemClose)),
+        Event::Network(event(
             EventType::NetworkConnectAttempt,
             Some("connection"),
             true,
-        )))
-        .unwrap();
-
-    let records = std::fs::read_to_string(&path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .collect::<Vec<_>>();
+        )),
+    ]
+    .iter()
+    .map(|event| serde_json::to_value(audit_record(event).unwrap()).unwrap())
+    .collect::<Vec<_>>();
     assert_eq!(records[0]["type"], "process");
     assert_eq!(records[0]["executable"], "/usr/bin/curl");
     assert_eq!(records[0]["arguments"][0], "curl");
@@ -210,34 +196,29 @@ fn audit_state_writes_process_network_and_filesystem_records_to_the_same_stream(
     assert_eq!(records[2]["operation"], "close");
     assert_eq!(records[3]["type"], "network");
     assert_eq!(records[3]["trace_id"], "trace-root");
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn audit_state_reports_an_unusable_output_directory() {
-    let root = std::env::temp_dir().join(format!("agora-audit-error-{}", Uuid::new_v4()));
+fn log_output_reports_an_unusable_output_directory() {
+    let root = std::env::temp_dir().join(format!("agora-log-error-{}", Uuid::new_v4()));
     let blocked_parent = root.join("blocked");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(&blocked_parent, b"not a directory").unwrap();
 
-    let error = AuditState::new(Some(&blocked_parent.join("audit.jsonl")))
+    let error = LogOutput::new(Some(&blocked_parent.join("sandbox.jsonl")))
         .err()
-        .expect("a file cannot be used as an audit directory");
-    assert!(
-        error
-            .to_string()
-            .contains("failed to create audit directory")
-    );
+        .expect("a file cannot be used as a log directory");
+    assert!(error.to_string().contains("failed to create log directory"));
 
     std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn audit_output_creates_new_files_with_private_permissions() {
-    let root = std::env::temp_dir().join(format!("agora-audit-mode-{}", Uuid::new_v4()));
-    let path = root.join("audit.jsonl");
+fn log_output_creates_new_files_with_private_permissions() {
+    let root = std::env::temp_dir().join(format!("agora-log-mode-{}", Uuid::new_v4()));
+    let path = root.join("sandbox.jsonl");
 
-    let output = AuditOutput::new(Some(&path)).unwrap();
+    let output = LogOutput::new(Some(&path)).unwrap();
 
     assert_eq!(
         std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -248,14 +229,14 @@ fn audit_output_creates_new_files_with_private_permissions() {
 }
 
 #[test]
-fn audit_output_preserves_existing_file_permissions() {
-    let root = std::env::temp_dir().join(format!("agora-audit-existing-{}", Uuid::new_v4()));
-    let path = root.join("audit.jsonl");
+fn log_output_preserves_existing_file_permissions() {
+    let root = std::env::temp_dir().join(format!("agora-log-existing-{}", Uuid::new_v4()));
+    let path = root.join("sandbox.jsonl");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(&path, b"").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
 
-    let output = AuditOutput::new(Some(&path)).unwrap();
+    let output = LogOutput::new(Some(&path)).unwrap();
 
     assert_eq!(
         std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -278,38 +259,27 @@ async fn exit_codes_and_shutdown_signals_are_stable() {
 }
 
 #[tokio::test]
-async fn json_callback_allows_events_after_recording_them() {
-    let root = std::env::temp_dir().join(format!("agora-json-callback-{}", Uuid::new_v4()));
-    let path = root.join("audit.jsonl");
-    let callback = JsonCallback::new(Some(&path)).unwrap();
+async fn json_callback_allows_audit_events() {
+    let callback = JsonCallback::new();
 
     assert!(matches!(
         callback.on_event(Event::Process(process_event())).await,
         Decision::Allow
     ));
-    let record = std::fs::read_to_string(path).unwrap();
-    assert!(record.contains("\"type\":\"process\""));
-    assert!(record.contains("\"executable\":\"/usr/bin/curl\""));
-
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
-async fn json_callback_allows_events_when_audit_output_fails() {
-    let root = std::env::temp_dir().join(format!("agora-json-callback-error-{}", Uuid::new_v4()));
-    let path = root.join("audit.jsonl");
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(&path, b"").unwrap();
-    let callback = JsonCallback {
-        state: std::sync::Mutex::new(AuditState {
-            output: AuditOutput::File(std::fs::File::open(&path).unwrap()),
-        }),
-    };
+async fn json_callback_allows_unrecorded_events() {
+    let callback = JsonCallback::new();
 
     assert!(matches!(
-        callback.on_event(Event::Process(process_event())).await,
+        callback
+            .on_event(Event::Network(event(
+                EventType::NetworkConnectEstablished,
+                Some("connection"),
+                true,
+            )))
+            .await,
         Decision::Allow
     ));
-
-    std::fs::remove_dir_all(root).unwrap();
 }

@@ -157,7 +157,8 @@ Current status:
   that backend. The existing `SmbRemoteConfig` public API is re-exported without exposing its
   implementation module. Each configured NFS root has an independent backend session holder and a
   non-blocking startup connection probe. The controller exposes sanitized connection results as
-  status events, while the runner owns stdout presentation; a failed probe does not stop the run.
+  status events, while the runner sends structured records through the same logger as CLI audit;
+  a failed probe does not stop the run.
   An NFS root is the highest-priority namespace layer ahead of overlay
   upper and lower state, while remote objects still bypass COW storage without creating a host
   mount. The parent owns backend credentials and sessions, while the hook receives only route ids,
@@ -172,9 +173,10 @@ Current status:
   Broker and NFS Broker share only private IPC
   framing; their protocols, handles, and synchronization policies remain independent. A Broker
   failure is monitored alongside the other run services.
-- The CLI renders one compact JSON Lines record per network connection attempt, intercepted
-  descendant process execution attempt, and intercepted file open or close to stdout by default,
-  or appends it to the configured `audit.file`; its callback always allows requests.
+- The CLI renders one structured JSON Lines log record per network connection attempt, intercepted
+  descendant process execution attempt, and intercepted file open or close. `audit.file` selects
+  the unified log destination; without it records go to stderr, leaving stdout to the child. Its
+  callback always allows requests.
 - The interception CA is trusted by covered macOS `SecTrust` SSL evaluations and by common
   environment-aware clients through a CA-keyed trust bundle containing the interception CA and
   current native roots. TLS stacks that ignore both mechanisms require their own trust

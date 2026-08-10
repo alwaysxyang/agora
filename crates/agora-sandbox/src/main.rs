@@ -2,6 +2,7 @@ use agora_core::lifecycle::{
     shutdown::{ShutdownGuard, ShutdownReason},
     signal::{Signal, SignalHandlers},
 };
+use agora_core::logger::{self, LoggerEntry};
 use agora_sandbox::{
     callback::{Callback, Decision, Event, EventType, FileOpenMode, ProcessOperation},
     hook_library,
@@ -52,135 +53,118 @@ enum CliCommand {
     },
 }
 
-struct JsonCallback {
-    state: Mutex<AuditState>,
-}
+struct JsonCallback;
 
 impl JsonCallback {
-    fn new(path: Option<&Path>) -> Result<Self> {
-        Ok(Self {
-            state: Mutex::new(AuditState::new(path)?),
-        })
+    fn new() -> Self {
+        Self
     }
 }
 
 impl Callback for JsonCallback {
     fn on_event(&self, event: Event) -> impl Future<Output = Decision> + Send {
-        if let Err(error) = lock(&self.state).on_event(&event) {
-            eprintln!("failed to write sandbox audit record: {error:#}");
+        if let Some(record) = audit_record(&event) {
+            logger::info!(
+                entry = LoggerEntry::new().with_entry("audit", record),
+                "sandbox audit event"
+            );
         }
         std::future::ready(Decision::Allow)
     }
 }
 
-struct AuditState {
-    output: AuditOutput,
-}
-
-impl AuditState {
-    fn new(path: Option<&Path>) -> Result<Self> {
-        Ok(Self {
-            output: AuditOutput::new(path)?,
-        })
-    }
-
-    fn on_event(&mut self, event: &Event) -> Result<()> {
-        let record = match event {
-            Event::Network(event) if event.event_type == EventType::NetworkConnectAttempt => {
-                event.network.as_ref().map(|network| AuditRecord::Network {
-                    access_time: event.occurred_at.clone(),
-                    trace_id: event.trace_id.clone(),
-                    pid: event.process.pid,
-                    destination_ip: network.destination_ip,
-                    destination_port: network.destination_port,
-                    domain: network.domain.clone(),
-                })
-            }
-            Event::Process(event) if event.event_type == EventType::ProcessExecAttempt => {
-                Some(AuditRecord::Process {
-                    access_time: event.occurred_at.clone(),
-                    trace_id: event.trace_id.clone(),
-                    pid: event.process.pid,
-                    ppid: event.process.ppid,
-                    process_executable: event.process.executable.clone(),
-                    executable: event.command.executable.clone(),
-                    arguments: event.command.arguments.clone(),
-                    current_dir: event.command.current_dir.clone(),
-                    operation: event.command.operation,
-                })
-            }
-            Event::File(event)
-                if matches!(
-                    event.event_type,
-                    EventType::FilesystemOpen | EventType::FilesystemClose
-                ) =>
-            {
-                Some(AuditRecord::Filesystem {
-                    access_time: event.occurred_at.clone(),
-                    trace_id: event.trace_id.clone(),
-                    pid: event.process.pid,
-                    operation: match event.event_type {
-                        EventType::FilesystemOpen => FileOperation::Open,
-                        EventType::FilesystemClose => FileOperation::Close,
-                        _ => unreachable!(),
-                    },
-                    path: event.file.path.clone(),
-                    mode: event.file.mode,
-                })
-            }
-            _ => None,
-        };
-        if let Some(record) = record {
-            self.output.write_record(&record)?;
+fn audit_record(event: &Event) -> Option<AuditRecord> {
+    match event {
+        Event::Network(event) if event.event_type == EventType::NetworkConnectAttempt => {
+            event.network.as_ref().map(|network| AuditRecord::Network {
+                access_time: event.occurred_at.clone(),
+                trace_id: event.trace_id.clone(),
+                pid: event.process.pid,
+                destination_ip: network.destination_ip,
+                destination_port: network.destination_port,
+                domain: network.domain.clone(),
+            })
         }
-        Ok(())
+        Event::Process(event) if event.event_type == EventType::ProcessExecAttempt => {
+            Some(AuditRecord::Process {
+                access_time: event.occurred_at.clone(),
+                trace_id: event.trace_id.clone(),
+                pid: event.process.pid,
+                ppid: event.process.ppid,
+                process_executable: event.process.executable.clone(),
+                executable: event.command.executable.clone(),
+                arguments: event.command.arguments.clone(),
+                current_dir: event.command.current_dir.clone(),
+                operation: event.command.operation,
+            })
+        }
+        Event::File(event)
+            if matches!(
+                event.event_type,
+                EventType::FilesystemOpen | EventType::FilesystemClose
+            ) =>
+        {
+            Some(AuditRecord::Filesystem {
+                access_time: event.occurred_at.clone(),
+                trace_id: event.trace_id.clone(),
+                pid: event.process.pid,
+                operation: match event.event_type {
+                    EventType::FilesystemOpen => FileOperation::Open,
+                    EventType::FilesystemClose => FileOperation::Close,
+                    _ => unreachable!(),
+                },
+                path: event.file.path.clone(),
+                mode: event.file.mode,
+            })
+        }
+        _ => None,
     }
 }
 
-enum AuditOutput {
-    Stdout(io::Stdout),
+enum LogOutput {
+    Stderr(io::Stderr),
     File(File),
 }
 
-impl AuditOutput {
+impl LogOutput {
     fn new(path: Option<&Path>) -> Result<Self> {
         let Some(path) = path else {
-            return Ok(Self::Stdout(io::stdout()));
+            return Ok(Self::Stderr(io::stderr()));
         };
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create audit directory {}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create log directory {}", parent.display()))?;
         }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
             .open(path)
-            .with_context(|| format!("failed to open audit file {}", path.display()))?;
+            .with_context(|| format!("failed to open log file {}", path.display()))?;
         Ok(Self::File(file))
-    }
-
-    fn write_record(&mut self, record: &AuditRecord) -> Result<()> {
-        match self {
-            Self::Stdout(writer) => Self::write_json_line(writer, record),
-            Self::File(writer) => Self::write_json_line(writer, record),
-        }
-    }
-
-    fn write_json_line(writer: &mut impl Write, record: &AuditRecord) -> Result<()> {
-        serde_json::to_writer(&mut *writer, record).context("failed to serialize audit record")?;
-        writer
-            .write_all(b"\n")
-            .context("failed to write audit record")?;
-        writer.flush().context("failed to flush audit record")
     }
 }
 
-#[derive(Serialize)]
+impl Write for LogOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Stderr(writer) => writer.write(buffer),
+            Self::File(writer) => writer.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stderr(writer) => writer.flush(),
+            Self::File(writer) => writer.flush(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AuditRecord {
     Network {
@@ -234,7 +218,11 @@ async fn run(config_path: PathBuf, executable: String) -> Result<u8> {
     let command = parse_command(&executable)?;
     let hook = hook_library::materialize(config.workdir())?;
     let (config, audit_file) = config.into_runtime(hook);
-    let callback = JsonCallback::new(audit_file.as_deref())?;
+    logger::init(
+        LogOutput::new(audit_file.as_deref())?,
+        logger::LevelFilter::Info,
+    )?;
+    let callback = JsonCallback::new();
 
     let status = Arc::new(Mutex::new(None::<ExitStatus>));
     let reason = Arc::new(Mutex::new(None::<ShutdownReason>));

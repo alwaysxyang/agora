@@ -505,46 +505,48 @@ fn smb_remote_config_rejects_unsafe_roots_and_remote_paths() {
 
 #[cfg(feature = "remote-smb")]
 #[test]
-fn nfs_connection_status_output_is_clear_and_redacts_credentials() {
+fn nfs_connection_status_log_is_structured_and_redacts_credentials() {
     let remote = SmbRemoteConfig::new("/smb", "files.example.com", "documents")
         .unwrap()
         .with_remote_path("projects/current")
         .unwrap()
         .with_credentials("alice", "top secret");
     let remotes = [remote];
-    let mut output = Vec::new();
-
-    super::write_remote_connection_status(
-        &mut output,
+    let connected = serde_json::to_value(super::remote_connection_log(
         &remotes,
         RemoteConnectionStatus::Connected { root: 0 },
-    )
+    ))
     .unwrap();
-    super::write_remote_connection_status(
-        &mut output,
+    let unknown = serde_json::to_value(super::remote_connection_log(
         &remotes,
         RemoteConnectionStatus::Connected { root: 9 },
-    )
+    ))
     .unwrap();
-    super::write_remote_connection_status(
-        &mut output,
+    let unavailable = serde_json::to_value(super::remote_connection_log(
         &remotes,
         RemoteConnectionStatus::Unavailable {
             root: 0,
             errno: libc::EACCES,
         },
-    )
+    ))
     .unwrap();
 
-    let output = String::from_utf8(output).unwrap();
+    assert_eq!(connected["route"], 0);
+    assert_eq!(connected["root"], "/smb");
     assert_eq!(
-        output,
-        "[agora-sandbox] NFS /smb connected: smb://files.example.com:445/documents/projects/current\n\
-[agora-sandbox] NFS route 9 has unknown status\n\
-[agora-sandbox] NFS /smb unavailable: Permission denied (os error 13)\n"
+        connected["endpoint"],
+        "smb://files.example.com:445/documents/projects/current"
     );
-    assert!(!output.contains("alice"));
-    assert!(!output.contains("top secret"));
+    assert_eq!(connected["status"], "connected");
+    assert!(connected.get("errno").is_none());
+    assert_eq!(unknown["route"], 9);
+    assert_eq!(unknown["status"], "unknown");
+    assert!(unknown.get("root").is_none());
+    assert_eq!(unavailable["status"], "unavailable");
+    assert_eq!(unavailable["errno"], libc::EACCES);
+    let logs = format!("{connected}{unknown}{unavailable}");
+    assert!(!logs.contains("alice"));
+    assert!(!logs.contains("top secret"));
 }
 
 #[cfg(target_os = "macos")]

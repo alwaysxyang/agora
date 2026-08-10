@@ -525,7 +525,7 @@ fn intercepted_cli_child() {
 }
 
 #[test]
-fn sandbox_cli_writes_compact_audit_to_stdout_by_default() {
+fn sandbox_cli_writes_structured_audit_logs_to_stderr_by_default() {
     let (output, destination) = run_audited_cli(None);
 
     assert!(
@@ -534,19 +534,19 @@ fn sandbox_cli_writes_compact_audit_to_stdout_by_default() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let records = audit_records(&output.stdout);
+    assert!(audit_records(&output.stdout).is_empty());
+    let records = audit_records(&output.stderr);
     let network_records = records
         .iter()
-        .filter(|record| record["type"] == "network")
+        .filter(|record| record["audit"]["type"] == "network")
         .collect::<Vec<_>>();
     assert_eq!(
         network_records.len(),
         1,
-        "stdout={}",
-        String::from_utf8_lossy(&output.stdout)
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
     );
     assert_audit_record(network_records[0], destination);
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("network.connect.attempt"));
 }
 
 #[test]
@@ -572,7 +572,7 @@ fn sandbox_cli_appends_compact_audit_to_the_configured_file() {
     let records = audit_records(&std::fs::read(&audit_file).unwrap());
     let network_records = records
         .iter()
-        .filter(|record| record["type"] == "network")
+        .filter(|record| record["audit"]["type"] == "network")
         .collect::<Vec<_>>();
     assert_eq!(network_records.len(), 2);
     assert_audit_record(network_records[0], first_destination);
@@ -621,6 +621,10 @@ fn audit_records(output: &[u8]) -> Vec<serde_json::Value> {
 }
 
 fn assert_audit_record(record: &serde_json::Value, destination: SocketAddr) {
+    assert_eq!(record["message"], "sandbox audit event");
+    assert_eq!(record["level"], "INFO");
+    assert!(record["time"].as_str().is_some());
+    let record = &record["audit"];
     let object = record.as_object().unwrap();
     assert_eq!(object.len(), 7);
     assert_eq!(record["type"], "network");

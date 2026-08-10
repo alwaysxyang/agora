@@ -95,7 +95,7 @@ agora-sandbox run -c sandbox.json \
 
 The configuration rejects unknown fields. Omitted settings retain the previous runtime defaults:
 `workdir` is `~/.agora-sandbox`, `tls` is `off`, the local filesystem is `plain`, NFS roots are
-empty, and audit records go to stdout. A relative `workdir` or `audit.file` is resolved from the
+empty, and structured logs go to stderr. A relative `workdir` or `audit.file` is resolved from the
 configuration file's directory, while a leading `~` uses `HOME`. The configuration must be a
 regular non-symlink file. Ownership and permission policy is left to the caller and the operating
 system; callers storing filesystem keys or remote credentials should protect the file accordingly.
@@ -109,8 +109,9 @@ a directory in the local overlay when the probe starts; a missing or non-directo
 the route as unavailable without attempting the remote connection. An SMB probe then validates a
 configured share subpath by statting it and requiring a directory before reporting success; a share
 URL without a subpath needs only a successful share connection. The CLI writes one sanitized
-connected or unavailable status line per root to stdout when each probe completes. A failed probe
-does not stop the run, and later access retries the backend connection.
+structured `nfs` record per root through its JSON logger when each probe completes. The record uses
+the configured `audit.file` destination or stderr and never enters child stdout. A failed probe does
+not stop the run, and later access retries the backend connection.
 
 The CLI contains the hook and automatically materializes it below
 `<workdir>/runtime/hook/<md5>/libagora_sandbox.dylib` before constructing `SandboxConfig`. It has no
@@ -130,18 +131,19 @@ Covered descendant launches restore these protected values even if the caller cl
 its environment. The child inherits stdin, stdout, and stderr. The
 `-e` value is tokenized into a program and arguments but is not
 implicitly run through a system shell; pipes, redirections, substitutions, and other shell
-operators require an explicit shell command. The CLI audit adapter writes one compact JSON record
-for each validated network connection attempt, intercepted descendant process execution attempt,
-and intercepted file open or close attempt. It writes JSON Lines to stdout by default;
-`audit.file` instead appends to that
-file and creates missing parent directories. Network records contain `access_time`, `trace_id`,
+operators require an explicit shell command. The CLI audit adapter writes one structured `audit`
+field through the JSON logger for each validated network connection attempt, intercepted descendant
+process execution attempt, and intercepted file open or close attempt. The logger writes JSON Lines
+to stderr by default; `audit.file` redirects the unified audit, NFS-status, and lifecycle log stream
+to that file and creates missing parent directories. Network records contain `access_time`, `trace_id`,
 `pid`, destination IP and port, and the observed domain. Process records contain `access_time`,
 `trace_id`, PID, PPID, current and requested executables, arguments, current directory, and launch
 operation. The root command is started directly by the runner and therefore does not emit a
 `process.exec.attempt` record. File records contain `access_time`, `trace_id`, PID, operation,
-logical path, and structured open mode. The child still inherits stdout and stderr, so callers that require a
-pure audit stream should configure `audit.file`. CLI startup and audit-write errors are written directly
-to stderr without the project logger. The CLI returns the child's exit code. SIGINT and SIGTERM
+logical path, and structured open mode. Child stdout remains exclusively available for child output;
+the child also inherits stderr, where default logs and child diagnostics may coexist. Callers that
+require a separate log stream should configure `audit.file`. Errors that occur before logger
+initialization are written directly to stderr. The CLI returns the child's exit code. SIGINT and SIGTERM
 terminate the active run through the shared process lifecycle. Strict network enforcement remains
 unavailable and is not exposed as a CLI option. Filesystem persistence and destructive-reset
 behavior are specified in [Sandbox Filesystem And Executable Preparation](sandbox.md).

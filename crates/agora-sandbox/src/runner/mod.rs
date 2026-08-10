@@ -16,6 +16,8 @@ use crate::nfs::{
     protocol::RemoteRoute,
 };
 use crate::trace::{TRACE_ID_ENVIRONMENT, TraceContext};
+#[cfg(all(target_os = "macos", feature = "remote-smb"))]
+use agora_core::logger::{self, LoggerEntry};
 use anyhow::{Context, Result, bail};
 #[cfg(target_os = "macos")]
 use base64::Engine;
@@ -867,13 +869,7 @@ where
                 remote: &mut remote,
             },
             #[cfg(feature = "remote-smb")]
-            |status| {
-                let stdout = std::io::stdout();
-                let mut stdout = stdout.lock();
-                let _ =
-                    write_remote_connection_status(&mut stdout, &self.config.smb_remotes, status);
-                let _ = stdout.flush();
-            },
+            |status| log_remote_connection_status(&self.config.smb_remotes, status),
         )
         .await;
         let terminal_restore = terminal
@@ -1206,35 +1202,58 @@ async fn wait_for_remote_failure(
 }
 
 #[cfg(all(target_os = "macos", feature = "remote-smb"))]
-fn write_remote_connection_status(
-    output: &mut impl Write,
+#[derive(Clone, serde::Serialize)]
+struct RemoteConnectionLog {
+    route: u32,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    errno: Option<libc::c_int>,
+}
+
+#[cfg(all(target_os = "macos", feature = "remote-smb"))]
+fn remote_connection_log(
     remotes: &[SmbRemoteConfig],
     status: RemoteConnectionStatus,
-) -> std::io::Result<()> {
-    let root = status.root();
-    let Some(remote) = remotes.get(root as usize) else {
-        return writeln!(
-            output,
-            "[agora-sandbox] NFS route {root} has unknown status"
-        );
+) -> RemoteConnectionLog {
+    let route = status.root();
+    let Some(remote) = remotes.get(route as usize) else {
+        return RemoteConnectionLog {
+            route,
+            status: "unknown",
+            root: None,
+            endpoint: None,
+            errno: None,
+        };
     };
     let mut endpoint = format!("smb://{}/{}", remote.server(), remote.share());
     if !remote.remote_path().is_empty() {
         endpoint.push('/');
         endpoint.push_str(remote.remote_path());
     }
-    match status {
-        RemoteConnectionStatus::Connected { .. } => writeln!(
-            output,
-            "[agora-sandbox] NFS {} connected: {endpoint}",
-            remote.logical_root().display(),
-        ),
-        RemoteConnectionStatus::Unavailable { errno, .. } => writeln!(
-            output,
-            "[agora-sandbox] NFS {} unavailable: {}",
-            remote.logical_root().display(),
-            std::io::Error::from_raw_os_error(errno),
-        ),
+    let (status, errno) = match status {
+        RemoteConnectionStatus::Connected { .. } => ("connected", None),
+        RemoteConnectionStatus::Unavailable { errno, .. } => ("unavailable", Some(errno)),
+    };
+    RemoteConnectionLog {
+        route,
+        status,
+        root: Some(remote.logical_root().display().to_string()),
+        endpoint: Some(endpoint),
+        errno,
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "remote-smb"))]
+fn log_remote_connection_status(remotes: &[SmbRemoteConfig], status: RemoteConnectionStatus) {
+    let event = remote_connection_log(remotes, status);
+    let entry = LoggerEntry::new().with_entry("nfs", event.clone());
+    match event.status {
+        "connected" => logger::info!(entry = entry, "sandbox NFS connection status"),
+        _ => logger::error!(entry = entry, "sandbox NFS connection status"),
     }
 }
 
