@@ -1,14 +1,14 @@
 use super::protocol::{
     PROTOCOL_VERSION, Request, RequestEnvelope, Response, ResponseEnvelope, valid_request_id,
 };
-use super::service::LocalBroker;
+use super::service::{LocalBroker, WRITEBACK_DELAY};
 use crate::filesystem::FileCipher;
 use crate::ipc;
 use anyhow::{Context, Result};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
@@ -144,8 +144,11 @@ impl Server {
 
     async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut tasks = JoinSet::new();
+        let mut writebacks = JoinSet::new();
         let mut expiry = tokio::time::interval(Duration::from_secs(30));
         expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut writeback = tokio::time::interval(WRITEBACK_DELAY);
+        writeback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
@@ -155,9 +158,19 @@ impl Server {
                     }
                 }
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+                Some(result) = writebacks.join_next(), if !writebacks.is_empty() => {
+                    result
+                        .context("local filesystem writeback task failed")??;
+                }
                 _ = expiry.tick() => {
                     self.state.broker.expire_closed();
                     self.state.broker.expire_requests();
+                },
+                _ = writeback.tick(), if writebacks.is_empty() => {
+                    if self.state.broker.writeback_pending() {
+                        let broker = Arc::clone(&self.state.broker);
+                        writebacks.spawn_blocking(move || broker.flush_due(Instant::now()));
+                    }
                 },
                 accepted = self.listener.accept() => {
                     let (stream, _) = accepted?;
@@ -174,6 +187,9 @@ impl Server {
             }
         }
         while tasks.join_next().await.is_some() {}
+        while let Some(result) = writebacks.join_next().await {
+            result.context("local filesystem writeback task failed")??;
+        }
         Ok(())
     }
 
@@ -182,51 +198,63 @@ impl Server {
         stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
         stream.set_write_timeout(Some(RESPONSE_TIMEOUT))?;
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             let mut stream = stream;
-            let (request, descriptor) = ipc::receive::<RequestEnvelope>(&mut stream)?;
-            let response = if request.version != PROTOCOL_VERSION {
-                Response::Error {
-                    errno: libc::EPROTO,
-                    message: "unsupported local filesystem protocol version".to_string(),
+            let mut persistent = false;
+            loop {
+                let (request, descriptor) = ipc::receive::<RequestEnvelope>(&mut stream)?;
+                let authenticated = request.version == PROTOCOL_VERSION
+                    && constant_time_equal(request.token.as_bytes(), state.token.as_bytes());
+                let valid_id = valid_request_id(&request.request_id)
+                    && !matches!(
+                        &request.request,
+                        Request::Claim { request_id } if !valid_request_id(request_id)
+                    )
+                    && !matches!(
+                        &request.request,
+                        Request::BeginWrite { write_id, .. }
+                            | Request::FinishWrite { write_id, .. }
+                            | Request::CancelWrite { write_id, .. }
+                            if !valid_request_id(write_id)
+                    );
+                let ping = matches!(&request.request, Request::Ping) && descriptor.is_none();
+                let response = if request.version != PROTOCOL_VERSION {
+                    Response::Error {
+                        errno: libc::EPROTO,
+                        message: "unsupported local filesystem protocol version".to_string(),
+                    }
+                } else if !authenticated {
+                    Response::Error {
+                        errno: libc::EACCES,
+                        message: "invalid local filesystem token".to_string(),
+                    }
+                } else if !valid_id {
+                    Response::Error {
+                        errno: libc::EPROTO,
+                        message: "invalid local filesystem request ID".to_string(),
+                    }
+                } else {
+                    state
+                        .broker
+                        .handle_request(request.request_id.clone(), request.request, descriptor)
+                        .response
+                };
+                ipc::send(
+                    &mut stream,
+                    &ResponseEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: request.request_id,
+                        response,
+                    },
+                    None,
+                )?;
+                if !persistent && ping && authenticated && valid_id {
+                    stream.set_read_timeout(None)?;
+                    persistent = true;
+                } else if !persistent || !authenticated || !valid_id {
+                    return Ok(());
                 }
-            } else if !constant_time_equal(request.token.as_bytes(), state.token.as_bytes()) {
-                Response::Error {
-                    errno: libc::EACCES,
-                    message: "invalid local filesystem token".to_string(),
-                }
-            } else if !valid_request_id(&request.request_id)
-                || matches!(
-                    &request.request,
-                    Request::Claim { request_id } if !valid_request_id(request_id)
-                )
-                || matches!(
-                    &request.request,
-                    Request::BeginWrite { write_id, .. }
-                        | Request::FinishWrite { write_id, .. }
-                        | Request::CancelWrite { write_id, .. }
-                        if !valid_request_id(write_id)
-                )
-            {
-                Response::Error {
-                    errno: libc::EPROTO,
-                    message: "invalid local filesystem request ID".to_string(),
-                }
-            } else {
-                state
-                    .broker
-                    .handle_request(request.request_id.clone(), request.request, descriptor)
-                    .response
-            };
-            ipc::send(
-                &mut stream,
-                &ResponseEnvelope {
-                    version: PROTOCOL_VERSION,
-                    request_id: request.request_id,
-                    response,
-                },
-                None,
-            )
+            }
         })
         .await
         .context("local filesystem request task failed")??;

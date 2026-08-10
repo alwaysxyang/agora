@@ -2,10 +2,29 @@
 #include <errno.h>
 #include <stddef.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <sys/types.h>
+
+typedef uint64_t guardid_t;
 
 extern int agora_sandbox_open_with_mode(const char *path, int flags, mode_t mode);
 extern int agora_sandbox_openat_with_mode(int directory, const char *path, int flags, mode_t mode);
+extern int agora_sandbox_guarded_open_with_mode(
+    const char *path,
+    const guardid_t *guard,
+    unsigned int guardflags,
+    int flags,
+    mode_t mode
+);
+extern int agora_sandbox_guarded_open_dprotected_with_mode(
+    const char *path,
+    const guardid_t *guard,
+    unsigned int guardflags,
+    int flags,
+    int dpclass,
+    int dpflags,
+    mode_t mode
+);
 extern const void *agora_sandbox_original_fcntl(void);
 extern void agora_sandbox_track_fcntl_duplicate(int source, int destination);
 extern int agora_sandbox_commit_synced_descriptor(int descriptor);
@@ -14,6 +33,16 @@ extern int agora_sandbox_validate_content_fcntl(int descriptor);
 
 typedef int (*open_fn)(const char *, int, ...);
 typedef int (*openat_fn)(int, const char *, int, ...);
+typedef int (*guarded_open_fn)(const char *, const guardid_t *, unsigned int, int, ...);
+typedef int (*guarded_open_dprotected_fn)(
+    const char *,
+    const guardid_t *,
+    unsigned int,
+    int,
+    int,
+    int,
+    ...
+);
 typedef int (*fcntl_fn)(int, int, ...);
 
 int agora_sandbox_call_open(const void *function, const char *path, int flags, mode_t mode) {
@@ -31,6 +60,36 @@ int agora_sandbox_call_openat(
     openat_fn original = (openat_fn)function;
     return (flags & O_CREAT) != 0 ? original(directory, path, flags, (int)mode)
                                   : original(directory, path, flags);
+}
+
+int agora_sandbox_call_guarded_open(
+    const void *function,
+    const char *path,
+    const guardid_t *guard,
+    unsigned int guardflags,
+    int flags,
+    mode_t mode
+) {
+    guarded_open_fn original = (guarded_open_fn)function;
+    return (flags & O_CREAT) != 0
+        ? original(path, guard, guardflags, flags, (int)mode)
+        : original(path, guard, guardflags, flags);
+}
+
+int agora_sandbox_call_guarded_open_dprotected(
+    const void *function,
+    const char *path,
+    const guardid_t *guard,
+    unsigned int guardflags,
+    int flags,
+    int dpclass,
+    int dpflags,
+    mode_t mode
+) {
+    guarded_open_dprotected_fn original = (guarded_open_dprotected_fn)function;
+    return (flags & O_CREAT) != 0
+        ? original(path, guard, guardflags, flags, dpclass, dpflags, (int)mode)
+        : original(path, guard, guardflags, flags, dpclass, dpflags);
 }
 
 int agora_sandbox_open_shim(const char *path, int flags, ...) {
@@ -53,6 +112,50 @@ int agora_sandbox_openat_shim(int directory, const char *path, int flags, ...) {
         va_end(arguments);
     }
     return agora_sandbox_openat_with_mode(directory, path, flags, mode);
+}
+
+int agora_sandbox_guarded_open_shim(
+    const char *path,
+    const guardid_t *guard,
+    unsigned int guardflags,
+    int flags,
+    ...
+) {
+    mode_t mode = 0;
+    if ((flags & O_CREAT) != 0) {
+        va_list arguments;
+        va_start(arguments, flags);
+        mode = (mode_t)va_arg(arguments, int);
+        va_end(arguments);
+    }
+    return agora_sandbox_guarded_open_with_mode(path, guard, guardflags, flags, mode);
+}
+
+int agora_sandbox_guarded_open_dprotected_shim(
+    const char *path,
+    const guardid_t *guard,
+    unsigned int guardflags,
+    int flags,
+    int dpclass,
+    int dpflags,
+    ...
+) {
+    mode_t mode = 0;
+    if ((flags & O_CREAT) != 0) {
+        va_list arguments;
+        va_start(arguments, dpflags);
+        mode = (mode_t)va_arg(arguments, int);
+        va_end(arguments);
+    }
+    return agora_sandbox_guarded_open_dprotected_with_mode(
+        path,
+        guard,
+        guardflags,
+        flags,
+        dpclass,
+        dpflags,
+        mode
+    );
 }
 
 int agora_sandbox_fcntl_shim(int descriptor, int command, ...) {

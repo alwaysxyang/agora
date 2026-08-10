@@ -145,12 +145,15 @@ Current status:
   and logical Unix mode authorization. Namespace changes deliberately do not provide
   abnormal-exit or power-loss recovery. In
   encrypted mode, an independent authenticated parent-side filesystem Broker owns the open content
-  containers and duplicate anonymous plaintext descriptors. It serializes synchronization per
-  ciphertext inode, propagates peer ranges with fixed-size buffers, and bounds closed fork-retention
-  handles. The libc hook selects real or effective credentials, reports conservative completed write
-  ranges and writable mapping lifecycles, and adapts results without duplicating permission or
-  encryption policy. Synchronous workspace and key-migration storage work runs on blocking workers
-  behind the public asynchronous runner API.
+  containers and duplicate anonymous plaintext descriptors. It batches completed ranges briefly,
+  serializes synchronization and durability per ciphertext inode, propagates peer ranges with
+  fixed-size buffers, and bounds closed fork-retention handles. The libc hook selects real or
+  effective credentials, preserves macOS guarded-descriptor semantics, reports conservative
+  completed write ranges and writable mapping lifecycles, and adapts results without duplicating
+  permission or encryption policy. Its narrow `control` module owns pre-authenticated inheritable
+  fallback streams for internal execution, audit, and filesystem services; the service clients and
+  controllers retain all protocol and operation ownership. Synchronous workspace and key-migration
+  storage work runs on blocking workers behind the public asynchronous runner API.
 - The `nfs` module owns protocol-backed network filesystem roots. Its generic storage trait and
   authenticated per-run Broker are independent of the hook; SMB2/3 is the first backend under
   `nfs/backend/smb`. `nfs/backend/mod.rs` exposes only the protocol-neutral storage boundary to

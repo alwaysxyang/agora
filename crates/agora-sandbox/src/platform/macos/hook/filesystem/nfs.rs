@@ -10,7 +10,11 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+use crate::ipc::InheritedControlStream;
 
 pub(super) struct RemoteFilesystem {
     client: RemoteClient,
@@ -48,19 +52,39 @@ pub(super) struct RemoteAnchor {
 }
 
 impl RemoteFilesystem {
+    #[cfg(any(test, coverage))]
     pub(super) fn from_json(
         socket: impl Into<PathBuf>,
         token: impl Into<String>,
         routes: &str,
     ) -> Result<Self> {
-        let routes = serde_json::from_str(routes).context("invalid remote filesystem routes")?;
-        Self::new(socket, token, routes)
+        Self::from_json_with_shared(socket, token, routes, None)
     }
 
+    pub(super) fn from_json_with_shared(
+        socket: impl Into<PathBuf>,
+        token: impl Into<String>,
+        routes: &str,
+        shared: Option<Arc<InheritedControlStream<UnixStream>>>,
+    ) -> Result<Self> {
+        let routes = serde_json::from_str(routes).context("invalid remote filesystem routes")?;
+        Self::new_with_shared(socket, token, routes, shared)
+    }
+
+    #[cfg(any(test, coverage))]
     pub(super) fn new(
         socket: impl Into<PathBuf>,
         token: impl Into<String>,
         routes: Vec<RemoteRoute>,
+    ) -> Result<Self> {
+        Self::new_with_shared(socket, token, routes, None)
+    }
+
+    fn new_with_shared(
+        socket: impl Into<PathBuf>,
+        token: impl Into<String>,
+        routes: Vec<RemoteRoute>,
+        shared: Option<Arc<InheritedControlStream<UnixStream>>>,
     ) -> Result<Self> {
         let socket = socket.into();
         if !socket.is_absolute() {
@@ -92,8 +116,12 @@ impl RemoteFilesystem {
         let runtime = runtime
             .canonicalize()
             .unwrap_or_else(|_| runtime.to_path_buf());
+        let client = shared.map_or_else(
+            || RemoteClient::new(&socket, &token),
+            |stream| RemoteClient::with_shared(&socket, &token, stream),
+        );
         Ok(Self {
-            client: RemoteClient::new(&socket, token),
+            client,
             routes: normalized,
             runtime,
         })

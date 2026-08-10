@@ -10,6 +10,21 @@ type PwritevFn = unsafe extern "C" fn(
     libc::c_int,
     libc::off_t,
 ) -> libc::ssize_t;
+type GuardedWriteFn =
+    unsafe extern "C" fn(libc::c_int, *const GuardId, *const libc::c_void, usize) -> libc::ssize_t;
+type GuardedPwriteFn = unsafe extern "C" fn(
+    libc::c_int,
+    *const GuardId,
+    *const libc::c_void,
+    usize,
+    libc::off_t,
+) -> libc::ssize_t;
+type GuardedWritevFn = unsafe extern "C" fn(
+    libc::c_int,
+    *const GuardId,
+    *const libc::iovec,
+    libc::c_int,
+) -> libc::ssize_t;
 
 unsafe fn sandbox_write(
     descriptor: libc::c_int,
@@ -153,6 +168,90 @@ pub unsafe extern "C" fn agora_sandbox_pwritev(
     unsafe { sandbox_pwritev(descriptor, vectors, count, offset) }
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_guarded_write(
+    descriptor: libc::c_int,
+    guard: *const GuardId,
+    buffer: *const libc::c_void,
+    length: usize,
+) -> libc::ssize_t {
+    catch_filesystem_panic(-1, || {
+        let Some(original) = original_guarded_write() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return -1;
+        };
+        let Some(_hook_guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(descriptor, guard, buffer, length) };
+        };
+        let before = current_offset(descriptor);
+        let reserved = sequential_write_reservation(length);
+        unsafe {
+            tracked_write(
+                descriptor,
+                reserved,
+                || original(descriptor, guard, buffer, length),
+                |result| sequential_write_range(descriptor, before, result),
+            )
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_guarded_pwrite(
+    descriptor: libc::c_int,
+    guard: *const GuardId,
+    buffer: *const libc::c_void,
+    length: usize,
+    offset: libc::off_t,
+) -> libc::ssize_t {
+    catch_filesystem_panic(-1, || {
+        let Some(original) = original_guarded_pwrite() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return -1;
+        };
+        let Some(_hook_guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(descriptor, guard, buffer, length, offset) };
+        };
+        let reserved = positional_write_reservation(offset, length);
+        unsafe {
+            tracked_write(
+                descriptor,
+                reserved,
+                || original(descriptor, guard, buffer, length, offset),
+                |result| positional_write_range(offset, result),
+            )
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_guarded_writev(
+    descriptor: libc::c_int,
+    guard: *const GuardId,
+    vectors: *const libc::iovec,
+    count: libc::c_int,
+) -> libc::ssize_t {
+    catch_filesystem_panic(-1, || {
+        let Some(original) = original_guarded_writev() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return -1;
+        };
+        let Some(_hook_guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(descriptor, guard, vectors, count) };
+        };
+        let before = current_offset(descriptor);
+        let reserved = sequential_write_reservation(vector_write_length(count));
+        unsafe {
+            tracked_write(
+                descriptor,
+                reserved,
+                || original(descriptor, guard, vectors, count),
+                |result| sequential_write_range(descriptor, before, result),
+            )
+        }
+    })
+}
+
 fn current_offset(descriptor: libc::c_int) -> Option<u64> {
     let offset = unsafe { libc::lseek(descriptor, 0, libc::SEEK_CUR) };
     u64::try_from(offset).ok()
@@ -252,17 +351,12 @@ unsafe fn tracked_write(
         let completed = written_range(result)
             .and_then(|(start, end)| LocalByteRange::new(start, end).ok())
             .or(reserved);
-        if let (Some(reservation), Some(range)) = (&reservation, completed) {
-            let _ = local.finish_write(&registration.handle, reservation, range);
-        }
-        if let Some(range) = completed {
-            runtime.record_local_write_locked(
-                descriptor,
-                &open,
-                registration,
-                range.start,
-                range.end,
-            );
+        if let (Some(reservation), Some(range)) = (&reservation, completed)
+            && local
+                .finish_write(&registration.handle, reservation, range)
+                .is_err()
+        {
+            runtime.record_local_write_locked(registration, range.start, range.end);
         }
     } else if let Some(reservation) = &reservation {
         let errno = unsafe { *libc::__error() };
@@ -288,10 +382,67 @@ fn original_pwritev() -> Option<PwritevFn> {
     function_from_interpose(&INTERPOSE_PWRITEV)
 }
 
+fn original_guarded_write() -> Option<GuardedWriteFn> {
+    function_from_interpose(&INTERPOSE_GUARDED_WRITE)
+}
+
+fn original_guarded_pwrite() -> Option<GuardedPwriteFn> {
+    function_from_interpose(&INTERPOSE_GUARDED_PWRITE)
+}
+
+fn original_guarded_writev() -> Option<GuardedWritevFn> {
+    function_from_interpose(&INTERPOSE_GUARDED_WRITEV)
+}
+
 dyld_interpose!(INTERPOSE_WRITE, agora_sandbox_write, libc::write);
 dyld_interpose!(INTERPOSE_PWRITE, agora_sandbox_pwrite, libc::pwrite);
 dyld_interpose!(INTERPOSE_WRITEV, agora_sandbox_writev, libc::writev);
 dyld_interpose!(INTERPOSE_PWRITEV, agora_sandbox_pwritev, libc::pwritev);
+
+unsafe extern "C" {
+    #[link_name = "guarded_write_np"]
+    fn system_guarded_write_np(
+        descriptor: libc::c_int,
+        guard: *const GuardId,
+        buffer: *const libc::c_void,
+        length: usize,
+    ) -> libc::ssize_t;
+
+    #[link_name = "guarded_pwrite_np"]
+    fn system_guarded_pwrite_np(
+        descriptor: libc::c_int,
+        guard: *const GuardId,
+        buffer: *const libc::c_void,
+        length: usize,
+        offset: libc::off_t,
+    ) -> libc::ssize_t;
+
+    #[link_name = "guarded_writev_np"]
+    fn system_guarded_writev_np(
+        descriptor: libc::c_int,
+        guard: *const GuardId,
+        vectors: *const libc::iovec,
+        count: libc::c_int,
+    ) -> libc::ssize_t;
+}
+
+dyld_interpose!(
+    INTERPOSE_GUARDED_WRITE,
+    agora_sandbox_guarded_write,
+    system_guarded_write_np
+);
+
+dyld_interpose!(
+    INTERPOSE_GUARDED_PWRITE,
+    agora_sandbox_guarded_pwrite,
+    system_guarded_pwrite_np
+);
+
+dyld_interpose!(
+    INTERPOSE_GUARDED_WRITEV,
+    agora_sandbox_guarded_writev,
+    system_guarded_writev_np
+);
 
 unsafe extern "C" {
     #[link_name = "write$NOCANCEL"]

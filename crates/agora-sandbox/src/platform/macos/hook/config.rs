@@ -13,6 +13,11 @@ const EXECUTION_CONTROL: &str = "AGORA_SANDBOX_EXECUTION_CONTROL";
 const EXECUTION_TOKEN: &str = "AGORA_SANDBOX_EXECUTION_TOKEN";
 const AUDIT_CONTROL: &str = "AGORA_SANDBOX_AUDIT_CONTROL";
 const AUDIT_TOKEN: &str = "AGORA_SANDBOX_AUDIT_TOKEN";
+pub(super) const CONTROL_LOCK_DESCRIPTOR: &str = "AGORA_SANDBOX_CONTROL_LOCK_FD";
+pub(super) const EXECUTION_CONTROL_DESCRIPTOR: &str = "AGORA_SANDBOX_EXECUTION_FD";
+pub(super) const AUDIT_CONTROL_DESCRIPTOR: &str = "AGORA_SANDBOX_AUDIT_FD";
+pub(super) const LOCAL_CONTROL_DESCRIPTOR: &str = "AGORA_SANDBOX_LOCAL_FILESYSTEM_FD";
+pub(super) const REMOTE_CONTROL_DESCRIPTOR: &str = "AGORA_SANDBOX_REMOTE_FD";
 const HOOK_LIBRARIES: &str = "AGORA_SANDBOX_HOOK_LIBRARIES";
 const FILESYSTEM_ROOT: &str = "AGORA_SANDBOX_FILESYSTEM_ROOT";
 const FILESYSTEM_MODE: &str = "AGORA_SANDBOX_FILESYSTEM_MODE";
@@ -35,7 +40,7 @@ const TLS_CLIENT_TRUST_ENVIRONMENT: [&str; 5] = [
     "GIT_SSL_CAINFO",
 ];
 
-pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 26] = [
+pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 31] = [
     TOKEN,
     PROXY_IPV4,
     PROXY_IPV6,
@@ -43,6 +48,11 @@ pub(super) const CHILD_RUNTIME_ENVIRONMENT: [&str; 26] = [
     EXECUTION_TOKEN,
     AUDIT_CONTROL,
     AUDIT_TOKEN,
+    CONTROL_LOCK_DESCRIPTOR,
+    EXECUTION_CONTROL_DESCRIPTOR,
+    AUDIT_CONTROL_DESCRIPTOR,
+    LOCAL_CONTROL_DESCRIPTOR,
+    REMOTE_CONTROL_DESCRIPTOR,
     HOOK_LIBRARIES,
     FILESYSTEM_ROOT,
     FILESYSTEM_MODE,
@@ -85,6 +95,18 @@ pub(super) struct HookConfig {
     tls_trust_anchor_der: Option<String>,
     tls_trust_bundle: Option<String>,
     trace: TraceContext,
+    #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+    inherited_control_descriptors: InheritedControlDescriptors,
+}
+
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct InheritedControlDescriptors {
+    pub(super) lock: Option<libc::c_int>,
+    pub(super) execution: Option<libc::c_int>,
+    pub(super) audit: Option<libc::c_int>,
+    pub(super) local: Option<libc::c_int>,
+    pub(super) remote: Option<libc::c_int>,
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +137,14 @@ impl HookConfig {
             .parse::<SocketAddr>()
             .map_err(|error| format!("invalid {AUDIT_CONTROL}: {error}"))?;
         let audit_token = Self::required(&mut get, AUDIT_TOKEN)?;
+        #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+        let inherited_control_descriptors = InheritedControlDescriptors {
+            lock: Self::optional_descriptor(&mut get, CONTROL_LOCK_DESCRIPTOR)?,
+            execution: Self::optional_descriptor(&mut get, EXECUTION_CONTROL_DESCRIPTOR)?,
+            audit: Self::optional_descriptor(&mut get, AUDIT_CONTROL_DESCRIPTOR)?,
+            local: Self::optional_descriptor(&mut get, LOCAL_CONTROL_DESCRIPTOR)?,
+            remote: Self::optional_descriptor(&mut get, REMOTE_CONTROL_DESCRIPTOR)?,
+        };
         let hook_libraries = Self::required(&mut get, HOOK_LIBRARIES)?;
         let filesystem_root = Self::required(&mut get, FILESYSTEM_ROOT)?;
         let filesystem_mode = Self::required(&mut get, FILESYSTEM_MODE)?;
@@ -227,6 +257,8 @@ impl HookConfig {
             tls_trust_anchor_der,
             tls_trust_bundle,
             trace,
+            #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+            inherited_control_descriptors,
         })
     }
 
@@ -321,6 +353,11 @@ impl HookConfig {
         &self.trace
     }
 
+    #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+    pub(super) fn inherited_control_descriptors(&self) -> InheritedControlDescriptors {
+        self.inherited_control_descriptors
+    }
+
     #[cfg(test)]
     pub(super) fn child_environment(&self) -> Vec<(&'static str, String)> {
         self.child_environment_for(&self.trace)
@@ -385,6 +422,23 @@ impl HookConfig {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| format!("missing {key}"))
     }
+
+    #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+    fn optional_descriptor(
+        get: &mut impl FnMut(&str) -> Option<String>,
+        key: &str,
+    ) -> Result<Option<libc::c_int>, String> {
+        get(key)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .parse::<libc::c_int>()
+                    .ok()
+                    .filter(|descriptor| *descriptor >= 0)
+                    .ok_or_else(|| format!("invalid {key}"))
+            })
+            .transpose()
+    }
 }
 
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
@@ -401,6 +455,11 @@ pub(super) fn initialize() -> Result<(), String> {
             REMOTE_TOKEN,
             REMOTE_ROOTS,
             REMOTE_CURRENT_DIRECTORY,
+            CONTROL_LOCK_DESCRIPTOR,
+            EXECUTION_CONTROL_DESCRIPTOR,
+            AUDIT_CONTROL_DESCRIPTOR,
+            LOCAL_CONTROL_DESCRIPTOR,
+            REMOTE_CONTROL_DESCRIPTOR,
         ] {
             unsafe { std::env::remove_var(key) };
         }

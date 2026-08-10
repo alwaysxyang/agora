@@ -2,6 +2,7 @@ use super::super::abi::{darwin_close, darwin_close_nocancel};
 use super::*;
 
 type CloseFn = unsafe extern "C" fn(libc::c_int) -> libc::c_int;
+type GuardedCloseFn = unsafe extern "C" fn(libc::c_int, *const GuardId) -> libc::c_int;
 type FcloseFn = unsafe extern "C" fn(*mut libc::FILE) -> libc::c_int;
 type DescriptorFn = unsafe extern "C" fn(libc::c_int) -> libc::c_int;
 type Dup2Fn = unsafe extern "C" fn(libc::c_int, libc::c_int) -> libc::c_int;
@@ -145,15 +146,16 @@ unsafe fn sandbox_descriptor_mutation_with_truncate(
             let logical = open.logical();
             let attributes =
                 runtime.refresh_attributes(descriptor, logical.to_string_lossy().as_ref());
-            if let Some(range) = reservation {
-                if let Some(active) = &active {
-                    let _ = local.finish_write(&registration.handle, active, range);
-                }
+            if let Some(range) = reservation
+                && active.as_ref().is_none_or(|active| {
+                    local
+                        .finish_write(&registration.handle, active, range)
+                        .is_err()
+                })
+            {
                 insert_dirty_range(&mut lock(&registration.dirty), range);
             }
-            let writeback =
-                runtime.commit_local_open_file_locked(descriptor, &open, registration, false);
-            if let Err(error) = attributes.and(writeback) {
+            if let Err(error) = attributes {
                 return unsafe { fail(&error, -1) };
             }
             return result;
@@ -217,17 +219,16 @@ pub unsafe extern "C" fn agora_sandbox_ftruncate(
     unsafe { sandbox_ftruncate(descriptor, length) }
 }
 
-unsafe fn sandbox_close(descriptor: libc::c_int, original: Option<CloseFn>) -> libc::c_int {
+unsafe fn sandbox_close(
+    descriptor: libc::c_int,
+    operation: impl FnOnce(libc::c_int) -> libc::c_int,
+) -> libc::c_int {
     catch_filesystem_panic(-1, || {
-        let Some(original) = original else {
-            unsafe { set_errno(libc::ENOSYS) };
-            return -1;
-        };
         let Some(_guard) = FilesystemHookGuard::enter() else {
-            return unsafe { original(descriptor) };
+            return operation(descriptor);
         };
         let Some(runtime) = FilesystemHookRuntime::global() else {
-            return unsafe { original(descriptor) };
+            return operation(descriptor);
         };
         if let Some(file) = runtime.tracked(descriptor)
             && let Err(error) = runtime.publish(FileOperation::Close, file)
@@ -246,7 +247,7 @@ unsafe fn sandbox_close(descriptor: libc::c_int, original: Option<CloseFn>) -> l
                 return unsafe { fail(&error, -1) };
             }
         }
-        let result = unsafe { original(descriptor) };
+        let result = operation(descriptor);
         if result != 0
             && let Some((open, _)) = tracked
         {
@@ -260,12 +261,32 @@ unsafe fn sandbox_close(descriptor: libc::c_int, original: Option<CloseFn>) -> l
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn agora_sandbox_close(descriptor: libc::c_int) -> libc::c_int {
-    unsafe { sandbox_close(descriptor, original_close()) }
+    let Some(original) = original_close() else {
+        unsafe { set_errno(libc::ENOSYS) };
+        return -1;
+    };
+    unsafe { sandbox_close(descriptor, |descriptor| original(descriptor)) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn agora_sandbox_close_nocancel(descriptor: libc::c_int) -> libc::c_int {
-    unsafe { sandbox_close(descriptor, original_close_nocancel()) }
+    let Some(original) = original_close_nocancel() else {
+        unsafe { set_errno(libc::ENOSYS) };
+        return -1;
+    };
+    unsafe { sandbox_close(descriptor, |descriptor| original(descriptor)) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_guarded_close(
+    descriptor: libc::c_int,
+    guard: *const GuardId,
+) -> libc::c_int {
+    let Some(original) = original_guarded_close() else {
+        unsafe { set_errno(libc::ENOSYS) };
+        return -1;
+    };
+    unsafe { sandbox_close(descriptor, |descriptor| original(descriptor, guard)) }
 }
 
 unsafe fn sandbox_fclose(stream: *mut libc::FILE) -> libc::c_int {
@@ -505,6 +526,10 @@ fn original_close_nocancel() -> Option<CloseFn> {
     function_from_interpose(&INTERPOSE_CLOSE_NOCANCEL)
 }
 
+fn original_guarded_close() -> Option<GuardedCloseFn> {
+    function_from_interpose(&INTERPOSE_GUARDED_CLOSE)
+}
+
 pub(super) fn original_fclose() -> Option<FcloseFn> {
     function_from_interpose(&INTERPOSE_FCLOSE)
 }
@@ -527,6 +552,9 @@ unsafe extern "C" {
         command: libc::c_int,
         ...
     ) -> libc::c_int;
+
+    #[link_name = "guarded_close_np"]
+    fn system_guarded_close_np(descriptor: libc::c_int, guard: *const GuardId) -> libc::c_int;
 }
 
 dyld_interpose!(INTERPOSE_TRUNCATE, agora_sandbox_truncate, libc::truncate);
@@ -538,6 +566,12 @@ dyld_interpose!(
 );
 
 dyld_interpose!(INTERPOSE_CLOSE, agora_sandbox_close, darwin_close);
+
+dyld_interpose!(
+    INTERPOSE_GUARDED_CLOSE,
+    agora_sandbox_guarded_close,
+    system_guarded_close_np
+);
 
 dyld_interpose!(
     INTERPOSE_CLOSE_NOCANCEL,

@@ -8,7 +8,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -49,45 +49,45 @@ fn read_frame_result(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     Ok(frame)
 }
 
-fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
-    read_frame_result(stream).unwrap()
-}
-
 fn accepted_audit_server(
     listener: TcpListener,
     stopped: Arc<AtomicBool>,
 ) -> thread::JoinHandle<usize> {
     listener.set_nonblocking(true).unwrap();
     thread::spawn(move || {
-        let mut requests = 0;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let mut connections = Vec::new();
         while !stopped.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     stream.set_nonblocking(false).unwrap();
-                    loop {
-                        match read_frame_result(&mut stream) {
-                            Ok(_request) => {
-                                let response = br#""Accepted""#;
-                                stream
-                                    .write_all(&(response.len() as u32).to_be_bytes())
-                                    .unwrap();
-                                stream.write_all(response).unwrap();
-                                requests += 1;
+                    let requests = Arc::clone(&requests);
+                    connections.push(thread::spawn(move || {
+                        loop {
+                            match read_frame_result(&mut stream) {
+                                Ok(_request) => {
+                                    let response = br#""Accepted""#;
+                                    stream
+                                        .write_all(&(response.len() as u32).to_be_bytes())
+                                        .unwrap();
+                                    stream.write_all(response).unwrap();
+                                    requests.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::UnexpectedEof
+                                            | std::io::ErrorKind::ConnectionAborted
+                                            | std::io::ErrorKind::ConnectionReset
+                                            | std::io::ErrorKind::BrokenPipe
+                                    ) =>
+                                {
+                                    break;
+                                }
+                                Err(error) => panic!("audit fixture failed: {error}"),
                             }
-                            Err(error)
-                                if matches!(
-                                    error.kind(),
-                                    std::io::ErrorKind::UnexpectedEof
-                                        | std::io::ErrorKind::ConnectionAborted
-                                        | std::io::ErrorKind::ConnectionReset
-                                        | std::io::ErrorKind::BrokenPipe
-                                ) =>
-                            {
-                                break;
-                            }
-                            Err(error) => panic!("audit fixture failed: {error}"),
                         }
-                    }
+                    }));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(2));
@@ -95,7 +95,10 @@ fn accepted_audit_server(
                 Err(error) => panic!("test listener failed: {error}"),
             }
         }
-        requests
+        for connection in connections {
+            connection.join().unwrap();
+        }
+        requests.load(Ordering::Relaxed)
     })
 }
 
@@ -103,19 +106,55 @@ fn denied_execution_server(
     listener: TcpListener,
     stopped: Arc<AtomicBool>,
 ) -> thread::JoinHandle<usize> {
-    serve_until_stopped(listener, stopped, |mut stream| {
-        let _request = read_frame(&mut stream);
-        let message = b"denied by coverage fixture";
-        let mut body = Vec::with_capacity(11 + message.len());
-        body.extend_from_slice(&crate::execution::EXECUTION_PROTOCOL_VERSION.to_be_bytes());
-        body.push(1);
-        body.extend_from_slice(&((4 + message.len()) as u32).to_be_bytes());
-        body.extend_from_slice(&libc::EACCES.to_be_bytes());
-        body.extend_from_slice(message);
-        stream
-            .write_all(&(body.len() as u32).to_be_bytes())
-            .unwrap();
-        stream.write_all(&body).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    thread::spawn(move || {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let mut connections = Vec::new();
+        while !stopped.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let requests = Arc::clone(&requests);
+                    connections.push(thread::spawn(move || {
+                        let mut persistent = false;
+                        while let Ok(request) = read_frame_result(&mut stream) {
+                            let ping = request.get(2) == Some(&0);
+                            let message = b"denied by coverage fixture";
+                            let mut body = Vec::with_capacity(11 + message.len());
+                            body.extend_from_slice(
+                                &crate::execution::EXECUTION_PROTOCOL_VERSION.to_be_bytes(),
+                            );
+                            if ping {
+                                body.push(0);
+                                body.extend_from_slice(&0_u32.to_be_bytes());
+                                persistent = true;
+                            } else {
+                                body.push(2);
+                                body.extend_from_slice(&((4 + message.len()) as u32).to_be_bytes());
+                                body.extend_from_slice(&libc::EACCES.to_be_bytes());
+                                body.extend_from_slice(message);
+                                requests.fetch_add(1, Ordering::Relaxed);
+                            }
+                            stream
+                                .write_all(&(body.len() as u32).to_be_bytes())
+                                .unwrap();
+                            stream.write_all(&body).unwrap();
+                            if !ping && !persistent {
+                                break;
+                            }
+                        }
+                    }));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("test listener failed: {error}"),
+            }
+        }
+        for connection in connections {
+            connection.join().unwrap();
+        }
+        requests.load(Ordering::Relaxed)
     })
 }
 

@@ -103,7 +103,7 @@ fn error_response(errno: libc::c_int, message: &[u8]) -> Vec<u8> {
     let mut content = Vec::with_capacity(4 + message.len());
     content.extend_from_slice(&errno.to_be_bytes());
     content.extend_from_slice(message);
-    response(1, &content)
+    response(2, &content)
 }
 
 fn runtime_with_response(response: Vec<u8>) -> (ProcessHookRuntime, thread::JoinHandle<Vec<u8>>) {
@@ -541,7 +541,7 @@ fn process_audit_prefers_the_tracked_logical_directory() {
 
 #[test]
 fn process_runtime_returns_the_prepared_executable() {
-    let (runtime, server) = runtime_with_response(response(0, b"/tmp/prepared-curl"));
+    let (runtime, server) = runtime_with_response(response(1, b"/tmp/prepared-curl"));
     let prepared = runtime.prepare(Path::new("/usr/bin/curl")).unwrap();
 
     assert_eq!(prepared.to_bytes(), b"/tmp/prepared-curl");
@@ -569,8 +569,8 @@ fn process_runtime_prepares_a_shebang_interpreter_and_preserves_the_script() {
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let script = script.canonicalize().unwrap();
     let (runtime, server) = runtime_with_responses(vec![
-        response(0, script.as_os_str().as_encoded_bytes()),
-        response(0, b"/tmp/prepared-env"),
+        response(1, script.as_os_str().as_encoded_bytes()),
+        response(1, b"/tmp/prepared-env"),
     ]);
 
     let prepared = runtime.prepare_executable(&script).unwrap();
@@ -604,8 +604,8 @@ fn process_runtime_rejects_a_nul_in_a_shebang_argument() {
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let script = script.canonicalize().unwrap();
     let (runtime, server) = runtime_with_responses(vec![
-        response(0, script.as_os_str().as_encoded_bytes()),
-        response(0, b"/tmp/prepared-sh"),
+        response(1, script.as_os_str().as_encoded_bytes()),
+        response(1, b"/tmp/prepared-sh"),
     ]);
 
     let error = runtime.prepare_executable(&script).unwrap_err();
@@ -625,7 +625,7 @@ fn process_runtime_keeps_a_direct_executable_unchanged() {
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
     let executable = executable.canonicalize().unwrap();
     let (runtime, server) =
-        runtime_with_response(response(0, executable.as_os_str().as_encoded_bytes()));
+        runtime_with_response(response(1, executable.as_os_str().as_encoded_bytes()));
 
     let prepared = runtime.prepare_executable(&executable).unwrap();
 
@@ -647,14 +647,14 @@ fn process_runtime_propagates_denied_and_invalid_responses() {
     assert_eq!(denied.to_string(), "missing executable");
     denied_server.join().unwrap();
 
-    let (runtime, invalid_server) = runtime_with_response(response(2, b"invalid"));
+    let (runtime, invalid_server) = runtime_with_response(response(3, b"invalid"));
     assert_eq!(
         runtime.prepare(Path::new("/bin/sh")).unwrap_err().errno,
         libc::EPROTO
     );
     invalid_server.join().unwrap();
 
-    let (runtime, nul_server) = runtime_with_response(response(0, b"/tmp/a\0b"));
+    let (runtime, nul_server) = runtime_with_response(response(1, b"/tmp/a\0b"));
     assert_eq!(
         runtime.prepare(Path::new("/bin/sh")).unwrap_err().errno,
         libc::EINVAL
@@ -669,15 +669,14 @@ fn process_runtime_rejects_an_oversized_execution_token_before_sending() {
         config: config_with_control_and_token(listener.local_addr().unwrap(), &"x".repeat(65_536)),
         audit: None,
     };
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut byte = [0_u8; 1];
-        assert_eq!(stream.read(&mut byte).unwrap(), 0);
-    });
     let error = runtime.prepare(Path::new("/bin/sh")).unwrap_err();
 
     assert_eq!(error.errno, libc::EINVAL);
-    server.join().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 #[test]
@@ -800,7 +799,7 @@ fn process_spawn_interposers_prepare_and_launch_native_children() {
     let file = CString::new("true").unwrap();
 
     for search_path in [false, true] {
-        let (runtime, server) = runtime_with_response(response(0, b"/usr/bin/true"));
+        let (runtime, server) = runtime_with_response(response(1, b"/usr/bin/true"));
         let requested = if search_path { &file } else { &executable };
         let mut arguments = [requested.as_ptr().cast_mut(), std::ptr::null_mut()];
         let mut pid = 0;
@@ -849,7 +848,7 @@ fn process_exec_interposers_prepare_before_native_exec_failure() {
 
     for operation in [ProcessOperation::Execve, ProcessOperation::Execv] {
         let (runtime, server) =
-            runtime_with_response(response(0, invalid.as_os_str().as_encoded_bytes()));
+            runtime_with_response(response(1, invalid.as_os_str().as_encoded_bytes()));
         let requested = &path;
         let arguments = [requested.as_ptr(), std::ptr::null()];
         unsafe { *libc::__error() = 0 };
@@ -874,8 +873,8 @@ fn process_exec_interposers_prepare_before_native_exec_failure() {
     }
 
     let (runtime, server) = runtime_with_responses(vec![
-        response(0, invalid.as_os_str().as_encoded_bytes()),
-        response(0, invalid.as_os_str().as_encoded_bytes()),
+        response(1, invalid.as_os_str().as_encoded_bytes()),
+        response(1, invalid.as_os_str().as_encoded_bytes()),
     ]);
     let arguments = [file.as_ptr(), std::ptr::null()];
     unsafe { *libc::__error() = 0 };

@@ -1,4 +1,4 @@
-use super::descriptor::{original_close, original_fclose};
+use super::descriptor::{agora_sandbox_guarded_close, original_close, original_fclose};
 use super::*;
 
 type OpenFn = unsafe extern "C" fn(*const libc::c_char, libc::c_int, libc::mode_t) -> libc::c_int;
@@ -22,26 +22,112 @@ type PosixSpawnAddOpenFn = unsafe extern "C" fn(
     libc::mode_t,
 ) -> libc::c_int;
 
+#[derive(Clone, Copy)]
+enum GuardedOpenKind {
+    Regular,
+    DataProtected {
+        class: libc::c_int,
+        flags: libc::c_int,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum OpenOperation {
+    Regular(OpenFn),
+    Guarded {
+        kind: GuardedOpenKind,
+        guard: *const GuardId,
+        guard_flags: libc::c_uint,
+    },
+}
+
+impl OpenOperation {
+    unsafe fn call(
+        self,
+        path: *const libc::c_char,
+        flags: libc::c_int,
+        mode: libc::mode_t,
+    ) -> libc::c_int {
+        match self {
+            Self::Regular(original) => unsafe { original(path, flags, mode) },
+            Self::Guarded {
+                kind,
+                guard,
+                guard_flags,
+            } => unsafe { call_original_guarded_open(kind, path, guard, guard_flags, flags, mode) },
+        }
+    }
+
+    unsafe fn close(self, descriptor: libc::c_int) {
+        match self {
+            Self::Regular(_) => {
+                if let Some(close) = original_close() {
+                    unsafe { close(descriptor) };
+                }
+            }
+            Self::Guarded { guard, .. } => {
+                unsafe { agora_sandbox_guarded_close(descriptor, guard) };
+            }
+        }
+    }
+
+    unsafe fn configure_anonymous(self, descriptor: libc::c_int) -> std::io::Result<()> {
+        let Self::Guarded {
+            guard, guard_flags, ..
+        } = self
+        else {
+            return Ok(());
+        };
+        let mut descriptor_flags = 0;
+        if unsafe {
+            system_change_fdguard_np(
+                descriptor,
+                std::ptr::null(),
+                0,
+                guard,
+                guard_flags,
+                &mut descriptor_flags,
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
 unsafe fn sandbox_open_with_mode(
     path: *const libc::c_char,
     flags: libc::c_int,
     mode: libc::mode_t,
 ) -> libc::c_int {
+    let Some(original) = original_open() else {
+        unsafe { set_errno(libc::ENOSYS) };
+        return -1;
+    };
+    unsafe { sandbox_open_with_operation(path, flags, mode, OpenOperation::Regular(original)) }
+}
+
+unsafe fn sandbox_open_with_operation(
+    path: *const libc::c_char,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+    operation: OpenOperation,
+) -> libc::c_int {
     catch_filesystem_panic(-1, || {
-        let Some(original) = original_open() else {
-            unsafe { set_errno(libc::ENOSYS) };
-            return -1;
-        };
         let Some(_guard) = FilesystemHookGuard::enter() else {
-            return unsafe { original(path, flags, mode) };
+            return unsafe { operation.call(path, flags, mode) };
         };
         let Some(runtime) = FilesystemHookRuntime::global() else {
-            return unsafe { original(path, flags, mode) };
+            return unsafe { operation.call(path, flags, mode) };
         };
         match runtime.prepare_open(path, libc::AT_FDCWD, flags, mode) {
             Ok(request) => {
                 match request.native_path() {
-                    Ok(Some(native)) => return unsafe { original(native.as_ptr(), flags, mode) },
+                    Ok(Some(native)) => {
+                        return unsafe { operation.call(native.as_ptr(), flags, mode) };
+                    }
                     Ok(None) => {}
                     Err(error) => return unsafe { fail(&error, -1) },
                 }
@@ -56,7 +142,7 @@ unsafe fn sandbox_open_with_mode(
                             Ok(mapped) => mapped,
                             Err(error) => return unsafe { fail(&error.into(), -1) },
                         };
-                        unsafe { original(mapped.as_ptr(), flags, mode) }
+                        unsafe { operation.call(mapped.as_ptr(), flags, mode) }
                     }
                     OpenTarget::Descriptor(file) => {
                         let descriptor = file.as_raw_fd();
@@ -70,10 +156,25 @@ unsafe fn sandbox_open_with_mode(
                     return descriptor;
                 }
                 if let Err(error) = runtime.commit_open(&mut prepared) {
-                    if target_is_path && let Some(close) = original_close() {
-                        unsafe { close(descriptor) };
+                    if target_is_path {
+                        unsafe { operation.close(descriptor) };
                     }
                     return unsafe { fail(&error, -1) };
+                }
+                if !target_is_path
+                    && let Err(error) = unsafe { operation.configure_anonymous(descriptor) }
+                {
+                    let errno = error.raw_os_error().unwrap_or(libc::EIO);
+                    let (target, open) = prepared.into_parts();
+                    let _ = runtime.finish_open_file(descriptor, &open);
+                    if let OpenTarget::Descriptor(file) = target {
+                        let descriptor = file.into_raw_fd();
+                        if let Some(close) = original_close() {
+                            unsafe { close(descriptor) };
+                        }
+                    }
+                    unsafe { set_errno(errno) };
+                    return -1;
                 }
                 let (target, open) = prepared.into_parts();
                 let descriptor = match target {
@@ -95,6 +196,77 @@ pub unsafe extern "C" fn agora_sandbox_open_with_mode(
     mode: libc::mode_t,
 ) -> libc::c_int {
     unsafe { sandbox_open_with_mode(path, flags, mode) }
+}
+
+unsafe fn sandbox_guarded_open_with_mode(
+    path: *const libc::c_char,
+    guard: *const GuardId,
+    guardflags: libc::c_uint,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+    kind: GuardedOpenKind,
+) -> libc::c_int {
+    if !guarded_open_available(kind) {
+        unsafe { set_errno(libc::ENOSYS) };
+        return -1;
+    }
+    unsafe {
+        sandbox_open_with_operation(
+            path,
+            flags,
+            mode,
+            OpenOperation::Guarded {
+                kind,
+                guard,
+                guard_flags: guardflags,
+            },
+        )
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_guarded_open_with_mode(
+    path: *const libc::c_char,
+    guard: *const GuardId,
+    guardflags: libc::c_uint,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> libc::c_int {
+    unsafe {
+        sandbox_guarded_open_with_mode(
+            path,
+            guard,
+            guardflags,
+            flags,
+            mode,
+            GuardedOpenKind::Regular,
+        )
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_guarded_open_dprotected_with_mode(
+    path: *const libc::c_char,
+    guard: *const GuardId,
+    guardflags: libc::c_uint,
+    flags: libc::c_int,
+    class: libc::c_int,
+    protection_flags: libc::c_int,
+    mode: libc::mode_t,
+) -> libc::c_int {
+    unsafe {
+        sandbox_guarded_open_with_mode(
+            path,
+            guard,
+            guardflags,
+            flags,
+            mode,
+            GuardedOpenKind::DataProtected {
+                class,
+                flags: protection_flags,
+            },
+        )
+    }
 }
 
 unsafe fn sandbox_openat_with_mode(
@@ -393,6 +565,52 @@ fn original_openat() -> Option<OpenAtFn> {
     (!INTERPOSE_OPENAT.replacee.is_null()).then_some(call_original_openat)
 }
 
+fn guarded_open_available(kind: GuardedOpenKind) -> bool {
+    match kind {
+        GuardedOpenKind::Regular => !INTERPOSE_GUARDED_OPEN.replacee.is_null(),
+        GuardedOpenKind::DataProtected { .. } => {
+            !INTERPOSE_GUARDED_OPEN_DPROTECTED.replacee.is_null()
+        }
+    }
+}
+
+unsafe fn call_original_guarded_open(
+    kind: GuardedOpenKind,
+    path: *const libc::c_char,
+    guard: *const GuardId,
+    guardflags: libc::c_uint,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> libc::c_int {
+    match kind {
+        GuardedOpenKind::Regular => unsafe {
+            agora_sandbox_call_guarded_open(
+                INTERPOSE_GUARDED_OPEN.replacee,
+                path,
+                guard,
+                guardflags,
+                flags,
+                mode,
+            )
+        },
+        GuardedOpenKind::DataProtected {
+            class,
+            flags: protection_flags,
+        } => unsafe {
+            agora_sandbox_call_guarded_open_dprotected(
+                INTERPOSE_GUARDED_OPEN_DPROTECTED.replacee,
+                path,
+                guard,
+                guardflags,
+                flags,
+                class,
+                protection_flags,
+                mode,
+            )
+        },
+    }
+}
+
 unsafe extern "C" fn call_original_open(
     path: *const libc::c_char,
     flags: libc::c_int,
@@ -438,6 +656,26 @@ unsafe extern "C" {
         mode: libc::mode_t,
     ) -> libc::c_int;
 
+    fn agora_sandbox_call_guarded_open(
+        function: *const libc::c_void,
+        path: *const libc::c_char,
+        guard: *const GuardId,
+        guardflags: libc::c_uint,
+        flags: libc::c_int,
+        mode: libc::mode_t,
+    ) -> libc::c_int;
+
+    fn agora_sandbox_call_guarded_open_dprotected(
+        function: *const libc::c_void,
+        path: *const libc::c_char,
+        guard: *const GuardId,
+        guardflags: libc::c_uint,
+        flags: libc::c_int,
+        class: libc::c_int,
+        protection_flags: libc::c_int,
+        mode: libc::mode_t,
+    ) -> libc::c_int;
+
     fn agora_sandbox_open_shim(path: *const libc::c_char, flags: libc::c_int, ...) -> libc::c_int;
 
     fn agora_sandbox_openat_shim(
@@ -446,11 +684,71 @@ unsafe extern "C" {
         flags: libc::c_int,
         ...
     ) -> libc::c_int;
+
+    fn agora_sandbox_guarded_open_shim(
+        path: *const libc::c_char,
+        guard: *const GuardId,
+        guardflags: libc::c_uint,
+        flags: libc::c_int,
+        ...
+    ) -> libc::c_int;
+
+    fn agora_sandbox_guarded_open_dprotected_shim(
+        path: *const libc::c_char,
+        guard: *const GuardId,
+        guardflags: libc::c_uint,
+        flags: libc::c_int,
+        class: libc::c_int,
+        protection_flags: libc::c_int,
+        ...
+    ) -> libc::c_int;
+
+    #[link_name = "guarded_open_np"]
+    fn system_guarded_open_np(
+        path: *const libc::c_char,
+        guard: *const GuardId,
+        guardflags: libc::c_uint,
+        flags: libc::c_int,
+        ...
+    ) -> libc::c_int;
+
+    #[link_name = "guarded_open_dprotected_np"]
+    fn system_guarded_open_dprotected_np(
+        path: *const libc::c_char,
+        guard: *const GuardId,
+        guardflags: libc::c_uint,
+        flags: libc::c_int,
+        class: libc::c_int,
+        protection_flags: libc::c_int,
+        ...
+    ) -> libc::c_int;
+
+    #[link_name = "change_fdguard_np"]
+    fn system_change_fdguard_np(
+        descriptor: libc::c_int,
+        guard: *const GuardId,
+        guardflags: libc::c_uint,
+        new_guard: *const GuardId,
+        new_guardflags: libc::c_uint,
+        descriptor_flags: *mut libc::c_int,
+    ) -> libc::c_int;
 }
 
 dyld_interpose!(INTERPOSE_OPEN, agora_sandbox_open_shim, libc::open);
 
 dyld_interpose!(INTERPOSE_OPENAT, agora_sandbox_openat_shim, libc::openat);
+
+dyld_interpose!(
+    INTERPOSE_GUARDED_OPEN,
+    agora_sandbox_guarded_open_shim,
+    system_guarded_open_np
+);
+
+dyld_interpose!(
+    INTERPOSE_GUARDED_OPEN_DPROTECTED,
+    agora_sandbox_guarded_open_dprotected_shim,
+    system_guarded_open_dprotected_np
+);
 
 dyld_interpose!(INTERPOSE_CREAT, agora_sandbox_creat, libc::creat);
 

@@ -2,10 +2,14 @@ use super::protocol::{
     BackingPath, ByteRange, PROTOCOL_VERSION, Request, RequestEnvelope, Response, ResponseEnvelope,
 };
 use crate::ipc;
+#[cfg(target_os = "macos")]
+use crate::ipc::InheritedControlStream;
 use std::fmt;
 use std::os::fd::RawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
 use std::time::Duration;
 
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -15,6 +19,8 @@ const IDEMPOTENT_ATTEMPTS: usize = 2;
 pub(crate) struct LocalClient {
     socket: PathBuf,
     token: String,
+    #[cfg(target_os = "macos")]
+    shared: Option<Arc<InheritedControlStream<UnixStream>>>,
 }
 
 pub(crate) struct LocalOpen {
@@ -37,6 +43,30 @@ impl LocalClient {
         Self {
             socket: socket.into(),
             token: token.into(),
+            #[cfg(target_os = "macos")]
+            shared: None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_shared(
+        socket: impl Into<PathBuf>,
+        token: impl Into<String>,
+        shared: Arc<InheritedControlStream<UnixStream>>,
+    ) -> Self {
+        let mut client = Self::new(socket, token);
+        client.shared = Some(shared);
+        client
+    }
+
+    #[cfg(all(target_os = "macos", any(agora_sandbox_hook_build, test, coverage)))]
+    pub(crate) fn ping_shared(&self) -> Result<(), LocalClientError> {
+        let request_id = uuid::Uuid::new_v4().simple().to_string();
+        match self.request_shared(request_id, Request::Ping, None)? {
+            Response::Success => Ok(()),
+            _ => Err(LocalClientError::protocol(
+                "local filesystem ping returned an unexpected response",
+            )),
         }
     }
 
@@ -150,10 +180,15 @@ impl LocalClient {
         )
     }
 
-    pub(crate) fn close(&self, handle: &str) -> Result<(), LocalClientError> {
+    pub(crate) fn close(
+        &self,
+        handle: &str,
+        ranges: Vec<ByteRange>,
+    ) -> Result<(), LocalClientError> {
         self.success(
             Request::Close {
                 handle: handle.to_string(),
+                ranges,
             },
             IDEMPOTENT_ATTEMPTS,
         )
@@ -216,20 +251,62 @@ impl LocalClient {
         request: Request,
         descriptor: Option<RawFd>,
     ) -> Result<Response, LocalClientError> {
-        let mut stream = UnixStream::connect(&self.socket).map_err(|error| {
-            LocalClientError::io("failed to connect to local filesystem broker", error, true)
-        })?;
+        let mut stream = match UnixStream::connect(&self.socket) {
+            Ok(stream) => stream,
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                if self.shared.is_some() {
+                    return self.request_shared(request_id, request, descriptor);
+                }
+                return Err(LocalClientError::io(
+                    "failed to connect to local filesystem broker",
+                    error,
+                    true,
+                ));
+            }
+        };
         stream
             .set_read_timeout(Some(CLIENT_TIMEOUT))
             .and_then(|()| stream.set_write_timeout(Some(CLIENT_TIMEOUT)))
             .map_err(|error| {
                 LocalClientError::io("failed to configure local filesystem broker", error, false)
             })?;
+        Self::exchange(&mut stream, &self.token, request_id, request, descriptor)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn request_shared(
+        &self,
+        request_id: String,
+        request: Request,
+        descriptor: Option<RawFd>,
+    ) -> Result<Response, LocalClientError> {
+        let shared = self.shared.as_ref().ok_or_else(|| {
+            LocalClientError::protocol("shared local filesystem control stream is unavailable")
+        })?;
+        shared
+            .transact(|stream| Self::exchange(stream, &self.token, request_id, request, descriptor))
+            .map_err(|error| {
+                LocalClientError::io(
+                    "failed to serialize inherited local filesystem request",
+                    error,
+                    true,
+                )
+            })?
+    }
+
+    fn exchange(
+        stream: &mut UnixStream,
+        token: &str,
+        request_id: String,
+        request: Request,
+        descriptor: Option<RawFd>,
+    ) -> Result<Response, LocalClientError> {
         ipc::send(
-            &mut stream,
+            stream,
             &RequestEnvelope {
                 version: PROTOCOL_VERSION,
-                token: self.token.clone(),
+                token: token.to_string(),
                 request_id: request_id.clone(),
                 request,
             },
@@ -238,10 +315,9 @@ impl LocalClient {
         .map_err(|error| {
             LocalClientError::io("failed to send local filesystem request", error, true)
         })?;
-        let (response, descriptor) =
-            ipc::receive::<ResponseEnvelope>(&mut stream).map_err(|error| {
-                LocalClientError::io("failed to receive local filesystem response", error, true)
-            })?;
+        let (response, descriptor) = ipc::receive::<ResponseEnvelope>(stream).map_err(|error| {
+            LocalClientError::io("failed to receive local filesystem response", error, true)
+        })?;
         if descriptor.is_some() {
             return Err(LocalClientError::protocol(
                 "local filesystem response unexpectedly included a descriptor",

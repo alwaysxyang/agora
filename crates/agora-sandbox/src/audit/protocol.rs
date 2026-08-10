@@ -2,7 +2,7 @@ use crate::callback::{CommandContext, FileContext, ProcessContext};
 use serde::{Deserialize, Serialize};
 use std::io;
 
-pub(super) const AUDIT_PROTOCOL_VERSION: u16 = 2;
+pub(super) const AUDIT_PROTOCOL_VERSION: u16 = 3;
 pub(super) const MAX_AUDIT_FRAME_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,6 +16,7 @@ pub(crate) struct AuditRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum AuditEventRequest {
+    Ping,
     Process {
         trace_id: String,
         process: ProcessContext,
@@ -52,6 +53,11 @@ pub(crate) fn encode_request(token: &str, event: AuditEventRequest) -> io::Resul
         request_id: uuid::Uuid::new_v4().simple().to_string(),
         event,
     })
+}
+
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
+pub(crate) fn encode_ping_request(token: &str) -> io::Result<Vec<u8>> {
+    encode_request(token, AuditEventRequest::Ping)
 }
 
 pub(super) fn decode_request(frame: &[u8]) -> io::Result<AuditRequest> {

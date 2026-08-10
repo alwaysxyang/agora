@@ -205,6 +205,9 @@ Sandbox::run
   -> publish a CA-keyed trust bundle, transport the interception CA DER bytes and bundle path to
      the child as internal runtime configuration, and retain the private key only in the host
   -> inject libagora_sandbox.dylib and immutable per-run control configuration
+  -> hook initialization authenticates one inheritable execution stream, one inheritable audit
+     stream, and any configured local or remote filesystem Broker streams before ordinary hooks
+     become active
   -> start the original or prepared child as a new process-group leader
 
 intercepted child posix_spawn/exec
@@ -214,6 +217,9 @@ intercepted child posix_spawn/exec
   -> reuse a valid persistent copy or mirror and ad-hoc sign a native-architecture copy beneath
      <workdir>/fs while preserving the executable's canonical absolute path
   -> rebuild the protected control environment and DYLD_INSERT_LIBRARIES from the loaded snapshot
+  -> pass the authenticated control descriptors and their anonymous cross-process lock to the new
+     image; ordinary requests still prefer fresh connections and use the inherited streams only
+     when a nested kernel sandbox denies a new internal connection
   -> invoke the original launch operation with the original or prepared executable
 
 intercepted child open/openat/fopen and close/fclose
@@ -433,12 +439,16 @@ The process path currently publishes `process.exec.attempt` for intercepted desc
 `posix_spawnp`, `execve`, `execv`, and `execvp` operations. A process event contains sandbox and run
 ids, the trace chain, current PID/PPID/executable, requested executable, arguments, current directory,
 operation, and result. The hook records at most 256 arguments and replaces the omitted argument tail
-with `[truncated]`. Process event delivery is independent of execution preparation protocol version 5,
-which now carries only authentication and an executable path. The root command is outside this
+with `[truncated]`. Process event delivery is independent of execution preparation protocol version 6,
+which carries authentication plus either a persistent-control `ping` or an executable path. A
+valid initial ping converts that connection into a multi-request inherited control stream; an
+ordinary preparation request remains a one-request connection. The root command is outside this
 process-event path because the runner launches it before any hooked descendant launch occurs.
 
 The filesystem path publishes `filesystem.open` and `filesystem.close` through local audit protocol
-version 2. Each request includes a random request ID that is retained across the client's one reconnect
+version 3. A valid initial `ping` authenticates the inheritable multi-request control stream without
+publishing an event and exempts that stream from the ordinary 30-second idle timeout. Each event
+request includes a random request ID that is retained across the client's one reconnect
 retry; the controller coalesces an in-progress duplicate and replays a bounded completed response so
 one logical publication invokes the callback and creates its event UUID at most once. Events include the logical path before overlay mapping, structured open mode, process
 identity, and the same trace chain used by process and network events. Successful opens register their

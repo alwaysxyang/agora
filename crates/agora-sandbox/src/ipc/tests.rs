@@ -1,5 +1,5 @@
 #[cfg(target_os = "macos")]
-use super::configure_no_sigpipe;
+use super::{InheritedControlLock, InheritedControlStream, configure_no_sigpipe};
 use super::{MAX_FRAME_SIZE, receive, send};
 use crate::nfs::protocol::{PROTOCOL_VERSION, RequestId, Response, ResponseEnvelope};
 use serde::Serialize;
@@ -7,6 +7,8 @@ use std::io::{Read, Write};
 use std::mem::zeroed;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
 
 #[test]
 fn framed_transport_round_trips_without_a_descriptor() {
@@ -51,6 +53,50 @@ fn framed_transport_disables_sigpipe_without_a_descriptor() {
         0
     );
     assert_eq!(enabled, 1);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn inherited_control_streams_are_inheritable_and_serialize_threads() {
+    let lock = InheritedControlLock::anonymous().unwrap();
+    let lock_flags = unsafe { libc::fcntl(lock.descriptor(), libc::F_GETFD) };
+    assert_eq!(lock_flags & libc::FD_CLOEXEC, 0);
+    let (stream, mut peer) = UnixStream::pair().unwrap();
+    let shared = InheritedControlStream::new(stream, Arc::clone(&lock), 0).unwrap();
+    let stream_flags = unsafe { libc::fcntl(shared.descriptor(), libc::F_GETFD) };
+    assert_eq!(stream_flags & libc::FD_CLOEXEC, 0);
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let mut byte = [0_u8; 1];
+            peer.read_exact(&mut byte).unwrap();
+            peer.write_all(&byte).unwrap();
+        }
+    });
+    let clients = (*b"ab").map(|byte| {
+        let shared = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            shared
+                .transact(|stream| {
+                    stream.write_all(&[byte])?;
+                    let mut response = [0_u8; 1];
+                    stream.read_exact(&mut response)?;
+                    Ok::<_, std::io::Error>(response[0])
+                })
+                .unwrap()
+                .unwrap()
+        })
+    });
+    let mut responses = clients.map(|client| client.join().unwrap());
+    responses.sort_unstable();
+    assert_eq!(responses, [b'a', b'b']);
+    server.join().unwrap();
+
+    unsafe { shared.reset_after_fork() };
+    let duplicate = unsafe { libc::fcntl(lock.descriptor(), libc::F_DUPFD_CLOEXEC, 0) };
+    assert!(duplicate >= 0);
+    let adopted = unsafe { InheritedControlLock::from_raw_descriptor(duplicate) }.unwrap();
+    let adopted_flags = unsafe { libc::fcntl(adopted.descriptor(), libc::F_GETFD) };
+    assert_eq!(adopted_flags & libc::FD_CLOEXEC, 0);
 }
 
 #[test]

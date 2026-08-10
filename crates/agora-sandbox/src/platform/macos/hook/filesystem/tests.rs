@@ -1,6 +1,7 @@
 use super::data::{
-    agora_sandbox_pwrite as sandbox_pwrite, agora_sandbox_pwritev as sandbox_pwritev,
-    agora_sandbox_writev as sandbox_writev,
+    agora_sandbox_guarded_pwrite as sandbox_guarded_pwrite,
+    agora_sandbox_guarded_writev as sandbox_guarded_writev, agora_sandbox_pwrite as sandbox_pwrite,
+    agora_sandbox_pwritev as sandbox_pwritev, agora_sandbox_writev as sandbox_writev,
 };
 use super::directory::{
     fts_bulk_entry_names_for_test, fts_directory_descent_path_for_test,
@@ -27,6 +28,8 @@ use super::{
     agora_sandbox_fstatat as sandbox_fstatat, agora_sandbox_fsync as sandbox_fsync,
     agora_sandbox_ftruncate as sandbox_ftruncate, agora_sandbox_futimens as sandbox_futimens,
     agora_sandbox_futimes as sandbox_futimes, agora_sandbox_getcwd as sandbox_getcwd,
+    agora_sandbox_guarded_close as sandbox_guarded_close,
+    agora_sandbox_guarded_open_with_mode as sandbox_guarded_open_with_mode,
     agora_sandbox_lchown as sandbox_lchown, agora_sandbox_link as sandbox_link,
     agora_sandbox_linkat as sandbox_linkat, agora_sandbox_lstat as sandbox_lstat,
     agora_sandbox_lutimes as sandbox_lutimes, agora_sandbox_mkdir as sandbox_mkdir,
@@ -1981,6 +1984,62 @@ fn encrypted_descriptors_keep_backing_ciphertext_and_write_back_on_last_close() 
 }
 
 #[test]
+fn guarded_file_operations_preserve_encrypted_descriptor_tracking() {
+    let fixture = Fixture::new();
+    let runtime = FilesystemHookRuntime::new_encrypted(
+        fixture.directory.join("guarded-workdir/fs"),
+        b"test-key",
+        b"0123456789abcdef",
+    )
+    .unwrap();
+    let logical = fixture.lower.join("guarded.txt");
+    let path = Fixture::c_path(&logical);
+    let guard = 0xa60a_5a7d_b001_u64;
+    let first = b"guarded";
+    let second = b" write";
+    let vectors = [libc::iovec {
+        iov_base: second.as_ptr().cast_mut().cast(),
+        iov_len: second.len(),
+    }];
+
+    with_test_runtime(&runtime, || unsafe {
+        let descriptor = sandbox_guarded_open_with_mode(
+            path.as_ptr(),
+            &guard,
+            (1_u32 << 0) | (1_u32 << 1),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(descriptor >= 0);
+        assert_eq!(
+            sandbox_guarded_pwrite(descriptor, &guard, first.as_ptr().cast(), first.len(), 0,),
+            first.len() as libc::ssize_t
+        );
+        assert_eq!(
+            libc::lseek(descriptor, first.len() as libc::off_t, libc::SEEK_SET),
+            7
+        );
+        assert_eq!(
+            sandbox_guarded_writev(descriptor, &guard, vectors.as_ptr(), 1),
+            second.len() as libc::ssize_t
+        );
+        assert_eq!(sandbox_guarded_close(descriptor, &guard), 0);
+    });
+
+    with_test_runtime(&runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(descriptor >= 0);
+        let mut contents = vec![0_u8; first.len() + second.len()];
+        assert_eq!(
+            libc::read(descriptor, contents.as_mut_ptr().cast(), contents.len()),
+            contents.len() as libc::ssize_t
+        );
+        assert_eq!(contents, b"guarded write");
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+}
+
+#[test]
 fn registry_aliases_not_temporary_arc_clones_determine_the_last_close() {
     let fixture = Fixture::new();
     let runtime = FilesystemHookRuntime::new_encrypted(
@@ -2626,6 +2685,10 @@ fn encrypted_stat_reports_plaintext_file_size() {
         let mut descriptor_status = std::mem::zeroed::<libc::stat>();
         assert_eq!(sandbox_fstat(descriptor, &mut descriptor_status), 0);
         assert_eq!(u32::from(descriptor_status.st_mode) & 0o777, 0o640);
+        let mut path_identity = std::mem::zeroed::<libc::stat>();
+        assert_eq!(sandbox_stat(path.as_ptr(), &mut path_identity), 0);
+        assert_eq!(descriptor_status.st_dev, path_identity.st_dev);
+        assert_eq!(descriptor_status.st_ino, path_identity.st_ino);
         assert_eq!(sandbox_close(descriptor), 0);
 
         let mut status = std::mem::zeroed::<libc::stat>();

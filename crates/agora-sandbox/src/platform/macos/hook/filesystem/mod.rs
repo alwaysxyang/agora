@@ -31,7 +31,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 const NATIVE_PASSTHROUGH_ROOTS: &[&str] = &["/dev"];
-const INHERITED_LOCAL_DESCRIPTOR_VERSION: u8 = 1;
+type GuardId = u64;
+const INHERITED_LOCAL_DESCRIPTOR_VERSION: u8 = 2;
 const MAX_INHERITED_LOCAL_DESCRIPTORS: usize = 256;
 
 thread_local! {
@@ -86,6 +87,7 @@ unsafe extern "C" fn reset_filesystem_after_fork() {
         );
     }
     FORK_IN_PROGRESS.with(|forking| forking.set(false));
+    unsafe { super::control::reset_after_fork() };
 }
 
 struct FilesystemHookGuard;
@@ -168,6 +170,7 @@ struct PreparedOpen {
     file: FileContext,
     logical: PathBuf,
     local: Option<LocalRegistration>,
+    identity: Option<LogicalFileIdentity>,
 }
 
 struct OpenFile {
@@ -176,6 +179,7 @@ struct OpenFile {
     writeback: Option<Writeback>,
     local: Option<LocalRegistration>,
     remote: Option<RemoteRegistration>,
+    identity: Option<LogicalFileIdentity>,
     layer: FileLayer,
     close_on_exec: bool,
     finished: AtomicBool,
@@ -192,6 +196,8 @@ struct InheritedLocalDescriptor {
     descriptor: libc::c_int,
     device: u64,
     inode: u64,
+    logical_device: u64,
+    logical_inode: u64,
     file: FileContext,
     logical: Vec<u8>,
     handle: String,
@@ -225,6 +231,12 @@ struct LocalRegistration {
     mutation: Mutex<()>,
 }
 
+#[derive(Clone, Copy)]
+struct LogicalFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
 type MetadataMapping = (
     CString,
     Option<libc::off_t>,
@@ -246,6 +258,7 @@ impl PreparedOpen {
                 writeback,
                 local: self.local,
                 remote,
+                identity: self.identity,
                 layer,
                 close_on_exec,
                 finished: AtomicBool::new(false),
@@ -323,6 +336,7 @@ impl OpenRequest {
             file: self.file,
             logical: self.logical,
             local: None,
+            identity: None,
         }
     }
 }
@@ -384,7 +398,12 @@ impl FilesystemHookRuntime {
                         let remote = config
                             .remote_filesystem()
                             .map(|(control, token, routes)| {
-                                RemoteFilesystem::from_json(control, token, routes)
+                                RemoteFilesystem::from_json_with_shared(
+                                    control,
+                                    token,
+                                    routes,
+                                    super::control::remote(),
+                                )
                             })
                             .transpose()
                             .ok()?;
@@ -396,13 +415,22 @@ impl FilesystemHookRuntime {
                         .ok()?;
                         let runtime = Self {
                             filesystem,
-                            local: config
-                                .local_filesystem()
-                                .map(|(control, token)| LocalClient::new(control, token)),
+                            local: config.local_filesystem().map(|(control, token)| {
+                                super::control::local().map_or_else(
+                                    || LocalClient::new(control, token),
+                                    |shared| LocalClient::with_shared(control, token, shared),
+                                )
+                            }),
                             remote,
-                            audit: Some(AuditClient::new(
-                                config.audit_control(),
-                                config.audit_token(),
+                            audit: Some(super::control::audit().map_or_else(
+                                || AuditClient::new(config.audit_control(), config.audit_token()),
+                                |shared| {
+                                    AuditClient::with_shared(
+                                        config.audit_control(),
+                                        config.audit_token(),
+                                        shared,
+                                    )
+                                },
                             )),
                             trace: config.trace().clone(),
                             prepared_executable,
@@ -848,6 +876,9 @@ impl FilesystemHookRuntime {
         match &mut prepared.prepared {
             PreparedOpenFile::Local(local) => {
                 self.filesystem.commit_open(local)?;
+                prepared.identity = local
+                    .encrypted_backing_identity()?
+                    .map(|(device, inode)| LogicalFileIdentity { device, inode });
                 if let Some(client) = &self.local
                     && let Some((path, descriptor, writable)) = local.local_broker_source()?
                 {
@@ -1019,10 +1050,15 @@ impl FilesystemHookRuntime {
             if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
                 continue;
             }
+            let Some(identity) = open.identity else {
+                continue;
+            };
             descriptors.push(InheritedLocalDescriptor {
                 descriptor,
                 device: status.st_dev as u64,
                 inode: status.st_ino,
+                logical_device: identity.device,
+                logical_inode: identity.inode,
                 file: open.file.clone(),
                 logical: open.logical().into_os_string().into_vec(),
                 handle: local.handle.clone(),
@@ -1083,6 +1119,10 @@ impl FilesystemHookRuntime {
                             mutation: Mutex::new(()),
                         }),
                         remote: None,
+                        identity: Some(LogicalFileIdentity {
+                            device: inherited.logical_device,
+                            inode: inherited.logical_inode,
+                        }),
                         layer: FileLayer::Upper,
                         close_on_exec: true,
                         finished: AtomicBool::new(false),
@@ -1115,14 +1155,7 @@ impl FilesystemHookRuntime {
         Ok(())
     }
 
-    fn record_local_write_locked(
-        &self,
-        descriptor: libc::c_int,
-        open: &OpenFile,
-        registration: &LocalRegistration,
-        start: u64,
-        end: u64,
-    ) {
+    fn record_local_write_locked(&self, registration: &LocalRegistration, start: u64, end: u64) {
         if !registration.writable || start >= end {
             return;
         }
@@ -1130,7 +1163,6 @@ impl FilesystemHookRuntime {
             return;
         };
         insert_dirty_range(&mut lock(&registration.dirty), range);
-        let _ = self.commit_local_open_file_locked(descriptor, open, registration, false);
     }
 
     fn commit_open_file(
@@ -1175,13 +1207,17 @@ impl FilesystemHookRuntime {
         }
         let result = (|| {
             if let Some(registration) = &open.local {
-                self.commit_open_file(descriptor, open, true)?;
-                return self
-                    .local
+                let _mutation = lock(&registration.mutation);
+                if descriptor >= 0 {
+                    self.refresh_open_attributes(descriptor, open)?;
+                }
+                let mut dirty = lock(&registration.dirty);
+                self.local
                     .as_ref()
                     .context("local filesystem runtime is unavailable")?
-                    .close(&registration.handle)
-                    .map_err(Into::into);
+                    .close(&registration.handle, dirty.clone())?;
+                dirty.clear();
+                return Ok(());
             }
             if let Some(registration) = &open.remote {
                 return self

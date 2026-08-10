@@ -1,5 +1,6 @@
 mod abi;
 mod config;
+mod control;
 mod dyld;
 mod filesystem;
 mod network;
@@ -51,6 +52,7 @@ extern "C" fn initialize_hook() {
     }
     let initialized = config::initialize()
         .map_err(anyhow::Error::msg)
+        .and_then(|()| control::initialize())
         .and_then(|()| filesystem::initialize_process());
     if let Err(error) = initialized {
         let message = format!("agora-sandbox: {error:#}\n");

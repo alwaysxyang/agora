@@ -2,6 +2,7 @@ use super::{
     PROTOCOL_VERSION, RemoteConnectionStatus, RemoteController, RemoteControllerEvent,
     RemoteRuntime, configure_server_stream,
 };
+use crate::ipc::{InheritedControlLock, InheritedControlStream};
 use crate::nfs::client::RemoteClient;
 use crate::nfs::protocol::{
     RemotePath, Request, RequestEnvelope, RequestId, Response, ResponseEnvelope,
@@ -180,6 +181,43 @@ async fn controller_authenticates_requests_and_transfers_open_descriptors() {
     let mut contents = String::new();
     std::io::Read::read_to_string(&mut file, &mut contents).unwrap();
     assert_eq!(contents, "through broker");
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_remote_control_stream_survives_new_connection_denial() {
+    let runtime = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    storage.insert_file(0, "file.txt", b"remote");
+    let controller = RemoteController::start_with_storage(storage, runtime.path())
+        .await
+        .unwrap();
+    let socket = controller.runtime().socket().to_path_buf();
+    let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    let shared =
+        InheritedControlStream::new(stream, InheritedControlLock::anonymous().unwrap(), 0).unwrap();
+    let client = RemoteClient::with_shared(&socket, controller.runtime().token(), shared);
+
+    let client = tokio::task::spawn_blocking(move || {
+        client.ping_shared().unwrap();
+        client
+    })
+    .await
+    .unwrap();
+    std::fs::remove_file(&socket).unwrap();
+    let (reply, client) = tokio::task::spawn_blocking(move || {
+        let reply = client.request(Request::Access {
+            path: RemotePath::new(0, "file.txt").unwrap(),
+            mode: libc::R_OK,
+        });
+        (reply, client)
+    })
+    .await
+    .unwrap();
+    let reply = reply.unwrap();
+    assert_eq!(reply.response, Response::Success);
+
+    drop(client);
     controller.shutdown().await.unwrap();
 }
 

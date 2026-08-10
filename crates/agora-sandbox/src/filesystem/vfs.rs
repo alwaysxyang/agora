@@ -193,6 +193,16 @@ impl PreparedFile {
             self.writable,
         )))
     }
+
+    pub(crate) fn encrypted_backing_identity(&self) -> Result<Option<(u64, u64)>> {
+        self.encrypted_backing
+            .as_ref()
+            .map(|path| {
+                let metadata = path.metadata()?;
+                Ok((metadata.dev(), metadata.ino()))
+            })
+            .transpose()
+    }
 }
 
 impl VirtualFilesystem {

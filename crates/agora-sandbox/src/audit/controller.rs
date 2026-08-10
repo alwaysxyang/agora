@@ -167,6 +167,7 @@ where
 {
     async fn publish(&self, request: AuditEventRequest) -> Result<()> {
         let event = match request {
+            AuditEventRequest::Ping => anyhow::bail!("audit ping cannot be published as an event"),
             AuditEventRequest::Process {
                 trace_id,
                 process,
@@ -406,15 +407,23 @@ where
         let first = tokio::time::timeout(handshake_timeout, read_frame(&mut stream))
             .await
             .context("sandbox audit handshake timed out")??;
-        Self::publish_frame(&mut stream, &state, first).await?;
+        let mut persistent = Self::publish_frame(&mut stream, &state, first).await?;
         loop {
-            let frame = match tokio::time::timeout(idle_timeout, read_frame(&mut stream)).await {
-                Ok(Ok(frame)) => frame,
-                Err(_) => anyhow::bail!("sandbox audit connection timed out"),
-                Ok(Err(error)) if disconnected(&error) => return Ok(()),
-                Ok(Err(error)) => return Err(error),
+            let frame = if persistent {
+                match read_frame(&mut stream).await {
+                    Ok(frame) => frame,
+                    Err(error) if disconnected(&error) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+            } else {
+                match tokio::time::timeout(idle_timeout, read_frame(&mut stream)).await {
+                    Ok(Ok(frame)) => frame,
+                    Err(_) => anyhow::bail!("sandbox audit connection timed out"),
+                    Ok(Err(error)) if disconnected(&error) => return Ok(()),
+                    Ok(Err(error)) => return Err(error),
+                }
             };
-            Self::publish_frame(&mut stream, &state, frame).await?;
+            persistent |= Self::publish_frame(&mut stream, &state, frame).await?;
         }
     }
 
@@ -422,18 +431,22 @@ where
         stream: &mut TcpStream,
         state: &AuditState<C>,
         frame: Vec<u8>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let request = decode_request(&frame)?;
-        let response = if request.token != state.token {
+        let authenticated = request.token == state.token;
+        let ping = matches!(&request.event, AuditEventRequest::Ping);
+        let response = if !authenticated {
             AuditResponse::Error {
                 errno: libc::EACCES,
                 message: "invalid audit token".to_string(),
             }
+        } else if ping {
+            AuditResponse::Accepted
         } else {
             state.publish_once(request.request_id, request.event).await
         };
         stream.write_all(&encode_response(&response)?).await?;
-        Ok(())
+        Ok(authenticated && ping)
     }
 }
 

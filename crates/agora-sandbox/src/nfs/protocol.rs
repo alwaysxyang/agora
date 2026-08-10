@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 4;
+pub(crate) const PROTOCOL_VERSION: u16 = 5;
 #[cfg(not(agora_sandbox_hook_build))]
 pub(crate) const MAX_REMOTE_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub(crate) const MAX_REMOTE_DIRECTORY_ENTRIES: usize = 100_000;
@@ -60,6 +60,7 @@ impl<'de> Deserialize<'de> for RequestId {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub(crate) enum Request {
+    Ping,
     Open {
         path: RemotePath,
         flags: i32,

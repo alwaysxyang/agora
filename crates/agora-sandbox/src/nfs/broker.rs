@@ -207,6 +207,7 @@ where
 
     async fn request_root(&self, request: &Request) -> Option<u32> {
         match request {
+            Request::Ping => None,
             Request::Open { path, .. }
             | Request::Stat { path, .. }
             | Request::List { path, .. }
@@ -224,6 +225,7 @@ where
 
     async fn dispatch(&self, request: Request, deadline: Instant) -> StorageResult<BrokerReply> {
         match request {
+            Request::Ping => Ok(success()),
             Request::Open { path, flags, mode } => self.open(path, flags, mode, deadline).await,
             Request::Stat {
                 path,

@@ -6,11 +6,13 @@ use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
+pub(super) const WRITEBACK_DELAY: Duration = Duration::from_millis(10);
 const CLOSED_HANDLE_TTL: Duration = Duration::from_secs(120);
 const CLOSED_HANDLE_CAPACITY: usize = 128;
 const REQUEST_CACHE_TTL: Duration = Duration::from_secs(120);
@@ -23,9 +25,10 @@ pub(crate) struct BrokerReply {
 pub(crate) struct LocalBroker {
     root: PathBuf,
     cipher: FileCipher,
-    handles: Mutex<HashMap<String, Arc<Mutex<LocalHandle>>>>,
-    files: Mutex<HashMap<FileIdentity, Weak<Mutex<()>>>>,
+    handles: Mutex<HashMap<String, RegisteredHandle>>,
+    files: Mutex<HashMap<FileIdentity, Weak<Mutex<FileState>>>>,
     requests: Mutex<RequestCache>,
+    writeback_pending: AtomicBool,
 }
 
 #[derive(Default)]
@@ -59,18 +62,29 @@ enum CacheDecision {
     Reject,
 }
 
-struct LocalHandle {
+#[derive(Clone)]
+struct RegisteredHandle {
     identity: FileIdentity,
+    handle: Arc<Mutex<LocalHandle>>,
+}
+
+struct LocalHandle {
     plaintext: File,
     encrypted: EncryptedFile,
     writable: bool,
     potentially_dirty: RangeSet,
     active_writes: HashMap<String, ByteRange>,
     pending_writes: RangeSet,
+    pending_since: Option<Instant>,
     baseline: PlaintextIdentity,
     references: usize,
     closed_at: Option<Instant>,
-    file_lock: Arc<Mutex<()>>,
+    file_state: Arc<Mutex<FileState>>,
+}
+
+#[derive(Default)]
+struct FileState {
+    needs_durable_sync: bool,
 }
 
 struct PeerHandle {
@@ -112,6 +126,7 @@ impl LocalBroker {
             handles: Mutex::new(HashMap::new()),
             files: Mutex::new(HashMap::new()),
             requests: Mutex::new(RequestCache::default()),
+            writeback_pending: AtomicBool::new(false),
         })
     }
 
@@ -183,17 +198,64 @@ impl LocalBroker {
     pub(crate) fn flush_all(&self) -> std::io::Result<()> {
         let handles = lock(&self.handles)
             .iter()
-            .map(|(id, handle)| (id.clone(), Arc::clone(handle)))
+            .map(|(id, registered)| {
+                (
+                    id.clone(),
+                    registered.identity,
+                    Arc::clone(&registered.handle),
+                )
+            })
             .collect::<Vec<_>>();
-        let ids = handles
+        let active = handles
             .into_iter()
-            .filter_map(|(id, handle)| (lock(&handle).references != 0).then_some(id))
+            .filter_map(|(id, identity, handle)| {
+                let handle = lock(&handle);
+                (handle.references != 0).then_some((id, identity))
+            })
             .collect::<Vec<_>>();
-        for id in ids {
-            self.sync_handle(&id, Vec::new(), true, true, true)
+        for (id, _) in &active {
+            self.sync_handle(id, Vec::new(), false, true, true)
+                .map_err(BrokerError::into_io)?;
+        }
+        let mut representatives = HashMap::new();
+        for (id, identity) in active {
+            representatives.entry(identity).or_insert(id);
+        }
+        for id in representatives.into_values() {
+            self.sync_handle(&id, Vec::new(), true, false, false)
                 .map_err(BrokerError::into_io)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn flush_due(&self, now: Instant) -> std::io::Result<()> {
+        self.writeback_pending.store(false, Ordering::Release);
+        let ids = lock(&self.handles)
+            .iter()
+            .filter_map(|(id, registered)| {
+                let handle = lock(&registered.handle);
+                (handle.references != 0
+                    && handle.pending_since.is_some_and(|pending| {
+                        now.saturating_duration_since(pending) >= WRITEBACK_DELAY
+                    }))
+                .then(|| id.clone())
+            })
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.sync_handle(&id, Vec::new(), false, false, false)
+                .map_err(BrokerError::into_io)?;
+        }
+        if lock(&self.handles).values().any(|registered| {
+            let handle = lock(&registered.handle);
+            handle.references != 0 && handle.pending_since.is_some()
+        }) {
+            self.writeback_pending.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    pub(super) fn writeback_pending(&self) -> bool {
+        self.writeback_pending.load(Ordering::Acquire)
     }
 
     pub(crate) fn expire_closed(&self) {
@@ -211,6 +273,10 @@ impl LocalBroker {
         descriptor: Option<OwnedFd>,
     ) -> Result<Response, BrokerError> {
         match request {
+            Request::Ping => {
+                Self::reject_descriptor(descriptor)?;
+                Ok(Response::Success)
+            }
             Request::Open { path, writable } => {
                 let descriptor = descriptor
                     .ok_or_else(|| BrokerError::protocol("local open requires a descriptor"))?;
@@ -233,10 +299,10 @@ impl LocalBroker {
             Request::PotentiallyDirty { handle, range } => {
                 Self::reject_descriptor(descriptor)?;
                 self.activate(&handle)?;
-                let handle = self.lookup_handle(&handle)?;
-                let file_lock = lock(&handle).file_lock.clone();
-                let _file_guard = lock(&file_lock);
-                let mut handle = lock(&handle);
+                let registered = self.lookup_handle(&handle)?;
+                let file_state = lock(&registered.handle).file_state.clone();
+                let _file_guard = lock(&file_state);
+                let mut handle = lock(&registered.handle);
                 if !handle.writable {
                     return Err(BrokerError::new(
                         libc::EBADF,
@@ -253,10 +319,10 @@ impl LocalBroker {
             } => {
                 Self::reject_descriptor(descriptor)?;
                 self.activate(&handle)?;
-                let handle = self.lookup_handle(&handle)?;
-                let file_lock = lock(&handle).file_lock.clone();
-                let _file_guard = lock(&file_lock);
-                let mut handle = lock(&handle);
+                let registered = self.lookup_handle(&handle)?;
+                let file_state = lock(&registered.handle).file_state.clone();
+                let _file_guard = lock(&file_state);
+                let mut handle = lock(&registered.handle);
                 if !handle.writable {
                     return Err(BrokerError::new(
                         libc::EBADF,
@@ -282,33 +348,41 @@ impl LocalBroker {
                 range,
             } => {
                 Self::reject_descriptor(descriptor)?;
-                let handle = self.lookup_handle(&handle)?;
-                let file_lock = lock(&handle).file_lock.clone();
-                let _file_guard = lock(&file_lock);
-                let mut handle = lock(&handle);
-                if !handle.writable {
+                let id = handle;
+                let registered = self.lookup_handle(&id)?;
+                let file_state = lock(&registered.handle).file_state.clone();
+                let file_guard = lock(&file_state);
+                let mut local = lock(&registered.handle);
+                if !local.writable {
                     return Err(BrokerError::new(
                         libc::EBADF,
                         "local filesystem handle is not writable",
                     ));
                 }
-                if let Some(reserved) = handle.active_writes.get(&write_id)
+                if let Some(reserved) = local.active_writes.get(&write_id)
                     && (range.start < reserved.start || range.end > reserved.end)
                 {
                     return Err(BrokerError::protocol(
                         "completed local write exceeds its reserved range",
                     ));
                 }
-                handle.active_writes.remove(&write_id);
-                handle.pending_writes.insert(range);
+                local.active_writes.remove(&write_id);
+                local.pending_writes.insert(range);
+                local.pending_since.get_or_insert_with(Instant::now);
+                self.writeback_pending.store(true, Ordering::Release);
+                drop(local);
+                drop(file_guard);
+                if self.has_live_peer(&id, registered.identity) {
+                    self.sync_handle(&id, Vec::new(), false, false, false)?;
+                }
                 Ok(Response::Success)
             }
             Request::CancelWrite { handle, write_id } => {
                 Self::reject_descriptor(descriptor)?;
-                let handle = self.lookup_handle(&handle)?;
-                let file_lock = lock(&handle).file_lock.clone();
-                let _file_guard = lock(&file_lock);
-                lock(&handle).active_writes.remove(&write_id);
+                let registered = self.lookup_handle(&handle)?;
+                let file_state = lock(&registered.handle).file_state.clone();
+                let _file_guard = lock(&file_state);
+                lock(&registered.handle).active_writes.remove(&write_id);
                 Ok(Response::Success)
             }
             Request::Claim { request_id } => {
@@ -340,13 +414,13 @@ impl LocalBroker {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 for handle in &retained_handles {
-                    let handle = lock(handle);
+                    let handle = lock(&handle.handle);
                     handle.references.checked_add(1).ok_or_else(|| {
                         BrokerError::new(libc::EOVERFLOW, "local filesystem reference overflow")
                     })?;
                 }
                 for handle in retained_handles {
-                    let mut handle = lock(&handle);
+                    let mut handle = lock(&handle.handle);
                     handle.references += 1;
                     handle.closed_at = None;
                 }
@@ -371,12 +445,12 @@ impl LocalBroker {
                     .collect::<Result<Vec<_>, _>>()?;
                 if retained_handles
                     .iter()
-                    .any(|handle| lock(handle).references == 0)
+                    .any(|handle| lock(&handle.handle).references == 0)
                 {
                     return Err(BrokerError::bad_descriptor());
                 }
                 for handle in retained_handles {
-                    let mut handle = lock(&handle);
+                    let mut handle = lock(&handle.handle);
                     handle.references -= 1;
                     if handle.references == 0 {
                         handle.closed_at = Some(Instant::now());
@@ -386,14 +460,14 @@ impl LocalBroker {
                 self.prune_closed(Instant::now());
                 Ok(Response::Success)
             }
-            Request::Close { handle } => {
+            Request::Close { handle, ranges } => {
                 Self::reject_descriptor(descriptor)?;
-                let Some(local) = lock(&self.handles).get(&handle).cloned() else {
+                let Some(registered) = lock(&self.handles).get(&handle).cloned() else {
                     return Ok(Response::Success);
                 };
-                let final_reference = lock(&local).references <= 1;
-                self.sync_handle(&handle, Vec::new(), true, true, final_reference)?;
-                let mut local = lock(&local);
+                let final_reference = lock(&registered.handle).references <= 1;
+                self.sync_handle(&handle, ranges, true, true, final_reference)?;
+                let mut local = lock(&registered.handle);
                 if local.references > 0 {
                     local.references -= 1;
                 }
@@ -443,13 +517,13 @@ impl LocalBroker {
             device: metadata.dev(),
             inode: metadata.ino(),
         };
-        let file_lock = {
+        let file_state = {
             let mut files = lock(&self.files);
             files.retain(|_, file| file.strong_count() != 0);
             if let Some(file) = files.get(&identity).and_then(Weak::upgrade) {
                 file
             } else {
-                let file = Arc::new(Mutex::new(()));
+                let file = Arc::new(Mutex::new(FileState::default()));
                 files.insert(identity, Arc::downgrade(&file));
                 file
             }
@@ -457,20 +531,27 @@ impl LocalBroker {
         let id = Uuid::new_v4().simple().to_string();
         lock(&self.handles).insert(
             id.clone(),
-            Arc::new(Mutex::new(LocalHandle {
+            RegisteredHandle {
                 identity,
-                plaintext,
-                encrypted,
-                writable,
-                potentially_dirty: RangeSet::default(),
-                active_writes: HashMap::new(),
-                pending_writes: RangeSet::default(),
-                baseline: PlaintextIdentity::from_metadata(&plaintext_metadata),
-                references: 1,
-                closed_at: None,
-                file_lock,
-            })),
+                handle: Arc::new(Mutex::new(LocalHandle {
+                    plaintext,
+                    encrypted,
+                    writable,
+                    potentially_dirty: RangeSet::default(),
+                    active_writes: HashMap::new(),
+                    pending_writes: RangeSet::default(),
+                    pending_since: None,
+                    baseline: PlaintextIdentity::from_metadata(&plaintext_metadata),
+                    references: 1,
+                    closed_at: None,
+                    file_state,
+                })),
+            },
         );
+        let peers = self.live_handle_ids(identity, Some(&id));
+        for peer in peers {
+            self.sync_handle(&peer, Vec::new(), false, false, false)?;
+        }
         Ok(Response::Open { handle: id })
     }
 
@@ -482,15 +563,17 @@ impl LocalBroker {
         include_potential: bool,
         include_active: bool,
     ) -> Result<(), BrokerError> {
-        let handle = self.lookup_handle(id)?;
-        let file_lock = lock(&handle).file_lock.clone();
-        let _file_guard = lock(&file_lock);
+        let registered = self.lookup_handle(id)?;
+        let file_state = lock(&registered.handle).file_state.clone();
+        let mut file_guard = lock(&file_state);
         let peer_handles = lock(&self.handles)
             .iter()
-            .filter(|(other_id, _)| other_id.as_str() != id)
-            .map(|(_, peer)| Arc::clone(peer))
+            .filter(|(other_id, peer)| {
+                other_id.as_str() != id && peer.identity == registered.identity
+            })
+            .map(|(_, peer)| Arc::clone(&peer.handle))
             .collect::<Vec<_>>();
-        let mut handle = lock(&handle);
+        let mut handle = lock(&registered.handle);
         let metadata = handle
             .plaintext
             .metadata()
@@ -498,6 +581,9 @@ impl LocalBroker {
         let current = PlaintextIdentity::from_metadata(&metadata);
         for range in ranges {
             handle.pending_writes.insert(range);
+        }
+        if !handle.pending_writes.ranges.is_empty() {
+            handle.pending_since.get_or_insert_with(Instant::now);
         }
         let mut candidates = handle.pending_writes.clone();
         if include_potential {
@@ -537,11 +623,10 @@ impl LocalBroker {
                 "local filesystem handle is not writable",
             ));
         }
-        let identity = handle.identity;
         let mut peers = Vec::new();
         for peer in peer_handles {
             let local = lock(&peer);
-            if local.identity != identity || local.references == 0 {
+            if local.references == 0 {
                 continue;
             }
             let plaintext = local
@@ -563,6 +648,7 @@ impl LocalBroker {
             });
         }
         let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
+        let mut mutated = false;
         for range in ranges {
             let start = range.start.min(length);
             let end = range.end.min(length);
@@ -582,6 +668,7 @@ impl LocalBroker {
                     .map_err(|error| {
                         BrokerError::anyhow("failed to encrypt local file range", error)
                     })?;
+                mutated = true;
                 for peer in &peers {
                     for visible in peer.protected.uncovered(offset, offset + count as u64) {
                         let start = usize::try_from(visible.start - offset)
@@ -600,13 +687,17 @@ impl LocalBroker {
             handle.encrypted.set_len(length).map_err(|error| {
                 BrokerError::anyhow("failed to resize encrypted local file", error)
             })?;
+            mutated = true;
         }
-        if durable {
+        file_guard.needs_durable_sync |= mutated;
+        if durable && file_guard.needs_durable_sync {
             handle.encrypted.sync_all().map_err(|error| {
                 BrokerError::anyhow("failed to sync encrypted local file", error)
             })?;
+            file_guard.needs_durable_sync = false;
         }
         handle.pending_writes = handle.pending_writes.intersection(&active);
+        handle.pending_since = (!handle.pending_writes.ranges.is_empty()).then(Instant::now);
         if include_potential && length_stable {
             handle.potentially_dirty.ranges.clear();
         }
@@ -647,8 +738,8 @@ impl LocalBroker {
 
     fn activate(&self, id: &str) -> Result<(), BrokerError> {
         let handles = lock(&self.handles);
-        let handle = handles.get(id).ok_or_else(BrokerError::bad_descriptor)?;
-        let mut handle = lock(handle);
+        let registered = handles.get(id).ok_or_else(BrokerError::bad_descriptor)?;
+        let mut handle = lock(&registered.handle);
         if handle.references == 0 {
             handle.references = 1;
             handle.closed_at = None;
@@ -656,11 +747,31 @@ impl LocalBroker {
         Ok(())
     }
 
-    fn lookup_handle(&self, id: &str) -> Result<Arc<Mutex<LocalHandle>>, BrokerError> {
+    fn lookup_handle(&self, id: &str) -> Result<RegisteredHandle, BrokerError> {
         lock(&self.handles)
             .get(id)
             .cloned()
             .ok_or_else(BrokerError::bad_descriptor)
+    }
+
+    fn has_live_peer(&self, id: &str, identity: FileIdentity) -> bool {
+        !self.live_handle_ids(identity, Some(id)).is_empty()
+    }
+
+    fn live_handle_ids(&self, identity: FileIdentity, exclude: Option<&str>) -> Vec<String> {
+        lock(&self.handles)
+            .iter()
+            .filter_map(|(id, registered)| {
+                if exclude == Some(id.as_str()) {
+                    return None;
+                }
+                if registered.identity != identity {
+                    return None;
+                }
+                let handle = lock(&registered.handle);
+                (handle.references != 0).then(|| id.clone())
+            })
+            .collect()
     }
 
     fn reject_descriptor(descriptor: Option<OwnedFd>) -> Result<(), BrokerError> {
@@ -687,9 +798,9 @@ impl LocalBroker {
         let mut handles = lock(&self.handles);
         let mut expired = Vec::new();
         let mut retained = Vec::new();
-        for (id, handle) in handles.iter() {
+        for (id, registered) in handles.iter() {
             let (references, closed_at) = {
-                let local = lock(handle);
+                let local = lock(&registered.handle);
                 (local.references, local.closed_at)
             };
             if references != 0 {

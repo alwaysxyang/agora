@@ -79,7 +79,7 @@ fn client_rejects_mismatched_and_descriptor_bearing_responses() {
         });
         let client = LocalClient::new(&socket, "token");
 
-        let error = client.close("handle").unwrap_err();
+        let error = client.close("handle", Vec::new()).unwrap_err();
 
         assert_eq!(error.errno(), libc::EPROTO);
         server.join().unwrap();
@@ -104,7 +104,7 @@ fn client_rejects_unexpected_success_shapes_and_maps_broker_errors() {
         )
     });
     let client = LocalClient::new(&socket, "token");
-    let error = client.close("handle").unwrap_err();
+    let error = client.close("handle", Vec::new()).unwrap_err();
     assert_eq!(error.errno(), libc::EPROTO);
     server.join().unwrap();
 
@@ -125,7 +125,7 @@ fn client_rejects_unexpected_success_shapes_and_maps_broker_errors() {
         )
     });
     let client = LocalClient::new(&socket, "token");
-    let error = client.close("handle").unwrap_err();
+    let error = client.close("handle", Vec::new()).unwrap_err();
     assert_eq!(error.errno(), libc::ENOSPC);
     assert_eq!(error.to_string(), "disk full");
     server.join().unwrap();
@@ -161,7 +161,7 @@ fn client_open_validates_its_response_and_missing_sockets_keep_errno() {
     server.join().unwrap();
 
     let missing = LocalClient::new(runtime.path().join("missing.sock"), "token");
-    let error = missing.close("handle").unwrap_err();
+    let error = missing.close("handle", Vec::new()).unwrap_err();
     assert_eq!(error.errno(), libc::ENOENT);
     assert!(error.to_string().contains("connect"));
     assert!(format!("{error:?}").contains("LocalClientError"));

@@ -1,7 +1,8 @@
 use super::ExecutionController;
 use super::protocol::{
-    EXECUTION_PROTOCOL_VERSION, PrepareRequest, PrepareResponse, decode_prepare_request,
-    decode_prepare_response, encode_prepare_request, encode_prepare_response, frame_length,
+    EXECUTION_PROTOCOL_VERSION, ExecutionRequest, PrepareRequest, PrepareResponse,
+    decode_prepare_request, decode_prepare_response, decode_request, encode_ping_request,
+    encode_prepare_request, encode_prepare_response, frame_length,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -40,6 +41,12 @@ fn body(frame: &[u8]) -> &[u8] {
 
 #[test]
 fn execution_prepare_protocol_preserves_paths() {
+    assert_eq!(
+        decode_request(body(&encode_ping_request("token").unwrap())).unwrap(),
+        ExecutionRequest::Ping {
+            token: "token".to_string(),
+        }
+    );
     let request = encode_prepare_request("token", Path::new("/tmp/客户端")).unwrap();
     assert_eq!(
         decode_prepare_request(body(&request)).unwrap(),
@@ -54,6 +61,13 @@ fn execution_prepare_protocol_preserves_paths() {
     assert_eq!(
         decode_prepare_response(body(&response)).unwrap(),
         PrepareResponse::Ready(PathBuf::from("/tmp/agora/curl"))
+    );
+    assert_eq!(
+        decode_prepare_response(body(
+            &encode_prepare_response(&PrepareResponse::Accepted).unwrap()
+        ))
+        .unwrap(),
+        PrepareResponse::Accepted
     );
 }
 
@@ -88,10 +102,10 @@ fn execution_prepare_protocol_rejects_malformed_requests() {
 
     let mut invalid_lengths =
         body(&encode_prepare_request("token", Path::new("/bin/sh")).unwrap()).to_vec();
-    invalid_lengths[2..4].copy_from_slice(&0_u16.to_be_bytes());
+    invalid_lengths[3..5].copy_from_slice(&0_u16.to_be_bytes());
     assert!(decode_prepare_request(&invalid_lengths).is_err());
 
-    let mut invalid_token = [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0xff, b'x'];
+    let mut invalid_token = [0, 0, 1, 0, 1, 0, 0, 0, 1, 0xff, b'x'];
     invalid_token[..2].copy_from_slice(&EXECUTION_PROTOCOL_VERSION.to_be_bytes());
     assert!(decode_prepare_request(&invalid_token).is_err());
 }
@@ -108,16 +122,16 @@ fn execution_prepare_protocol_rejects_malformed_responses() {
     assert!(decode_prepare_response(&invalid_length).is_err());
 
     let mut invalid_status = body(&ready).to_vec();
-    invalid_status[2] = 2;
+    invalid_status[2] = 3;
     assert!(decode_prepare_response(&invalid_status).is_err());
 
-    let mut invalid_error = [0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 1, 0xff];
+    let mut invalid_error = [0, 0, 2, 0, 0, 0, 5, 0, 0, 0, 1, 0xff];
     invalid_error[..2].copy_from_slice(&EXECUTION_PROTOCOL_VERSION.to_be_bytes());
     assert!(decode_prepare_response(&invalid_error).is_err());
-    let mut truncated_error = [0, 0, 1, 0, 0, 0, 3, 0, 0, 0];
+    let mut truncated_error = [0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
     truncated_error[..2].copy_from_slice(&EXECUTION_PROTOCOL_VERSION.to_be_bytes());
     assert!(decode_prepare_response(&truncated_error).is_err());
-    let mut invalid_errno = [0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 0];
+    let mut invalid_errno = [0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 0];
     invalid_errno[..2].copy_from_slice(&EXECUTION_PROTOCOL_VERSION.to_be_bytes());
     assert!(decode_prepare_response(&invalid_errno).is_err());
 
@@ -254,6 +268,45 @@ async fn execution_controller_closes_an_idle_handshake() {
         .expect("idle execution handshake was not closed before the timeout");
 
     assert_eq!(read.unwrap(), 0);
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn execution_controller_keeps_an_authenticated_control_stream() {
+    let root = TestDirectory::new();
+    let controller = ExecutionController::start(root.cache()).await.unwrap();
+    let mut stream = TcpStream::connect(controller.runtime().control())
+        .await
+        .unwrap();
+    stream
+        .write_all(&encode_ping_request(controller.runtime().token()).unwrap())
+        .await
+        .unwrap();
+    let mut prefix = [0_u8; 4];
+    stream.read_exact(&mut prefix).await.unwrap();
+    let mut response = vec![0_u8; frame_length(prefix).unwrap()];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(
+        decode_prepare_response(&response).unwrap(),
+        PrepareResponse::Accepted
+    );
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    stream
+        .write_all(
+            &encode_prepare_request(controller.runtime().token(), Path::new("/bin/sh")).unwrap(),
+        )
+        .await
+        .unwrap();
+    stream.read_exact(&mut prefix).await.unwrap();
+    let mut response = vec![0_u8; frame_length(prefix).unwrap()];
+    stream.read_exact(&mut response).await.unwrap();
+    assert!(matches!(
+        decode_prepare_response(&response).unwrap(),
+        PrepareResponse::Ready(_)
+    ));
+
+    drop(stream);
     controller.shutdown().await.unwrap();
 }
 

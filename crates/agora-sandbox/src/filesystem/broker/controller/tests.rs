@@ -3,6 +3,7 @@ use crate::filesystem::broker::LocalClient;
 use crate::filesystem::broker::protocol::{
     BackingPath, ByteRange, Request, RequestEnvelope, Response, ResponseEnvelope,
 };
+use crate::ipc::{InheritedControlLock, InheritedControlStream};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
@@ -68,8 +69,8 @@ async fn controller_serves_the_complete_local_client_lifecycle() {
             .sync(&opened.handle, vec![ByteRange::new(0, 3).unwrap()], false)
             .unwrap();
         client.retain(vec![opened.handle.clone()]).unwrap();
-        client.close(&opened.handle).unwrap();
-        client.close(&opened.handle).unwrap();
+        client.close(&opened.handle, Vec::new()).unwrap();
+        client.close(&opened.handle, Vec::new()).unwrap();
         opened.handle
     })
     .await
@@ -86,6 +87,28 @@ async fn controller_serves_the_complete_local_client_lifecycle() {
     restored.read_to_string(&mut contents).unwrap();
     assert_eq!(contents, "after!");
     assert!(!runtime.join("local-filesystem.sock").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_local_control_stream_survives_new_connection_denial() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fs");
+    std::fs::create_dir(&root).unwrap();
+    let controller = LocalController::start(&root, cipher(), &directory.path().join("runtime"))
+        .await
+        .unwrap();
+    let socket = controller.runtime().socket().to_path_buf();
+    let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    let shared =
+        InheritedControlStream::new(stream, InheritedControlLock::anonymous().unwrap(), 0).unwrap();
+    let client = LocalClient::with_shared(&socket, controller.runtime().token(), shared);
+
+    client.ping_shared().unwrap();
+    std::fs::remove_file(&socket).unwrap();
+    client.close("missing", Vec::new()).unwrap();
+
+    drop(client);
+    controller.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -196,6 +219,7 @@ async fn server_shutdown_waits_for_an_accepted_request() {
                 request_id: "0".repeat(32),
                 request: Request::Close {
                     handle: "missing".to_string(),
+                    ranges: Vec::new(),
                 },
             },
             None,
@@ -219,7 +243,7 @@ async fn controller_rejects_wrong_tokens_versions_and_unexpected_descriptors() {
         .unwrap();
 
     let wrong = LocalClient::new(controller.runtime().socket(), "wrong");
-    let error = tokio::task::spawn_blocking(move || wrong.close("missing"))
+    let error = tokio::task::spawn_blocking(move || wrong.close("missing", Vec::new()))
         .await
         .unwrap()
         .unwrap_err();
@@ -241,6 +265,7 @@ async fn controller_rejects_wrong_tokens_versions_and_unexpected_descriptors() {
                 request_id: "old-version".to_string(),
                 request: Request::Close {
                     handle: "missing".to_string(),
+                    ranges: Vec::new(),
                 },
             },
             Some(tempfile::tempfile().unwrap().as_raw_fd()),
@@ -268,6 +293,7 @@ async fn controller_rejects_wrong_tokens_versions_and_unexpected_descriptors() {
                 request_id: "not-a-request-id".to_string(),
                 request: Request::Close {
                     handle: "missing".to_string(),
+                    ranges: Vec::new(),
                 },
             },
             None,

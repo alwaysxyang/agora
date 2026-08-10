@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 2;
+pub(crate) const PROTOCOL_VERSION: u16 = 4;
 
 pub(crate) fn valid_request_id(value: &str) -> bool {
     value.len() == 32
@@ -31,6 +31,7 @@ pub(crate) struct ResponseEnvelope {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub(crate) enum Request {
+    Ping,
     Open {
         path: BackingPath,
         writable: bool,
@@ -72,6 +73,7 @@ pub(crate) enum Request {
     },
     Close {
         handle: String,
+        ranges: Vec<ByteRange>,
     },
 }
 

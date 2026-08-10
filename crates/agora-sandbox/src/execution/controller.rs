@@ -1,5 +1,5 @@
 use super::protocol::{
-    PrepareResponse, decode_prepare_request, encode_prepare_response, frame_length,
+    ExecutionRequest, PrepareResponse, decode_request, encode_prepare_response, frame_length,
 };
 use super::store::ExecutableStore;
 use crate::filesystem::FileCipher;
@@ -194,32 +194,68 @@ impl ExecutionServer {
             tokio::time::timeout(EXECUTION_HANDSHAKE_TIMEOUT, Self::read_frame(&mut stream))
                 .await
                 .context("sandbox execution handshake timed out")??;
-        let request = decode_prepare_request(&frame)?;
-        let response = if request.token != state.token {
+        let (ping, authenticated) = Self::respond(&mut stream, &state, frame).await?;
+        if !ping || !authenticated {
+            stream.shutdown().await?;
+            return Ok(());
+        }
+        loop {
+            let frame = match Self::read_frame(&mut stream).await {
+                Ok(frame) => frame,
+                Err(error) if disconnected(&error) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            let (_, authenticated) = Self::respond(&mut stream, &state, frame).await?;
+            if !authenticated {
+                stream.shutdown().await?;
+                return Ok(());
+            }
+        }
+    }
+
+    async fn respond(
+        stream: &mut TcpStream,
+        state: &ExecutionState,
+        frame: Vec<u8>,
+    ) -> Result<(bool, bool)> {
+        let request = decode_request(&frame)?;
+        let ping = matches!(&request, ExecutionRequest::Ping { .. });
+        let token = match &request {
+            ExecutionRequest::Ping { token } => token,
+            ExecutionRequest::Prepare(request) => &request.token,
+        };
+        let authenticated = token == &state.token;
+        let response = if !authenticated {
             PrepareResponse::Error {
                 errno: libc::EACCES,
                 message: "invalid execution token".to_string(),
             }
         } else {
-            let store = Arc::clone(&state.store);
-            let executable = request.executable;
-            match tokio::task::spawn_blocking(move || lock(&store).prepare(&executable)).await {
-                Ok(Ok(path)) => PrepareResponse::Ready(path),
-                Ok(Err(error)) => PrepareResponse::Error {
-                    errno: preparation_errno(&error),
-                    message: format!("{error:#}"),
-                },
-                Err(error) => PrepareResponse::Error {
-                    errno: libc::EIO,
-                    message: format!("sandbox executable preparation task failed: {error}"),
-                },
+            match request {
+                ExecutionRequest::Ping { .. } => PrepareResponse::Accepted,
+                ExecutionRequest::Prepare(request) => {
+                    let store = Arc::clone(&state.store);
+                    let executable = request.executable;
+                    match tokio::task::spawn_blocking(move || lock(&store).prepare(&executable))
+                        .await
+                    {
+                        Ok(Ok(path)) => PrepareResponse::Ready(path),
+                        Ok(Err(error)) => PrepareResponse::Error {
+                            errno: preparation_errno(&error),
+                            message: format!("{error:#}"),
+                        },
+                        Err(error) => PrepareResponse::Error {
+                            errno: libc::EIO,
+                            message: format!("sandbox executable preparation task failed: {error}"),
+                        },
+                    }
+                }
             }
         };
         stream
             .write_all(&encode_prepare_response(&response)?)
             .await?;
-        stream.shutdown().await?;
-        Ok(())
+        Ok((ping, authenticated))
     }
 
     async fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {
@@ -229,6 +265,18 @@ impl ExecutionServer {
         stream.read_exact(&mut frame).await?;
         Ok(frame)
     }
+}
+
+fn disconnected(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+        )
+    })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

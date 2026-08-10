@@ -311,6 +311,12 @@ unsafe fn sandbox_fstat(descriptor: libc::c_int, status: *mut libc::stat) -> lib
                 }
             };
             unsafe { patch_stat(&mut *status, None, attributes.as_ref()) };
+            if let Some(identity) = open.identity {
+                unsafe {
+                    (*status).st_dev = identity.device as _;
+                    (*status).st_ino = identity.inode;
+                }
+            }
         }
         if result == 0 {
             unsafe { set_errno(caller_errno) };

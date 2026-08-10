@@ -226,15 +226,15 @@ pub unsafe extern "C" fn agora_sandbox_connect(
         Ok(None) => return unsafe { original(socket, address, length) },
         Err(()) => return -1,
     };
+    if config::global().is_some_and(|config| config.is_internal(destination)) {
+        return unsafe { original(socket, address, length) };
+    }
     if !initialized() {
         return unsafe { HookRuntime::deny() };
     }
     let Some(runtime) = HookRuntime::global() else {
         return unsafe { HookRuntime::deny() };
     };
-    if runtime.config.is_internal(destination) {
-        return unsafe { original(socket, address, length) };
-    }
     let Some(connectx) = original_connectx() else {
         return unsafe { HookRuntime::deny() };
     };
@@ -294,13 +294,7 @@ pub unsafe extern "C" fn agora_sandbox_connectx(
         }
         Err(()) => return -1,
     };
-    if !initialized() {
-        return unsafe { HookRuntime::deny() };
-    }
-    let Some(runtime) = HookRuntime::global() else {
-        return unsafe { HookRuntime::deny() };
-    };
-    if runtime.config.is_internal(destination) {
+    if config::global().is_some_and(|config| config.is_internal(destination)) {
         return unsafe {
             original(
                 socket,
@@ -314,6 +308,12 @@ pub unsafe extern "C" fn agora_sandbox_connectx(
             )
         };
     }
+    if !initialized() {
+        return unsafe { HookRuntime::deny() };
+    }
+    let Some(runtime) = HookRuntime::global() else {
+        return unsafe { HookRuntime::deny() };
+    };
     let simple = association_id == 0
         && flags == 0
         && vector_count == 0

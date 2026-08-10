@@ -9,13 +9,12 @@ use super::set_errno;
 use crate::audit::{AuditClient, AuditEventRequest};
 use crate::callback::{CommandContext, ProcessContext, ProcessOperation};
 use crate::execution::{
-    DEFAULT_EXECUTABLE_PATH, PrepareResponse, decode_prepare_response, encode_prepare_request,
-    frame_length, resolve_shebang,
+    DEFAULT_EXECUTABLE_PATH, PrepareResponse, encode_prepare_request, resolve_shebang,
 };
 use crate::trace::TraceContext;
 use std::cell::Cell;
 use std::ffi::{CStr, CString, OsStr, OsString};
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
@@ -83,6 +82,7 @@ struct PreparedExecutable {
 struct PrepareError {
     errno: libc::c_int,
     message: String,
+    transport: bool,
 }
 
 impl PrepareError {
@@ -90,6 +90,7 @@ impl PrepareError {
         Self {
             errno,
             message: message.into(),
+            transport: false,
         }
     }
 
@@ -105,7 +106,11 @@ impl PrepareError {
 
 impl From<io::Error> for PrepareError {
     fn from(error: io::Error) -> Self {
-        Self::new(io_errno(&error), error.to_string())
+        Self {
+            errno: io_errno(&error),
+            message: error.to_string(),
+            transport: true,
+        }
     }
 }
 
@@ -229,6 +234,9 @@ impl ChildEnvironment {
             entry.extend_from_slice(value.as_bytes());
             values.push(CString::new(entry).ok()?);
         }
+        for (key, value) in super::control::child_environment() {
+            values.push(CString::new(format!("{key}={value}")).ok()?);
+        }
         if let Some(descriptors) = super::filesystem::inherited_local_descriptors() {
             values.push(CString::new(format!("{INHERITED_LOCAL_DESCRIPTORS}={descriptors}")).ok()?);
         }
@@ -280,9 +288,15 @@ impl ProcessHookRuntime {
         RUNTIME
             .get_or_init(|| {
                 config::global().cloned().map(|config| Self {
-                    audit: Some(AuditClient::new(
-                        config.audit_control(),
-                        config.audit_token(),
+                    audit: Some(super::control::audit().map_or_else(
+                        || AuditClient::new(config.audit_control(), config.audit_token()),
+                        |shared| {
+                            AuditClient::with_shared(
+                                config.audit_control(),
+                                config.audit_token(),
+                                shared,
+                            )
+                        },
                     )),
                     config,
                 })
@@ -291,18 +305,24 @@ impl ProcessHookRuntime {
     }
 
     fn prepare(&self, executable: &Path) -> Result<CString, PrepareError> {
-        let mut stream = TcpStream::connect(self.config.execution_control())?;
-        let timeout = Some(Duration::from_secs(30));
-        stream.set_read_timeout(timeout)?;
-        stream.set_write_timeout(timeout)?;
-        let request = encode_prepare_request(self.config.execution_token(), executable)?;
-        stream.write_all(&request)?;
-        let mut prefix = [0_u8; 4];
-        stream.read_exact(&mut prefix)?;
-        let length = frame_length(prefix)?;
-        let mut frame = vec![0_u8; length];
-        stream.read_exact(&mut frame)?;
-        match decode_prepare_response(&frame)? {
+        let request = encode_prepare_request(self.config.execution_token(), executable)
+            .map_err(|error| PrepareError::new(io_errno(&error), error.to_string()))?;
+        let response = match self.prepare_fresh(&request) {
+            Err(error) if error.transport => {
+                let Some(shared) = super::control::execution() else {
+                    return Err(error);
+                };
+                shared
+                    .transact(|stream| super::control::execution_request(stream, &request))
+                    .map_err(PrepareError::from)??
+            }
+            result => result?,
+        };
+        match response {
+            PrepareResponse::Accepted => Err(PrepareError::new(
+                libc::EPROTO,
+                "execution preparation returned a handshake response",
+            )),
             PrepareResponse::Ready(path) => {
                 CString::new(path.as_os_str().as_bytes()).map_err(|_| {
                     PrepareError::new(libc::EINVAL, "prepared executable path contains NUL")
@@ -310,6 +330,14 @@ impl ProcessHookRuntime {
             }
             PrepareResponse::Error { errno, message } => Err(PrepareError::new(errno, message)),
         }
+    }
+
+    fn prepare_fresh(&self, request: &[u8]) -> Result<PrepareResponse, PrepareError> {
+        let mut stream = TcpStream::connect(self.config.execution_control())?;
+        let timeout = Some(Duration::from_secs(30));
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
+        super::control::execution_request(&mut stream, request).map_err(PrepareError::from)
     }
 
     fn prepare_executable(&self, executable: &Path) -> Result<PreparedExecutable, PrepareError> {

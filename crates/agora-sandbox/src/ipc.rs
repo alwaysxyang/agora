@@ -1,14 +1,217 @@
 //! Unix socket framing and descriptor transfer shared by sandbox brokers.
 
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+#[cfg(target_os = "macos")]
+use std::cell::UnsafeCell;
+#[cfg(all(target_os = "macos", any(agora_sandbox_hook_build, test, coverage)))]
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 pub(crate) const MAX_FRAME_SIZE: usize = 1024 * 1024;
 const FRAME_MARKER: u8 = 0;
+
+#[cfg(target_os = "macos")]
+pub(crate) struct InheritedControlLock {
+    descriptor: OwnedFd,
+}
+
+#[cfg(target_os = "macos")]
+impl InheritedControlLock {
+    #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+    pub(crate) fn anonymous() -> io::Result<Arc<Self>> {
+        let file = tempfile::tempfile()?;
+        Self::from_file(file)
+    }
+
+    #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+    pub(crate) unsafe fn from_raw_descriptor(descriptor: RawFd) -> io::Result<Arc<Self>> {
+        if descriptor < 0 || unsafe { libc::fcntl(descriptor, libc::F_GETFD) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Self::from_owned_descriptor(unsafe { OwnedFd::from_raw_fd(descriptor) })
+    }
+
+    #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+    fn from_file(file: File) -> io::Result<Arc<Self>> {
+        Self::from_owned_descriptor(file.into())
+    }
+
+    #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+    pub(crate) fn from_owned_descriptor(descriptor: OwnedFd) -> io::Result<Arc<Self>> {
+        make_inheritable(descriptor.as_raw_fd())?;
+        Ok(Arc::new(Self { descriptor }))
+    }
+
+    pub(crate) fn descriptor(&self) -> RawFd {
+        self.descriptor.as_raw_fd()
+    }
+
+    fn lock(&self, slot: i64) -> io::Result<InheritedControlLockGuard<'_>> {
+        set_record_lock(self.descriptor(), slot, libc::F_WRLCK, libc::F_SETLKW)?;
+        Ok(InheritedControlLockGuard { lock: self, slot })
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct InheritedControlLockGuard<'a> {
+    lock: &'a InheritedControlLock,
+    slot: i64,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for InheritedControlLockGuard<'_> {
+    fn drop(&mut self) {
+        let _ = set_record_lock(
+            self.lock.descriptor(),
+            self.slot,
+            libc::F_UNLCK,
+            libc::F_SETLK,
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct InheritedControlStream<S> {
+    stream: UnsafeCell<S>,
+    mutex: UnsafeCell<libc::pthread_mutex_t>,
+    lock: Arc<InheritedControlLock>,
+    slot: i64,
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl<S: Send> Send for InheritedControlStream<S> {}
+#[cfg(target_os = "macos")]
+unsafe impl<S: Send> Sync for InheritedControlStream<S> {}
+
+#[cfg(target_os = "macos")]
+impl<S> InheritedControlStream<S>
+where
+    S: AsRawFd,
+{
+    #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+    pub(crate) fn new(
+        stream: S,
+        lock: Arc<InheritedControlLock>,
+        slot: i64,
+    ) -> io::Result<Arc<Self>> {
+        make_inheritable(stream.as_raw_fd())?;
+        Ok(Arc::new(Self {
+            stream: UnsafeCell::new(stream),
+            mutex: UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER),
+            lock,
+            slot,
+        }))
+    }
+
+    pub(crate) fn descriptor(&self) -> RawFd {
+        unsafe { &*self.stream.get() }.as_raw_fd()
+    }
+
+    pub(crate) fn transact<T>(&self, operation: impl FnOnce(&mut S) -> T) -> io::Result<T> {
+        let _mutex = RawMutexGuard::lock(self.mutex.get())?;
+        let _process = self.lock.lock(self.slot)?;
+        Ok(operation(unsafe { &mut *self.stream.get() }))
+    }
+
+    #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+    pub(crate) unsafe fn reset_after_fork(&self) {
+        unsafe {
+            std::ptr::write(self.mutex.get(), libc::PTHREAD_MUTEX_INITIALIZER);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl<S> std::fmt::Debug for InheritedControlStream<S>
+where
+    S: AsRawFd,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InheritedControlStream")
+            .field("descriptor", &self.descriptor())
+            .field("slot", &self.slot)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl<S> Drop for InheritedControlStream<S> {
+    fn drop(&mut self) {
+        unsafe {
+            libc::pthread_mutex_destroy(self.mutex.get());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct RawMutexGuard {
+    mutex: *mut libc::pthread_mutex_t,
+}
+
+#[cfg(target_os = "macos")]
+impl RawMutexGuard {
+    fn lock(mutex: *mut libc::pthread_mutex_t) -> io::Result<Self> {
+        let result = unsafe { libc::pthread_mutex_lock(mutex) };
+        if result == 0 {
+            Ok(Self { mutex })
+        } else {
+            Err(io::Error::from_raw_os_error(result))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for RawMutexGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::pthread_mutex_unlock(self.mutex);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
+fn make_inheritable(descriptor: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn set_record_lock(
+    descriptor: RawFd,
+    slot: i64,
+    lock_type: libc::c_short,
+    command: libc::c_int,
+) -> io::Result<()> {
+    let mut lock = libc::flock {
+        l_start: slot,
+        l_len: 1,
+        l_pid: 0,
+        l_type: lock_type,
+        l_whence: libc::SEEK_SET as libc::c_short,
+    };
+    loop {
+        if unsafe { libc::fcntl(descriptor, command, &raw mut lock) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
 
 pub(crate) fn send<T: Serialize>(
     stream: &mut UnixStream,

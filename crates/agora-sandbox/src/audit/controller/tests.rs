@@ -1,5 +1,5 @@
 use super::*;
-use crate::audit::protocol::encode_request;
+use crate::audit::protocol::{decode_response, encode_ping_request, encode_request};
 use crate::callback::{Decision, FileAccessMode, FileContext, FileOpenMode, ProcessContext};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -150,6 +150,74 @@ async fn audit_server_times_out_idle_established_connections() {
         .unwrap()
         .unwrap_err();
     assert!(error.to_string().contains("connection timed out"));
+}
+
+#[tokio::test]
+async fn audit_server_keeps_an_authenticated_control_stream() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(address).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let state = Arc::new(AuditState {
+        token: "token".to_string(),
+        sandbox_id: "sandbox".to_string(),
+        run_id: "run".to_string(),
+        callback: |_| std::future::ready(Decision::Allow),
+        callback_timeout: Duration::from_secs(1),
+        requests: Mutex::new(AuditRequestCache::default()),
+    });
+    let task = tokio::spawn(AuditServer::handle_with_timeouts(
+        server,
+        state,
+        Duration::from_secs(1),
+        Duration::from_millis(20),
+    ));
+    client
+        .write_all(&encode_ping_request("token").unwrap())
+        .await
+        .unwrap();
+    let mut prefix = [0_u8; 4];
+    client.read_exact(&mut prefix).await.unwrap();
+    let mut response = vec![0_u8; frame_length(prefix).unwrap()];
+    client.read_exact(&mut response).await.unwrap();
+    assert_eq!(decode_response(&response).unwrap(), AuditResponse::Accepted);
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    client
+        .write_all(
+            &encode_request(
+                "token",
+                AuditEventRequest::File {
+                    trace_id: "trace".to_string(),
+                    process: ProcessContext {
+                        pid: 1,
+                        ppid: 0,
+                        executable: "/bin/tool".to_string(),
+                    },
+                    operation: FileOperation::Open,
+                    file: FileContext {
+                        path: "/tmp/file".to_string(),
+                        mode: FileOpenMode {
+                            access: FileAccessMode::Read,
+                            create: false,
+                            truncate: false,
+                            append: false,
+                            exclusive: false,
+                        },
+                    },
+                },
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    client.read_exact(&mut prefix).await.unwrap();
+    let mut response = vec![0_u8; frame_length(prefix).unwrap()];
+    client.read_exact(&mut response).await.unwrap();
+    assert_eq!(decode_response(&response).unwrap(), AuditResponse::Accepted);
+
+    drop(client);
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]

@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use crate::ipc::InheritedControlStream;
 use crate::nfs::protocol::{
     PROTOCOL_VERSION, REMOTE_CLIENT_TIMEOUT, Request, RequestEnvelope, RequestId, Response,
     ResponseEnvelope,
@@ -11,6 +13,8 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
 use std::time::Duration;
 
 const REMOTE_REQUEST_ATTEMPTS: usize = 2;
@@ -20,6 +24,8 @@ pub(crate) struct RemoteClient {
     socket: PathBuf,
     token: String,
     timeout: Duration,
+    #[cfg(target_os = "macos")]
+    shared: Option<Arc<InheritedControlStream<UnixStream>>>,
 }
 
 impl RemoteClient {
@@ -36,6 +42,34 @@ impl RemoteClient {
             socket: socket.into(),
             token: token.into(),
             timeout,
+            #[cfg(target_os = "macos")]
+            shared: None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_shared(
+        socket: impl Into<PathBuf>,
+        token: impl Into<String>,
+        shared: Arc<InheritedControlStream<UnixStream>>,
+    ) -> Self {
+        let mut client = Self::new(socket, token);
+        client.shared = Some(shared);
+        client
+    }
+
+    #[cfg(all(target_os = "macos", any(agora_sandbox_hook_build, test, coverage)))]
+    pub(crate) fn ping_shared(&self) -> Result<(), RemoteClientError> {
+        let request_id = RequestId::new(uuid::Uuid::new_v4().simple().to_string())
+            .expect("UUID is a valid remote request ID");
+        let reply = self.request_shared(request_id, Request::Ping)?;
+        if reply.response == Response::Success && reply.descriptor.is_none() {
+            Ok(())
+        } else {
+            Err(RemoteClientError::new(
+                libc::EPROTO,
+                "remote filesystem ping returned an unexpected response",
+            ))
         }
     }
 
@@ -89,9 +123,20 @@ impl RemoteClient {
         request_id: RequestId,
         request: Request,
     ) -> Result<RemoteReply, RemoteClientError> {
-        let mut stream = UnixStream::connect(&self.socket).map_err(|error| {
-            RemoteClientError::io("failed to connect to remote broker", error, true)
-        })?;
+        let mut stream = match UnixStream::connect(&self.socket) {
+            Ok(stream) => stream,
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                if self.shared.is_some() {
+                    return self.request_shared(request_id, request);
+                }
+                return Err(RemoteClientError::io(
+                    "failed to connect to remote broker",
+                    error,
+                    true,
+                ));
+            }
+        };
         stream
             .set_read_timeout(Some(self.timeout))
             .map_err(|error| {
@@ -102,16 +147,48 @@ impl RemoteClient {
             .map_err(|error| {
                 RemoteClientError::io("failed to configure remote broker", error, false)
             })?;
+        Self::exchange(&mut stream, &self.token, request_id, request)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn request_shared(
+        &self,
+        request_id: RequestId,
+        request: Request,
+    ) -> Result<RemoteReply, RemoteClientError> {
+        let shared = self.shared.as_ref().ok_or_else(|| {
+            RemoteClientError::new(
+                libc::ENOTCONN,
+                "shared remote filesystem control stream is unavailable",
+            )
+        })?;
+        shared
+            .transact(|stream| Self::exchange(stream, &self.token, request_id, request))
+            .map_err(|error| {
+                RemoteClientError::io(
+                    "failed to serialize inherited remote filesystem request",
+                    error,
+                    true,
+                )
+            })?
+    }
+
+    fn exchange(
+        stream: &mut UnixStream,
+        token: &str,
+        request_id: RequestId,
+        request: Request,
+    ) -> Result<RemoteReply, RemoteClientError> {
         let request = RequestEnvelope {
             version: PROTOCOL_VERSION,
-            token: self.token.clone(),
+            token: token.to_string(),
             request_id: request_id.clone(),
             request,
         };
-        transport::send(&mut stream, &request, None)
+        transport::send(stream, &request, None)
             .map_err(|error| RemoteClientError::io("failed to send remote request", error, true))?;
         let (response, descriptor) =
-            transport::receive::<ResponseEnvelope>(&mut stream).map_err(|error| {
+            transport::receive::<ResponseEnvelope>(stream).map_err(|error| {
                 RemoteClientError::io("failed to receive remote response", error, true)
             })?;
         if response.version != PROTOCOL_VERSION {

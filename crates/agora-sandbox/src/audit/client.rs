@@ -1,10 +1,16 @@
+#[cfg(all(target_os = "macos", any(agora_sandbox_hook_build, test, coverage)))]
+use super::protocol::encode_ping_request;
 use super::protocol::{
     AuditEventRequest, AuditResponse, decode_response, encode_request, frame_length,
 };
+#[cfg(target_os = "macos")]
+use crate::ipc::InheritedControlStream;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
 use std::time::Duration;
 
 const AUDIT_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -28,6 +34,8 @@ thread_local! {
 #[derive(Clone, Debug)]
 pub(crate) struct AuditClient {
     endpoint: AuditEndpoint,
+    #[cfg(target_os = "macos")]
+    shared: Option<Arc<InheritedControlStream<TcpStream>>>,
 }
 
 impl AuditClient {
@@ -37,11 +45,39 @@ impl AuditClient {
                 control,
                 token: token.into(),
             },
+            #[cfg(target_os = "macos")]
+            shared: None,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_shared(
+        control: SocketAddr,
+        token: impl Into<String>,
+        shared: Arc<InheritedControlStream<TcpStream>>,
+    ) -> Self {
+        let mut client = Self::new(control, token);
+        client.shared = Some(shared);
+        client
     }
 
     pub(crate) fn publish(&self, event: AuditEventRequest) -> Result<(), AuditError> {
         let request = encode_request(&self.endpoint.token, event).map_err(AuditError::from_io)?;
+        let result = self.publish_regular(&request);
+        #[cfg(target_os = "macos")]
+        if result.as_ref().is_err_and(AuditError::disconnects) && self.shared.is_some() {
+            return self.publish_shared(&request);
+        }
+        result
+    }
+
+    #[cfg(all(target_os = "macos", any(agora_sandbox_hook_build, test, coverage)))]
+    pub(crate) fn ping_shared(&self) -> Result<(), AuditError> {
+        let request = encode_ping_request(&self.endpoint.token).map_err(AuditError::from_io)?;
+        self.publish_shared(&request)
+    }
+
+    fn publish_regular(&self, request: &[u8]) -> Result<(), AuditError> {
         CONNECTIONS
             .try_with(|connections| {
                 let mut connections = connections.borrow_mut();
@@ -67,7 +103,7 @@ impl AuditClient {
                             .get_mut(&self.endpoint)
                             .expect("audit connection was inserted")
                             .stream,
-                        &request,
+                        request,
                     );
                     if !result.as_ref().is_err_and(AuditError::disconnects) {
                         return result;
@@ -88,8 +124,20 @@ impl AuditClient {
             })
             .unwrap_or_else(|_| {
                 let mut stream = Self::connect(self.endpoint.control)?;
-                Self::publish_on(&mut stream, &request)
+                Self::publish_on(&mut stream, request)
             })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn publish_shared(&self, request: &[u8]) -> Result<(), AuditError> {
+        let shared = self.shared.as_ref().ok_or_else(|| AuditError {
+            errno: libc::ENOTCONN,
+            message: "shared audit control stream is unavailable".to_string(),
+            disconnect: true,
+        })?;
+        shared
+            .transact(|stream| Self::publish_on(stream, request))
+            .map_err(AuditError::from_io)?
     }
 
     fn connect(control: SocketAddr) -> Result<TcpStream, AuditError> {

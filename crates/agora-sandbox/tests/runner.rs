@@ -765,6 +765,50 @@ async fn a_second_open_sees_writes_from_a_live_encrypted_descriptor() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn sqlite_wal_transactions_survive_encrypted_reopen() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-sqlite-wal-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    let initialize = Sandbox::new(sandbox_config_in(&workdir), NoopCallback).run(
+        SandboxCommand::new("/usr/bin/sqlite3")
+            .args([
+                "-batch",
+                "-bail",
+                "state.db",
+                "PRAGMA journal_mode=WAL; CREATE TABLE entries(value TEXT NOT NULL); BEGIN IMMEDIATE; INSERT INTO entries VALUES('persisted'); COMMIT; PRAGMA wal_checkpoint(FULL);",
+            ])
+            .current_dir(&source),
+    );
+
+    let initialized = tokio::time::timeout(sandbox_lifecycle_timeout(20), initialize)
+        .await
+        .expect("SQLite WAL initialization timed out")
+        .unwrap();
+    assert!(initialized.status().success());
+
+    let verified = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(
+            SandboxCommand::new("/bin/sh")
+                .args([
+                    "-c",
+                    "test \"$(/usr/bin/sqlite3 -batch -bail state.db 'SELECT value FROM entries;')\" = persisted",
+                ])
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+
+    assert!(verified.status().success());
+    assert!(!source.join("state.db").exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn system_rm_removes_lower_entries_from_an_encrypted_workspace() {
     let directory = std::env::temp_dir().join(format!(
         "agora-sandbox-system-rm-test-{}",
@@ -1639,6 +1683,47 @@ fn process_audit_does_not_reject_a_large_argument() {
         .status()
         .unwrap();
     assert!(status.success());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cloexec_default_spawn_child_process() {
+    if std::env::var_os("AGORA_SANDBOX_TEST_CLOEXEC_SPAWN").is_none() {
+        return;
+    }
+
+    const POSIX_SPAWN_CLOEXEC_DEFAULT: libc::c_short = 0x4000;
+    let mut attributes: libc::posix_spawnattr_t = std::ptr::null_mut();
+    assert_eq!(unsafe { libc::posix_spawnattr_init(&mut attributes) }, 0);
+    assert_eq!(
+        unsafe { libc::posix_spawnattr_setflags(&mut attributes, POSIX_SPAWN_CLOEXEC_DEFAULT) },
+        0
+    );
+    let arguments = [
+        c"/bin/bash".as_ptr(),
+        c"-lc".as_ptr(),
+        c"printf cloexec-control-ok > \"$AGORA_SANDBOX_TEST_CLOEXEC_PATH\" || { printf 'write failed: %s\\n' \"$?\" >&2; exit 21; }; value=$(cat \"$AGORA_SANDBOX_TEST_CLOEXEC_PATH\"); status=$?; printf 'cat status=%s value=<%s>\\n' \"$status\" \"$value\" >&2; test \"$status\" = 0 && test \"$value\" = cloexec-control-ok".as_ptr(),
+        std::ptr::null(),
+    ];
+    let environment = unsafe { *libc::_NSGetEnviron() };
+    let mut pid = 0;
+    let result = unsafe {
+        libc::posix_spawn(
+            &mut pid,
+            arguments[0],
+            std::ptr::null(),
+            &attributes,
+            arguments.as_ptr().cast_mut().cast(),
+            environment,
+        )
+    };
+    assert_eq!(unsafe { libc::posix_spawnattr_destroy(&mut attributes) }, 0);
+    assert_eq!(result, 0);
+
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 0);
 }
 
 #[cfg(target_os = "macos")]
@@ -3199,6 +3284,67 @@ async fn runner_truncates_large_process_audit_without_rejecting_the_command() {
         .unwrap();
 
     assert!(outcome.status().success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_control_channels_survive_a_nested_network_sandbox() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-nested-policy-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let logical = workspace_root().join(format!(
+        "target/agora-sandbox-nested-policy-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let command = SandboxCommand::new("/usr/bin/sandbox-exec")
+        .args([
+            "-p",
+            "(version 1) (allow default) (deny network*)",
+            "/bin/bash",
+            "-lc",
+            "printf nested-control-ok > \"$AGORA_SANDBOX_TEST_NESTED_PATH\" && test \"$(cat \"$AGORA_SANDBOX_TEST_NESTED_PATH\")\" = nested-control-ok",
+        ])
+        .current_dir(workspace_root())
+        .env("AGORA_SANDBOX_TEST_NESTED_PATH", &logical);
+
+    let outcome = Sandbox::new(sandbox_config_in(directory.join("cache")), NoopCallback)
+        .run(command)
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    assert!(!logical.exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runner_control_channels_reconnect_after_cloexec_default_spawn() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-cloexec-control-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let logical = workspace_root().join(format!(
+        "target/agora-sandbox-cloexec-control-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let command = SandboxCommand::new(std::env::current_exe().unwrap())
+        .arg("cloexec_default_spawn_child_process")
+        .arg("--exact")
+        .arg("--nocapture")
+        .current_dir(workspace_root())
+        .env("AGORA_SANDBOX_TEST_CLOEXEC_SPAWN", "1")
+        .env("AGORA_SANDBOX_TEST_CLOEXEC_PATH", &logical);
+
+    let outcome = Sandbox::new(sandbox_config_in(directory.join("cache")), NoopCallback)
+        .run(command)
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    assert!(!logical.exists());
     std::fs::remove_dir_all(directory).unwrap();
 }
 

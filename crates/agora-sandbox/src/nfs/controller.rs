@@ -1,6 +1,8 @@
 use crate::nfs::backend::RemoteStorage;
 use crate::nfs::broker::Broker;
-use crate::nfs::protocol::{PROTOCOL_VERSION, RequestEnvelope, Response, ResponseEnvelope};
+use crate::nfs::protocol::{
+    PROTOCOL_VERSION, Request, RequestEnvelope, Response, ResponseEnvelope,
+};
 use crate::nfs::transport;
 use anyhow::{Context, Result};
 use std::os::fd::AsRawFd;
@@ -272,62 +274,78 @@ where
     }
 
     async fn handle(stream: UnixStream, state: Arc<RemoteState<S>>) -> Result<()> {
-        let stream = stream.into_std()?;
+        let mut stream = stream.into_std()?;
         configure_server_stream(&stream, REMOTE_REQUEST_TIMEOUT, REMOTE_RESPONSE_TIMEOUT)?;
-        let (mut stream, received) = tokio::task::spawn_blocking(move || {
-            let mut stream = stream;
-            let result = transport::receive::<RequestEnvelope>(&mut stream);
-            (stream, result)
-        })
-        .await
-        .context("remote filesystem receive task failed")?;
-        let (request, descriptor) = received?;
-        let request_id = request.request_id.clone();
-        let reply = if descriptor.is_some() {
-            crate::nfs::broker::BrokerReply {
-                response: Response::Error {
-                    errno: libc::EPROTO,
-                    message: "remote request unexpectedly included a descriptor".to_string(),
-                },
-                descriptor: None,
+        let mut persistent = false;
+        loop {
+            let (returned, received) = tokio::task::spawn_blocking(move || {
+                let mut stream = stream;
+                let result = transport::receive::<RequestEnvelope>(&mut stream);
+                (stream, result)
+            })
+            .await
+            .context("remote filesystem receive task failed")?;
+            stream = returned;
+            let (request, descriptor) = received?;
+            let request_id = request.request_id.clone();
+            let authenticated = request.version == PROTOCOL_VERSION
+                && constant_time_equal(request.token.as_bytes(), state.token.as_bytes());
+            let valid = authenticated && descriptor.is_none();
+            let ping = matches!(&request.request, Request::Ping);
+            let reply = if descriptor.is_some() {
+                crate::nfs::broker::BrokerReply {
+                    response: Response::Error {
+                        errno: libc::EPROTO,
+                        message: "remote request unexpectedly included a descriptor".to_string(),
+                    },
+                    descriptor: None,
+                }
+            } else if request.version != PROTOCOL_VERSION {
+                crate::nfs::broker::BrokerReply {
+                    response: Response::Error {
+                        errno: libc::EPROTO,
+                        message: "unsupported remote filesystem protocol version".to_string(),
+                    },
+                    descriptor: None,
+                }
+            } else if !authenticated {
+                crate::nfs::broker::BrokerReply {
+                    response: Response::Error {
+                        errno: libc::EACCES,
+                        message: "invalid remote filesystem token".to_string(),
+                    },
+                    descriptor: None,
+                }
+            } else {
+                state
+                    .broker
+                    .handle_request(request_id.clone(), request.request)
+                    .await
+            };
+            let response = ResponseEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id,
+                response: reply.response,
+            };
+            let (returned, sent) = tokio::task::spawn_blocking(move || {
+                let result = transport::send(
+                    &mut stream,
+                    &response,
+                    reply.descriptor.as_ref().map(AsRawFd::as_raw_fd),
+                );
+                (stream, result)
+            })
+            .await
+            .context("remote filesystem send task failed")?;
+            stream = returned;
+            sent?;
+            if !persistent && ping && valid {
+                stream.set_read_timeout(None)?;
+                persistent = true;
+            } else if !persistent || !valid {
+                return Ok(());
             }
-        } else if request.version != PROTOCOL_VERSION {
-            crate::nfs::broker::BrokerReply {
-                response: Response::Error {
-                    errno: libc::EPROTO,
-                    message: "unsupported remote filesystem protocol version".to_string(),
-                },
-                descriptor: None,
-            }
-        } else if !constant_time_equal(request.token.as_bytes(), state.token.as_bytes()) {
-            crate::nfs::broker::BrokerReply {
-                response: Response::Error {
-                    errno: libc::EACCES,
-                    message: "invalid remote filesystem token".to_string(),
-                },
-                descriptor: None,
-            }
-        } else {
-            state
-                .broker
-                .handle_request(request_id.clone(), request.request)
-                .await
-        };
-        let response = ResponseEnvelope {
-            version: PROTOCOL_VERSION,
-            request_id,
-            response: reply.response,
-        };
-        tokio::task::spawn_blocking(move || {
-            transport::send(
-                &mut stream,
-                &response,
-                reply.descriptor.as_ref().map(AsRawFd::as_raw_fd),
-            )
-        })
-        .await
-        .context("remote filesystem send task failed")??;
-        Ok(())
+        }
     }
 }
 
