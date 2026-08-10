@@ -12,6 +12,7 @@
 - Do not start, dispatch, or delegate work to multiple agents or subagents. Complete all work with the current agent only.
 - Treat every agent and every channel as an autonomous component. Agents and channels must not depend on each other; the daemon composes them through neutral task, output, and outcome boundaries.
 - Keep agent execution, protocol parsing, and session state inside the agent. Keep connection management, message delivery, acknowledgement, reconnection, and reply rendering inside the channel.
+- For ordinary sandbox runtime mutations, abnormal process termination and power-loss recovery are out of scope unless explicitly requested. Preserve live-process and graceful-shutdown correctness, but do not add journals, rollback state, backups, filesystem syncs, or other durability-only machinery solely for abrupt-exit recovery.
 - If the existing architecture is poor, improve only the part directly touched by the task.
 - Follow `spec/` documents when they exist.
 - Keep code and `spec/` documents consistent after every code change.
