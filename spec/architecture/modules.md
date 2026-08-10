@@ -105,7 +105,8 @@ Responsibility:
 - Versioned, caller-owned asynchronous policy and event callback contract.
 - Thin command-line delivery using `agora-sandbox run -c <config> -e '<command>'`.
 - Rootless TLS termination with an explicit or workdir-local fixed CA.
-- Future workspace, file, and native policy enforcement.
+- Process-tree-scoped filesystem overlay, encrypted storage, remote filesystem roots, and native
+  operation interception on supported platforms.
 
 Current status:
 
