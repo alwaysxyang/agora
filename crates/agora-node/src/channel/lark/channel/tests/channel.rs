@@ -83,6 +83,10 @@ async fn permission_api() -> (LarkApi, HttpMockServer) {
             r#"{"code":0,"msg":"ok","bot":{"open_id":"ou-bot"}}"#
         } else if request.path.ends_with("/reply") {
             r#"{"code":0,"msg":"ok","data":{"message_id":"om-reply"}}"#
+        } else if request.method == "PATCH"
+            && request.path.starts_with("/open-apis/im/v1/messages/")
+        {
+            r#"{"code":0,"msg":"ok"}"#
         } else {
             panic!("unexpected Lark request {}", request.path);
         };
@@ -444,11 +448,23 @@ async fn lark_actions_check_the_actor_but_do_not_require_a_new_mention() {
     let task = channel.recv().await.unwrap().unwrap();
 
     assert_eq!(task.task_id(), "evt-allowed");
+    assert_eq!(task.conversation(), Some(LarkConversation::Group));
     assert!(!interrupted.load(AtomicOrdering::Relaxed));
+    let cloned = channel.clone();
+    assert!(cloned.group_sessions.is_empty());
+    cloned
+        .reply(&task, ChannelReply::new("legacy action reply"))
+        .await
+        .unwrap();
     let requests = server.requests().await;
     assert!(requests.iter().any(|request| {
         request.path == "/open-apis/im/v1/messages/om-card-denied/reply"
             && request.body.contains("User ID：`ou-denied`")
+    }));
+    assert!(requests.iter().any(|request| {
+        request.method == "PATCH"
+            && request.path == "/open-apis/im/v1/messages/om-card-allowed"
+            && request.body.contains("legacy action reply")
     }));
 }
 

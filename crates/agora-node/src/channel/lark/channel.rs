@@ -704,18 +704,20 @@ impl LarkChannel {
                 );
                 Ok(Some(task))
             }
-            LarkEvent::CardAction(event) => {
+            LarkEvent::CardAction(mut event) => {
+                let conversation = self.action_conversation(&event.session_id, event.conversation);
                 if !self
                     .admit_action(
                         &event.user_id,
                         &event.session_id,
                         &event.message_id,
-                        event.conversation,
+                        conversation,
                     )
                     .await
                 {
                     return Ok(None);
                 }
+                event.conversation = conversation;
                 logger::info!(
                     "lark card action received channel={} session={} event_id={}",
                     self.name(),
