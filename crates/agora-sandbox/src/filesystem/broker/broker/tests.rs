@@ -334,6 +334,38 @@ fn overlapping_completed_write_waits_for_the_remaining_reservation() {
 }
 
 #[test]
+fn final_close_flushes_an_abandoned_active_write() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("abandoned-write", b"abcdefgh");
+    let (handle, plaintext) = fixture.open(&path, b"abcdefgh", true);
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::BeginWrite {
+                    handle: handle.clone(),
+                    write_id: "11111111111111111111111111111111".to_string(),
+                    range: ByteRange::new(0, u64::MAX).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    write_all_at(&plaintext, b"XYZ", 8).unwrap();
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(Request::Close { handle }, None)
+            .response,
+        Response::Success
+    );
+
+    assert_eq!(fixture.decrypt(&path), b"abcdefghXYZ");
+}
+
+#[test]
 fn sync_ignores_ranges_beyond_eof_and_reports_plaintext_read_failures() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("range-errors", b"data");

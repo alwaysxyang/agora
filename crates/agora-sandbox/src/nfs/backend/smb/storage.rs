@@ -95,6 +95,7 @@ impl RemoteStorage for SmbStorage {
     }
 
     async fn stat(&self, path: &RemotePath) -> StorageResult<RemoteMetadata> {
+        ensure_public_path(path)?;
         let mut root = self.root(path).await?;
         let remote = root.path(path);
         for attempt in 0..2 {
@@ -119,6 +120,7 @@ impl RemoteStorage for SmbStorage {
         destination: &mut File,
         max_length: u64,
     ) -> StorageResult<RemoteMetadata> {
+        ensure_public_path(path)?;
         let mut root = self.root(path).await?;
         let remote = root.path(path);
         for attempt in 0..2 {
@@ -144,6 +146,7 @@ impl RemoteStorage for SmbStorage {
         source: &mut File,
         length: u64,
     ) -> StorageResult<RemoteMetadata> {
+        ensure_public_path(path)?;
         let mut root = self.root(path).await?;
         let remote = root.path(path);
         let mut operation = WriteOperation::new(&remote);
@@ -166,6 +169,7 @@ impl RemoteStorage for SmbStorage {
         path: &RemotePath,
         emit: &mut (impl FnMut(RemoteEntry) -> StorageResult<()> + Send),
     ) -> StorageResult<()> {
+        ensure_public_path(path)?;
         let mut root = self.root(path).await?;
         let remote = root.path(path);
         for attempt in 0..2 {
@@ -192,6 +196,7 @@ impl RemoteStorage for SmbStorage {
     }
 
     async fn create_directory(&self, path: &RemotePath) -> StorageResult<()> {
+        ensure_public_path(path)?;
         let mut root = self.root(path).await?;
         let remote = root.path(path);
         let session = root.session().await?;
@@ -203,6 +208,7 @@ impl RemoteStorage for SmbStorage {
     }
 
     async fn remove(&self, path: &RemotePath, directory: bool) -> StorageResult<()> {
+        ensure_public_path(path)?;
         let mut root = self.root(path).await?;
         let remote = root.path(path);
         let session = root.session().await?;
@@ -225,6 +231,8 @@ impl RemoteStorage for SmbStorage {
         if from.root() != to.root() {
             return Err(StorageError::new(libc::EXDEV, "cross-root SMB rename"));
         }
+        ensure_public_path(from)?;
+        ensure_public_path(to)?;
         let mut root = self.root(from).await?;
         let from = root.path(from);
         let to = root.path(to);
@@ -440,8 +448,32 @@ fn emit_directory_page(
 }
 
 fn is_smb_control_entry(name: &str) -> bool {
-    (name.starts_with(".agora-write-") && name.ends_with(".tmp"))
-        || (name.starts_with(".agora-lock-") && name.ends_with(".lck"))
+    control_identifier(name, ".agora-write-", ".tmp").is_some()
+        || control_identifier(name, ".agora-lock-", ".lck").is_some()
+}
+
+fn control_identifier<'a>(name: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+    let identifier = name.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    (identifier.len() == 32
+        && identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+    .then_some(identifier)
+}
+
+fn ensure_public_path(path: &RemotePath) -> StorageResult<()> {
+    if path
+        .path()
+        .rsplit('/')
+        .next()
+        .is_some_and(is_smb_control_entry)
+    {
+        return Err(StorageError::new(
+            libc::EACCES,
+            "SMB transaction artifact is reserved",
+        ));
+    }
+    Ok(())
 }
 
 async fn rename_replacing(

@@ -1,3 +1,4 @@
+use super::super::abi::{darwin_removefile, darwin_removefileat};
 use super::*;
 
 type UtimesFn = unsafe extern "C" fn(*const libc::c_char, *const libc::timeval) -> libc::c_int;
@@ -62,6 +63,14 @@ type CopyfileFn = unsafe extern "C" fn(
     *const libc::c_char,
     libc::copyfile_state_t,
     libc::copyfile_flags_t,
+) -> libc::c_int;
+type RemovefileFn =
+    unsafe extern "C" fn(*const libc::c_char, *mut libc::c_void, libc::c_uint) -> libc::c_int;
+type RemovefileAtFn = unsafe extern "C" fn(
+    libc::c_int,
+    *const libc::c_char,
+    *mut libc::c_void,
+    libc::c_uint,
 ) -> libc::c_int;
 
 pub(super) unsafe fn sandbox_unsupported_path_mutation(
@@ -233,6 +242,35 @@ macro_rules! unsupported_pair_filesystem_hook {
         }
     }
 }
+
+unsupported_path_filesystem_hook!(
+    sandbox_removefile,
+    agora_sandbox_removefile,
+    original_removefile,
+    (
+        path: *const libc::c_char,
+        state: *mut libc::c_void,
+        flags: libc::c_uint,
+    ),
+    path,
+    libc::AT_FDCWD,
+    |original, _native_directory, native| original(native, state, flags)
+);
+
+unsupported_path_filesystem_hook!(
+    sandbox_removefileat,
+    agora_sandbox_removefileat,
+    original_removefileat,
+    (
+        directory: libc::c_int,
+        path: *const libc::c_char,
+        state: *mut libc::c_void,
+        flags: libc::c_uint,
+    ),
+    path,
+    directory,
+    |original, native_directory, native| original(native_directory, native, state, flags)
+);
 
 unsupported_path_filesystem_hook!(
     sandbox_utimes,
@@ -635,6 +673,26 @@ fn original_clonefileat() -> Option<ClonefileAtFn> {
 fn original_copyfile() -> Option<CopyfileFn> {
     function_from_interpose(&INTERPOSE_COPYFILE)
 }
+
+fn original_removefile() -> Option<RemovefileFn> {
+    function_from_interpose(&INTERPOSE_REMOVEFILE)
+}
+
+fn original_removefileat() -> Option<RemovefileAtFn> {
+    function_from_interpose(&INTERPOSE_REMOVEFILEAT)
+}
+
+dyld_interpose!(
+    INTERPOSE_REMOVEFILE,
+    agora_sandbox_removefile,
+    darwin_removefile
+);
+
+dyld_interpose!(
+    INTERPOSE_REMOVEFILEAT,
+    agora_sandbox_removefileat,
+    darwin_removefileat
+);
 
 dyld_interpose!(INTERPOSE_UTIMES, agora_sandbox_utimes, libc::utimes);
 

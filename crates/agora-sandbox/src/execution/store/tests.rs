@@ -14,6 +14,11 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
+#[test]
+fn default_executable_path_matches_macos_execvp() {
+    assert_eq!(crate::execution::DEFAULT_EXECUTABLE_PATH, "/usr/bin:/bin");
+}
+
 struct TestDirectory(PathBuf);
 
 impl TestDirectory {

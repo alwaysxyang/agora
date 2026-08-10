@@ -12,6 +12,8 @@ use std::process::{Command, Output};
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
+use super::DEFAULT_EXECUTABLE_PATH;
+
 const MACH_64_MAGIC: u32 = 0xfeed_facf;
 const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 const CPU_SUBTYPE_ARM64E: u32 = 2;
@@ -501,7 +503,7 @@ pub(crate) fn resolve_executable(
         .get(OsStr::new("PATH"))
         .cloned()
         .or_else(|| std::env::var_os("PATH"))
-        .unwrap_or_else(|| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"));
+        .unwrap_or_else(|| OsString::from(DEFAULT_EXECUTABLE_PATH));
     for directory in std::env::split_paths(&path) {
         let directory = if directory.as_os_str().is_empty() {
             base.clone()

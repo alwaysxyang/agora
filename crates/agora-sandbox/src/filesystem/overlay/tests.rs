@@ -494,6 +494,60 @@ fn whiteout_without_backing_remains_authoritative() {
 }
 
 #[test]
+fn removing_a_file_does_not_publish_a_namespace_journal() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("journal-free-unlink");
+    std::fs::write(&logical, b"lower").unwrap();
+    let before = fixture.store.namespace_journal_count_for_test();
+
+    fixture.store.remove(&logical, false).unwrap();
+
+    assert_eq!(fixture.store.namespace_journal_count_for_test(), before);
+    assert_eq!(
+        fixture.store.state(&logical).unwrap(),
+        Some(EntryState::Whiteout)
+    );
+}
+
+#[test]
+fn encrypted_unlink_publishes_metadata_once() {
+    let (fixture, _) = Fixture::encrypted();
+    let logical = fixture.lower.join("single-publication-unlink");
+    std::fs::write(&logical, b"lower").unwrap();
+    fixture
+        .store
+        .metadata
+        .ensure_marker(&fixture.lower)
+        .unwrap();
+    let before = fixture.store.metadata.publication_count_for_test();
+
+    fixture.store.remove(&logical, false).unwrap();
+
+    assert_eq!(
+        fixture.store.metadata.publication_count_for_test() - before,
+        1
+    );
+}
+
+#[test]
+fn encrypted_directory_removal_does_not_reserve_a_file_backing_name() {
+    let (fixture, _) = Fixture::encrypted();
+    let directory = fixture.lower.join("removed-directory");
+    std::fs::create_dir(&directory).unwrap();
+
+    fixture.store.remove(&directory, true).unwrap();
+
+    assert_eq!(
+        fixture.store.metadata.encrypted_name(&directory).unwrap(),
+        None
+    );
+    assert_eq!(
+        fixture.store.state(&directory).unwrap(),
+        Some(EntryState::Whiteout)
+    );
+}
+
+#[test]
 fn whiteout_removes_an_unexpected_upper_object_without_revealing_lower() {
     let fixture = Fixture::new();
     let logical = fixture.lower.join("whiteout-orphan");
@@ -1139,37 +1193,151 @@ fn rename_and_mkdir_never_change_lower_paths() {
 }
 
 #[test]
-fn interrupted_unlink_recovery_never_reveals_the_lower_file() {
+fn same_directory_rename_publishes_metadata_once() {
     let fixture = Fixture::new();
+    let source = fixture.lower.join("rename-source");
+    let target = fixture.lower.join("rename-target");
+    std::fs::write(&source, b"lower").unwrap();
+    let upper = fixture.store.prepare_write(&source, false).unwrap();
+    std::fs::write(upper, b"upper").unwrap();
+    let before = fixture.store.metadata.publication_count_for_test();
+
+    fixture.store.rename(&source, &target).unwrap();
+
+    assert_eq!(
+        fixture.store.metadata.publication_count_for_test() - before,
+        1
+    );
+    assert_eq!(
+        std::fs::read(fixture.store.prepare_read(&target).unwrap()).unwrap(),
+        b"upper"
+    );
+}
+
+#[test]
+fn renaming_between_hard_links_to_the_same_file_is_a_noop() {
+    let fixture = Fixture::new();
+    let source = fixture.lower.join("hard-link-source");
+    let target = fixture.lower.join("hard-link-target");
+    std::fs::write(&source, b"lower").unwrap();
+    std::fs::hard_link(&source, &target).unwrap();
+
+    fixture.store.rename(&source, &target).unwrap();
+
+    assert_eq!(std::fs::read(&source).unwrap(), b"lower");
+    assert_eq!(std::fs::read(&target).unwrap(), b"lower");
+    assert_eq!(fixture.store.state(&source).unwrap(), None);
+    assert_eq!(fixture.store.state(&target).unwrap(), None);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn case_only_file_rename_updates_the_physical_directory_entry() {
+    let fixture = Fixture::new();
+    let source = fixture.lower.join("case-file");
+    let target = fixture.lower.join("CASE-FILE");
+    std::fs::write(&source, b"lower").unwrap();
+    if !target.exists() {
+        return;
+    }
+
+    fixture.store.rename(&source, &target).unwrap();
+
+    let view = fixture.store.directory_view(&fixture.lower).unwrap();
+    let visible = std::fs::read_dir(view.primary())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| !view.hidden().contains(name))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(visible.contains(target.file_name().unwrap()));
+    assert!(!visible.contains(source.file_name().unwrap()));
+    assert_eq!(
+        std::fs::read(fixture.store.prepare_read(&target).unwrap()).unwrap(),
+        b"lower"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn case_only_upper_file_rename_preserves_its_contents() {
+    let fixture = Fixture::new();
+    let source = fixture.lower.join("upper-case-file");
+    let target = fixture.lower.join("UPPER-CASE-FILE");
+    let upper = fixture.store.prepare_write(&source, true).unwrap();
+    std::fs::write(upper, b"upper").unwrap();
+    if !fixture.store.destination(&target).unwrap().exists() {
+        return;
+    }
+
+    fixture.store.rename(&source, &target).unwrap();
+
+    assert_eq!(
+        std::fs::read(fixture.store.prepare_read(&target).unwrap()).unwrap(),
+        b"upper"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn case_only_encrypted_directory_rename_does_not_replace_itself() {
+    let (fixture, cipher) = Fixture::encrypted();
+    let source = fixture.lower.join("case-directory");
+    let target = fixture.lower.join("CASE-DIRECTORY");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("child"), b"lower").unwrap();
+    if !target.exists() {
+        return;
+    }
+
+    fixture.store.rename(&source, &target).unwrap();
+
+    let physical_parent = fixture.store.plain_destination(&fixture.lower).unwrap();
+    let names = std::fs::read_dir(physical_parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(names.contains(target.file_name().unwrap()));
+    assert!(!names.contains(source.file_name().unwrap()));
+    let mut plaintext = tempfile::tempfile().unwrap();
+    cipher
+        .decrypt(
+            &fixture.store.prepare_read(&target.join("child")).unwrap(),
+            &mut plaintext,
+        )
+        .unwrap();
+    let mut contents = Vec::new();
+    plaintext.read_to_end(&mut contents).unwrap();
+    assert_eq!(contents, b"lower");
+}
+
+#[test]
+fn whiteout_reconciliation_cleans_an_interrupted_encrypted_unlink() {
+    let (fixture, _) = Fixture::encrypted();
     let logical = fixture.lower.join("unlink-recovery");
     std::fs::write(&logical, b"lower").unwrap();
     let destination = fixture.store.prepare_write(&logical, false).unwrap();
     std::fs::write(&destination, b"upper").unwrap();
-    let journal = NamespaceJournal {
-        version: NAMESPACE_JOURNAL_VERSION,
-        operation: NamespaceOperation::Unlink {
-            logical: OverlayStore::encode_journal_path(&logical),
-            destination: fixture.store.encode_backing_path(&destination).unwrap(),
-            lease: None,
-        },
-    };
-    fixture.store.write_namespace_journal(&journal).unwrap();
-    std::fs::remove_file(&destination).unwrap();
-
-    fixture.store.recover_namespace_operation_locked().unwrap();
+    let lease = OverlayStore::write_lease_path(&destination).unwrap();
+    std::fs::write(&lease, destination.as_os_str().as_bytes()).unwrap();
+    fixture
+        .store
+        .metadata
+        .ensure_encrypted_name(&logical)
+        .unwrap();
+    fixture
+        .store
+        .metadata
+        .set_with_attributes(&logical, EntryState::Whiteout, None)
+        .unwrap();
 
     assert_eq!(
-        fixture.store.state(&logical).unwrap(),
+        fixture.store.reconcile_entry_locked(&logical).unwrap(),
         Some(EntryState::Whiteout)
     );
+
+    assert!(!destination.exists());
+    assert!(!lease.exists());
     assert!(fixture.store.prepare_read(&logical).is_err());
-    assert!(
-        !fixture
-            .store
-            .root()
-            .join(crate::filesystem::namespace::NAMESPACE_JOURNAL_FILE)
-            .exists()
-    );
 }
 
 #[test]

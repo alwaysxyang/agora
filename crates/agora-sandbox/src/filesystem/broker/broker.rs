@@ -391,7 +391,8 @@ impl LocalBroker {
                 let Some(local) = lock(&self.handles).get(&handle).cloned() else {
                     return Ok(Response::Success);
                 };
-                self.sync_handle(&handle, Vec::new(), true, true, false)?;
+                let final_reference = lock(&local).references <= 1;
+                self.sync_handle(&handle, Vec::new(), true, true, final_reference)?;
                 let mut local = lock(&local);
                 if local.references > 0 {
                     local.references -= 1;

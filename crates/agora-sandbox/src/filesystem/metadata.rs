@@ -218,6 +218,8 @@ pub(super) struct MetadataStore {
     parse_count: AtomicUsize,
     #[cfg(test)]
     probe_count: AtomicUsize,
+    #[cfg(test)]
+    publication_count: AtomicUsize,
 }
 
 pub(super) struct FilenameMigrationPlan {
@@ -288,6 +290,8 @@ impl MetadataStore {
             parse_count: AtomicUsize::new(0),
             #[cfg(test)]
             probe_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            publication_count: AtomicUsize::new(0),
         };
         store.ensure_marker(Path::new("/"))?;
         Ok(store)
@@ -461,6 +465,55 @@ impl MetadataStore {
             }
         }
         self.write(parent, &metadata)
+    }
+
+    pub(super) fn set_whiteout(&self, path: &Path, reserve_encrypted_name: bool) -> Result<()> {
+        let (parent, name) = Self::split(path)?;
+        let mut metadata = self.load(parent)?;
+        let name = Self::encode(name);
+        if reserve_encrypted_name
+            && !metadata.encrypted_names.contains_key(&name)
+            && let Some(cipher) = &self.cipher
+        {
+            let logical = Self::decode(&name)?;
+            metadata
+                .encrypted_names
+                .insert(name.clone(), cipher.encrypt_name(logical.as_bytes())?);
+        }
+        metadata.entries.insert(name.clone(), EntryState::Whiteout);
+        metadata.attributes.remove(&name);
+        self.write(parent, &metadata)
+    }
+
+    pub(super) fn move_entry(
+        &self,
+        from: &Path,
+        to: &Path,
+        attributes: Option<FileAttributes>,
+    ) -> Result<()> {
+        let (from_parent, from_name) = Self::split(from)?;
+        let (to_parent, to_name) = Self::split(to)?;
+        if from_parent != to_parent {
+            self.set_with_attributes(from, EntryState::Whiteout, None)?;
+            return self.set_with_attributes(to, EntryState::Cow, attributes);
+        }
+        let mut metadata = self.load(from_parent)?;
+        let from_name = Self::encode(from_name);
+        metadata
+            .entries
+            .insert(from_name.clone(), EntryState::Whiteout);
+        metadata.attributes.remove(&from_name);
+        let to_name = Self::encode(to_name);
+        metadata.entries.insert(to_name.clone(), EntryState::Cow);
+        match attributes {
+            Some(attributes) => {
+                metadata.attributes.insert(to_name, attributes);
+            }
+            None => {
+                metadata.attributes.remove(&to_name);
+            }
+        }
+        self.write(from_parent, &metadata)
     }
 
     pub(super) fn attributes(&self, path: &Path) -> Result<Option<FileAttributes>> {
@@ -713,6 +766,8 @@ impl MetadataStore {
         if result.is_err() {
             let _ = fs::remove_file(temporary);
         } else {
+            #[cfg(test)]
+            self.publication_count.fetch_add(1, Ordering::Relaxed);
             self.advance_generation()?;
         }
         result
@@ -1035,6 +1090,11 @@ impl MetadataStore {
     #[cfg(test)]
     fn probe_count(&self) -> usize {
         self.probe_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn publication_count_for_test(&self) -> usize {
+        self.publication_count.load(Ordering::Relaxed)
     }
 }
 

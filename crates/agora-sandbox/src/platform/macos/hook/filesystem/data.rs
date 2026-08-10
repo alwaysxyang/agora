@@ -25,7 +25,7 @@ unsafe fn sandbox_write(
             return unsafe { original(descriptor, buffer, length) };
         };
         let before = current_offset(descriptor);
-        let reserved = sequential_write_reservation(descriptor, before, length);
+        let reserved = sequential_write_reservation(length);
         unsafe {
             tracked_write(
                 descriptor,
@@ -96,7 +96,7 @@ unsafe fn sandbox_writev(
             return unsafe { original(descriptor, vectors, count) };
         };
         let before = current_offset(descriptor);
-        let reserved = sequential_write_reservation(descriptor, before, vector_write_length(count));
+        let reserved = sequential_write_reservation(vector_write_length(count));
         unsafe {
             tracked_write(
                 descriptor,
@@ -185,21 +185,9 @@ fn sequential_write_range(
     Some((start, end))
 }
 
-fn sequential_write_reservation(
-    descriptor: libc::c_int,
-    before: Option<u64>,
-    length: usize,
-) -> Option<LocalByteRange> {
+fn sequential_write_reservation(length: usize) -> Option<LocalByteRange> {
     if length == 0 {
         return None;
-    }
-    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
-    if flags >= 0
-        && flags & libc::O_APPEND == 0
-        && let Some(start) = before
-        && let Some(end) = start.checked_add(length as u64)
-    {
-        return LocalByteRange::new(start, end).ok();
     }
     LocalByteRange::new(0, u64::MAX).ok()
 }

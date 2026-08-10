@@ -37,9 +37,10 @@ use super::{
     agora_sandbox_posix_spawn_file_actions_addopen as sandbox_spawn_addopen,
     agora_sandbox_readdir as sandbox_readdir, agora_sandbox_readdir_r as sandbox_readdir_r,
     agora_sandbox_readlink as sandbox_readlink, agora_sandbox_readlinkat as sandbox_readlinkat,
-    agora_sandbox_realpath as sandbox_realpath, agora_sandbox_removexattr as sandbox_removexattr,
-    agora_sandbox_rename as sandbox_rename, agora_sandbox_renameat as sandbox_renameat,
-    agora_sandbox_renameatx_np as sandbox_renameatx_np,
+    agora_sandbox_realpath as sandbox_realpath, agora_sandbox_removefile as sandbox_removefile,
+    agora_sandbox_removefileat as sandbox_removefileat,
+    agora_sandbox_removexattr as sandbox_removexattr, agora_sandbox_rename as sandbox_rename,
+    agora_sandbox_renameat as sandbox_renameat, agora_sandbox_renameatx_np as sandbox_renameatx_np,
     agora_sandbox_renamex_np as sandbox_renamex_np, agora_sandbox_rewinddir as sandbox_rewinddir,
     agora_sandbox_rmdir as sandbox_rmdir, agora_sandbox_setxattr as sandbox_setxattr,
     agora_sandbox_stat as sandbox_stat, agora_sandbox_symlink as sandbox_symlink,
@@ -4022,6 +4023,37 @@ fn mutation_interposers_keep_path_and_spawn_action_writes_in_the_overlay() {
         .unwrap(),
         Path::new("target")
     );
+}
+
+#[test]
+fn removefile_fails_closed_without_mutating_the_lower_file() {
+    let fixture = Fixture::new();
+    let file = fixture.lower.join("secure-remove");
+    std::fs::write(&file, b"content").unwrap();
+    let path = Fixture::c_path(&file);
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        assert_eq!(
+            sandbox_removefile(path.as_ptr(), std::ptr::null_mut(), 0),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        let directory = libc::open(Fixture::c_path(&fixture.lower).as_ptr(), libc::O_RDONLY);
+        assert!(directory >= 0);
+        assert_eq!(
+            sandbox_removefileat(
+                directory,
+                c"secure-remove".as_ptr(),
+                std::ptr::null_mut(),
+                0
+            ),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(libc::close(directory), 0);
+    });
+
+    assert_eq!(std::fs::read(file).unwrap(), b"content");
 }
 
 #[test]

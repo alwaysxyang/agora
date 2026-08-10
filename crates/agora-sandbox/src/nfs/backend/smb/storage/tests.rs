@@ -175,10 +175,49 @@ fn smb_writeback_lock_is_stable_opaque_and_scoped_to_the_parent() {
 
 #[test]
 fn smb_listing_hides_only_reserved_transaction_artifacts() {
-    assert!(is_smb_control_entry(".agora-write-abc.tmp"));
-    assert!(is_smb_control_entry(".agora-lock-abc.lck"));
+    assert!(is_smb_control_entry(
+        ".agora-write-0123456789abcdef0123456789abcdef.tmp"
+    ));
+    assert!(is_smb_control_entry(
+        ".agora-lock-0123456789abcdef0123456789abcdef.lck"
+    ));
+    assert!(!is_smb_control_entry(".agora-write-abc.tmp"));
+    assert!(!is_smb_control_entry(".agora-lock-abc.lck"));
+    assert!(!is_smb_control_entry(".agora-write-report.tmp"));
+    assert!(!is_smb_control_entry(".agora-lock-report.lck"));
+    assert!(!is_smb_control_entry(
+        ".agora-write-0123456789ABCDEF0123456789ABCDEF.tmp"
+    ));
     assert!(!is_smb_control_entry(".agora-write-not-a-temp"));
     assert!(!is_smb_control_entry("report.docx"));
+}
+
+#[tokio::test]
+async fn smb_storage_rejects_direct_access_to_reserved_transaction_artifacts() {
+    let storage = SmbStorage::new(&[]);
+    let control = RemotePath::new(0, ".agora-write-0123456789abcdef0123456789abcdef.tmp").unwrap();
+    let ordinary = RemotePath::new(0, ".agora-write-report.tmp").unwrap();
+    let mut file = tempfile::tempfile().unwrap();
+
+    assert_errno(storage.stat(&control).await, libc::EACCES);
+    assert_errno(
+        storage.read_into(&control, &mut file, u64::MAX).await,
+        libc::EACCES,
+    );
+    assert_errno(
+        storage
+            .write_from_if_unchanged(&control, None, &mut file, 0)
+            .await,
+        libc::EACCES,
+    );
+    let mut emit = |_| Ok(());
+    assert_errno(storage.list(&control, &mut emit).await, libc::EACCES);
+    assert_errno(storage.create_directory(&control).await, libc::EACCES);
+    assert_errno(storage.remove(&control, false).await, libc::EACCES);
+    assert_errno(storage.rename(&control, &ordinary).await, libc::EACCES);
+    assert_errno(storage.rename(&ordinary, &control).await, libc::EACCES);
+
+    assert_errno(storage.stat(&ordinary).await, libc::EINVAL);
 }
 
 #[test]

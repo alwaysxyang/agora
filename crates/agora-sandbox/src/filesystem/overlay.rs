@@ -32,11 +32,6 @@ struct NamespaceJournal {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum NamespaceOperation {
-    Unlink {
-        logical: String,
-        destination: String,
-        lease: Option<String>,
-    },
     Rename {
         from: String,
         to: String,
@@ -80,6 +75,8 @@ pub(crate) struct OverlayStore {
     reconciliation_count: AtomicUsize,
     #[cfg(test)]
     resolution_count: AtomicUsize,
+    #[cfg(test)]
+    namespace_journal_count: AtomicUsize,
 }
 
 struct LockDescriptorPool {
@@ -467,6 +464,8 @@ impl OverlayStore {
             reconciliation_count: AtomicUsize::new(0),
             #[cfg(test)]
             resolution_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            namespace_journal_count: AtomicUsize::new(0),
         };
         let recovery = store.recover_namespace_operation_locked();
         let unlock = Self::flock(&lock, libc::LOCK_UN);
@@ -501,6 +500,11 @@ impl OverlayStore {
     #[cfg(test)]
     pub(super) fn resolution_count_for_test(&self) -> usize {
         self.resolution_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn namespace_journal_count_for_test(&self) -> usize {
+        self.namespace_journal_count.load(Ordering::Relaxed)
     }
 
     pub(super) fn transaction<T>(
@@ -1370,25 +1374,15 @@ impl OverlayStore {
         } else if metadata.is_dir() {
             return Err(std::io::Error::from_raw_os_error(libc::EISDIR).into());
         }
-        if self.cipher.is_some() && !metadata.is_dir() {
-            self.metadata.ensure_encrypted_name(path)?;
-        }
         let lease = (!metadata.is_dir())
             .then(|| Self::write_lease_path(&destination))
             .transpose()?;
-        let journal = NamespaceJournal {
-            version: NAMESPACE_JOURNAL_VERSION,
-            operation: NamespaceOperation::Unlink {
-                logical: Self::encode_journal_path(path),
-                destination: self.encode_backing_path(&destination)?,
-                lease: lease
-                    .as_deref()
-                    .map(|path| self.encode_backing_path(path))
-                    .transpose()?,
-            },
-        };
-        self.write_namespace_journal(&journal)?;
-        self.recover_namespace_operation_locked()
+        self.metadata.set_whiteout(path, !metadata.is_dir())?;
+        Self::remove_existing(&destination)?;
+        if let Some(lease) = lease.as_deref() {
+            Self::remove_existing(lease)?;
+        }
+        Ok(())
     }
 
     fn directory_is_empty_locked(&self, path: &Path) -> Result<bool> {
@@ -1443,8 +1437,18 @@ impl OverlayStore {
         if from_visible_metadata.is_dir() && to.starts_with(from) {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL).into());
         }
+        let visible_identity = BackingIdentity::from_metadata(&from_visible_metadata);
+        let to_destination_before_materialization = self.destination(to)?;
+        if Self::exact_path_identity(to)? == Some(visible_identity)
+            || Self::exact_path_identity(&to_destination_before_materialization)?
+                == Some(visible_identity)
+        {
+            return Ok(());
+        }
+        let case_only_alias = Self::is_case_only_alias(to, visible_identity)?
+            || Self::is_case_only_alias(&to_destination_before_materialization, visible_identity)?;
         let mut namespace_leases = Vec::new();
-        if self.visible_exists_locked(to)? {
+        if !case_only_alias && self.visible_exists_locked(to)? {
             let to_visible = self.prepare_read_locked(to)?;
             let to_metadata = to_visible.symlink_metadata()?;
             if from_visible_metadata.is_dir() && !to_metadata.is_dir() {
@@ -1491,12 +1495,16 @@ impl OverlayStore {
         } else {
             Self::path_identity(&Self::write_lease_path(&from_destination)?)?
         };
-        let target_backup = Self::path_identity(&to_destination)?.map(|_| {
-            to_destination.with_file_name(format!(
-                ".agora-namespace-target-{}.tmp",
-                Uuid::new_v4().simple()
-            ))
-        });
+        let target_backup = if case_only_alias {
+            None
+        } else {
+            Self::path_identity(&to_destination)?.map(|_| {
+                to_destination.with_file_name(format!(
+                    ".agora-namespace-target-{}.tmp",
+                    Uuid::new_v4().simple()
+                ))
+            })
+        };
         let journal = NamespaceJournal {
             version: NAMESPACE_JOURNAL_VERSION,
             operation: NamespaceOperation::Rename {
@@ -1518,7 +1526,7 @@ impl OverlayStore {
         match self.recover_namespace_operation_locked() {
             Ok(()) => Ok(()),
             Err(error) => {
-                if Self::path_has_identity(&from_destination, source_identity)? {
+                if Self::path_has_exact_identity(&from_destination, source_identity)? {
                     if let Some(backup) = target_backup.as_deref()
                         && Self::path_identity(backup)?.is_some()
                     {
@@ -1897,6 +1905,8 @@ impl OverlayStore {
     }
 
     fn write_namespace_journal(&self, journal: &NamespaceJournal) -> Result<()> {
+        #[cfg(test)]
+        self.namespace_journal_count.fetch_add(1, Ordering::Relaxed);
         let path = self.canonical_root.join(namespace::NAMESPACE_JOURNAL_FILE);
         Self::validate_namespace_journal(journal)?;
         let contents = serde_json::to_vec(journal)
@@ -1988,14 +1998,6 @@ impl OverlayStore {
 
     fn validate_namespace_journal(journal: &NamespaceJournal) -> Result<()> {
         let paths = match &journal.operation {
-            NamespaceOperation::Unlink {
-                logical,
-                destination,
-                lease,
-            } => vec![logical, destination]
-                .into_iter()
-                .chain(lease.iter())
-                .collect::<Vec<_>>(),
             NamespaceOperation::Rename {
                 from,
                 to,
@@ -2025,27 +2027,6 @@ impl OverlayStore {
             return Ok(());
         };
         match journal.operation {
-            NamespaceOperation::Unlink {
-                logical,
-                destination,
-                lease,
-            } => {
-                let logical = Self::decode_journal_path(&logical)?;
-                let destination = self.decode_backing_path(&destination)?;
-                let lease = lease
-                    .as_deref()
-                    .map(|path| self.decode_backing_path(path))
-                    .transpose()?;
-                self.metadata
-                    .set_with_attributes(&logical, EntryState::Whiteout, None)?;
-                Self::remove_existing(&destination)?;
-                if let Some(lease) = lease.as_deref() {
-                    Self::remove_existing(lease)?;
-                }
-                Self::sync_parent_directories(
-                    std::iter::once(destination.as_path()).chain(lease.as_deref()),
-                )?;
-            }
             NamespaceOperation::Rename {
                 from,
                 to,
@@ -2065,8 +2046,8 @@ impl OverlayStore {
                     .as_deref()
                     .map(|path| self.decode_backing_path(path))
                     .transpose()?;
-                if !Self::path_has_identity(&to_destination, source_identity)? {
-                    if !Self::path_has_identity(&from_destination, source_identity)? {
+                if !Self::path_has_exact_identity(&to_destination, source_identity)? {
+                    if !Self::path_has_exact_identity(&from_destination, source_identity)? {
                         anyhow::bail!("filesystem rename source changed during recovery");
                     }
                     match target_backup.as_deref() {
@@ -2084,6 +2065,8 @@ impl OverlayStore {
                             fs::rename(&to_destination, backup)?;
                             Self::sync_parent_directories([to_destination.as_path(), backup])?;
                         }
+                        None if Self::path_identity(&to_destination)? == Some(source_identity)
+                            && Self::exact_path_identity(&to_destination)?.is_none() => {}
                         None if Self::path_identity(&to_destination)?.is_some() => {
                             anyhow::bail!("filesystem rename target appeared during recovery");
                         }
@@ -2102,10 +2085,7 @@ impl OverlayStore {
                         source_lease_identity,
                     )?;
                 }
-                self.metadata
-                    .set_with_attributes(&from, EntryState::Whiteout, None)?;
-                self.metadata
-                    .set_with_attributes(&to, EntryState::Cow, attributes)?;
+                self.metadata.move_entry(&from, &to, attributes)?;
                 if let Some(backup) = target_backup.as_deref() {
                     Self::remove_existing(backup)?;
                     Self::sync_parent(backup)?;
@@ -2204,6 +2184,34 @@ impl OverlayStore {
 
     fn path_has_identity(path: &Path, identity: BackingIdentity) -> Result<bool> {
         Ok(Self::path_identity(path)? == Some(identity))
+    }
+
+    fn exact_path_identity(path: &Path) -> Result<Option<BackingIdentity>> {
+        let parent = path.parent().context("filesystem path has no parent")?;
+        let name = path
+            .file_name()
+            .context("filesystem path has no file name")?;
+        let entries = match fs::read_dir(parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_name().as_bytes() == name.as_bytes() {
+                return Self::path_identity(&entry.path());
+            }
+        }
+        Ok(None)
+    }
+
+    fn path_has_exact_identity(path: &Path, identity: BackingIdentity) -> Result<bool> {
+        Ok(Self::exact_path_identity(path)? == Some(identity))
+    }
+
+    fn is_case_only_alias(path: &Path, identity: BackingIdentity) -> Result<bool> {
+        Ok(Self::path_identity(path)? == Some(identity)
+            && Self::exact_path_identity(path)?.is_none())
     }
 
     fn sync_parent(path: &Path) -> Result<()> {

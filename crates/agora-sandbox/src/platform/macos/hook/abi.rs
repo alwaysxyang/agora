@@ -71,6 +71,21 @@ unsafe extern "C" {
         size: libc::size_t,
         options: u64,
     ) -> libc::c_int;
+
+    #[link_name = "removefile"]
+    pub(super) fn darwin_removefile(
+        path: *const libc::c_char,
+        state: *mut libc::c_void,
+        flags: libc::c_uint,
+    ) -> libc::c_int;
+
+    #[link_name = "removefileat"]
+    pub(super) fn darwin_removefileat(
+        directory: libc::c_int,
+        path: *const libc::c_char,
+        state: *mut libc::c_void,
+        flags: libc::c_uint,
+    ) -> libc::c_int;
 }
 
 pub(super) use libc::readdir_r as darwin_readdir_r;

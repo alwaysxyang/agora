@@ -80,6 +80,15 @@ fn sequential_write_ranges_cover_concurrent_shared_offset_progress() {
 }
 
 #[test]
+fn sequential_writes_reserve_the_full_file_for_shared_offset_progress() {
+    assert_eq!(
+        sequential_write_reservation(4),
+        LocalByteRange::new(0, u64::MAX).ok()
+    );
+    assert_eq!(sequential_write_reservation(0), None);
+}
+
+#[test]
 fn positional_write_reservations_remain_conservative_on_length_overflow() {
     assert_eq!(
         positional_write_reservation(8, usize::MAX),

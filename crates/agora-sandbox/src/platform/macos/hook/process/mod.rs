@@ -9,7 +9,8 @@ use super::set_errno;
 use crate::audit::{AuditClient, AuditEventRequest};
 use crate::callback::{CommandContext, ProcessContext, ProcessOperation};
 use crate::execution::{
-    PrepareResponse, decode_prepare_response, encode_prepare_request, frame_length, resolve_shebang,
+    DEFAULT_EXECUTABLE_PATH, PrepareResponse, decode_prepare_response, encode_prepare_request,
+    frame_length, resolve_shebang,
 };
 use crate::trace::TraceContext;
 use std::cell::Cell;
@@ -387,7 +388,7 @@ unsafe fn requested_executable(
                 .join(path)
         });
     }
-    let search = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
+    let search = std::env::var_os("PATH").unwrap_or_else(|| DEFAULT_EXECUTABLE_PATH.into());
     let current = std::env::current_dir()
         .or_else(|error| std::env::var_os("PWD").map(PathBuf::from).ok_or(error))
         .map_err(PrepareError::from)?;

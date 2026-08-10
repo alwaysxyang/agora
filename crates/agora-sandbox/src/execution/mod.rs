@@ -2,6 +2,8 @@ mod controller;
 mod protocol;
 mod store;
 
+pub(crate) const DEFAULT_EXECUTABLE_PATH: &str = "/usr/bin:/bin";
+
 pub(crate) use controller::ExecutionController;
 #[cfg(test)]
 pub(crate) use protocol::{EXECUTION_PROTOCOL_VERSION, decode_prepare_request};
