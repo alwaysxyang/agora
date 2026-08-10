@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use uuid::Uuid;
 
 const LEGACY_METADATA_VERSION: u32 = 1;
 const READABLE_METADATA_VERSION: u32 = 2;
@@ -22,6 +21,7 @@ const MAX_DIRECTORY_METADATA_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DIRECTORY_METADATA_RECORDS: usize = 100_000;
 const MAX_METADATA_NAME_BYTES: usize = 4 * 1024;
 const ENCODED_NAME_PREFIX: &str = "base64:";
+const VERSION_THREE_OBJECT_SUFFIX: &[u8] = b"\n  }\n}";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -214,6 +214,7 @@ pub(super) struct MetadataStore {
     generation: File,
     cipher: Option<super::FileCipher>,
     cache: Mutex<MetadataCache>,
+    append_file: Mutex<Option<AppendFile>>,
     #[cfg(test)]
     parse_count: AtomicUsize,
     #[cfg(test)]
@@ -231,6 +232,11 @@ pub(super) struct FilenameMigrationPlan {
 struct MetadataCache {
     generation: Option<u64>,
     directories: HashMap<PathBuf, CachedDirectoryMetadata>,
+}
+
+struct AppendFile {
+    path: PathBuf,
+    file: File,
 }
 
 #[derive(Clone)]
@@ -286,6 +292,7 @@ impl MetadataStore {
                 generation: None,
                 directories: HashMap::new(),
             }),
+            append_file: Mutex::new(None),
             #[cfg(test)]
             parse_count: AtomicUsize::new(0),
             #[cfg(test)]
@@ -469,6 +476,9 @@ impl MetadataStore {
 
     pub(super) fn set_whiteout(&self, path: &Path, reserve_encrypted_name: bool) -> Result<()> {
         let (parent, name) = Self::split(path)?;
+        if self.append_new_whiteout(parent, name, reserve_encrypted_name)? {
+            return Ok(());
+        }
         let mut metadata = self.load(parent)?;
         let name = Self::encode(name);
         if reserve_encrypted_name
@@ -733,44 +743,243 @@ impl MetadataStore {
         if !parent_exists {
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
-        let temporary = parent.join(format!("{METADATA_FILE}.{}.tmp", Uuid::new_v4().simple()));
         let contents = self.serialize_metadata(metadata)?;
-        let result = (|| {
-            let mut file = File::create(&temporary).with_context(|| {
-                format!(
-                    "failed to create filesystem metadata {}",
-                    temporary.display()
-                )
-            })?;
-            file.write_all(&contents).with_context(|| {
-                format!(
-                    "failed to write filesystem metadata {}",
-                    temporary.display()
-                )
-            })?;
-            file.sync_all().with_context(|| {
-                format!("failed to sync filesystem metadata {}", temporary.display())
-            })?;
-            fs::rename(&temporary, &path).with_context(|| {
-                format!("failed to publish filesystem metadata {}", path.display())
-            })?;
-            File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .with_context(|| {
-                    format!(
-                        "failed to sync filesystem metadata directory {}",
-                        parent.display()
-                    )
-                })
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temporary);
-        } else {
-            #[cfg(test)]
-            self.publication_count.fetch_add(1, Ordering::Relaxed);
-            self.advance_generation()?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("failed to create filesystem metadata {}", path.display()))?;
+        file.write_all(&contents)
+            .with_context(|| format!("failed to write filesystem metadata {}", path.display()))?;
+        let identity = SourceIdentity::from_metadata(&file.metadata()?);
+        drop(file);
+        #[cfg(test)]
+        self.publication_count.fetch_add(1, Ordering::Relaxed);
+        self.record_publication(path, identity, metadata.clone())?;
+        Ok(())
+    }
+
+    fn append_new_whiteout(
+        &self,
+        directory: &Path,
+        name: &OsStr,
+        reserve_encrypted_name: bool,
+    ) -> Result<bool> {
+        let generation = self.current_generation()?;
+        let path = self.path(directory)?;
+        let cache_ready = {
+            let mut cache = self.cache();
+            if cache.generation != Some(generation) {
+                cache.generation = Some(generation);
+                cache.directories.clear();
+            }
+            cache.directories.contains_key(&path)
+        };
+        if !cache_ready {
+            let _ = self.load_at_generation(directory, generation)?;
         }
-        result
+        let logical_name = Self::encode(name);
+        let candidate = {
+            let cache = self.cache();
+            let Some(cached) = cache.directories.get(&path) else {
+                return Ok(false);
+            };
+            let (Some(expected_identity), Some(metadata)) =
+                (cached.identity, cached.metadata.as_ref())
+            else {
+                return Ok(false);
+            };
+            if metadata.entries.contains_key(&logical_name)
+                || metadata.attributes.contains_key(&logical_name)
+                || metadata.encrypted_names.contains_key(&logical_name)
+            {
+                return Ok(false);
+            }
+            let encrypted_name = if reserve_encrypted_name {
+                self.cipher
+                    .as_ref()
+                    .map(|cipher| cipher.encrypt_name(name.as_bytes()))
+                    .transpose()?
+            } else {
+                None
+            };
+            let stored_name = match encrypted_name.as_ref() {
+                Some(encrypted_name) => encrypted_name.clone(),
+                None => Self::storage_name(&logical_name)?,
+            };
+            if stored_name.len() > MAX_METADATA_NAME_BYTES {
+                bail!("filesystem metadata name exceeds {MAX_METADATA_NAME_BYTES} bytes");
+            }
+            let record_upper_bound = metadata
+                .entries
+                .len()
+                .saturating_add(metadata.attributes.len())
+                .saturating_add(metadata.encrypted_names.len());
+            if record_upper_bound >= MAX_DIRECTORY_METADATA_RECORDS
+                && metadata
+                    .entries
+                    .keys()
+                    .chain(metadata.attributes.keys())
+                    .chain(metadata.encrypted_names.keys())
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    >= MAX_DIRECTORY_METADATA_RECORDS
+            {
+                bail!("filesystem metadata exceeds {MAX_DIRECTORY_METADATA_RECORDS} records");
+            }
+            if encrypted_name.as_ref().is_some_and(|candidate| {
+                metadata
+                    .encrypted_names
+                    .values()
+                    .any(|existing| existing == candidate)
+            }) {
+                bail!("duplicate filesystem metadata record {stored_name:?}");
+            }
+            (expected_identity, stored_name, encrypted_name)
+        };
+        let (expected_identity, stored_name, encrypted_name) = candidate;
+        let record = StoredMetadataRecord {
+            entry: Some(EntryState::Whiteout),
+            attributes: None,
+        };
+        let Some(identity) =
+            self.append_serialized_record(&path, expected_identity, &stored_name, &record)?
+        else {
+            return Ok(false);
+        };
+        #[cfg(test)]
+        self.publication_count.fetch_add(1, Ordering::Relaxed);
+        let next_generation = generation.wrapping_add(1);
+        self.generation
+            .write_all_at(&next_generation.to_be_bytes(), 0)?;
+        let mut cache = self.cache();
+        if cache.generation != Some(generation) {
+            cache.directories.clear();
+        } else if let Some(cached) = cache.directories.get_mut(&path)
+            && cached.identity == Some(expected_identity)
+            && let Some(metadata) = cached.metadata.as_mut()
+        {
+            metadata
+                .entries
+                .insert(logical_name.clone(), EntryState::Whiteout);
+            metadata.attributes.remove(&logical_name);
+            if let Some(encrypted_name) = encrypted_name {
+                metadata
+                    .encrypted_names
+                    .insert(logical_name, encrypted_name);
+            }
+            cached.identity = Some(identity);
+        } else {
+            cache.directories.clear();
+        }
+        cache.generation = Some(next_generation);
+        Ok(true)
+    }
+
+    fn append_serialized_record(
+        &self,
+        path: &Path,
+        expected_identity: SourceIdentity,
+        name: &str,
+        record: &StoredMetadataRecord,
+    ) -> Result<Option<SourceIdentity>> {
+        let mut append = self
+            .append_file
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let reusable = append.as_ref().is_some_and(|cached| {
+            cached.path == path
+                && cached.file.metadata().is_ok_and(|metadata| {
+                    SourceIdentity::from_metadata(&metadata) == expected_identity
+                })
+        });
+        if !reusable {
+            let file = match OpenOptions::new().read(true).write(true).open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            if SourceIdentity::from_metadata(&file.metadata()?) != expected_identity {
+                return Ok(None);
+            }
+            *append = Some(AppendFile {
+                path: path.to_path_buf(),
+                file,
+            });
+        }
+        let file = &append
+            .as_ref()
+            .context("filesystem metadata append file is missing")?
+            .file;
+        let file_metadata = file.metadata()?;
+        let length = file_metadata.len();
+        let suffix_length = VERSION_THREE_OBJECT_SUFFIX.len() as u64;
+        if length < suffix_length {
+            return Ok(None);
+        }
+        let mut suffix = [0_u8; VERSION_THREE_OBJECT_SUFFIX.len()];
+        let mut read = 0;
+        while read < suffix.len() {
+            let count = file.read_at(&mut suffix[read..], length - suffix_length + read as u64)?;
+            if count == 0 {
+                return Ok(None);
+            }
+            read += count;
+        }
+        if suffix != VERSION_THREE_OBJECT_SUFFIX {
+            return Ok(None);
+        }
+        let mut replacement = format!(
+            ",\n    {}: ",
+            serde_json::to_string(name).context("failed to serialize filesystem metadata name")?
+        )
+        .into_bytes();
+        replacement.extend_from_slice(
+            &serde_json::to_vec(record)
+                .context("failed to serialize filesystem metadata record")?,
+        );
+        replacement.extend_from_slice(VERSION_THREE_OBJECT_SUFFIX);
+        let offset = length - suffix_length;
+        let final_length = offset
+            .checked_add(replacement.len() as u64)
+            .context("filesystem metadata size overflow")?;
+        if final_length > MAX_DIRECTORY_METADATA_BYTES as u64 {
+            bail!("filesystem metadata exceeds {MAX_DIRECTORY_METADATA_BYTES} bytes");
+        }
+        file.write_all_at(&replacement, offset)?;
+        file.set_len(final_length)?;
+        Ok(Some(SourceIdentity::from_metadata(&file.metadata()?)))
+    }
+
+    fn record_publication(
+        &self,
+        path: PathBuf,
+        identity: SourceIdentity,
+        metadata: DirectoryMetadata,
+    ) -> Result<()> {
+        let previous = self.current_generation()?;
+        let generation = previous.wrapping_add(1);
+        self.generation.write_all_at(&generation.to_be_bytes(), 0)?;
+        let mut cache = self.cache();
+        if cache.generation != Some(previous) {
+            cache.directories.clear();
+        }
+        cache.generation = Some(generation);
+        if cache.directories.len() >= METADATA_CACHE_CAPACITY
+            && !cache.directories.contains_key(&path)
+        {
+            cache.directories.clear();
+        }
+        cache.directories.insert(
+            path,
+            CachedDirectoryMetadata {
+                identity: Some(identity),
+                metadata: Some(metadata),
+            },
+        );
+        Ok(())
     }
 
     fn decode_metadata(&self, contents: &[u8], path: &Path) -> Result<DirectoryMetadata> {

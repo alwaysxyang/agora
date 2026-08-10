@@ -1,7 +1,6 @@
 use super::crypto::FileCipher;
 use super::metadata::{EntryState, MetadataStore};
 use super::namespace;
-use super::overlay::OverlayStore;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -183,9 +182,6 @@ impl EncryptedWorkspace {
         let old_cipher = FileCipher::derive(old_passphrase, &old_salt)?;
         if old_cipher.key_id() != metadata.key_id {
             bail!("sandbox filesystem key is incorrect");
-        }
-        if Self::path_entry_exists(&root.join(namespace::NAMESPACE_JOURNAL_FILE))? {
-            drop(OverlayStore::encrypted(&root, old_cipher.clone())?);
         }
         let new_salt = Self::random_salt()?;
         let new_cipher = FileCipher::derive(new_passphrase, &new_salt)?;
@@ -588,7 +584,6 @@ impl EncryptedWorkspace {
             || name == KEY_FILE.as_bytes()
             || name == VFS_LOCK_FILE.as_bytes()
             || name == REKEY_JOURNAL_FILE.as_bytes()
-            || name == namespace::NAMESPACE_JOURNAL_FILE.as_bytes()
             || name == DIRECTORY_METADATA_FILE.as_bytes()
             || name.starts_with(b".key.json.")
             || name.starts_with(b".rekey.json.")

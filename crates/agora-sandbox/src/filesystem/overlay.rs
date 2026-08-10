@@ -3,9 +3,7 @@ use super::metadata::{EntryState, FileAttributes, Materializer, MetadataStore, S
 use super::namespace;
 use super::{normalize_path, resolve_existing_ancestor};
 use anyhow::{Context, Result};
-use base64::Engine;
 use md5::{Digest, Md5};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -20,32 +18,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
 const LOCK_DESCRIPTOR_POOL_CAPACITY: usize = 16;
-const NAMESPACE_JOURNAL_VERSION: u32 = 1;
-const MAX_NAMESPACE_JOURNAL_BYTES: usize = 1024 * 1024;
 
-#[derive(Debug, Deserialize, Serialize)]
-struct NamespaceJournal {
-    version: u32,
-    operation: NamespaceOperation,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "operation", rename_all = "snake_case")]
-enum NamespaceOperation {
-    Rename {
-        from: String,
-        to: String,
-        from_destination: String,
-        to_destination: String,
-        target_backup: Option<String>,
-        source_identity: BackingIdentity,
-        source_lease_identity: Option<BackingIdentity>,
-        regular: bool,
-        attributes: Option<FileAttributes>,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BackingIdentity {
     device: u64,
     inode: u64,
@@ -75,8 +49,6 @@ pub(crate) struct OverlayStore {
     reconciliation_count: AtomicUsize,
     #[cfg(test)]
     resolution_count: AtomicUsize,
-    #[cfg(test)]
-    namespace_journal_count: AtomicUsize,
 }
 
 struct LockDescriptorPool {
@@ -464,15 +436,11 @@ impl OverlayStore {
             reconciliation_count: AtomicUsize::new(0),
             #[cfg(test)]
             resolution_count: AtomicUsize::new(0),
-            #[cfg(test)]
-            namespace_journal_count: AtomicUsize::new(0),
         };
-        let recovery = store.recover_namespace_operation_locked();
         let unlock = Self::flock(&lock, libc::LOCK_UN);
         if unlock.is_ok() {
             store.return_lock_descriptor(lock);
         }
-        recovery?;
         unlock?;
         Ok(store)
     }
@@ -500,11 +468,6 @@ impl OverlayStore {
     #[cfg(test)]
     pub(super) fn resolution_count_for_test(&self) -> usize {
         self.resolution_count.load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    fn namespace_journal_count_for_test(&self) -> usize {
-        self.namespace_journal_count.load(Ordering::Relaxed)
     }
 
     pub(super) fn transaction<T>(
@@ -1489,58 +1452,11 @@ impl OverlayStore {
             self.file_destination(to, true)?
         };
         let attributes = self.metadata.attributes(from)?;
-        let source_identity = BackingIdentity::from_metadata(&from_destination.symlink_metadata()?);
-        let source_lease_identity = if from_visible_metadata.is_dir() {
-            None
-        } else {
-            Self::path_identity(&Self::write_lease_path(&from_destination)?)?
-        };
-        let target_backup = if case_only_alias {
-            None
-        } else {
-            Self::path_identity(&to_destination)?.map(|_| {
-                to_destination.with_file_name(format!(
-                    ".agora-namespace-target-{}.tmp",
-                    Uuid::new_v4().simple()
-                ))
-            })
-        };
-        let journal = NamespaceJournal {
-            version: NAMESPACE_JOURNAL_VERSION,
-            operation: NamespaceOperation::Rename {
-                from: Self::encode_journal_path(from),
-                to: Self::encode_journal_path(to),
-                from_destination: self.encode_backing_path(&from_destination)?,
-                to_destination: self.encode_backing_path(&to_destination)?,
-                target_backup: target_backup
-                    .as_deref()
-                    .map(|path| self.encode_backing_path(path))
-                    .transpose()?,
-                source_identity,
-                source_lease_identity,
-                regular: !from_visible_metadata.is_dir(),
-                attributes,
-            },
-        };
-        self.write_namespace_journal(&journal)?;
-        match self.recover_namespace_operation_locked() {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if Self::path_has_exact_identity(&from_destination, source_identity)? {
-                    if let Some(backup) = target_backup.as_deref()
-                        && Self::path_identity(backup)?.is_some()
-                    {
-                        if Self::path_identity(&to_destination)?.is_some() {
-                            return Err(error);
-                        }
-                        fs::rename(backup, &to_destination)?;
-                        Self::sync_parent_directories([backup, to_destination.as_path()])?;
-                    }
-                    self.remove_namespace_journal()?;
-                }
-                Err(error)
-            }
+        fs::rename(&from_destination, &to_destination)?;
+        if !from_visible_metadata.is_dir() {
+            self.move_write_lease(&from_destination, &to_destination)?;
         }
+        self.metadata.move_entry(from, to, attributes)
     }
 
     fn materialize_tree_locked(&self, source: &Path) -> Result<()> {
@@ -1904,274 +1820,23 @@ impl OverlayStore {
         namespace::backing_path(&self.root, path)
     }
 
-    fn write_namespace_journal(&self, journal: &NamespaceJournal) -> Result<()> {
-        #[cfg(test)]
-        self.namespace_journal_count.fetch_add(1, Ordering::Relaxed);
-        let path = self.canonical_root.join(namespace::NAMESPACE_JOURNAL_FILE);
-        Self::validate_namespace_journal(journal)?;
-        let contents = serde_json::to_vec(journal)
-            .context("failed to serialize filesystem namespace journal")?;
-        if contents.len() > MAX_NAMESPACE_JOURNAL_BYTES {
-            anyhow::bail!(
-                "filesystem namespace journal exceeds {MAX_NAMESPACE_JOURNAL_BYTES} bytes"
-            );
-        }
-        if let Some(cipher) = &self.cipher {
-            let mut plaintext = tempfile::tempfile()
-                .context("failed to create anonymous filesystem namespace journal")?;
-            plaintext.write_all(&contents)?;
-            return cipher
-                .encrypt(&mut plaintext, &path)
-                .context("failed to publish encrypted filesystem namespace journal");
-        }
-        let temporary = self.canonical_root.join(format!(
-            "{}.{}.tmp",
-            namespace::NAMESPACE_JOURNAL_FILE,
-            Uuid::new_v4().simple()
-        ));
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temporary)?;
-            file.write_all(&contents)?;
-            file.sync_all()?;
-            fs::rename(&temporary, &path)?;
-            Self::sync_parent(&path)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temporary);
-        }
-        result.context("failed to publish filesystem namespace journal")
-    }
-
-    fn read_namespace_journal(&self) -> Result<Option<NamespaceJournal>> {
-        let path = self.canonical_root.join(namespace::NAMESPACE_JOURNAL_FILE);
-        if Self::path_identity(&path)?.is_none() {
-            return Ok(None);
-        }
-        let contents = if let Some(cipher) = &self.cipher {
-            let encrypted = cipher
-                .open_file(&path)
-                .context("failed to inspect encrypted filesystem namespace journal")?;
-            if encrypted.len() > MAX_NAMESPACE_JOURNAL_BYTES as u64 {
-                anyhow::bail!(
-                    "filesystem namespace journal exceeds {MAX_NAMESPACE_JOURNAL_BYTES} bytes"
-                );
-            }
-            let mut plaintext = tempfile::tempfile()
-                .context("failed to create anonymous filesystem namespace journal")?;
-            cipher
-                .decrypt(&path, &mut plaintext)
-                .context("failed to decrypt filesystem namespace journal")?;
-            super::read_control_file(
-                &mut plaintext,
-                MAX_NAMESPACE_JOURNAL_BYTES,
-                "filesystem namespace journal",
-            )?
-        } else {
-            let mut file =
-                File::open(&path).context("failed to open filesystem namespace journal")?;
-            if file.metadata()?.len() > MAX_NAMESPACE_JOURNAL_BYTES as u64 {
-                anyhow::bail!(
-                    "filesystem namespace journal exceeds {MAX_NAMESPACE_JOURNAL_BYTES} bytes"
-                );
-            }
-            super::read_control_file(
-                &mut file,
-                MAX_NAMESPACE_JOURNAL_BYTES,
-                "filesystem namespace journal",
-            )?
-        };
-        let journal: NamespaceJournal = serde_json::from_slice(&contents)
-            .context("failed to parse filesystem namespace journal")?;
-        if journal.version != NAMESPACE_JOURNAL_VERSION {
-            anyhow::bail!(
-                "unsupported filesystem namespace journal version {}",
-                journal.version
-            );
-        }
-        Self::validate_namespace_journal(&journal)?;
-        Ok(Some(journal))
-    }
-
-    fn validate_namespace_journal(journal: &NamespaceJournal) -> Result<()> {
-        let paths = match &journal.operation {
-            NamespaceOperation::Rename {
-                from,
-                to,
-                from_destination,
-                to_destination,
-                target_backup,
-                ..
-            } => vec![from, to, from_destination, to_destination]
-                .into_iter()
-                .chain(target_backup.iter())
-                .collect::<Vec<_>>(),
-        };
-        if paths
-            .into_iter()
-            .any(|path| path.len() > super::MAX_CONTROL_PATH_BYTES)
-        {
-            anyhow::bail!(
-                "filesystem namespace journal path exceeds {} bytes",
-                super::MAX_CONTROL_PATH_BYTES
-            );
-        }
-        Ok(())
-    }
-
-    fn recover_namespace_operation_locked(&self) -> Result<()> {
-        let Some(journal) = self.read_namespace_journal()? else {
-            return Ok(());
-        };
-        match journal.operation {
-            NamespaceOperation::Rename {
-                from,
-                to,
-                from_destination,
-                to_destination,
-                target_backup,
-                source_identity,
-                source_lease_identity,
-                regular,
-                attributes,
-            } => {
-                let from = Self::decode_journal_path(&from)?;
-                let to = Self::decode_journal_path(&to)?;
-                let from_destination = self.decode_backing_path(&from_destination)?;
-                let to_destination = self.decode_backing_path(&to_destination)?;
-                let target_backup = target_backup
-                    .as_deref()
-                    .map(|path| self.decode_backing_path(path))
-                    .transpose()?;
-                if !Self::path_has_exact_identity(&to_destination, source_identity)? {
-                    if !Self::path_has_exact_identity(&from_destination, source_identity)? {
-                        anyhow::bail!("filesystem rename source changed during recovery");
-                    }
-                    match target_backup.as_deref() {
-                        Some(backup) if Self::path_identity(backup)?.is_some() => {
-                            if Self::path_identity(&to_destination)?.is_some() {
-                                anyhow::bail!("filesystem rename target changed during recovery");
-                            }
-                        }
-                        Some(backup) => {
-                            if Self::path_identity(&to_destination)?.is_none() {
-                                anyhow::bail!(
-                                    "filesystem rename target disappeared during recovery"
-                                );
-                            }
-                            fs::rename(&to_destination, backup)?;
-                            Self::sync_parent_directories([to_destination.as_path(), backup])?;
-                        }
-                        None if Self::path_identity(&to_destination)? == Some(source_identity)
-                            && Self::exact_path_identity(&to_destination)?.is_none() => {}
-                        None if Self::path_identity(&to_destination)?.is_some() => {
-                            anyhow::bail!("filesystem rename target appeared during recovery");
-                        }
-                        None => {}
-                    }
-                    fs::rename(&from_destination, &to_destination)?;
-                    Self::sync_parent_directories([
-                        from_destination.as_path(),
-                        to_destination.as_path(),
-                    ])?;
-                }
-                if regular {
-                    self.recover_write_lease(
-                        &from_destination,
-                        &to_destination,
-                        source_lease_identity,
-                    )?;
-                }
-                self.metadata.move_entry(&from, &to, attributes)?;
-                if let Some(backup) = target_backup.as_deref() {
-                    Self::remove_existing(backup)?;
-                    Self::sync_parent(backup)?;
-                }
-            }
-        }
-        self.remove_namespace_journal()
-    }
-
-    fn recover_write_lease(
-        &self,
-        from: &Path,
-        to: &Path,
-        source_identity: Option<BackingIdentity>,
-    ) -> Result<()> {
+    fn move_write_lease(&self, from: &Path, to: &Path) -> Result<()> {
         if self.cipher.is_none() {
             return Ok(());
         }
         let from_lease = Self::write_lease_path(from)?;
         let to_lease = Self::write_lease_path(to)?;
-        let Some(source_identity) = source_identity else {
-            Self::remove_existing(&to_lease)?;
-            return Self::sync_parent(&to_lease);
+        let lease = match OpenOptions::new().read(true).write(true).open(&from_lease) {
+            Ok(lease) => lease,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Self::remove_existing(&to_lease);
+            }
+            Err(error) => return Err(error.into()),
         };
-        if Self::path_has_identity(&to_lease, source_identity)? {
-            return Ok(());
-        }
-        if !Self::path_has_identity(&from_lease, source_identity)? {
-            anyhow::bail!("filesystem write lease changed during rename recovery");
-        }
-        let lease = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&from_lease)?;
         Self::write_write_lease_destination(&lease, to)?;
         drop(lease);
         fs::rename(&from_lease, &to_lease)?;
-        Self::sync_parent_directories([from_lease.as_path(), to_lease.as_path()])
-    }
-
-    fn remove_namespace_journal(&self) -> Result<()> {
-        let path = self.canonical_root.join(namespace::NAMESPACE_JOURNAL_FILE);
-        match fs::remove_file(&path) {
-            Ok(()) => Self::sync_parent(&path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).context("failed to remove filesystem namespace journal"),
-        }
-    }
-
-    fn encode_journal_path(path: &Path) -> String {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(path.as_os_str().as_bytes())
-    }
-
-    fn decode_journal_path(encoded: &str) -> Result<PathBuf> {
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(encoded)
-            .context("invalid filesystem namespace journal path")?;
-        let path = PathBuf::from(OsString::from_vec(bytes));
-        let normalized = normalize_path(&path)?;
-        if normalized != path {
-            anyhow::bail!("filesystem namespace journal path is not normalized");
-        }
-        Ok(path)
-    }
-
-    fn encode_backing_path(&self, path: &Path) -> Result<String> {
-        let relative = path
-            .strip_prefix(&self.root)
-            .or_else(|_| path.strip_prefix(&self.canonical_root))
-            .with_context(|| format!("path is outside filesystem root: {}", path.display()))?;
-        Ok(Self::encode_journal_path(relative))
-    }
-
-    fn decode_backing_path(&self, encoded: &str) -> Result<PathBuf> {
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(encoded)
-            .context("invalid filesystem namespace backing path")?;
-        let relative = PathBuf::from(OsString::from_vec(bytes));
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
-            anyhow::bail!("invalid path in filesystem namespace journal");
-        }
-        Ok(self.root.join(relative))
+        Ok(())
     }
 
     fn path_identity(path: &Path) -> Result<Option<BackingIdentity>> {
@@ -2180,10 +1845,6 @@ impl OverlayStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
-    }
-
-    fn path_has_identity(path: &Path, identity: BackingIdentity) -> Result<bool> {
-        Ok(Self::path_identity(path)? == Some(identity))
     }
 
     fn exact_path_identity(path: &Path) -> Result<Option<BackingIdentity>> {
@@ -2205,35 +1866,9 @@ impl OverlayStore {
         Ok(None)
     }
 
-    fn path_has_exact_identity(path: &Path, identity: BackingIdentity) -> Result<bool> {
-        Ok(Self::exact_path_identity(path)? == Some(identity))
-    }
-
     fn is_case_only_alias(path: &Path, identity: BackingIdentity) -> Result<bool> {
         Ok(Self::path_identity(path)? == Some(identity)
             && Self::exact_path_identity(path)?.is_none())
-    }
-
-    fn sync_parent(path: &Path) -> Result<()> {
-        let parent = path.parent().context("filesystem path has no parent")?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .with_context(|| format!("failed to sync filesystem directory {}", parent.display()))
-    }
-
-    fn sync_parent_directories<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<()> {
-        let mut parents = HashSet::new();
-        for path in paths {
-            let parent = path.parent().context("filesystem path has no parent")?;
-            if parents.insert(parent.to_path_buf()) {
-                File::open(parent)
-                    .and_then(|directory| directory.sync_all())
-                    .with_context(|| {
-                        format!("failed to sync filesystem directory {}", parent.display())
-                    })?;
-            }
-        }
-        Ok(())
     }
 
     fn normalize(&self, path: &Path) -> Result<PathBuf> {
@@ -2317,7 +1952,6 @@ impl OverlayStore {
             offset += written;
         }
         lease.set_len(contents.len() as u64)?;
-        lease.sync_data()?;
         Ok(())
     }
 
@@ -2401,9 +2035,7 @@ impl OverlayStore {
             self.return_lock_descriptor(lock);
             return Err(error.into());
         }
-        let result = self
-            .recover_namespace_operation_locked()
-            .and_then(|()| operation());
+        let result = operation();
         let unlock = Self::flock(&lock, libc::LOCK_UN);
         if unlock.is_ok() {
             self.return_lock_descriptor(lock);

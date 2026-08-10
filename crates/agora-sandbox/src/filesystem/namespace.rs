@@ -10,7 +10,6 @@ pub(super) const FILESYSTEM_LOCK_FILE: &str = ".fs.lock";
 pub(super) const KEY_FILE: &str = ".key.json";
 pub(super) const VFS_LOCK_FILE: &str = ".vfs.lock";
 pub(super) const REKEY_JOURNAL_FILE: &str = ".rekey.json";
-pub(super) const NAMESPACE_JOURNAL_FILE: &str = ".namespace.json";
 pub(super) const WRITE_LEASE_PREFIX: &[u8] = b".agora-write-lease-";
 const ESCAPED_PREFIX: &[u8] = b".agora-entry-";
 
@@ -83,7 +82,6 @@ fn is_reserved(name: &[u8]) -> bool {
         || name == KEY_FILE.as_bytes()
         || name == VFS_LOCK_FILE.as_bytes()
         || name == REKEY_JOURNAL_FILE.as_bytes()
-        || name == NAMESPACE_JOURNAL_FILE.as_bytes()
 }
 
 fn is_reserved_or_variant(name: &[u8]) -> bool {
@@ -96,7 +94,6 @@ fn is_reserved_or_variant(name: &[u8]) -> bool {
         KEY_FILE,
         VFS_LOCK_FILE,
         REKEY_JOURNAL_FILE,
-        NAMESPACE_JOURNAL_FILE,
     ]
     .into_iter()
     .any(|reserved| {

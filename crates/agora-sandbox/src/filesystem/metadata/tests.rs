@@ -248,12 +248,20 @@ fn encrypted_metadata_uses_the_physical_name_as_an_opaque_record_key() {
     store
         .set_with_attributes(&path, EntryState::Cow, Some(attributes.clone()))
         .unwrap();
+    let deleted = directory.join("已删除.txt");
+    store.set_whiteout(&deleted, true).unwrap();
+    let deleted_physical_name = store.encrypted_name(&deleted).unwrap().unwrap();
 
     let contents = std::fs::read(store.path(directory).unwrap()).unwrap();
     assert!(
         !contents
             .windows("安全方案.docx".len())
             .any(|window| { window == "安全方案.docx".as_bytes() })
+    );
+    assert!(
+        !contents
+            .windows("已删除.txt".len())
+            .any(|window| window == "已删除.txt".as_bytes())
     );
     let metadata: serde_json::Value = serde_json::from_slice(&contents).unwrap();
     assert_eq!(metadata["version"], 3);
@@ -264,6 +272,10 @@ fn encrypted_metadata_uses_the_physical_name_as_an_opaque_record_key() {
     assert!(record.get("name").is_none());
     assert_eq!(record["entry"]["state"], "cow");
     assert!(record["attributes"].is_object());
+    assert_eq!(
+        metadata["entries"][deleted_physical_name.to_str().unwrap()]["entry"]["state"],
+        "whiteout"
+    );
 
     drop(store);
     assert_eq!(
@@ -272,6 +284,10 @@ fn encrypted_metadata_uses_the_physical_name_as_an_opaque_record_key() {
     );
     let reopened = MetadataStore::encrypted(&root, cipher).unwrap();
     assert_eq!(reopened.state(&path).unwrap(), Some(EntryState::Cow));
+    assert_eq!(
+        reopened.state(&deleted).unwrap(),
+        Some(EntryState::Whiteout)
+    );
     assert_eq!(reopened.attributes(&path).unwrap(), Some(attributes));
     assert_eq!(
         reopened.encrypted_name(&path).unwrap().as_deref(),
@@ -297,6 +313,83 @@ fn unchanged_metadata_is_parsed_once() {
     assert_eq!(store.state(path).unwrap(), Some(EntryState::Cow));
     assert_eq!(store.parse_count(), parsed);
 
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn consecutive_whiteouts_reuse_the_writer_metadata_cache() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let directory = Path::new("/tmp/cache-after-write");
+    let first = directory.join("first");
+    let second = directory.join("second");
+    store.ensure_marker(directory).unwrap();
+    assert!(store.entries(directory).unwrap().is_empty());
+    let parsed = store.parse_count();
+
+    store.set_whiteout(&first, false).unwrap();
+    store.set_whiteout(&second, false).unwrap();
+
+    assert_eq!(store.parse_count(), parsed);
+    assert_eq!(store.state(&first).unwrap(), Some(EntryState::Whiteout));
+    assert_eq!(store.state(&second).unwrap(), Some(EntryState::Whiteout));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_updates_reuse_the_existing_marker_inode() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let marker = root.join(".metadata");
+    let inode = marker.metadata().unwrap().ino();
+
+    store.set(Path::new("/first"), EntryState::Cow).unwrap();
+    store
+        .set(Path::new("/second"), EntryState::Whiteout)
+        .unwrap();
+
+    assert_eq!(marker.metadata().unwrap().ino(), inode);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn new_whiteouts_append_without_rewriting_existing_records() {
+    let root = tempfile();
+    let store = MetadataStore::new(&root).unwrap();
+    let marker = root.join(".metadata");
+
+    store.set_whiteout(Path::new("/z-last"), false).unwrap();
+    let first = std::fs::read(&marker).unwrap();
+    let reader = MetadataStore::new(&root).unwrap();
+    assert_eq!(
+        reader.state(Path::new("/z-last")).unwrap(),
+        Some(EntryState::Whiteout)
+    );
+    store.set_whiteout(Path::new("/a-first"), false).unwrap();
+    let second = std::fs::read(&marker).unwrap();
+
+    let retained = first
+        .strip_suffix(b"\n  }\n}" as &[u8])
+        .expect("version-three metadata suffix");
+    assert!(second.starts_with(retained));
+    assert!(
+        second
+            .windows(b"\"a-first\"".len())
+            .any(|bytes| bytes == b"\"a-first\"")
+    );
+    assert_eq!(
+        store.state(Path::new("/z-last")).unwrap(),
+        Some(EntryState::Whiteout)
+    );
+    assert_eq!(
+        store.state(Path::new("/a-first")).unwrap(),
+        Some(EntryState::Whiteout)
+    );
+    assert_eq!(
+        reader.state(Path::new("/a-first")).unwrap(),
+        Some(EntryState::Whiteout)
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -861,32 +954,7 @@ fn metadata_store_rejects_a_file_as_its_root() {
 }
 
 #[test]
-fn metadata_publication_failure_removes_the_temporary_file() {
-    let root = tempfile();
-    let store = MetadataStore::new(&root).unwrap();
-    let directory = Path::new("/blocked-publication");
-    let path = store.path(directory).unwrap();
-    std::fs::create_dir_all(&path).unwrap();
-
-    assert!(
-        store
-            .write(directory, &DirectoryMetadata::default())
-            .is_err()
-    );
-    assert_eq!(
-        std::fs::read_dir(path.parent().unwrap())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
-            .count(),
-        0
-    );
-
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn metadata_creation_failure_leaves_no_temporary_file() {
+fn metadata_creation_reports_an_unwritable_parent() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile();
@@ -906,13 +974,6 @@ fn metadata_creation_failure_leaves_no_temporary_file() {
     );
 
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(
-        std::fs::read_dir(parent)
-            .unwrap()
-            .filter_map(Result::ok)
-            .count(),
-        0
-    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

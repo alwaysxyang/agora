@@ -138,9 +138,11 @@ Current status:
   controller, then delivered through the same callback as network events with the shared trace
   chain. File events retain the logical pre-overlay path and structured open mode from open through
   close. A run terminates residual members of its process group but retains prepared copies.
-- The filesystem VFS owns overlay namespace, short publication locking, direct durable whiteout
-  publication for deletion, a recoverable rename journal, per-backing namespace leases, and
-  logical Unix mode authorization. In
+- The filesystem VFS owns overlay namespace, short publication locking, lock-serialized
+  runtime-visible metadata updates with an append fast path for new whiteouts, direct non-journaled
+  rename, per-backing namespace leases,
+  and logical Unix mode authorization. Namespace changes deliberately do not provide
+  abnormal-exit or power-loss recovery. In
   encrypted mode, an independent authenticated parent-side filesystem Broker owns the open content
   containers and duplicate anonymous plaintext descriptors. It serializes synchronization per
   ciphertext inode, propagates peer ranges with fixed-size buffers, and bounds closed fork-retention
