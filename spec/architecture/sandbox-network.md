@@ -95,10 +95,10 @@ agora-sandbox run -c sandbox.json \
 
 The configuration rejects unknown fields. Omitted settings retain the previous runtime defaults:
 `workdir` is `~/.agora-sandbox`, `tls` is `off`, the local filesystem is `plain`, NFS roots are
-empty, and structured logs append to `<workdir>/sandbox.log`. A relative `workdir` is resolved from
-the configuration file's directory, while a relative `log.file` is resolved from the resulting
-workdir; a leading `~` uses `HOME` in either field. The removed `audit` object is rejected as an
-unknown field. The configuration must be a regular non-symlink file. Ownership and permission
+empty, and structured logs append to `<workdir>/runtime/logs/sandbox.log`. A relative `workdir` is
+resolved from the configuration file's directory, while a relative `log.file` is resolved from the
+resulting workdir; a leading `~` uses `HOME` in either field. The removed `audit` object is rejected
+as an unknown field. The configuration must be a regular non-symlink file. Ownership and permission
 policy is left to the caller and the operating system; callers storing filesystem keys or remote
 credentials should protect the file accordingly.
 `tls` accepts `off` or `auto`. The CLI supports `filesystem.local.encrypt` values `plain` and
@@ -112,8 +112,8 @@ the route as unavailable without attempting the remote connection. An SMB probe 
 configured share subpath by statting it and requiring a directory before reporting success; a share
 URL without a subpath needs only a successful share connection. The CLI writes one sanitized
 structured `nfs` record per root through its JSON logger when each probe completes. The record uses
-the configured `log.file` destination or `<workdir>/sandbox.log` and never enters child stdout. A
-failed probe does not stop the run, and later access retries the backend connection.
+the configured `log.file` destination or `<workdir>/runtime/logs/sandbox.log` and never enters child
+stdout. A failed probe does not stop the run, and later access retries the backend connection.
 
 The CLI contains the hook and automatically materializes it below
 `<workdir>/runtime/hook/<md5>/libagora_sandbox.dylib` before constructing `SandboxConfig`. It has no
@@ -136,8 +136,8 @@ implicitly run through a system shell; pipes, redirections, substitutions, and o
 operators require an explicit shell command. The CLI audit adapter writes one structured `audit`
 field through the JSON logger for each validated network connection attempt, intercepted descendant
 process execution attempt, and intercepted file open or close attempt. The logger appends JSON Lines
-to `log.file`, defaulting to `<workdir>/sandbox.log`, and creates missing parent directories. The same
-file contains the unified audit, NFS-status, and lifecycle log stream. Network records contain `access_time`, `trace_id`,
+to `log.file`, defaulting to `<workdir>/runtime/logs/sandbox.log`, and creates missing parent
+directories. The same file contains the unified audit, NFS-status, and lifecycle log stream. Network records contain `access_time`, `trace_id`,
 `pid`, destination IP and port, and the observed domain. Process records contain `access_time`,
 `trace_id`, PID, PPID, current and requested executables, arguments, current directory, and launch
 operation. The root command is started directly by the runner and therefore does not emit a

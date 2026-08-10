@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
-const DEFAULT_LOG_FILE: &str = "sandbox.log";
+const DEFAULT_LOG_FILE: &str = "runtime/logs/sandbox.log";
 
 pub(super) struct RunConfig {
     workdir: PathBuf,

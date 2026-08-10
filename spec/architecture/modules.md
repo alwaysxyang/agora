@@ -175,8 +175,8 @@ Current status:
   failure is monitored alongside the other run services.
 - The CLI renders one structured JSON Lines log record per network connection attempt, intercepted
   descendant process execution attempt, and intercepted file open or close. `log.file` selects the
-  unified log destination and defaults to `<workdir>/sandbox.log`, leaving child stdout and stderr
-  inherited without Agora records. Its callback always allows requests.
+  unified log destination and defaults to `<workdir>/runtime/logs/sandbox.log`, leaving child stdout
+  and stderr inherited without Agora records. Its callback always allows requests.
 - The interception CA is trusted by covered macOS `SecTrust` SSL evaluations and by common
   environment-aware clients through a CA-keyed trust bundle containing the interception CA and
   current native roots. TLS stacks that ignore both mechanisms require their own trust

@@ -103,7 +103,7 @@ fn empty_config_uses_all_runtime_defaults() {
     assert_eq!(loaded.workdir(), SandboxConfig::default_workdir());
     assert_eq!(
         loaded.log_file(),
-        SandboxConfig::default_workdir().join("sandbox.log")
+        SandboxConfig::default_workdir().join("runtime/logs/sandbox.log")
     );
     let runtime = loaded.into_runtime(PathBuf::from("/tmp/hook.dylib"));
     assert!(matches!(runtime.network.tls, TlsMode::Off));

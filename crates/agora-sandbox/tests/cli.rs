@@ -126,7 +126,11 @@ fn sandbox_cli_runs_from_one_strict_config_file() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(root.path().join("workdir/fs").is_dir());
-    assert!(root.path().join("workdir/sandbox.log").is_file());
+    assert!(
+        root.path()
+            .join("workdir/runtime/logs/sandbox.log")
+            .is_file()
+    );
 }
 
 #[test]
@@ -606,7 +610,7 @@ fn run_audited_cli(log_file: Option<&Path>) -> (Output, SocketAddr, Vec<serde_js
                 workdir.join(path)
             }
         })
-        .unwrap_or_else(|| workdir.join("sandbox.log"));
+        .unwrap_or_else(|| workdir.join("runtime/logs/sandbox.log"));
     let config = write_cli_config(root.path(), &workdir, "off", "plain", None, log_file);
     let mut process = configured_command(&config, command);
     process
