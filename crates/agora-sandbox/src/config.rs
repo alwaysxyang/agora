@@ -7,12 +7,14 @@ use serde::Deserialize;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
+const DEFAULT_LOG_FILE: &str = "sandbox.log";
+
 pub(super) struct RunConfig {
     workdir: PathBuf,
     tls: TlsMode,
     local: LocalFilesystem,
     remotes: Vec<SmbRemoteConfig>,
-    audit_file: Option<PathBuf>,
+    log_file: PathBuf,
 }
 
 impl RunConfig {
@@ -29,7 +31,11 @@ impl RunConfig {
         &self.workdir
     }
 
-    pub(super) fn into_runtime(self, hook: PathBuf) -> (SandboxConfig, Option<PathBuf>) {
+    pub(super) fn log_file(&self) -> &Path {
+        &self.log_file
+    }
+
+    pub(super) fn into_runtime(self, hook: PathBuf) -> SandboxConfig {
         let mut config = SandboxConfig::new(hook).with_workdir(&self.workdir);
         config.network.tls = self.tls;
         config = match self.local {
@@ -39,7 +45,7 @@ impl RunConfig {
         for remote in self.remotes {
             config = config.with_smb_remote(remote);
         }
-        (config, self.audit_file)
+        config
     }
 }
 
@@ -58,7 +64,7 @@ struct StoredConfig {
     #[serde(default)]
     filesystem: StoredFilesystem,
     #[serde(default)]
-    audit: StoredAudit,
+    log: StoredLog,
 }
 
 impl StoredConfig {
@@ -81,20 +87,23 @@ impl StoredConfig {
             .into_iter()
             .map(StoredRemote::resolve)
             .collect::<Result<Vec<_>>>()?;
+        let workdir = self
+            .workdir
+            .map(|path| resolve_path(directory, &path))
+            .transpose()?
+            .unwrap_or_else(SandboxConfig::default_workdir);
+        let log_file = self
+            .log
+            .file
+            .map(|path| resolve_path(&workdir, &path))
+            .transpose()?
+            .unwrap_or_else(|| workdir.join(DEFAULT_LOG_FILE));
         Ok(RunConfig {
-            workdir: self
-                .workdir
-                .map(|path| resolve_path(directory, &path))
-                .transpose()?
-                .unwrap_or_else(SandboxConfig::default_workdir),
+            workdir,
             tls: self.tls.into(),
             local,
             remotes,
-            audit_file: self
-                .audit
-                .file
-                .map(|path| resolve_path(directory, &path))
-                .transpose()?,
+            log_file,
         })
     }
 }
@@ -170,7 +179,7 @@ impl StoredRemote {
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StoredAudit {
+struct StoredLog {
     #[serde(default)]
     file: Option<PathBuf>,
 }

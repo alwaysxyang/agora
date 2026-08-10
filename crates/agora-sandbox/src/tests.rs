@@ -1,5 +1,5 @@
 use super::{
-    JsonCallback, LogOutput, audit_record, exit_status_code, parse_command, shutdown_signals,
+    JsonCallback, audit_record, exit_status_code, open_log, parse_command, shutdown_signals,
     signal_exit_code,
 };
 use agora_core::lifecycle::shutdown::ShutdownGuard;
@@ -199,26 +199,25 @@ fn audit_records_process_network_and_filesystem_events() {
 }
 
 #[test]
-fn log_output_reports_an_unusable_output_directory() {
+fn open_log_reports_an_unusable_output_directory() {
     let root = std::env::temp_dir().join(format!("agora-log-error-{}", Uuid::new_v4()));
     let blocked_parent = root.join("blocked");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(&blocked_parent, b"not a directory").unwrap();
 
-    let error = LogOutput::new(Some(&blocked_parent.join("sandbox.jsonl")))
-        .err()
-        .expect("a file cannot be used as a log directory");
+    let error = open_log(&blocked_parent.join("sandbox.jsonl"))
+        .expect_err("a file cannot be used as a log directory");
     assert!(error.to_string().contains("failed to create log directory"));
 
     std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn log_output_creates_new_files_with_private_permissions() {
+fn open_log_creates_new_files_with_private_permissions() {
     let root = std::env::temp_dir().join(format!("agora-log-mode-{}", Uuid::new_v4()));
     let path = root.join("sandbox.jsonl");
 
-    let output = LogOutput::new(Some(&path)).unwrap();
+    let output = open_log(&path).unwrap();
 
     assert_eq!(
         std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -229,14 +228,14 @@ fn log_output_creates_new_files_with_private_permissions() {
 }
 
 #[test]
-fn log_output_preserves_existing_file_permissions() {
+fn open_log_preserves_existing_file_permissions() {
     let root = std::env::temp_dir().join(format!("agora-log-existing-{}", Uuid::new_v4()));
     let path = root.join("sandbox.jsonl");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(&path, b"").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
 
-    let output = LogOutput::new(Some(&path)).unwrap();
+    let output = open_log(&path).unwrap();
 
     assert_eq!(
         std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,

@@ -21,14 +21,14 @@ fn write_cli_config(
     tls: &str,
     encryption: &str,
     key: Option<&str>,
-    audit_file: Option<&Path>,
+    log_file: Option<&Path>,
 ) -> PathBuf {
     std::fs::create_dir_all(directory).unwrap();
     let mut local = serde_json::json!({ "encrypt": encryption });
     if let Some(key) = key {
         local["key"] = serde_json::Value::String(key.to_string());
     }
-    let audit = audit_file
+    let log = log_file
         .map(|path| serde_json::json!({ "file": path }))
         .unwrap_or_else(|| serde_json::json!({}));
     let config = serde_json::json!({
@@ -38,7 +38,7 @@ fn write_cli_config(
             "local": local,
             "nfs": []
         },
-        "audit": audit
+        "log": log
     });
     let path = directory.join("sandbox.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
@@ -104,7 +104,7 @@ fn sandbox_cli_runs_from_one_strict_config_file() {
             "local": { "encrypt": "plain" },
             "nfs": []
           },
-          "audit": {}
+          "log": {}
         }"#,
     )
     .unwrap();
@@ -126,6 +126,7 @@ fn sandbox_cli_runs_from_one_strict_config_file() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(root.path().join("workdir/fs").is_dir());
+    assert!(root.path().join("workdir/sandbox.log").is_file());
 }
 
 #[test]
@@ -525,8 +526,8 @@ fn intercepted_cli_child() {
 }
 
 #[test]
-fn sandbox_cli_writes_structured_audit_logs_to_stderr_by_default() {
-    let (output, destination) = run_audited_cli(None);
+fn sandbox_cli_writes_audit_to_the_default_workspace_log() {
+    let (output, destination, records) = run_audited_cli(None);
 
     assert!(
         output.status.success(),
@@ -535,27 +536,22 @@ fn sandbox_cli_writes_structured_audit_logs_to_stderr_by_default() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(audit_records(&output.stdout).is_empty());
-    let records = audit_records(&output.stderr);
+    assert!(audit_records(&output.stderr).is_empty());
     let network_records = records
         .iter()
         .filter(|record| record["audit"]["type"] == "network")
         .collect::<Vec<_>>();
-    assert_eq!(
-        network_records.len(),
-        1,
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_eq!(network_records.len(), 1, "records={records:?}");
     assert_audit_record(network_records[0], destination);
 }
 
 #[test]
-fn sandbox_cli_appends_compact_audit_to_the_configured_file() {
-    let temp = std::env::temp_dir().join(format!("agora-sandbox-audit-{}", uuid::Uuid::new_v4()));
-    let audit_file = temp.join("nested/network.jsonl");
+fn sandbox_cli_appends_structured_logs_to_the_configured_file() {
+    let temp = std::env::temp_dir().join(format!("agora-sandbox-log-{}", uuid::Uuid::new_v4()));
+    let log_file = temp.join("nested/sandbox.log");
 
-    let (first, first_destination) = run_audited_cli(Some(&audit_file));
-    let (second, second_destination) = run_audited_cli(Some(&audit_file));
+    let (first, first_destination, first_records) = run_audited_cli(Some(&log_file));
+    let (second, second_destination, records) = run_audited_cli(Some(&log_file));
 
     assert!(
         first.status.success(),
@@ -569,7 +565,13 @@ fn sandbox_cli_appends_compact_audit_to_the_configured_file() {
     );
     assert!(audit_records(&first.stdout).is_empty());
     assert!(audit_records(&second.stdout).is_empty());
-    let records = audit_records(&std::fs::read(&audit_file).unwrap());
+    assert_eq!(
+        first_records
+            .iter()
+            .filter(|record| record["audit"]["type"] == "network")
+            .count(),
+        1
+    );
     let network_records = records
         .iter()
         .filter(|record| record["audit"]["type"] == "network")
@@ -580,7 +582,7 @@ fn sandbox_cli_appends_compact_audit_to_the_configured_file() {
     std::fs::remove_dir_all(temp).unwrap();
 }
 
-fn run_audited_cli(audit_file: Option<&Path>) -> (Output, SocketAddr) {
+fn run_audited_cli(log_file: Option<&Path>) -> (Output, SocketAddr, Vec<serde_json::Value>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let destination = listener.local_addr().unwrap();
     let echo = std::thread::spawn(move || {
@@ -596,7 +598,16 @@ fn run_audited_cli(audit_file: Option<&Path>) -> (Output, SocketAddr) {
     );
     let root = tempfile::tempdir().unwrap();
     let workdir = root.path().join("workdir");
-    let config = write_cli_config(root.path(), &workdir, "off", "plain", None, audit_file);
+    let expected_log = log_file
+        .map(|path| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                workdir.join(path)
+            }
+        })
+        .unwrap_or_else(|| workdir.join("sandbox.log"));
+    let config = write_cli_config(root.path(), &workdir, "off", "plain", None, log_file);
     let mut process = configured_command(&config, command);
     process
         .env("AGORA_SANDBOX_TEST_CLI_CHILD", "1")
@@ -607,7 +618,8 @@ fn run_audited_cli(audit_file: Option<&Path>) -> (Output, SocketAddr) {
         drop(TcpStream::connect(destination));
     }
     echo.join().unwrap();
-    (output, destination)
+    let records = audit_records(&std::fs::read(expected_log).unwrap());
+    (output, destination, records)
 }
 
 fn audit_records(output: &[u8]) -> Vec<serde_json::Value> {

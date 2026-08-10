@@ -42,13 +42,17 @@ fn unified_config_resolves_runtime_settings_and_redacts_secrets() {
               }
             ]
           },
-          "audit": { "file": "logs/audit.jsonl" }
+          "log": { "file": "logs/sandbox.jsonl" }
         }"#,
     );
 
     let loaded = RunConfig::load(&path).unwrap();
     assert_eq!(loaded.workdir(), root.path().join("state"));
-    let (runtime, audit) = loaded.into_runtime(PathBuf::from("/tmp/hook.dylib"));
+    assert_eq!(
+        loaded.log_file(),
+        root.path().join("state/logs/sandbox.jsonl")
+    );
+    let runtime = loaded.into_runtime(PathBuf::from("/tmp/hook.dylib"));
 
     assert!(matches!(runtime.network.tls, TlsMode::Auto));
     assert_eq!(runtime.filesystem_mode(), FilesystemMode::Encrypted);
@@ -70,7 +74,6 @@ fn unified_config_resolves_runtime_settings_and_redacts_secrets() {
     let debug = format!("{runtime:?}");
     assert!(!debug.contains("local-secret"));
     assert!(!debug.contains("remote-secret"));
-    assert_eq!(audit, Some(root.path().join("logs/audit.jsonl")));
 }
 
 #[test]
@@ -85,6 +88,10 @@ fn config_paths_expand_home_and_resolve_relative_to_the_config() {
         resolve_path(root.path(), Path::new("~/.agora-sandbox")).unwrap(),
         home.join(".agora-sandbox")
     );
+    assert_eq!(
+        resolve_path(root.path(), Path::new("/var/tmp/sandbox.log")).unwrap(),
+        PathBuf::from("/var/tmp/sandbox.log")
+    );
 }
 
 #[test]
@@ -94,12 +101,23 @@ fn empty_config_uses_all_runtime_defaults() {
 
     let loaded = RunConfig::load(&path).unwrap();
     assert_eq!(loaded.workdir(), SandboxConfig::default_workdir());
-    let (runtime, audit) = loaded.into_runtime(PathBuf::from("/tmp/hook.dylib"));
+    assert_eq!(
+        loaded.log_file(),
+        SandboxConfig::default_workdir().join("sandbox.log")
+    );
+    let runtime = loaded.into_runtime(PathBuf::from("/tmp/hook.dylib"));
     assert!(matches!(runtime.network.tls, TlsMode::Off));
     assert_eq!(runtime.filesystem_mode(), FilesystemMode::Plain);
     assert!(runtime.encrypted_workspace_key().is_none());
     assert!(runtime.smb_remotes().is_empty());
-    assert!(audit.is_none());
+}
+
+#[test]
+fn config_rejects_the_removed_audit_section() {
+    let root = tempfile::tempdir().unwrap();
+    let path = write_config(root.path(), r#"{ "audit": {} }"#);
+
+    assert!(load_error(&path).contains("failed to parse sandbox config"));
 }
 
 #[test]

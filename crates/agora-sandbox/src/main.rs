@@ -12,7 +12,6 @@ use anyhow::{Context, Result};
 use clap::{ColorChoice, Parser, Subcommand};
 use serde::Serialize;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
@@ -121,47 +120,20 @@ fn audit_record(event: &Event) -> Option<AuditRecord> {
     }
 }
 
-enum LogOutput {
-    Stderr(io::Stderr),
-    File(File),
-}
-
-impl LogOutput {
-    fn new(path: Option<&Path>) -> Result<Self> {
-        let Some(path) = path else {
-            return Ok(Self::Stderr(io::stderr()));
-        };
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create log directory {}", parent.display()))?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("failed to open log file {}", path.display()))?;
-        Ok(Self::File(file))
+fn open_log(path: &Path) -> Result<File> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create log directory {}", parent.display()))?;
     }
-}
-
-impl Write for LogOutput {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Stderr(writer) => writer.write(buffer),
-            Self::File(writer) => writer.write(buffer),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Stderr(writer) => writer.flush(),
-            Self::File(writer) => writer.flush(),
-        }
-    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to open log file {}", path.display()))
 }
 
 #[derive(Clone, Serialize)]
@@ -217,11 +189,8 @@ async fn run(config_path: PathBuf, executable: String) -> Result<u8> {
     let config = config::RunConfig::load(&config_path)?;
     let command = parse_command(&executable)?;
     let hook = hook_library::materialize(config.workdir())?;
-    let (config, audit_file) = config.into_runtime(hook);
-    logger::init(
-        LogOutput::new(audit_file.as_deref())?,
-        logger::LevelFilter::Info,
-    )?;
+    logger::init(open_log(config.log_file())?, logger::LevelFilter::Info)?;
+    let config = config.into_runtime(hook);
     let callback = JsonCallback::new();
 
     let status = Arc::new(Mutex::new(None::<ExitStatus>));
