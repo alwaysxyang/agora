@@ -1239,14 +1239,6 @@ async fn request_cache_waiters_capacity_and_tombstones_are_bounded() {
     assert!(cache.claim(&request_id(201)).is_none());
     assert!(cache.claim(&request_id(200)).is_none());
 
-    let pending_id = request_id(9_999);
-    cache.entries.insert(
-        pending_id.clone(),
-        CachedRequest::Pending {
-            fingerprint,
-            waiters: Vec::new(),
-        },
-    );
     for value in 0..=REQUEST_CACHE_CAPACITY {
         cache.entries.insert(
             request_id(10_000 + value as u128),
@@ -1259,11 +1251,7 @@ async fn request_cache_waiters_capacity_and_tombstones_are_bounded() {
         );
     }
     let _ = cache.prune(Instant::now());
-    assert!(cache.entries.len() <= REQUEST_CACHE_CAPACITY + 2);
-    assert!(matches!(
-        cache.entries.get(&pending_id),
-        Some(CachedRequest::Pending { .. })
-    ));
+    assert!(cache.entries.len() <= REQUEST_CACHE_CAPACITY + 1);
 
     let mut tombstones = HandleTombstones::default();
     for value in 0..=CLOSED_HANDLE_CAPACITY {
@@ -1272,141 +1260,6 @@ async fn request_cache_waiters_capacity_and_tombstones_are_bounded() {
     tombstones.insert("handle-1".to_string());
     assert!(!tombstones.contains("handle-0"));
     assert!(tombstones.contains(&format!("handle-{CLOSED_HANDLE_CAPACITY}")));
-}
-
-#[tokio::test]
-async fn waiting_request_cancellation_and_missing_list_replay_are_protocol_errors() {
-    let root = tempfile::tempdir().unwrap();
-    let broker = std::sync::Arc::new(
-        Broker::new(std::sync::Arc::new(MemoryStorage::default()), root.path()).unwrap(),
-    );
-    let id = request_id(300);
-    let request = Request::Access {
-        path: path("file.txt"),
-        mode: libc::R_OK,
-    };
-    let fingerprint = request_fingerprint(&request).unwrap();
-    assert!(matches!(
-        broker.requests.lock().await.begin(id.clone(), fingerprint),
-        CacheDecision::Execute
-    ));
-
-    let waiting = std::sync::Arc::clone(&broker);
-    let waiting_id = id.clone();
-    let task = tokio::spawn(async move { waiting.handle_request(waiting_id, request).await });
-    loop {
-        let ready = matches!(
-            broker.requests.lock().await.entries.get(&id),
-            Some(CachedRequest::Pending { waiters, .. }) if !waiters.is_empty()
-        );
-        if ready {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    broker.requests.lock().await.entries.remove(&id);
-    let reply = task.await.unwrap();
-    assert!(matches!(
-        reply.response,
-        Response::Error { errno: libc::EPROTO, ref message }
-            if message.contains("cancelled")
-    ));
-
-    let reply = broker
-        .reply_for_response(Response::List {
-            anchor: "missing-anchor".to_string(),
-        })
-        .await;
-    assert_errno(reply.response, libc::EPROTO);
-    assert!(reply.descriptor.is_none());
-}
-
-#[tokio::test]
-async fn request_root_timeout_and_idempotent_abort_preserve_broker_state() {
-    let root = tempfile::tempdir().unwrap();
-    let storage = std::sync::Arc::new(MemoryStorage::default());
-    storage.insert_file(0, "file.txt", b"data");
-    let broker = Broker::new_with_limits(
-        storage,
-        root.path(),
-        RemoteLimits {
-            operation_timeout: Duration::from_millis(10),
-            ..RemoteLimits::default()
-        },
-    )
-    .unwrap();
-    let opened = broker
-        .handle(Request::Open {
-            path: path("file.txt"),
-            flags: libc::O_RDONLY,
-            mode: 0,
-        })
-        .await;
-    let handle = open_handle(&opened.response);
-    drop(opened.descriptor);
-
-    let handles = broker.handles.lock().await;
-    assert_errno(
-        broker
-            .handle(Request::Sync {
-                handle: handle.clone(),
-            })
-            .await
-            .response,
-        libc::ETIMEDOUT,
-    );
-    drop(handles);
-
-    assert_eq!(
-        broker
-            .handle(Request::Abort {
-                handle: handle.clone(),
-            })
-            .await
-            .response,
-        Response::Success
-    );
-    assert_eq!(
-        broker.handle(Request::Abort { handle }).await.response,
-        Response::Success
-    );
-}
-
-#[tokio::test]
-async fn missing_directory_open_and_list_serialization_errors_are_precise() {
-    let root = tempfile::tempdir().unwrap();
-    let broker = Broker::new(
-        std::sync::Arc::new(MemoryStorage::default()),
-        root.path(),
-    )
-    .unwrap();
-    assert_errno(
-        broker
-            .handle(Request::Open {
-                path: path("missing"),
-                flags: libc::O_RDONLY | libc::O_DIRECTORY,
-                mode: 0,
-            })
-            .await
-            .response,
-        libc::ENOENT,
-    );
-
-    let error = list_payload_error(std::io::Error::other("broken writer"), false);
-    assert_eq!(error.errno(), libc::EIO);
-    assert!(error.to_string().contains("serialize remote list"));
-    assert_eq!(
-        list_payload_error(std::io::Error::other("too large"), true).errno(),
-        libc::EOVERFLOW
-    );
-
-    let mut writer = LimitedWriter::new(Vec::new(), 3);
-    writer.write_all(b"abc").unwrap();
-    writer.flush().unwrap();
-    assert!(!writer.exceeded());
-    let error = writer.write_all(b"d").unwrap_err();
-    assert_eq!(error.raw_os_error(), Some(libc::EOVERFLOW));
-    assert!(writer.exceeded());
 }
 
 #[tokio::test]

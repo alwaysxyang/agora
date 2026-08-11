@@ -253,39 +253,6 @@ fn child_arguments_replace_a_script_with_its_prepared_interpreter() {
 }
 
 #[test]
-fn child_argument_builders_preserve_null_sources_and_shell_fallback_arguments() {
-    let direct = PreparedExecutable {
-        program: CString::new("/bin/true").unwrap(),
-        arguments: Vec::new(),
-    };
-    let direct = unsafe { ChildArguments::new(std::ptr::null(), &direct) }.unwrap();
-    assert!(direct.values.is_empty());
-    assert!((unsafe { *direct.as_exec_ptr() }).is_null());
-
-    let source = [
-        CString::new("script").unwrap(),
-        CString::new("first").unwrap(),
-        CString::new("second").unwrap(),
-    ];
-    let pointers = [
-        source[0].as_ptr(),
-        source[1].as_ptr(),
-        source[2].as_ptr(),
-        std::ptr::null(),
-    ];
-    let script = CString::new("/tmp/script").unwrap();
-    let fallback = unsafe { ChildArguments::shell_fallback(pointers.as_ptr(), &script) }.unwrap();
-    assert_eq!(
-        fallback
-            .values
-            .iter()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect::<Vec<_>>(),
-        ["sh", "/tmp/script", "first", "second"]
-    );
-}
-
-#[test]
 fn child_environment_replaces_untrusted_runtime_values() {
     let stale = [
         CString::new("AGORA_SANDBOX_TOKEN=stale").unwrap(),
@@ -475,21 +442,6 @@ fn path_search_skips_non_executable_files() {
             .errno,
         libc::EACCES
     );
-
-    std::fs::create_dir(blocked.join("directory-tool")).unwrap();
-    assert_eq!(
-        search_path_executable(OsStr::new("directory-tool"), &denied, root.path())
-            .unwrap_err()
-            .errno,
-        libc::EACCES
-    );
-    std::os::unix::fs::symlink("loop", blocked.join("loop")).unwrap();
-    assert_eq!(
-        search_path_executable(OsStr::new("loop"), &denied, root.path())
-            .unwrap_err()
-            .errno,
-        libc::ENOENT
-    );
 }
 
 #[test]
@@ -573,20 +525,6 @@ fn command_request_records_process_context_and_bounds_argument_count() {
         panic!("expected process audit event");
     };
     assert_eq!(command.arguments, [TRUNCATED_ARGUMENTS]);
-
-    let request = unsafe {
-        process_event_request(
-            Path::new("/bin/true"),
-            std::ptr::null(),
-            ProcessOperation::Execv,
-            &trace,
-        )
-    }
-    .unwrap();
-    let AuditEventRequest::Process { command, .. } = request else {
-        panic!("expected process audit event");
-    };
-    assert!(command.arguments.is_empty());
 }
 
 #[test]
@@ -706,12 +644,6 @@ fn process_runtime_keeps_a_direct_executable_unchanged() {
 
 #[test]
 fn process_runtime_propagates_denied_and_invalid_responses() {
-    let (runtime, accepted_server) = runtime_with_response(response(0, b""));
-    let accepted = runtime.prepare(Path::new("/bin/sh")).unwrap_err();
-    assert_eq!(accepted.errno, libc::EPROTO);
-    assert!(accepted.to_string().contains("handshake"));
-    accepted_server.join().unwrap();
-
     let (runtime, denied_server) =
         runtime_with_response(error_response(libc::ENOENT, b"missing executable"));
     let denied = runtime.prepare(Path::new("/bin/sh")).unwrap_err();

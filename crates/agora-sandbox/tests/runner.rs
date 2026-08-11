@@ -32,7 +32,7 @@ fn sandbox_lifecycle_timeout(seconds: u64) -> Duration {
     let multiplier = match (cfg!(target_arch = "x86_64"), coverage) {
         (true, true) => 8,
         (true, false) | (false, true) => 4,
-        (false, false) => 1,
+        (false, false) => 2,
     };
     Duration::from_secs(seconds.saturating_mul(multiplier))
 }

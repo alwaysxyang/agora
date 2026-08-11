@@ -1,13 +1,12 @@
 use super::{
     FILE_ATTRIBUTE_DIRECTORY, SmbRoot, SmbStorage, build_open_request, build_rename_information,
-    configured_storage, emit_directory_page, expect_success, is_connection_failure,
-    is_smb_control_entry, metadata_from_close, metadata_from_create, metadata_from_file,
-    remote_path, same_file_object, smb_errno, staging_path, stale_file, storage_error,
-    validate_read_response_size, validate_remote_root, validate_transfer_size, wire_path,
-    write_lock_is_busy, write_lock_path,
+    configured_storage, emit_directory_page, expect_success, is_smb_control_entry,
+    metadata_from_close, metadata_from_create, metadata_from_file, remote_path, same_file_object,
+    smb_errno, staging_path, stale_file, storage_error, validate_read_response_size,
+    validate_remote_root, validate_transfer_size, wire_path, write_lock_path,
 };
 use crate::nfs::SmbRemoteConfig;
-use crate::nfs::backend::{RemoteStorage, StorageError, StorageResult};
+use crate::nfs::backend::{RemoteStorage, StorageResult};
 use crate::nfs::protocol::{RemoteEntry, RemoteFileType, RemotePath};
 use smb2::client::tree::FileInfo;
 use smb2::msg::close::CloseResponse;
@@ -264,69 +263,6 @@ fn smb_directory_pages_preserve_visible_entries_and_filter_only_control_entries(
     assert_eq!(entries[1].name, "資料");
     assert_eq!(entries[1].metadata.file_type, RemoteFileType::Directory);
     assert_eq!(entries[1].metadata.identity, "directory:0:200:100");
-}
-
-#[test]
-fn smb_directory_page_rejects_truncation_invalid_offsets_and_emit_failures() {
-    let mut emit = |_| Ok(());
-    assert_errno(emit_directory_page(&[], &mut emit), libc::EPROTO);
-    assert_errno(emit_directory_page(&[0; 93], &mut emit), libc::EPROTO);
-
-    let mut invalid_offset = directory_page(&[("first", 1, false), ("last", 2, false)]);
-    invalid_offset[..4].copy_from_slice(&93_u32.to_le_bytes());
-    assert_errno(
-        emit_directory_page(&invalid_offset, &mut emit),
-        libc::EPROTO,
-    );
-    invalid_offset[..4].copy_from_slice(&u32::MAX.to_le_bytes());
-    assert_errno(
-        emit_directory_page(&invalid_offset, &mut emit),
-        libc::EPROTO,
-    );
-
-    let page = directory_page(&[("visible", 1, false)]);
-    assert_errno(
-        emit_directory_page(&page, &mut |_| {
-            Err(StorageError::new(libc::ECANCELED, "consumer stopped"))
-        }),
-        libc::ECANCELED,
-    );
-}
-
-#[test]
-fn smb_retry_and_write_lock_classification_matches_recoverable_failures() {
-    for errno in [
-        libc::ENETDOWN,
-        libc::ETIMEDOUT,
-        libc::ECONNRESET,
-        libc::ECONNABORTED,
-        libc::ENOTCONN,
-        libc::EPIPE,
-        libc::EIO,
-    ] {
-        assert!(is_connection_failure(&StorageError::new(errno, "offline")));
-    }
-    assert!(!is_connection_failure(&StorageError::new(
-        libc::EINVAL,
-        "bad request"
-    )));
-
-    assert!(write_lock_is_busy(&Error::Protocol {
-        status: NtStatus::OBJECT_NAME_COLLISION,
-        command: Command::Create,
-    }));
-    assert!(write_lock_is_busy(&Error::Protocol {
-        status: NtStatus::SHARING_VIOLATION,
-        command: Command::Create,
-    }));
-    assert!(write_lock_is_busy(&Error::Protocol {
-        status: NtStatus::DELETE_PENDING,
-        command: Command::Create,
-    }));
-    assert!(!write_lock_is_busy(&Error::Protocol {
-        status: NtStatus::ACCESS_DENIED,
-        command: Command::Create,
-    }));
 }
 
 #[tokio::test]

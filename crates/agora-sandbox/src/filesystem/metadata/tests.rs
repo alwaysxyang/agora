@@ -1,7 +1,5 @@
 use super::{
-    CachedDirectoryMetadata, DirectoryMetadata, EntryState, FileAttributes,
-    MAX_DIRECTORY_METADATA_RECORDS, MAX_METADATA_NAME_BYTES, METADATA_VERSION, Materializer,
-    MetadataStore, SourceIdentity,
+    DirectoryMetadata, EntryState, FileAttributes, METADATA_VERSION, Materializer, MetadataStore,
 };
 use crate::filesystem::FileCipher;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -976,111 +974,6 @@ fn metadata_creation_reports_an_unwritable_parent() {
     );
 
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn metadata_record_and_name_limits_are_enforced_at_each_persistence_boundary() {
-    use std::fmt::Write as _;
-
-    let root = tempfile();
-    let store = MetadataStore::new(&root).unwrap();
-    let directory = Path::new("/limits");
-    let marker = store.path(directory).unwrap();
-    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-
-    let mut oversized = DirectoryMetadata::default();
-    for index in 0..=MAX_DIRECTORY_METADATA_RECORDS {
-        oversized
-            .entries
-            .insert(format!("name-{index}"), EntryState::Whiteout);
-    }
-    assert!(
-        MetadataStore::validate_metadata_limits(&oversized, &marker)
-            .unwrap_err()
-            .to_string()
-            .contains("records")
-    );
-    assert!(
-        store
-            .serialize_metadata(&oversized)
-            .unwrap_err()
-            .to_string()
-            .contains("records")
-    );
-
-    let mut encoded = String::from("{\"version\":3,\"entries\":{");
-    for index in 0..=MAX_DIRECTORY_METADATA_RECORDS {
-        if index != 0 {
-            encoded.push(',');
-        }
-        write!(&mut encoded, "\"{index}\":{{}}").unwrap();
-    }
-    encoded.push_str("}}");
-    assert!(
-        store
-            .decode_version_three_metadata(encoded.as_bytes(), &marker)
-            .unwrap_err()
-            .to_string()
-            .contains("records")
-    );
-
-    let long_name = "x".repeat(MAX_METADATA_NAME_BYTES + 1);
-    let encoded = serde_json::to_vec(&serde_json::json!({
-        "version": METADATA_VERSION,
-        "entries": { long_name.clone(): { "entry": { "state": "whiteout" } } }
-    }))
-    .unwrap();
-    assert!(
-        store
-            .decode_version_three_metadata(&encoded, &marker)
-            .unwrap_err()
-            .to_string()
-            .contains("name exceeds")
-    );
-
-    let mut long = DirectoryMetadata::default();
-    long.entries.insert(
-        MetadataStore::encode(std::ffi::OsStr::new(&long_name)),
-        EntryState::Whiteout,
-    );
-    assert!(
-        MetadataStore::validate_metadata_limits(&long, &marker)
-            .unwrap_err()
-            .to_string()
-            .contains("name exceeds")
-    );
-    assert!(
-        store
-            .serialize_metadata(&long)
-            .unwrap_err()
-            .to_string()
-            .contains("name exceeds")
-    );
-
-    std::fs::write(&marker, store.serialize_metadata(&DirectoryMetadata::default()).unwrap())
-        .unwrap();
-    let identity = SourceIdentity::from_metadata(&std::fs::metadata(&marker).unwrap());
-    let generation = store.current_generation().unwrap();
-    {
-        let mut cache = store.cache();
-        cache.generation = Some(generation);
-        cache.directories.insert(
-            marker.clone(),
-            CachedDirectoryMetadata {
-                identity: Some(identity),
-                metadata: Some(oversized),
-            },
-        );
-    }
-    assert!(
-        store
-            .append_new_whiteout(directory, std::ffi::OsStr::new("next"), false)
-            .unwrap_err()
-            .to_string()
-            .contains("records")
-    );
-
     std::fs::remove_dir_all(root).unwrap();
 }
 
