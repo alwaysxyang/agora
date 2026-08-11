@@ -1,13 +1,14 @@
 use super::{
     FILE_ATTRIBUTE_DIRECTORY, SmbRoot, SmbStorage, build_open_request, build_rename_information,
-    configured_storage, expect_success, is_smb_control_entry, metadata_from_close,
-    metadata_from_create, metadata_from_file, remote_path, same_file_object, smb_errno,
-    staging_path, stale_file, storage_error, validate_read_response_size, validate_remote_root,
-    validate_transfer_size, wire_path, write_lock_path,
+    configured_storage, emit_directory_page, expect_success, is_connection_failure,
+    is_smb_control_entry, metadata_from_close, metadata_from_create, metadata_from_file,
+    remote_path, same_file_object, smb_errno, staging_path, stale_file, storage_error,
+    validate_read_response_size, validate_remote_root, validate_transfer_size, wire_path,
+    write_lock_is_busy, write_lock_path,
 };
 use crate::nfs::SmbRemoteConfig;
-use crate::nfs::backend::{RemoteStorage, StorageResult};
-use crate::nfs::protocol::{RemoteFileType, RemotePath};
+use crate::nfs::backend::{RemoteStorage, StorageError, StorageResult};
+use crate::nfs::protocol::{RemoteEntry, RemoteFileType, RemotePath};
 use smb2::client::tree::FileInfo;
 use smb2::msg::close::CloseResponse;
 use smb2::msg::create::{CreateAction, CreateDisposition, CreateResponse, ShareAccess};
@@ -22,6 +23,48 @@ fn assert_errno<T>(result: StorageResult<T>, expected: libc::c_int) {
         Ok(_) => panic!("operation unexpectedly succeeded"),
         Err(error) => assert_eq!(error.errno(), expected),
     }
+}
+
+fn directory_entry(name: &str, size: u64, directory: bool) -> Vec<u8> {
+    let encoded = name.encode_utf16().collect::<Vec<_>>();
+    let mut entry = Vec::with_capacity(94 + encoded.len() * 2);
+    entry.extend_from_slice(&0_u32.to_le_bytes());
+    entry.extend_from_slice(&0_u32.to_le_bytes());
+    entry.extend_from_slice(&100_u64.to_le_bytes());
+    entry.extend_from_slice(&0_u64.to_le_bytes());
+    entry.extend_from_slice(&200_u64.to_le_bytes());
+    entry.extend_from_slice(&0_u64.to_le_bytes());
+    entry.extend_from_slice(&size.to_le_bytes());
+    entry.extend_from_slice(&size.to_le_bytes());
+    entry.extend_from_slice(
+        &(if directory {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            0
+        })
+        .to_le_bytes(),
+    );
+    entry.extend_from_slice(&u32::try_from(encoded.len() * 2).unwrap().to_le_bytes());
+    entry.extend_from_slice(&0_u32.to_le_bytes());
+    entry.extend_from_slice(&[0, 0]);
+    entry.extend_from_slice(&[0; 24]);
+    for unit in encoded {
+        entry.extend_from_slice(&unit.to_le_bytes());
+    }
+    entry
+}
+
+fn directory_page(entries: &[(&str, u64, bool)]) -> Vec<u8> {
+    let mut page = Vec::new();
+    for (index, (name, size, directory)) in entries.iter().enumerate() {
+        let mut entry = directory_entry(name, *size, *directory);
+        if index + 1 < entries.len() {
+            let next = u32::try_from(entry.len()).unwrap();
+            entry[..4].copy_from_slice(&next.to_le_bytes());
+        }
+        page.extend_from_slice(&entry);
+    }
+    page
 }
 
 #[test]
@@ -190,6 +233,100 @@ fn smb_listing_hides_only_reserved_transaction_artifacts() {
     ));
     assert!(!is_smb_control_entry(".agora-write-not-a-temp"));
     assert!(!is_smb_control_entry("report.docx"));
+}
+
+#[test]
+fn smb_directory_pages_preserve_visible_entries_and_filter_only_control_entries() {
+    let page = directory_page(&[
+        (".", 0, true),
+        ("..", 0, true),
+        (
+            ".agora-write-0123456789abcdef0123456789abcdef.tmp",
+            4,
+            false,
+        ),
+        ("report.txt", 12, false),
+        ("資料", 0, true),
+    ]);
+    let mut entries = Vec::<RemoteEntry>::new();
+
+    emit_directory_page(&page, &mut |entry| {
+        entries.push(entry);
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].name, "report.txt");
+    assert_eq!(entries[0].metadata.file_type, RemoteFileType::File);
+    assert_eq!(entries[0].metadata.size, 12);
+    assert_eq!(entries[0].metadata.identity, "file:12:200:100");
+    assert_eq!(entries[1].name, "資料");
+    assert_eq!(entries[1].metadata.file_type, RemoteFileType::Directory);
+    assert_eq!(entries[1].metadata.identity, "directory:0:200:100");
+}
+
+#[test]
+fn smb_directory_page_rejects_truncation_invalid_offsets_and_emit_failures() {
+    let mut emit = |_| Ok(());
+    assert_errno(emit_directory_page(&[], &mut emit), libc::EPROTO);
+    assert_errno(emit_directory_page(&[0; 93], &mut emit), libc::EPROTO);
+
+    let mut invalid_offset = directory_page(&[("first", 1, false), ("last", 2, false)]);
+    invalid_offset[..4].copy_from_slice(&93_u32.to_le_bytes());
+    assert_errno(
+        emit_directory_page(&invalid_offset, &mut emit),
+        libc::EPROTO,
+    );
+    invalid_offset[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_errno(
+        emit_directory_page(&invalid_offset, &mut emit),
+        libc::EPROTO,
+    );
+
+    let page = directory_page(&[("visible", 1, false)]);
+    assert_errno(
+        emit_directory_page(&page, &mut |_| {
+            Err(StorageError::new(libc::ECANCELED, "consumer stopped"))
+        }),
+        libc::ECANCELED,
+    );
+}
+
+#[test]
+fn smb_retry_and_write_lock_classification_matches_recoverable_failures() {
+    for errno in [
+        libc::ENETDOWN,
+        libc::ETIMEDOUT,
+        libc::ECONNRESET,
+        libc::ECONNABORTED,
+        libc::ENOTCONN,
+        libc::EPIPE,
+        libc::EIO,
+    ] {
+        assert!(is_connection_failure(&StorageError::new(errno, "offline")));
+    }
+    assert!(!is_connection_failure(&StorageError::new(
+        libc::EINVAL,
+        "bad request"
+    )));
+
+    assert!(write_lock_is_busy(&Error::Protocol {
+        status: NtStatus::OBJECT_NAME_COLLISION,
+        command: Command::Create,
+    }));
+    assert!(write_lock_is_busy(&Error::Protocol {
+        status: NtStatus::SHARING_VIOLATION,
+        command: Command::Create,
+    }));
+    assert!(write_lock_is_busy(&Error::Protocol {
+        status: NtStatus::DELETE_PENDING,
+        command: Command::Create,
+    }));
+    assert!(!write_lock_is_busy(&Error::Protocol {
+        status: NtStatus::ACCESS_DENIED,
+        command: Command::Create,
+    }));
 }
 
 #[tokio::test]

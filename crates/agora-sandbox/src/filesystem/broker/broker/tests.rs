@@ -1286,3 +1286,373 @@ fn retain_overflow_is_atomic_and_internal_error_helpers_preserve_context() {
     ranges.insert(ByteRange { start: 1, end: 4 });
     assert_eq!(ranges.ranges, vec![ByteRange { start: 1, end: 6 }]);
 }
+
+#[test]
+fn broker_rejects_conflicting_write_ids_and_read_only_write_protocols() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("write-protocol", b"abcdefgh");
+    let (read_only, _reader) = fixture.open(&path, false);
+    let range = ByteRange::new(1, 3).unwrap();
+    let write_id = "11111111111111111111111111111111";
+
+    for request in [
+        Request::BeginWrite {
+            handle: read_only.clone(),
+            write_id: write_id.to_string(),
+            range,
+        },
+        Request::BeginAppend {
+            handle: read_only.clone(),
+            write_id: write_id.to_string(),
+        },
+        Request::FinishWrite {
+            handle: read_only,
+            write_id: write_id.to_string(),
+            range,
+        },
+    ] {
+        assert_error(fixture.broker.handle(request, None).response, libc::EBADF);
+    }
+
+    let (writable, _writer) = fixture.open(&path, true);
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::BeginWrite {
+                    handle: writable.clone(),
+                    write_id: write_id.to_string(),
+                    range,
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::BeginWrite {
+                    handle: writable.clone(),
+                    write_id: write_id.to_string(),
+                    range,
+                },
+                None,
+            )
+            .response,
+        Response::Success,
+        "an idempotent retry must retain the original reservation"
+    );
+    assert_error(
+        fixture
+            .broker
+            .handle(
+                Request::BeginWrite {
+                    handle: writable.clone(),
+                    write_id: write_id.to_string(),
+                    range: ByteRange::new(3, 5).unwrap(),
+                },
+                None,
+            )
+            .response,
+        libc::EPROTO,
+    );
+    assert_error(
+        fixture
+            .broker
+            .handle(
+                Request::FinishWrite {
+                    handle: writable.clone(),
+                    write_id: write_id.to_string(),
+                    range: ByteRange::new(0, 4).unwrap(),
+                },
+                None,
+            )
+            .response,
+        libc::EPROTO,
+    );
+    assert_error(
+        fixture
+            .broker
+            .handle(
+                Request::FinishWrite {
+                    handle: writable.clone(),
+                    write_id: "22222222222222222222222222222222".to_string(),
+                    range,
+                },
+                None,
+            )
+            .response,
+        libc::EPROTO,
+    );
+
+    let append_id = "33333333333333333333333333333333";
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::BeginAppend {
+                    handle: writable.clone(),
+                    write_id: append_id.to_string(),
+                },
+                None,
+            )
+            .response,
+        Response::Offset { offset: 8 }
+    );
+    assert_error(
+        fixture
+            .broker
+            .handle(
+                Request::BeginAppend {
+                    handle: writable.clone(),
+                    write_id: append_id.to_string(),
+                },
+                None,
+            )
+            .response,
+        libc::EPROTO,
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::CancelWrite {
+                    handle: writable.clone(),
+                    write_id: append_id.to_string(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::CancelWrite {
+                    handle: writable,
+                    write_id: "missing".to_string(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+}
+
+#[test]
+fn abort_and_release_retain_clean_up_only_valid_live_handles() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("abort", b"data");
+    let (handle, _writer) = fixture.open(&path, true);
+    let write_id = "11111111111111111111111111111111";
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::BeginWrite {
+                    handle: handle.clone(),
+                    write_id: write_id.to_string(),
+                    range: ByteRange::new(0, 4).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Abort {
+                    handle: handle.clone(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert!(!lock(&fixture.broker.handles).contains_key(&handle));
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Abort {
+                    handle: "missing".to_string(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_error(
+        fixture
+            .broker
+            .handle(
+                Request::Claim {
+                    request_id: "missing".to_string(),
+                },
+                None,
+            )
+            .response,
+        libc::EPROTO,
+    );
+
+    let (released, _reader) = fixture.open(&path, false);
+    let local = lock(&fixture.broker.handles)
+        .get(&released)
+        .unwrap()
+        .clone();
+    lock(&local).references = 0;
+    assert_error(
+        fixture
+            .broker
+            .handle(
+                Request::ReleaseRetain {
+                    handles: vec![released],
+                },
+                None,
+            )
+            .response,
+        libc::EBADF,
+    );
+    assert_error(
+        fixture
+            .broker
+            .handle(
+                Request::ReleaseRetain {
+                    handles: vec!["missing".to_string()],
+                },
+                None,
+            )
+            .response,
+        libc::EBADF,
+    );
+}
+
+#[test]
+fn request_cache_waiters_claim_rules_and_capacity_are_deterministic() {
+    let completion = Arc::new(RequestCompletion::default());
+    let waiting = Arc::clone(&completion);
+    let (sender, receiver) = mpsc::channel();
+    let waiter = thread::spawn(move || sender.send(waiting.wait()).unwrap());
+    assert!(receiver.recv_timeout(Duration::from_millis(20)).is_err());
+    completion.complete(Response::Success);
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+        Response::Success
+    );
+    waiter.join().unwrap();
+
+    let fingerprint = [1_u8; 32];
+    let mut cache = RequestCache::default();
+    assert!(matches!(
+        cache.begin("pending".to_string(), fingerprint),
+        CacheDecision::Execute
+    ));
+    assert!(matches!(
+        cache.begin("pending".to_string(), fingerprint),
+        CacheDecision::Wait(_)
+    ));
+    assert!(matches!(
+        cache.begin("pending".to_string(), [2_u8; 32]),
+        CacheDecision::Reject
+    ));
+    assert_eq!(cache.claim("pending"), None);
+    assert!(cache
+        .complete("missing".to_string(), Response::Success, Instant::now())
+        .is_empty());
+    assert!(cache
+        .complete("pending".to_string(), Response::Success, Instant::now())
+        .is_empty());
+    assert_eq!(cache.claim("pending"), None);
+    assert!(matches!(
+        cache.begin("pending".to_string(), fingerprint),
+        CacheDecision::Replay(Response::Success)
+    ));
+
+    let open_id = "unclaimed".to_string();
+    assert!(matches!(
+        cache.begin(open_id.clone(), fingerprint),
+        CacheDecision::Execute
+    ));
+    let completed_at = Instant::now() - REQUEST_CACHE_TTL - Duration::from_secs(1);
+    assert!(
+        cache
+            .complete(
+            open_id,
+            Response::Open {
+                handle: "abandoned-handle".to_string(),
+                device: 1,
+                inode: 2,
+                links: 1,
+            },
+            completed_at,
+        )
+            .is_empty()
+    );
+    assert_eq!(
+        cache.prune(Instant::now()),
+        vec!["abandoned-handle".to_string()]
+    );
+
+    let now = Instant::now();
+    for index in 0..=REQUEST_CACHE_CAPACITY {
+        cache.entries.insert(
+            format!("capacity-{index}"),
+            CachedRequest::Completed {
+                fingerprint,
+                response: Response::Success,
+                completed_at: now,
+                claimed: true,
+            },
+        );
+    }
+    assert!(cache.prune(now).is_empty());
+    assert_eq!(
+        cache
+            .entries
+            .values()
+            .filter(|entry| matches!(entry, CachedRequest::Completed { .. }))
+            .count(),
+        REQUEST_CACHE_CAPACITY
+    );
+}
+
+#[test]
+fn truncating_a_live_shared_file_updates_every_descriptor_and_ciphertext() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("live-truncate", b"plaintext");
+    let (_first, first) = fixture.open(&path, true);
+    let mut reply = fixture.broker.handle(
+        Request::Open {
+            path: BackingPath::from_path(&path),
+            flags: libc::O_RDWR | libc::O_TRUNC,
+        },
+        None,
+    );
+    let Response::Open { handle, .. } = reply.response else {
+        panic!("unexpected truncate response: {:?}", reply.response);
+    };
+    let second = reply.descriptors.remove(0);
+
+    assert_eq!(first.metadata().unwrap().len(), 0);
+    assert_eq!(second.metadata().unwrap().len(), 0);
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Sync {
+                    handle,
+                    ranges: Vec::new(),
+                    durable: true,
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert!(fixture.decrypt(&path).is_empty());
+}
