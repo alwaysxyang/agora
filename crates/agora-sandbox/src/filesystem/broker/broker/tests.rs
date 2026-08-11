@@ -1561,12 +1561,16 @@ fn request_cache_waiters_claim_rules_and_capacity_are_deterministic() {
         CacheDecision::Reject
     ));
     assert_eq!(cache.claim("pending"), None);
-    assert!(cache
-        .complete("missing".to_string(), Response::Success, Instant::now())
-        .is_empty());
-    assert!(cache
-        .complete("pending".to_string(), Response::Success, Instant::now())
-        .is_empty());
+    assert!(
+        cache
+            .complete("missing".to_string(), Response::Success, Instant::now())
+            .is_empty()
+    );
+    assert!(
+        cache
+            .complete("pending".to_string(), Response::Success, Instant::now())
+            .is_empty()
+    );
     assert_eq!(cache.claim("pending"), None);
     assert!(matches!(
         cache.begin("pending".to_string(), fingerprint),
@@ -1582,15 +1586,15 @@ fn request_cache_waiters_claim_rules_and_capacity_are_deterministic() {
     assert!(
         cache
             .complete(
-            open_id,
-            Response::Open {
-                handle: "abandoned-handle".to_string(),
-                device: 1,
-                inode: 2,
-                links: 1,
-            },
-            completed_at,
-        )
+                open_id,
+                Response::Open {
+                    handle: "abandoned-handle".to_string(),
+                    device: 1,
+                    inode: 2,
+                    links: 1,
+                },
+                completed_at,
+            )
             .is_empty()
     );
     assert_eq!(
@@ -1599,6 +1603,13 @@ fn request_cache_waiters_claim_rules_and_capacity_are_deterministic() {
     );
 
     let now = Instant::now();
+    cache.entries.insert(
+        "capacity-pending".to_string(),
+        CachedRequest::Pending {
+            fingerprint,
+            completion: Arc::new(RequestCompletion::default()),
+        },
+    );
     for index in 0..=REQUEST_CACHE_CAPACITY {
         cache.entries.insert(
             format!("capacity-{index}"),
@@ -1619,6 +1630,103 @@ fn request_cache_waiters_claim_rules_and_capacity_are_deterministic() {
             .count(),
         REQUEST_CACHE_CAPACITY
     );
+    assert!(matches!(
+        cache.entries.get("capacity-pending"),
+        Some(CachedRequest::Pending { .. })
+    ));
+}
+
+#[test]
+fn shared_mutations_are_idempotent_and_serialize_append_and_sync() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("mutation-order", b"plaintext");
+    let (handle, _content) = fixture.open(&path, true);
+    let shared = {
+        let handles = lock(&fixture.broker.handles);
+        Arc::clone(&lock(handles.get(&handle).unwrap()).shared)
+    };
+    let write = WriteKey {
+        handle: handle.clone(),
+        write_id: "write".to_string(),
+    };
+    let append = WriteKey {
+        handle,
+        write_id: "append".to_string(),
+    };
+
+    shared.begin_write(write.clone());
+    shared.begin_write(write.clone());
+
+    let waiting = Arc::clone(&shared);
+    let waiting_append = append.clone();
+    let (append_ready, append_started) = mpsc::channel();
+    let append_thread = thread::spawn(move || {
+        waiting.begin_append(waiting_append);
+        append_ready.send(()).unwrap();
+    });
+    assert!(append_started
+        .recv_timeout(Duration::from_millis(20))
+        .is_err());
+    shared.finish_write(&write);
+    append_started.recv_timeout(Duration::from_secs(1)).unwrap();
+    append_thread.join().unwrap();
+
+    shared.begin_append(append.clone());
+    let waiting = Arc::clone(&shared);
+    let (sync_ready, sync_started) = mpsc::channel();
+    let sync_thread = thread::spawn(move || {
+        let _guard = waiting.begin_sync();
+        sync_ready.send(()).unwrap();
+    });
+    assert!(sync_started
+        .recv_timeout(Duration::from_millis(20))
+        .is_err());
+    shared.finish_write(&append);
+    sync_started.recv_timeout(Duration::from_secs(1)).unwrap();
+    sync_thread.join().unwrap();
+}
+
+#[test]
+fn release_retain_marks_the_last_reference_closed_and_expiration_finishes_writes() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("release-retain", b"plaintext");
+    let (handle, _content) = fixture.open(&path, true);
+    let write_id = "unfinished".to_string();
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::BeginWrite {
+                    handle: handle.clone(),
+                    write_id: write_id.clone(),
+                    range: ByteRange::new(0, 1).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::ReleaseRetain {
+                    handles: vec![handle.clone()],
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    let local = lock(&fixture.broker.handles).get(&handle).unwrap().clone();
+    assert_eq!(lock(&local).references, 0);
+    assert!(lock(&local).closed_at.is_some());
+
+    lock(&local).closed_at = Some(Instant::now() - CLOSED_HANDLE_TTL - Duration::from_secs(1));
+    fixture.broker.expire_closed();
+    assert!(!lock(&fixture.broker.handles).contains_key(&handle));
+    assert!(lock(&lock(&local).shared.mutations).active.is_empty());
 }
 
 #[test]

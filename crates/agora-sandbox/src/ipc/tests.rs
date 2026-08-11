@@ -1,6 +1,12 @@
 #[cfg(target_os = "macos")]
-use super::{InheritedControlLock, InheritedControlStream, configure_no_sigpipe};
-use super::{MAX_FRAME_SIZE, receive, receive_with_descriptors, send, send_with_descriptors};
+use super::{
+    InheritedControlLock, InheritedControlStream, configure_no_sigpipe, make_inheritable,
+    set_record_lock,
+};
+use super::{
+    MAX_DESCRIPTORS, MAX_FRAME_SIZE, receive, receive_with_descriptors, send,
+    send_with_descriptors,
+};
 use crate::nfs::protocol::{PROTOCOL_VERSION, RequestId, Response, ResponseEnvelope};
 use serde::Serialize;
 use std::io::{Read, Write};
@@ -97,6 +103,25 @@ fn inherited_control_streams_are_inheritable_and_serialize_threads() {
     let adopted = unsafe { InheritedControlLock::from_raw_descriptor(duplicate) }.unwrap();
     let adopted_flags = unsafe { libc::fcntl(adopted.descriptor(), libc::F_GETFD) };
     assert_eq!(adopted_flags & libc::FD_CLOEXEC, 0);
+    let debug = format!("{shared:?}");
+    assert!(debug.contains("InheritedControlStream"));
+    assert!(debug.contains("descriptor"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn inherited_control_primitives_reject_invalid_descriptors_and_lock_commands() {
+    assert!(unsafe { InheritedControlLock::from_raw_descriptor(-1) }.is_err());
+    assert_eq!(
+        make_inheritable(-1).unwrap_err().raw_os_error(),
+        Some(libc::EBADF)
+    );
+    assert_eq!(
+        set_record_lock(-1, 0, libc::F_WRLCK, libc::F_SETLK)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EBADF)
+    );
 }
 
 #[test]
@@ -251,6 +276,27 @@ fn framed_transport_rejects_an_invalid_descriptor() {
     let error = send(&mut sender, &response, Some(-1)).unwrap_err();
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+    let descriptors = std::iter::repeat_n(file_descriptor(), MAX_DESCRIPTORS + 1)
+        .collect::<Vec<_>>();
+    let error = send_with_descriptors(&mut sender, &response, &descriptors).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn framed_transport_reports_marker_send_failures() {
+    let (mut sender, receiver) = UnixStream::pair().unwrap();
+    let response = ResponseEnvelope {
+        version: PROTOCOL_VERSION,
+        request_id: request_id(),
+        response: Response::Success,
+    };
+    let descriptor = std::fs::File::open("/dev/null").unwrap();
+    drop(receiver);
+
+    let error = send_with_descriptors(&mut sender, &response, &[descriptor.as_raw_fd()])
+        .unwrap_err();
+    assert!(error.raw_os_error().is_some(), "unexpected error: {error:?}");
 }
 
 #[cfg(target_os = "macos")]
@@ -285,6 +331,12 @@ fn single_descriptor_wrapper_rejects_multiple_descriptors() {
 
 fn request_id() -> RequestId {
     RequestId::new("0123456789abcdef0123456789abcdef").unwrap()
+}
+
+fn file_descriptor() -> RawFd {
+    static FILE: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| std::fs::File::open("/dev/null").unwrap())
+        .as_raw_fd()
 }
 
 fn send_descriptor_marker(stream: &UnixStream, descriptors: &[RawFd]) {
