@@ -99,12 +99,15 @@
 - 不要强制整个 workspace 使用 `--test-threads=1`；只串行化共享进程级全局状态的特定测试。
 - 不要针对同一个 target 目录并发启动多个 Cargo build、test、Clippy 或 coverage 进程。使用 Cargo 和 libtest 自身的内部并发，避免 target 锁竞争。
 - 聚焦验证通过后只运行一次 workspace 覆盖率，不要在每次中间修改后都运行。
+- 所有 LLVM 原始覆盖率文件（`.profraw`）都必须写入 workspace 的 `target/` 目录，不得遗留在仓库根目录或 crate 目录。
 - 存在项目自带的覆盖率命令时使用它；否则运行：
 
 ```bash
-cargo llvm-cov --no-clean --workspace --all-targets --jobs 16 --fail-under-lines 80
+LLVM_PROFILE_FILE="$PWD/target/agora-%p-%12m.profraw" \
+  cargo llvm-cov --no-clean --workspace --all-targets --jobs 16 --fail-under-lines 80
 ```
 
+- 覆盖率命令结束后，运行 `rg --files -uu -g '*.profraw' -g '!target/**'`；该命令必须无输出，并在完成任务前删除任何 target 外残留的 `.profraw`。
 - 不要降低阈值、排除生产代码，或仅为了满足覆盖率而把代码标记为不计覆盖。
 - 覆盖率低于 80%，或无法运行所需覆盖率检查时，验证均视为未完成。
 
