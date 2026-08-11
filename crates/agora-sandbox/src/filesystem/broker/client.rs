@@ -13,9 +13,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+const BUSY_RETRY_DELAY: Duration = Duration::from_millis(1);
+const MAX_BUSY_RETRY_DELAY: Duration = Duration::from_millis(25);
 const IDEMPOTENT_ATTEMPTS: usize = 2;
 
 #[derive(Clone, Debug)]
@@ -107,12 +109,13 @@ impl LocalClient {
         path: &Path,
         flags: libc::c_int,
     ) -> Result<LocalOpen, LocalClientError> {
-        let request_id = uuid::Uuid::new_v4().simple().to_string();
-        let LocalReply {
-            response,
-            mut descriptors,
-        } = self.request_with_id(
-            request_id.clone(),
+        let (
+            request_id,
+            LocalReply {
+                response,
+                mut descriptors,
+            },
+        ) = self.request_until_ready(
             Request::Open {
                 path: BackingPath::from_path(path),
                 flags,
@@ -188,7 +191,7 @@ impl LocalClient {
         ranges: Vec<ByteRange>,
         durable: bool,
     ) -> Result<(), LocalClientError> {
-        self.success(
+        self.success_until_ready(
             Request::Sync {
                 handle: handle.to_string(),
                 ranges,
@@ -218,7 +221,7 @@ impl LocalClient {
         range: ByteRange,
     ) -> Result<LocalWrite, LocalClientError> {
         let write_id = uuid::Uuid::new_v4().simple().to_string();
-        self.success(
+        self.success_until_ready(
             Request::BeginWrite {
                 handle: handle.to_string(),
                 write_id: write_id.clone(),
@@ -231,7 +234,7 @@ impl LocalClient {
 
     pub(crate) fn begin_append(&self, handle: &str) -> Result<(LocalWrite, u64), LocalClientError> {
         let write_id = uuid::Uuid::new_v4().simple().to_string();
-        let reply = self.request(
+        let (_, reply) = self.request_until_ready(
             Request::BeginAppend {
                 handle: handle.to_string(),
                 write_id: write_id.clone(),
@@ -287,7 +290,7 @@ impl LocalClient {
         handle: &str,
         ranges: Vec<ByteRange>,
     ) -> Result<(), LocalClientError> {
-        self.success(
+        self.success_until_ready(
             Request::Close {
                 handle: handle.to_string(),
                 ranges,
@@ -312,6 +315,19 @@ impl LocalClient {
 
     fn success(&self, request: Request, attempts: usize) -> Result<(), LocalClientError> {
         let reply = self.request(request, None, attempts)?;
+        Self::expect_success(reply)
+    }
+
+    fn success_until_ready(
+        &self,
+        request: Request,
+        attempts: usize,
+    ) -> Result<(), LocalClientError> {
+        let (_, reply) = self.request_until_ready(request, None, attempts)?;
+        Self::expect_success(reply)
+    }
+
+    fn expect_success(reply: LocalReply) -> Result<(), LocalClientError> {
         if !reply.descriptors.is_empty() {
             return Err(LocalClientError::protocol(
                 "local filesystem response unexpectedly included descriptors",
@@ -322,6 +338,27 @@ impl LocalClient {
             _ => Err(LocalClientError::protocol(
                 "local filesystem broker returned an unexpected response",
             )),
+        }
+    }
+
+    fn request_until_ready(
+        &self,
+        request: Request,
+        descriptor: Option<RawFd>,
+        attempts: usize,
+    ) -> Result<(String, LocalReply), LocalClientError> {
+        let deadline = Instant::now() + CLIENT_TIMEOUT;
+        let mut retry_delay = BUSY_RETRY_DELAY;
+        loop {
+            let request_id = uuid::Uuid::new_v4().simple().to_string();
+            match self.request_with_id(request_id.clone(), request.clone(), descriptor, attempts) {
+                Ok(reply) => return Ok((request_id, reply)),
+                Err(error) if error.errno == libc::EAGAIN && Instant::now() < deadline => {
+                    std::thread::sleep(retry_delay);
+                    retry_delay = (retry_delay * 2).min(MAX_BUSY_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 

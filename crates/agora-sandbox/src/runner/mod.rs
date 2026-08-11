@@ -1,4 +1,12 @@
 #[cfg(target_os = "macos")]
+mod runtime;
+
+#[cfg(target_os = "macos")]
+pub(crate) use runtime::{
+    PreparedLaunch, ProtectedEnvironment, RunningSandboxCommand, SandboxRuntime,
+};
+
+#[cfg(target_os = "macos")]
 use crate::audit::AuditController;
 use crate::callback::Callback;
 #[cfg(target_os = "macos")]
@@ -473,7 +481,7 @@ impl SandboxCommand {
     }
 
     #[cfg(target_os = "macos")]
-    fn resolved_program(&self) -> Result<PathBuf> {
+    pub(crate) fn resolved_program(&self) -> Result<PathBuf> {
         resolve_executable(
             &self.program,
             self.current_dir.as_deref(),
@@ -504,23 +512,25 @@ impl SandboxCommand {
     }
 
     #[cfg(target_os = "macos")]
-    fn set_program(&mut self, program: PathBuf) {
-        self.program = program.into_os_string();
+    pub(crate) fn apply_prepared(&mut self, launch: &PreparedLaunch) {
+        self.program = launch.program().as_os_str().to_owned();
+        let mut arguments = Vec::with_capacity(
+            launch
+                .argument_prefix()
+                .len()
+                .saturating_add(self.arguments.len()),
+        );
+        arguments.extend_from_slice(launch.argument_prefix());
+        arguments.append(&mut self.arguments);
+        self.arguments = arguments;
     }
 
     #[cfg(target_os = "macos")]
-    fn set_script_interpreter(
-        &mut self,
-        interpreter: PathBuf,
-        interpreter_argument: Option<OsString>,
-        script: PathBuf,
-    ) {
-        self.program = interpreter.into_os_string();
-        let mut arguments = Vec::with_capacity(self.arguments.len() + 2);
-        arguments.extend(interpreter_argument);
-        arguments.push(script.into_os_string());
-        arguments.append(&mut self.arguments);
-        self.arguments = arguments;
+    fn effective_environment(&self, key: &str) -> Option<OsString> {
+        self.environment
+            .get(OsStr::new(key))
+            .cloned()
+            .or_else(|| std::env::var_os(key))
     }
 }
 
@@ -541,362 +551,29 @@ where
     }
 
     #[cfg(target_os = "macos")]
-    pub async fn run(self, mut command: SandboxCommand) -> Result<SandboxOutcome> {
-        self.config.validate()?;
-        let callback = std::sync::Arc::new(self.callback);
-        let filesystem_workdir = self.config.workdir.clone();
-        let filesystem_mode = self.config.filesystem_mode;
-        let filesystem_key = self.config.encrypted_workspace_key().map(<[u8]>::to_vec);
-        let filesystem = filesystem_blocking(move || {
-            FilesystemWorkspace::start(
-                &filesystem_workdir,
-                filesystem_mode,
-                filesystem_key.as_deref(),
-            )
-        })
-        .await?;
-        #[cfg(feature = "remote-smb")]
-        let remote_preflight_errors = self
-            .config
-            .smb_remotes
-            .iter()
-            .map(|remote| remote_logical_parent_errno(&filesystem, remote.logical_root()))
-            .collect::<Result<Vec<_>>>()?;
-        let runtime_directory = tempfile::Builder::new()
-            .prefix("agora-sandbox-run-")
-            .tempdir_in("/tmp")
-            .context("failed to create sandbox runtime directory")?;
-        let mut local_filesystem = match filesystem.encrypted_cipher_key() {
-            Some(key) => Some(
-                LocalController::start(
-                    filesystem.root(),
-                    crate::filesystem::FileCipher::from_key(key)?,
-                    &runtime_directory.path().join("filesystem"),
-                )
-                .await?,
-            ),
-            None => None,
-        };
-        let tls_ca_files = self.config.tls_ca_for_workdir()?;
-        let hook_library = self.config.hook_library.canonicalize().with_context(|| {
-            format!(
-                "failed to resolve sandbox hook library {}",
-                self.config.hook_library.display()
-            )
-        })?;
-        let tls_ca = tls_ca_files
-            .as_ref()
-            .map(|ca| {
-                let certificate_path = ca.certificate.canonicalize().with_context(|| {
-                    format!(
-                        "failed to resolve TLS CA certificate {}",
-                        ca.certificate.display()
-                    )
-                })?;
-                let certificate = std::fs::read(&certificate_path).with_context(|| {
-                    format!(
-                        "failed to read TLS CA certificate {}",
-                        certificate_path.display()
-                    )
-                })?;
-                let private_key = std::fs::read(&ca.private_key).with_context(|| {
-                    format!(
-                        "failed to read TLS CA private key {}",
-                        ca.private_key.display()
-                    )
-                })?;
-                let trust_bundle = self
-                    .config
-                    .write_tls_trust_bundle(runtime_directory.path(), &certificate)?;
-                Ok::<_, anyhow::Error>((certificate, private_key, certificate_path, trust_bundle))
-            })
-            .transpose()?;
-        let sandbox_id = Uuid::new_v4().to_string();
-        let run_id = Uuid::new_v4().to_string();
-        let trace = TraceContext::root();
-        let audit_callback = {
-            let callback = std::sync::Arc::clone(&callback);
-            move |event| {
-                let callback = std::sync::Arc::clone(&callback);
-                async move { callback.on_event(event).await }
-            }
-        };
-        let mut audit = AuditController::start(
-            sandbox_id.clone(),
-            run_id.clone(),
-            audit_callback,
-            self.config.network.callback_timeout,
-        )
-        .await?;
-        let mut execution = {
-            let execution = match filesystem.encrypted_cipher_key() {
-                Some(key) => {
-                    ExecutionController::start_encrypted(
-                        filesystem.root().to_path_buf(),
-                        crate::filesystem::FileCipher::from_key(key)?,
-                    )
-                    .await
-                }
-                None => ExecutionController::start(filesystem.root().to_path_buf()).await,
-            };
-            let controller = match execution {
-                Ok(controller) => controller,
-                Err(error) => {
-                    let _ = audit.shutdown().await;
-                    return Err(error);
-                }
-            };
-            let executable = command.resolved_program()?;
-            let prepared = controller.prepare(executable).await?;
-            if let Some(shebang) = resolve_shebang(&prepared)? {
-                let interpreter = controller.prepare(shebang.interpreter).await?;
-                command.set_script_interpreter(interpreter, shebang.argument, prepared);
-            } else {
-                command.set_program(prepared);
-            }
-            controller
-        };
-        let context = NetworkRunContext::new(&sandbox_id, &run_id);
-        let network_callback = {
-            let callback = std::sync::Arc::clone(&callback);
-            move |event| {
-                let callback = std::sync::Arc::clone(&callback);
-                async move { callback.on_event(event).await }
-            }
-        };
-        #[cfg(test)]
-        let upstream_tls_roots = self.config.upstream_tls_roots.clone();
-        #[cfg(test)]
-        let controller = match (tls_ca.as_ref(), upstream_tls_roots) {
-            (Some((certificate, private_key, _, _)), Some(roots)) => {
-                NetworkController::start_with_tls_ca_and_roots(
-                    self.config.network,
-                    context,
-                    network_callback,
-                    certificate,
-                    private_key,
-                    roots,
-                )
-                .await
-            }
-            (tls_ca, None) => match tls_ca {
-                Some((certificate, private_key, _, _)) => {
-                    NetworkController::start_with_tls_ca(
-                        self.config.network,
-                        context,
-                        network_callback,
-                        certificate,
-                        private_key,
-                    )
-                    .await
-                }
-                None => {
-                    NetworkController::start(self.config.network, context, network_callback).await
-                }
-            },
-            (None, Some(_)) => Err(anyhow::anyhow!(
-                "test upstream TLS roots require TLS interception"
-            )),
-        };
-        #[cfg(not(test))]
-        let controller = match tls_ca.as_ref() {
-            Some((certificate, private_key, _, _)) => {
-                NetworkController::start_with_tls_ca(
-                    self.config.network,
-                    context,
-                    network_callback,
-                    certificate,
-                    private_key,
-                )
-                .await
-            }
-            None => NetworkController::start(self.config.network, context, network_callback).await,
-        };
-        let mut controller = match controller {
-            Ok(controller) => controller,
+    pub async fn run(self, command: SandboxCommand) -> Result<SandboxOutcome> {
+        let executable = command.resolved_program()?;
+        let mut runtime = SandboxRuntime::start(self.config, self.callback).await?;
+        let sandbox_id = runtime.sandbox_id().to_owned();
+        let run_id = runtime.run_id().to_owned();
+        let launch = match runtime.prepare(executable).await {
+            Ok(launch) => launch,
             Err(error) => {
-                let _ = execution.shutdown().await;
-                let _ = audit.shutdown().await;
+                let _ = runtime.shutdown().await;
                 return Err(error);
             }
         };
-        #[cfg(feature = "remote-smb")]
-        let mut remote = if self.config.smb_remotes.is_empty() {
-            None
-        } else {
-            match crate::nfs::start_controller(
-                &self.config.smb_remotes,
-                &runtime_directory.path().join("nfs"),
-                &remote_preflight_errors,
-            )
-            .await
-            {
-                Ok(remote) => Some(remote),
-                Err(error) => {
-                    let _ = controller.shutdown().await;
-                    let _ = execution.shutdown().await;
-                    let _ = audit.shutdown().await;
-                    return Err(error);
-                }
-            }
-        };
-        let runtime = controller.runtime();
-        let execution_runtime = execution.runtime();
-        let audit_runtime = audit.runtime();
-        let injected_libraries = Self::injected_libraries(&hook_library)?;
-        let mut child = command.into_command();
-        child
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .env(TOKEN, runtime.token())
-            .env(PROXY_IPV4, runtime.proxy_ipv4().to_string())
-            .env(PROXY_IPV6, runtime.proxy_ipv6().to_string())
-            .env(EXECUTION_CONTROL, execution_runtime.control().to_string())
-            .env(EXECUTION_TOKEN, execution_runtime.token())
-            .env(AUDIT_CONTROL, audit_runtime.control().to_string())
-            .env(AUDIT_TOKEN, audit_runtime.token())
-            .env(HOOK_LIBRARIES, &injected_libraries)
-            .env(FILESYSTEM_ROOT, filesystem.root())
-            .env(
-                FILESYSTEM_MODE,
-                match self.config.filesystem_mode {
-                    FilesystemMode::Encrypted => "encrypted",
-                    FilesystemMode::Plain => "plain",
-                },
-            )
-            .env(TRACE_ID_ENVIRONMENT, trace.encode())
-            .env("DYLD_INSERT_LIBRARIES", injected_libraries);
-        child
-            .env_remove(REMOTE_CONTROL)
-            .env_remove(REMOTE_TOKEN)
-            .env_remove(REMOTE_ROOTS)
-            .env_remove(REMOTE_CURRENT_DIRECTORY)
-            .env_remove(LOCAL_FILESYSTEM_CONTROL)
-            .env_remove(LOCAL_FILESYSTEM_TOKEN)
-            .env_remove(INHERITED_LOCAL_DESCRIPTORS);
-        if let Some(local) = &local_filesystem {
-            child
-                .env(LOCAL_FILESYSTEM_CONTROL, local.runtime().socket())
-                .env(LOCAL_FILESYSTEM_TOKEN, local.runtime().token());
-        }
-        #[cfg(feature = "remote-smb")]
-        if let Some(remote) = &remote {
-            let routes = self
-                .config
-                .smb_remotes
-                .iter()
-                .enumerate()
-                .map(|(root, remote)| {
-                    Ok(RemoteRoute {
-                        root: u32::try_from(root).context("too many SMB remote roots")?,
-                        logical_root: remote.logical_root().to_string_lossy().into_owned(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            child
-                .env(REMOTE_CONTROL, remote.runtime().socket())
-                .env(REMOTE_TOKEN, remote.runtime().token())
-                .env(REMOTE_ROOTS, serde_json::to_string(&routes)?);
-        }
-        if let Some(key) = filesystem.encrypted_cipher_key() {
-            child.env(
-                FILESYSTEM_CIPHER_KEY,
-                base64::engine::general_purpose::STANDARD.encode(key),
-            );
-        }
-        if let Some(anchor) = runtime.tls_trust_anchor_der() {
-            child.env(
-                TLS_TRUST_ANCHOR_DER,
-                base64::engine::general_purpose::STANDARD.encode(anchor),
-            );
-        }
-        if let Some((_, _, _, trust_bundle)) = &tls_ca {
-            child.env(TLS_TRUST_BUNDLE, trust_bundle);
-            for key in TLS_CLIENT_TRUST_ENVIRONMENT {
-                child.env(key, trust_bundle);
-            }
-        }
-        child.as_std_mut().process_group(0);
-        let mut terminal = ForegroundTerminal::capture()?;
-
-        let mut child = match child.spawn() {
+        let mut child = match RunningSandboxCommand::spawn(command, &launch) {
             Ok(child) => child,
             Err(error) => {
-                #[cfg(feature = "remote-smb")]
-                if let Some(remote) = remote.take() {
-                    let _ = remote.shutdown().await;
-                }
-                if let Some(local) = local_filesystem.take() {
-                    let _ = local.shutdown().await;
-                }
-                let _ = controller.shutdown().await;
-                let _ = execution.shutdown().await;
-                let _ = audit.shutdown().await;
-                return Err(error).context("failed to start sandbox child");
+                let _ = runtime.shutdown().await;
+                return Err(error);
             }
         };
-        let process_group = child
-            .id()
-            .and_then(|id| libc::pid_t::try_from(id).ok())
-            .context("sandbox child has no valid process id")?;
-        if let Some(terminal) = terminal.as_mut()
-            && let Err(error) = terminal.handoff(process_group)
-        {
-            let _ = terminate_process_group(&mut child, process_group).await;
-            #[cfg(feature = "remote-smb")]
-            if let Some(remote) = remote.take() {
-                let _ = remote.shutdown().await;
-            }
-            if let Some(local) = local_filesystem.take() {
-                let _ = local.shutdown().await;
-            }
-            let _ = controller.shutdown().await;
-            let _ = execution.shutdown().await;
-            let _ = audit.shutdown().await;
-            return Err(error);
-        }
-        let status = wait_for_child_or_service(
-            &mut child,
-            process_group,
-            RuntimeServices {
-                network: &mut controller,
-                execution: &mut execution,
-                audit: &mut audit,
-                local_filesystem: &mut local_filesystem,
-                #[cfg(feature = "remote-smb")]
-                remote: &mut remote,
-            },
-            #[cfg(feature = "remote-smb")]
-            |status| log_remote_connection_status(&self.config.smb_remotes, status),
-        )
-        .await;
-        let terminal_restore = terminal
-            .as_mut()
-            .map(ForegroundTerminal::restore)
-            .transpose();
-        let shutdown = controller.shutdown().await;
-        let execution_shutdown = execution.shutdown().await;
-        let audit_shutdown = audit.shutdown().await;
-        let local_filesystem_shutdown = match local_filesystem.take() {
-            Some(local) => local.shutdown().await,
-            None => Ok(()),
-        };
-        #[cfg(feature = "remote-smb")]
-        let remote_shutdown = match remote.take() {
-            Some(remote) => remote.shutdown().await,
-            None => Ok(()),
-        };
+        let status = child.wait_or_failure(runtime.wait_failure()).await;
+        let shutdown = runtime.shutdown().await;
         let status = status?;
-        terminal_restore?;
         shutdown?;
-        execution_shutdown?;
-        audit_shutdown?;
-        local_filesystem_shutdown?;
-        #[cfg(feature = "remote-smb")]
-        remote_shutdown?;
-
         Ok(SandboxOutcome {
             status,
             sandbox_id,
@@ -909,15 +586,11 @@ where
         self.config.validate()?;
         unreachable!("sandbox validation must reject unsupported platforms")
     }
+}
 
-    #[cfg(target_os = "macos")]
-    fn injected_libraries(hook_library: &Path) -> Result<OsString> {
-        let mut libraries = vec![hook_library.to_path_buf()];
-        if let Some(existing) = std::env::var_os("DYLD_INSERT_LIBRARIES") {
-            libraries.extend(std::env::split_paths(&existing));
-        }
-        std::env::join_paths(libraries).context("invalid DYLD_INSERT_LIBRARIES path")
-    }
+#[cfg(target_os = "macos")]
+fn injected_libraries(hook_library: &Path) -> Result<OsString> {
+    std::env::join_paths([hook_library]).context("invalid sandbox hook DYLD_INSERT_LIBRARIES path")
 }
 
 #[cfg(target_os = "macos")]
@@ -1096,7 +769,7 @@ fn set_terminal_process_group(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 struct RuntimeServices<'a> {
     network: &'a mut NetworkController,
     execution: &'a mut ExecutionController,
@@ -1106,6 +779,7 @@ struct RuntimeServices<'a> {
     remote: &'a mut Option<RemoteController>,
 }
 
+#[cfg(all(test, target_os = "macos"))]
 async fn wait_for_child_or_service(
     child: &mut tokio::process::Child,
     process_group: libc::pid_t,
@@ -1185,7 +859,7 @@ fn remote_logical_parent_errno(
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "remote-smb"))]
+#[cfg(all(test, target_os = "macos", feature = "remote-smb"))]
 async fn wait_for_remote_failure(
     remote: &mut Option<RemoteController>,
     status: &mut impl FnMut(RemoteConnectionStatus),
@@ -1313,6 +987,14 @@ pub struct SandboxOutcome {
 }
 
 impl SandboxOutcome {
+    pub(crate) fn new(status: ExitStatus, sandbox_id: String, run_id: String) -> Self {
+        Self {
+            status,
+            sandbox_id,
+            run_id,
+        }
+    }
+
     pub fn status(&self) -> ExitStatus {
         self.status
     }

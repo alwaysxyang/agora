@@ -1,12 +1,17 @@
+#[cfg(target_os = "macos")]
 use agora_core::lifecycle::{
     shutdown::{ShutdownGuard, ShutdownReason},
     signal::{Signal, SignalHandlers},
 };
 use agora_core::logger::{self, LoggerEntry};
+#[cfg(not(target_os = "macos"))]
+use agora_sandbox::runner::Sandbox;
+#[cfg(target_os = "macos")]
+use agora_sandbox::session;
 use agora_sandbox::{
     callback::{Callback, Decision, Event, EventType, FileOpenMode, ProcessOperation},
     hook_library,
-    runner::{Sandbox, SandboxCommand},
+    runner::SandboxCommand,
 };
 use anyhow::{Context, Result};
 use clap::{ColorChoice, Parser, Subcommand};
@@ -15,6 +20,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
+#[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex, MutexGuard};
 
 mod config;
@@ -49,6 +55,17 @@ enum CliCommand {
         /// Sandbox work directory; defaults to ~/.agora-sandbox
         #[arg(long)]
         workdir: Option<PathBuf>,
+    },
+
+    #[cfg(target_os = "macos")]
+    #[command(name = "__session-daemon", hide = true)]
+    SessionDaemon {
+        #[arg(long, hide = true)]
+        config: PathBuf,
+        #[arg(long, hide = true)]
+        ready_fd: libc::c_int,
+        #[arg(long, hide = true)]
+        startup_lock_fd: libc::c_int,
     },
 }
 
@@ -182,43 +199,99 @@ async fn async_main(arguments: Arguments) -> Result<u8> {
             Ok(0)
         }
         CliCommand::Run { config, executable } => run(config, executable).await,
+        #[cfg(target_os = "macos")]
+        CliCommand::SessionDaemon {
+            config,
+            ready_fd,
+            startup_lock_fd,
+        } => run_session_daemon(config, ready_fd, startup_lock_fd).await,
     }
 }
 
 async fn run(config_path: PathBuf, executable: String) -> Result<u8> {
+    let config_path = absolute_config_path(config_path)?;
     let config = config::RunConfig::load(&config_path)?;
     let command = parse_command(&executable)?;
     let hook = hook_library::materialize(config.workdir())?;
-    logger::init(open_log(config.log_file())?, logger::LevelFilter::Info)?;
-    let config = config.into_runtime(hook);
-    let callback = JsonCallback::new();
 
-    let status = Arc::new(Mutex::new(None::<ExitStatus>));
-    let reason = Arc::new(Mutex::new(None::<ShutdownReason>));
-    let process_status = Arc::clone(&status);
-    let shutdown_reason = Arc::clone(&reason);
-    let guard = ShutdownGuard::get();
-    let signals = shutdown_signals(&guard)?;
-    let process = async move {
-        let outcome = Sandbox::new(config, callback).run(command).await?;
-        *lock(&process_status) = Some(outcome.status());
-        Ok(())
-    };
-
-    guard
-        .run_with_shutdown(process, signals, move |reason| async move {
-            *lock(&shutdown_reason) = Some(reason);
-        })
-        .await?;
-
-    if let Some(status) = lock(&status).take() {
-        return Ok(exit_status_code(status));
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = config.session_identity(&hook)?;
+        logger::init(open_log(config.log_file())?, logger::LevelFilter::Info)?;
+        let outcome = Sandbox::new(config.into_runtime(hook), JsonCallback::new())
+            .run(command)
+            .await?;
+        return Ok(exit_status_code(outcome.status()));
     }
-    let signal = match lock(&reason).as_ref() {
-        Some(ShutdownReason::Signal { signal }) => Some(*signal),
-        _ => None,
+
+    #[cfg(target_os = "macos")]
+    {
+        let identity = config.session_identity(&hook)?;
+        let workdir = config.workdir().to_path_buf();
+
+        let status = Arc::new(Mutex::new(None::<ExitStatus>));
+        let reason = Arc::new(Mutex::new(None::<ShutdownReason>));
+        let process_status = Arc::clone(&status);
+        let shutdown_reason = Arc::clone(&reason);
+        let guard = ShutdownGuard::get();
+        let signals = shutdown_signals(&guard)?;
+        let process = async move {
+            let outcome = session::run(&config_path, &workdir, &identity, command).await?;
+            *lock(&process_status) = Some(outcome.status());
+            Ok(())
+        };
+
+        guard
+            .run_with_shutdown(process, signals, move |reason| async move {
+                *lock(&shutdown_reason) = Some(reason);
+            })
+            .await?;
+
+        if let Some(status) = lock(&status).take() {
+            return Ok(exit_status_code(status));
+        }
+        let signal = match lock(&reason).as_ref() {
+            Some(ShutdownReason::Signal { signal }) => Some(*signal),
+            _ => None,
+        };
+        Ok(signal.map(signal_exit_code).unwrap_or(1))
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn run_session_daemon(
+    config_path: PathBuf,
+    ready_fd: libc::c_int,
+    startup_lock_fd: libc::c_int,
+) -> Result<u8> {
+    let startup =
+        unsafe { session::DaemonStartup::from_raw_descriptors(ready_fd, startup_lock_fd) }?;
+    let prepared = (|| {
+        let config_path = absolute_config_path(config_path)?;
+        let config = config::RunConfig::load(&config_path)?;
+        let hook = hook_library::materialize(config.workdir())?;
+        let identity = config.session_identity(&hook)?;
+        logger::init(open_log(config.log_file())?, logger::LevelFilter::Info)?;
+        Ok::<_, anyhow::Error>((config.into_runtime(hook), identity))
+    })();
+    let (config, identity) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = startup.failed(&error).await;
+            return Err(error);
+        }
     };
-    Ok(signal.map(signal_exit_code).unwrap_or(1))
+    session::serve(config, JsonCallback::new(), identity, startup).await?;
+    Ok(0)
+}
+
+fn absolute_config_path(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(std::env::current_dir()
+        .context("failed to resolve current directory")?
+        .join(path))
 }
 
 fn parse_command(command: &str) -> Result<SandboxCommand> {
@@ -230,6 +303,7 @@ fn parse_command(command: &str) -> Result<SandboxCommand> {
     Ok(SandboxCommand::new(program).args(words))
 }
 
+#[cfg(target_os = "macos")]
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -243,11 +317,12 @@ fn exit_status_code(status: ExitStatus) -> u8 {
         .unwrap_or(1)
 }
 
+#[cfg(target_os = "macos")]
 fn signal_exit_code(signal: i32) -> u8 {
     u8::try_from(128_i32.saturating_add(signal)).unwrap_or(u8::MAX)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn shutdown_signals(guard: &Arc<ShutdownGuard>) -> Result<SignalHandlers<Arc<ShutdownGuard>>> {
     use tokio::signal::unix::SignalKind;
 
@@ -261,11 +336,6 @@ fn shutdown_signals(guard: &Arc<ShutdownGuard>) -> Result<SignalHandlers<Arc<Shu
         Arc::clone(guard),
     )?;
     Ok(signals)
-}
-
-#[cfg(not(unix))]
-fn shutdown_signals(_guard: &Arc<ShutdownGuard>) -> Result<SignalHandlers<Arc<ShutdownGuard>>> {
-    Ok(SignalHandlers::new())
 }
 
 fn main() -> ExitCode {

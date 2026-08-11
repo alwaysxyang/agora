@@ -12,4 +12,7 @@ pub mod nfs;
 mod platform;
 mod protocol;
 pub mod runner;
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub mod session;
 mod trace;

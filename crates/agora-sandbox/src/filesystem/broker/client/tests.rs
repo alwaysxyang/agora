@@ -66,6 +66,60 @@ fn client_retries_idempotent_requests_and_preserves_the_request_id() {
 }
 
 #[test]
+fn client_retries_busy_mutations_with_a_new_request_id() {
+    let runtime = tempfile::tempdir().unwrap();
+    let socket = runtime.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut requests = Vec::new();
+        while requests.len() < 2 && std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let (request, descriptor) =
+                        ipc::receive::<RequestEnvelope>(&mut stream).unwrap();
+                    assert!(descriptor.is_none());
+                    let response = if requests.is_empty() {
+                        Response::Error {
+                            errno: libc::EAGAIN,
+                            message: "local plaintext file is busy".to_string(),
+                        }
+                    } else {
+                        Response::Success
+                    };
+                    ipc::send(
+                        &mut stream,
+                        &ResponseEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: request.request_id.clone(),
+                            response,
+                        },
+                        None,
+                    )
+                    .unwrap();
+                    requests.push(request);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("failed to accept local broker request: {error}"),
+            }
+        }
+        requests
+    });
+    let client = LocalClient::new(&socket, "token");
+
+    let result = client.begin_write("handle", ByteRange::new(1, 3).unwrap());
+    let requests = server.join().unwrap();
+
+    assert!(result.is_ok(), "busy mutation was not retried");
+    assert_eq!(requests.len(), 2);
+    assert_ne!(requests[0].request_id, requests[1].request_id);
+    assert_eq!(requests[0].request, requests[1].request);
+}
+
+#[test]
 fn client_rejects_mismatched_and_descriptor_bearing_responses() {
     for descriptor_response in [false, true] {
         let runtime = tempfile::tempdir().unwrap();

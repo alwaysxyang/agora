@@ -5,7 +5,9 @@ use agora_sandbox::runner::{SandboxConfig, SmbRemoteConfig};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
 
 const DEFAULT_LOG_FILE: &str = "runtime/logs/sandbox.log";
 
@@ -15,6 +17,7 @@ pub(super) struct RunConfig {
     local: LocalFilesystem,
     remotes: Vec<SmbRemoteConfig>,
     log_file: PathBuf,
+    identity_seed: [u8; 32],
 }
 
 impl RunConfig {
@@ -33,6 +36,29 @@ impl RunConfig {
 
     pub(super) fn log_file(&self) -> &Path {
         &self.log_file
+    }
+
+    pub(super) fn session_identity(&self, hook: &Path) -> Result<String> {
+        let hook = hook
+            .canonicalize()
+            .with_context(|| format!("failed to resolve sandbox hook {}", hook.display()))?;
+        let mut file = File::open(&hook)
+            .with_context(|| format!("failed to open sandbox hook {}", hook.display()))?;
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        digest.update(b"agora-sandbox-session-identity-v1");
+        digest.update(&self.identity_seed);
+        update_digest_field(&mut digest, hook.as_os_str().as_bytes());
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .with_context(|| format!("failed to read sandbox hook {}", hook.display()))?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        Ok(hex(digest.finish().as_ref()))
     }
 
     pub(super) fn into_runtime(self, hook: PathBuf) -> SandboxConfig {
@@ -81,29 +107,49 @@ impl StoredConfig {
                 bail!("filesystem.local.key is required when encrypt is encrypted")
             }
         };
-        let remotes = self
-            .filesystem
-            .nfs
-            .into_iter()
-            .map(StoredRemote::resolve)
-            .collect::<Result<Vec<_>>>()?;
         let workdir = self
             .workdir
             .map(|path| resolve_path(directory, &path))
             .transpose()?
             .unwrap_or_else(SandboxConfig::default_workdir);
+        let workdir = normalize_absolute_path(&workdir)?;
+        let identity_workdir = canonicalize_with_missing(&workdir)?;
         let log_file = self
             .log
             .file
             .map(|path| resolve_path(&workdir, &path))
             .transpose()?
             .unwrap_or_else(|| workdir.join(DEFAULT_LOG_FILE));
+        let log_file = normalize_absolute_path(&log_file)?;
+        let identity_log_file = canonicalize_with_missing(&log_file)?;
+        let tls: TlsMode = self.tls.into();
+        let mut identity = IdentityBuilder::new();
+        identity.path(&identity_workdir);
+        identity.path(&identity_log_file);
+        identity.byte(match tls {
+            TlsMode::Off => 0,
+            TlsMode::Auto => 1,
+        });
+        match &local {
+            LocalFilesystem::Plain => identity.byte(0),
+            LocalFilesystem::Encrypted(key) => {
+                identity.byte(1);
+                identity.field(key.as_bytes());
+            }
+        }
+        let remotes = self.filesystem.nfs;
+        identity.usize(remotes.len());
+        let remotes = remotes
+            .into_iter()
+            .map(|remote| remote.resolve(&mut identity))
+            .collect::<Result<Vec<_>>>()?;
         Ok(RunConfig {
             workdir,
-            tls: self.tls.into(),
+            tls,
             local,
             remotes,
             log_file,
+            identity_seed: identity.finish(),
         })
     }
 }
@@ -165,14 +211,25 @@ enum StoredRemote {
 }
 
 impl StoredRemote {
-    fn resolve(self) -> Result<SmbRemoteConfig> {
+    fn resolve(self, identity: &mut IdentityBuilder) -> Result<SmbRemoteConfig> {
         match self {
             Self::Smb {
                 dir,
                 server,
                 username,
                 password,
-            } => smb_remote(dir, &server, username, password),
+            } => {
+                let remote = smb_remote(dir, &server, username, password.clone())?;
+                identity.field(b"smb");
+                identity.path(remote.logical_root());
+                identity.field(remote.server().as_bytes());
+                identity.field(remote.share().as_bytes());
+                identity.field(remote.remote_path().as_bytes());
+                identity.field(remote.domain().as_bytes());
+                identity.field(remote.username().as_bytes());
+                identity.field(password.as_bytes());
+                Ok(remote)
+            }
         }
     }
 }
@@ -231,6 +288,102 @@ fn resolve_path(directory: &Path, path: &Path) -> Result<PathBuf> {
     } else {
         Ok(directory.join(path))
     }
+}
+
+fn canonicalize_with_missing(path: &Path) -> Result<PathBuf> {
+    let normalized = normalize_absolute_path(path)?;
+    let mut missing = Vec::new();
+    let mut ancestor = normalized.as_path();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor.file_name().with_context(|| {
+                    format!("failed to resolve sandbox path {}", path.display())
+                })?;
+                missing.push(name.to_os_string());
+                ancestor = ancestor.parent().with_context(|| {
+                    format!("failed to resolve sandbox path {}", path.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to resolve sandbox path {}", path.display()));
+            }
+        }
+    }
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("sandbox path is not absolute: {}", path.display());
+    }
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(value) => normalized.push(value),
+            Component::Prefix(_) => bail!("unsupported sandbox path: {}", path.display()),
+        }
+    }
+    Ok(normalized)
+}
+
+struct IdentityBuilder(ring::digest::Context);
+
+impl IdentityBuilder {
+    fn new() -> Self {
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        digest.update(b"agora-sandbox-effective-config-v1");
+        Self(digest)
+    }
+
+    fn byte(&mut self, value: u8) {
+        self.field(&[value]);
+    }
+
+    fn usize(&mut self, value: usize) {
+        self.field(&(value as u64).to_be_bytes());
+    }
+
+    fn path(&mut self, value: &Path) {
+        self.field(value.as_os_str().as_bytes());
+    }
+
+    fn field(&mut self, value: &[u8]) {
+        update_digest_field(&mut self.0, value);
+    }
+
+    fn finish(self) -> [u8; 32] {
+        self.0
+            .finish()
+            .as_ref()
+            .try_into()
+            .expect("SHA-256 digest has 32 bytes")
+    }
+}
+
+fn update_digest_field(digest: &mut ring::digest::Context, value: &[u8]) {
+    digest.update(&(value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn open_config(path: &Path) -> Result<File> {

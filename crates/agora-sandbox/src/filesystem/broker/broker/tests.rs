@@ -246,7 +246,8 @@ fn completed_single_handle_writes_are_merged_until_the_batch_deadline() {
     assert_eq!(fixture.decrypt(&path), b"abcdefgh");
     assert!(fixture.broker.writeback_pending());
     let local = lock(&fixture.broker.handles).get(&handle).unwrap().clone();
-    let pending_since = lock(&local).pending_since.unwrap();
+    let shared = Arc::clone(&lock(&local).shared);
+    let pending_since = lock(&shared.inner).pending_since.unwrap();
     fixture.broker.flush_due(pending_since).unwrap();
     assert!(fixture.broker.writeback_pending());
     fixture
@@ -298,6 +299,154 @@ fn completed_writes_are_visible_to_an_existing_peer_before_writeback() {
     read_exact_at(&peer, &mut contents, 0).unwrap();
     assert_eq!(&contents, b"abWXYZgh");
     assert_eq!(fixture.decrypt(&path), b"abcdefgh");
+}
+
+#[test]
+fn syncing_one_handle_flushes_completed_writes_from_a_peer_handle() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("peer-sync", b"abcdefgh");
+    let (syncing_handle, _syncing_file) = fixture.open(&path, true);
+    let (writing_handle, writing_file) = fixture.open(&path, true);
+    let write_id = "11111111111111111111111111111111";
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::BeginWrite {
+                    handle: writing_handle.clone(),
+                    write_id: write_id.to_string(),
+                    range: ByteRange::new(2, 6).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    write_all_at(&writing_file, b"WXYZ", 2).unwrap();
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::FinishWrite {
+                    handle: writing_handle,
+                    write_id: write_id.to_string(),
+                    range: ByteRange::new(2, 6).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Sync {
+                    handle: syncing_handle,
+                    ranges: Vec::new(),
+                    durable: true,
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+
+    assert_eq!(fixture.decrypt(&path), b"abWXYZgh");
+}
+
+#[test]
+fn competing_begin_write_returns_busy_without_waiting_for_the_active_writer() {
+    let fixture = Arc::new(Fixture::new());
+    let path = fixture.encrypted("busy-write", b"abcdefgh");
+    let (active_handle, _active_file) = fixture.open(&path, true);
+    let (waiting_handle, _waiting_file) = fixture.open(&path, true);
+    let active_write_id = "11111111111111111111111111111111";
+    let waiting_write_id = "22222222222222222222222222222222";
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::BeginWrite {
+                    handle: active_handle.clone(),
+                    write_id: active_write_id.to_string(),
+                    range: ByteRange::new(0, 1).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+
+    let waiting_fixture = Arc::clone(&fixture);
+    let waiting_handle_for_request = waiting_handle.clone();
+    let (sent, received) = mpsc::channel();
+    let waiting = thread::spawn(move || {
+        let response = waiting_fixture
+            .broker
+            .handle(
+                Request::BeginWrite {
+                    handle: waiting_handle_for_request,
+                    write_id: waiting_write_id.to_string(),
+                    range: ByteRange::new(1, 2).unwrap(),
+                },
+                None,
+            )
+            .response;
+        sent.send(response).unwrap();
+    });
+
+    let response = received.recv_timeout(Duration::from_millis(100));
+    if response.is_err() {
+        assert_eq!(
+            fixture
+                .broker
+                .handle(
+                    Request::CancelWrite {
+                        handle: active_handle,
+                        write_id: active_write_id.to_string(),
+                    },
+                    None,
+                )
+                .response,
+            Response::Success
+        );
+        let response = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        if response == Response::Success {
+            assert_eq!(
+                fixture
+                    .broker
+                    .handle(
+                        Request::CancelWrite {
+                            handle: waiting_handle,
+                            write_id: waiting_write_id.to_string(),
+                        },
+                        None,
+                    )
+                    .response,
+                Response::Success
+            );
+        }
+        waiting.join().unwrap();
+        panic!("competing begin-write blocked while another write was active");
+    }
+
+    assert_error(response.unwrap(), libc::EAGAIN);
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::CancelWrite {
+                    handle: active_handle,
+                    write_id: active_write_id.to_string(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    waiting.join().unwrap();
 }
 
 #[test]
@@ -396,82 +545,6 @@ fn concurrent_syncs_for_different_files_do_not_deadlock() {
     for thread in threads {
         thread.join().unwrap();
     }
-}
-
-#[test]
-fn writes_to_the_same_shared_file_are_serialized() {
-    let fixture = Arc::new(Fixture::new());
-    let path = fixture.encrypted("serialized", b"abcdefgh");
-    let (first, _first_file) = fixture.open(&path, true);
-    let (second, _second_file) = fixture.open(&path, true);
-    let first_write = "11111111111111111111111111111111";
-    let second_write = "22222222222222222222222222222222";
-    assert_eq!(
-        fixture
-            .broker
-            .handle(
-                Request::BeginWrite {
-                    handle: first.clone(),
-                    write_id: first_write.to_string(),
-                    range: ByteRange::new(0, 2).unwrap(),
-                },
-                None,
-            )
-            .response,
-        Response::Success
-    );
-
-    let (sender, receiver) = mpsc::channel();
-    let waiting_fixture = Arc::clone(&fixture);
-    let waiting_handle = second.clone();
-    let waiter = thread::spawn(move || {
-        let response = waiting_fixture
-            .broker
-            .handle(
-                Request::BeginWrite {
-                    handle: waiting_handle,
-                    write_id: second_write.to_string(),
-                    range: ByteRange::new(4, 6).unwrap(),
-                },
-                None,
-            )
-            .response;
-        sender.send(response).unwrap();
-    });
-    assert!(receiver.recv_timeout(Duration::from_millis(20)).is_err());
-
-    assert_eq!(
-        fixture
-            .broker
-            .handle(
-                Request::FinishWrite {
-                    handle: first,
-                    write_id: first_write.to_string(),
-                    range: ByteRange::new(0, 2).unwrap(),
-                },
-                None,
-            )
-            .response,
-        Response::Success
-    );
-    assert_eq!(
-        receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
-        Response::Success
-    );
-    assert_eq!(
-        fixture
-            .broker
-            .handle(
-                Request::CancelWrite {
-                    handle: second,
-                    write_id: second_write.to_string(),
-                },
-                None,
-            )
-            .response,
-        Response::Success
-    );
-    waiter.join().unwrap();
 }
 
 #[test]
@@ -1533,160 +1606,6 @@ fn abort_and_release_retain_clean_up_only_valid_live_handles() {
 }
 
 #[test]
-fn request_cache_waiters_claim_rules_and_capacity_are_deterministic() {
-    let completion = Arc::new(RequestCompletion::default());
-    let waiting = Arc::clone(&completion);
-    let (sender, receiver) = mpsc::channel();
-    let waiter = thread::spawn(move || sender.send(waiting.wait()).unwrap());
-    assert!(receiver.recv_timeout(Duration::from_millis(20)).is_err());
-    completion.complete(Response::Success);
-    assert_eq!(
-        receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
-        Response::Success
-    );
-    waiter.join().unwrap();
-
-    let fingerprint = [1_u8; 32];
-    let mut cache = RequestCache::default();
-    assert!(matches!(
-        cache.begin("pending".to_string(), fingerprint),
-        CacheDecision::Execute
-    ));
-    assert!(matches!(
-        cache.begin("pending".to_string(), fingerprint),
-        CacheDecision::Wait(_)
-    ));
-    assert!(matches!(
-        cache.begin("pending".to_string(), [2_u8; 32]),
-        CacheDecision::Reject
-    ));
-    assert_eq!(cache.claim("pending"), None);
-    assert!(
-        cache
-            .complete("missing".to_string(), Response::Success, Instant::now())
-            .is_empty()
-    );
-    assert!(
-        cache
-            .complete("pending".to_string(), Response::Success, Instant::now())
-            .is_empty()
-    );
-    assert_eq!(cache.claim("pending"), None);
-    assert!(matches!(
-        cache.begin("pending".to_string(), fingerprint),
-        CacheDecision::Replay(Response::Success)
-    ));
-
-    let open_id = "unclaimed".to_string();
-    assert!(matches!(
-        cache.begin(open_id.clone(), fingerprint),
-        CacheDecision::Execute
-    ));
-    let completed_at = Instant::now() - REQUEST_CACHE_TTL - Duration::from_secs(1);
-    assert!(
-        cache
-            .complete(
-                open_id,
-                Response::Open {
-                    handle: "abandoned-handle".to_string(),
-                    device: 1,
-                    inode: 2,
-                    links: 1,
-                },
-                completed_at,
-            )
-            .is_empty()
-    );
-    assert_eq!(
-        cache.prune(Instant::now()),
-        vec!["abandoned-handle".to_string()]
-    );
-
-    let now = Instant::now();
-    cache.entries.insert(
-        "capacity-pending".to_string(),
-        CachedRequest::Pending {
-            fingerprint,
-            completion: Arc::new(RequestCompletion::default()),
-        },
-    );
-    for index in 0..=REQUEST_CACHE_CAPACITY {
-        cache.entries.insert(
-            format!("capacity-{index}"),
-            CachedRequest::Completed {
-                fingerprint,
-                response: Response::Success,
-                completed_at: now,
-                claimed: true,
-            },
-        );
-    }
-    assert!(cache.prune(now).is_empty());
-    assert_eq!(
-        cache
-            .entries
-            .values()
-            .filter(|entry| matches!(entry, CachedRequest::Completed { .. }))
-            .count(),
-        REQUEST_CACHE_CAPACITY
-    );
-    assert!(matches!(
-        cache.entries.get("capacity-pending"),
-        Some(CachedRequest::Pending { .. })
-    ));
-}
-
-#[test]
-fn shared_mutations_are_idempotent_and_serialize_append_and_sync() {
-    let fixture = Fixture::new();
-    let path = fixture.encrypted("mutation-order", b"plaintext");
-    let (handle, _content) = fixture.open(&path, true);
-    let shared = {
-        let handles = lock(&fixture.broker.handles);
-        Arc::clone(&lock(handles.get(&handle).unwrap()).shared)
-    };
-    let write = WriteKey {
-        handle: handle.clone(),
-        write_id: "write".to_string(),
-    };
-    let append = WriteKey {
-        handle,
-        write_id: "append".to_string(),
-    };
-
-    shared.begin_write(write.clone());
-    shared.begin_write(write.clone());
-
-    let waiting = Arc::clone(&shared);
-    let waiting_append = append.clone();
-    let (append_ready, append_started) = mpsc::channel();
-    let append_thread = thread::spawn(move || {
-        waiting.begin_append(waiting_append);
-        append_ready.send(()).unwrap();
-    });
-    assert!(append_started
-        .recv_timeout(Duration::from_millis(20))
-        .is_err());
-    shared.finish_write(&write);
-    append_started.recv_timeout(Duration::from_secs(1)).unwrap();
-    append_thread.join().unwrap();
-
-    shared.begin_append(append.clone());
-    let waiting = Arc::clone(&shared);
-    let (sync_ready, sync_started) = mpsc::channel();
-    let sync_thread = thread::spawn(move || {
-        let _guard = waiting.begin_sync();
-        sync_ready.send(()).unwrap();
-    });
-    assert!(sync_started
-        .recv_timeout(Duration::from_millis(20))
-        .is_err());
-    shared.finish_write(&append);
-    sync_started.recv_timeout(Duration::from_secs(1)).unwrap();
-    sync_thread.join().unwrap();
-}
-
-#[test]
 fn release_retain_marks_the_last_reference_closed_and_expiration_finishes_writes() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("release-retain", b"plaintext");
@@ -1726,7 +1645,7 @@ fn release_retain_marks_the_last_reference_closed_and_expiration_finishes_writes
     lock(&local).closed_at = Some(Instant::now() - CLOSED_HANDLE_TTL - Duration::from_secs(1));
     fixture.broker.expire_closed();
     assert!(!lock(&fixture.broker.handles).contains_key(&handle));
-    assert!(lock(&lock(&local).shared.mutations).active.is_empty());
+    assert!(lock(&lock(&local).shared.mutations).active.is_none());
 }
 
 #[test]

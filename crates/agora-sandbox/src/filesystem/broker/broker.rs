@@ -2,7 +2,7 @@ use super::LocalOpenState;
 use super::protocol::{ByteRange, Request, Response};
 use crate::filesystem::{EncryptedFile, FileCipher};
 use ring::digest::{SHA256, digest};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -70,8 +70,6 @@ struct LocalHandle {
     writable: bool,
     potentially_dirty: RangeSet,
     active_writes: HashMap<String, ByteRange>,
-    pending_writes: RangeSet,
-    pending_since: Option<Instant>,
     references: usize,
     closed_at: Option<Instant>,
     shared: Arc<SharedPlaintext>,
@@ -89,14 +87,15 @@ struct SharedFile {
     plaintext: File,
     encrypted: EncryptedFile,
     baseline: PlaintextIdentity,
+    pending_writes: RangeSet,
+    pending_since: Option<Instant>,
     needs_durable_sync: bool,
 }
 
 #[derive(Default)]
 struct SharedMutations {
-    active: HashSet<WriteKey>,
-    append: Option<WriteKey>,
-    waiting_append: usize,
+    active: Option<WriteKey>,
+    waiting_syncs: usize,
     syncing: bool,
 }
 
@@ -135,68 +134,58 @@ struct SharedSyncGuard<'a> {
     shared: &'a SharedPlaintext,
 }
 
+#[derive(Clone, Copy)]
+enum SyncAcquire {
+    Wait,
+    Try,
+}
+
 fn open_status_flags(flags: libc::c_int) -> libc::c_int {
     flags & (libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK)
 }
 
 impl SharedPlaintext {
-    fn begin_write(&self, key: WriteKey) {
+    fn try_begin_write(&self, key: WriteKey) -> bool {
         let mut mutations = lock(&self.mutations);
-        if mutations.active.contains(&key) {
-            return;
+        if mutations.active.as_ref() == Some(&key) {
+            return true;
         }
-        while mutations.syncing
-            || mutations.append.is_some()
-            || mutations.waiting_append != 0
-            || !mutations.active.is_empty()
-        {
-            mutations = self
-                .mutation_ready
-                .wait(mutations)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if mutations.syncing || mutations.waiting_syncs != 0 || mutations.active.is_some() {
+            return false;
         }
-        mutations.active.insert(key);
-    }
-
-    fn begin_append(&self, key: WriteKey) {
-        let mut mutations = lock(&self.mutations);
-        if mutations.append.as_ref() == Some(&key) {
-            return;
-        }
-        mutations.waiting_append += 1;
-        while mutations.syncing || mutations.append.is_some() || !mutations.active.is_empty() {
-            mutations = self
-                .mutation_ready
-                .wait(mutations)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        mutations.waiting_append -= 1;
-        mutations.append = Some(key);
+        mutations.active = Some(key);
+        true
     }
 
     fn finish_write(&self, key: &WriteKey) {
         let mut mutations = lock(&self.mutations);
-        let changed = mutations.active.remove(key) || mutations.append.as_ref() == Some(key);
-        if mutations.append.as_ref() == Some(key) {
-            mutations.append = None;
-        }
-        if changed {
+        if mutations.active.as_ref() == Some(key) {
+            mutations.active = None;
             self.mutation_ready.notify_all();
         }
     }
 
     fn begin_sync(&self) -> SharedSyncGuard<'_> {
         let mut mutations = lock(&self.mutations);
-        mutations.waiting_append += 1;
-        while mutations.syncing || mutations.append.is_some() || !mutations.active.is_empty() {
+        mutations.waiting_syncs += 1;
+        while mutations.syncing || mutations.active.is_some() {
             mutations = self
                 .mutation_ready
                 .wait(mutations)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
-        mutations.waiting_append -= 1;
+        mutations.waiting_syncs -= 1;
         mutations.syncing = true;
         SharedSyncGuard { shared: self }
+    }
+
+    fn try_begin_sync(&self) -> Option<SharedSyncGuard<'_>> {
+        let mut mutations = lock(&self.mutations);
+        if mutations.syncing || mutations.active.is_some() {
+            return None;
+        }
+        mutations.syncing = true;
+        Some(SharedSyncGuard { shared: self })
     }
 }
 
@@ -349,7 +338,7 @@ impl LocalBroker {
                 .map_err(BrokerError::into_io)?;
         }
         for (id, _) in &active {
-            self.sync_handle(id, Vec::new(), false, true, false)
+            self.sync_handle(id, Vec::new(), false, true, false, SyncAcquire::Wait)
                 .map_err(BrokerError::into_io)?;
         }
         let mut representatives: Vec<(String, Arc<SharedPlaintext>)> = Vec::new();
@@ -362,7 +351,7 @@ impl LocalBroker {
             }
         }
         for (id, _) in representatives {
-            self.sync_handle(&id, Vec::new(), true, false, false)
+            self.sync_handle(&id, Vec::new(), true, false, false, SyncAcquire::Wait)
                 .map_err(BrokerError::into_io)?;
         }
         Ok(())
@@ -370,25 +359,38 @@ impl LocalBroker {
 
     pub(crate) fn flush_due(&self, now: Instant) -> std::io::Result<()> {
         self.writeback_pending.store(false, Ordering::Release);
-        let ids = lock(&self.handles)
+        let active = lock(&self.handles)
             .iter()
             .filter_map(|(id, handle)| {
                 let handle = lock(handle);
-                (handle.references != 0
-                    && handle.pending_since.is_some_and(|pending| {
-                        now.saturating_duration_since(pending) >= WRITEBACK_DELAY
-                    }))
-                .then(|| id.clone())
+                (handle.references != 0).then(|| (id.clone(), Arc::clone(&handle.shared)))
             })
             .collect::<Vec<_>>();
-        for id in ids {
-            self.sync_handle(&id, Vec::new(), false, false, false)
+        let ids = active
+            .iter()
+            .filter(|(_, shared)| {
+                lock(&shared.inner).pending_since.is_some_and(|pending| {
+                    now.saturating_duration_since(pending) >= WRITEBACK_DELAY
+                })
+            })
+            .cloned()
+            .fold(
+                Vec::<(String, Arc<SharedPlaintext>)>::new(),
+                |mut due, item| {
+                    if !due.iter().any(|(_, shared)| Arc::ptr_eq(shared, &item.1)) {
+                        due.push(item);
+                    }
+                    due
+                },
+            );
+        for (id, _) in ids {
+            self.sync_handle(&id, Vec::new(), false, false, false, SyncAcquire::Wait)
                 .map_err(BrokerError::into_io)?;
         }
-        if lock(&self.handles).values().any(|handle| {
-            let handle = lock(handle);
-            handle.references != 0 && handle.pending_since.is_some()
-        }) {
+        if active
+            .iter()
+            .any(|(_, shared)| lock(&shared.inner).pending_since.is_some())
+        {
             self.writeback_pending.store(true, Ordering::Release);
         }
         Ok(())
@@ -429,7 +431,7 @@ impl LocalBroker {
                 Self::reject_descriptor(descriptor)?;
                 Self::validate_ranges(&ranges)?;
                 self.activate(&handle)?;
-                self.sync_handle(&handle, ranges, durable, false, false)?;
+                self.sync_handle(&handle, ranges, durable, false, false, SyncAcquire::Try)?;
                 Ok(Response::Success)
             }
             Request::PotentiallyDirty { handle, range } => {
@@ -474,10 +476,12 @@ impl LocalBroker {
                         ));
                     }
                     None => {
-                        shared.begin_write(WriteKey {
+                        if !shared.try_begin_write(WriteKey {
                             handle: handle.clone(),
                             write_id: write_id.clone(),
-                        });
+                        }) {
+                            return Err(BrokerError::busy());
+                        }
                         lock(&local).active_writes.insert(write_id, range);
                     }
                 }
@@ -501,7 +505,9 @@ impl LocalBroker {
                     handle: handle.clone(),
                     write_id: write_id.clone(),
                 };
-                shared.begin_append(key.clone());
+                if !shared.try_begin_write(key.clone()) {
+                    return Err(BrokerError::busy());
+                }
                 let offset = match lock(&shared.inner).plaintext.metadata() {
                     Ok(metadata) => metadata.len(),
                     Err(error) => {
@@ -533,25 +539,28 @@ impl LocalBroker {
                 Self::reject_descriptor(descriptor)?;
                 let local = self.lookup_handle(&handle)?;
                 let shared = Arc::clone(&lock(&local).shared);
-                let mut local = lock(&local);
-                if !local.writable {
-                    return Err(BrokerError::new(
-                        libc::EBADF,
-                        "local filesystem handle is not writable",
-                    ));
-                }
-                let Some(reserved) = local.active_writes.remove(&write_id) else {
-                    return Err(BrokerError::protocol("unknown local write ID"));
+                let reserved = {
+                    let mut local = lock(&local);
+                    if !local.writable {
+                        return Err(BrokerError::new(
+                            libc::EBADF,
+                            "local filesystem handle is not writable",
+                        ));
+                    }
+                    local
+                        .active_writes
+                        .remove(&write_id)
+                        .ok_or_else(|| BrokerError::protocol("unknown local write ID"))?
                 };
                 let valid = range.start < range.end
                     && range.start >= reserved.start
                     && range.end <= reserved.end;
                 if valid {
-                    local.pending_writes.insert(range);
-                    local.pending_since.get_or_insert_with(Instant::now);
+                    let mut shared_file = lock(&shared.inner);
+                    shared_file.pending_writes.insert(range);
+                    shared_file.pending_since.get_or_insert_with(Instant::now);
                     self.writeback_pending.store(true, Ordering::Release);
                 }
-                drop(local);
                 shared.finish_write(&WriteKey { handle, write_id });
                 if !valid {
                     Err(BrokerError::protocol(
@@ -651,7 +660,14 @@ impl LocalBroker {
                     return Ok(Response::Success);
                 };
                 let final_reference = lock(&local).references <= 1;
-                self.sync_handle(&handle, ranges, true, true, final_reference)?;
+                self.sync_handle(
+                    &handle,
+                    ranges,
+                    true,
+                    true,
+                    final_reference,
+                    SyncAcquire::Try,
+                )?;
                 let mut local = lock(&local);
                 if local.references > 0 {
                     local.references -= 1;
@@ -714,7 +730,7 @@ impl LocalBroker {
             if let Some(file) = files.get(&identity).and_then(Weak::upgrade) {
                 drop(files);
                 if flags & libc::O_TRUNC != 0 {
-                    let _sync = file.begin_sync();
+                    let _sync = file.try_begin_sync().ok_or_else(BrokerError::busy)?;
                     let mut shared = lock(&file.inner);
                     shared.plaintext.set_len(0).map_err(|error| {
                         BrokerError::io("failed to truncate shared local plaintext file", error)
@@ -752,6 +768,8 @@ impl LocalBroker {
                         plaintext,
                         encrypted,
                         baseline: PlaintextIdentity::from_metadata(&plaintext_metadata),
+                        pending_writes: RangeSet::default(),
+                        pending_since: None,
                         needs_durable_sync: flags & libc::O_TRUNC != 0,
                     }),
                     lock_anchor: tempfile::NamedTempFile::new_in(self.lock_directory.path())
@@ -774,8 +792,6 @@ impl LocalBroker {
                 writable: access != libc::O_RDONLY,
                 potentially_dirty: RangeSet::default(),
                 active_writes: HashMap::new(),
-                pending_writes: RangeSet::default(),
-                pending_since: None,
                 references: 1,
                 closed_at: None,
                 shared,
@@ -820,13 +836,17 @@ impl LocalBroker {
         durable: bool,
         include_potential: bool,
         include_active: bool,
+        acquire: SyncAcquire,
     ) -> Result<(), BrokerError> {
         if include_active {
             self.abandon_active_writes(id)?;
         }
         let handle = self.lookup_handle(id)?;
         let shared = Arc::clone(&lock(&handle).shared);
-        let _sync = shared.begin_sync();
+        let _sync = match acquire {
+            SyncAcquire::Wait => shared.begin_sync(),
+            SyncAcquire::Try => shared.try_begin_sync().ok_or_else(BrokerError::busy)?,
+        };
         let mut shared = lock(&shared.inner);
         let mut handle = lock(&handle);
         let metadata = shared
@@ -834,13 +854,29 @@ impl LocalBroker {
             .metadata()
             .map_err(|error| BrokerError::io("failed to inspect local plaintext file", error))?;
         let current = PlaintextIdentity::from_metadata(&metadata);
+        if include_potential
+            && !handle.writable
+            && shared.pending_writes.ranges.is_empty()
+            && current != shared.baseline
+        {
+            return Err(BrokerError::new(
+                libc::EBADF,
+                "local filesystem handle is not writable",
+            ));
+        }
+        if !ranges.is_empty() && !handle.writable {
+            return Err(BrokerError::new(
+                libc::EBADF,
+                "local filesystem handle is not writable",
+            ));
+        }
         for range in ranges {
-            handle.pending_writes.insert(range);
+            shared.pending_writes.insert(range);
         }
-        if !handle.pending_writes.ranges.is_empty() {
-            handle.pending_since.get_or_insert_with(Instant::now);
+        if !shared.pending_writes.ranges.is_empty() {
+            shared.pending_since.get_or_insert_with(Instant::now);
         }
-        let mut candidates = handle.pending_writes.clone();
+        let mut candidates = shared.pending_writes.clone();
         if include_potential {
             for range in &handle.potentially_dirty.ranges {
                 candidates.insert(*range);
@@ -860,7 +896,7 @@ impl LocalBroker {
         }
         let ranges = candidates.ranges.clone();
         let length = current.length;
-        if !ranges.is_empty() && !handle.writable {
+        if include_potential && !handle.potentially_dirty.ranges.is_empty() && !handle.writable {
             return Err(BrokerError::new(
                 libc::EBADF,
                 "local filesystem handle is not writable",
@@ -891,7 +927,7 @@ impl LocalBroker {
                 offset += count as u64;
             }
         }
-        if handle.writable && shared.encrypted.len() != length {
+        if shared.encrypted.len() != length {
             shared.encrypted.set_len(length).map_err(|error| {
                 BrokerError::anyhow("failed to resize encrypted local file", error)
             })?;
@@ -904,8 +940,8 @@ impl LocalBroker {
             })?;
             shared.needs_durable_sync = false;
         }
-        handle.pending_writes.ranges.clear();
-        handle.pending_since = None;
+        shared.pending_writes.ranges.clear();
+        shared.pending_since = None;
         if include_potential {
             handle.potentially_dirty.ranges.clear();
         }
@@ -962,15 +998,16 @@ impl LocalBroker {
             let mut local = lock(&handle);
             let shared = Arc::clone(&local.shared);
             let writes = std::mem::take(&mut local.active_writes);
-            for range in writes.values() {
-                local.pending_writes.insert(*range);
-            }
-            if !writes.is_empty() {
-                local.pending_since.get_or_insert_with(Instant::now);
-                self.writeback_pending.store(true, Ordering::Release);
-            }
             (shared, writes)
         };
+        if !writes.is_empty() {
+            let mut shared_file = lock(&shared.inner);
+            for range in writes.values() {
+                shared_file.pending_writes.insert(*range);
+            }
+            shared_file.pending_since.get_or_insert_with(Instant::now);
+            self.writeback_pending.store(true, Ordering::Release);
+        }
         for write_id in writes.into_keys() {
             shared.finish_write(&WriteKey {
                 handle: id.to_string(),
@@ -1238,6 +1275,10 @@ impl BrokerError {
 
     fn bad_descriptor() -> Self {
         Self::new(libc::EBADF, "unknown local filesystem handle")
+    }
+
+    fn busy() -> Self {
+        Self::new(libc::EAGAIN, "local plaintext file is busy")
     }
 
     fn protocol(message: impl Into<String>) -> Self {

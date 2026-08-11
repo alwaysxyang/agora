@@ -105,6 +105,21 @@ credentials should protect the file accordingly.
 `encrypted`; plain mode rejects a key, while encrypted mode requires a non-empty
 `filesystem.local.key`. An empty JSON object therefore selects all defaults.
 
+Overlapping CLI `run` invocations whose canonical workdir, executable build,
+materialized Hook, and default-expanded runtime configuration have the same
+semantic SHA-256 identity join one ephemeral per-workspace session. The first
+client starts a hidden owner daemon; later clients may run different commands
+through the same filesystem, local and NFS Brokers, proxy, execution controller,
+audit controller, credentials, `sandbox_id`, and callback-visible `run_id`.
+Each client still resolves its executable against its own PATH and current
+directory, retains its own ordinary environment, arguments, process group,
+terminal descriptors, exit status, and root trace ID, and starts the prepared
+child locally. A mismatched build or effective configuration is rejected. The
+daemon stops after the final client exits and completes controller shutdown and
+encrypted writeback before releasing the final client and `.fs.lock`. The
+library-level `Sandbox::run` API remains a one-command runtime and does not join
+CLI sessions.
+
 Configured NFS roots are probed asynchronously after their Broker starts, so remote readiness never
 delays child startup. The logical root itself is synthetic, but its parent must already be visible as
 a directory in the local overlay when the probe starts; a missing or non-directory parent reports
@@ -182,15 +197,21 @@ SDK callers may instead continue to pass any explicit hook path directly to `San
 
 ## Runtime Flow
 
-Each run creates independent identifiers, credentials, and listeners:
+The SDK creates one runtime for one command. The CLI creates or joins one
+runtime for each set of overlapping compatible commands:
 
 ```text
 CLI startup
   -> resolve the configured or default workdir
   -> materialize and verify the embedded hook in <workdir>/runtime/hook/<md5>
-  -> pass that path to the existing SandboxConfig::new API
+  -> derive the effective configuration and executable-build identities
+  -> connect to the owner-only per-workspace session socket
+  -> if absent, elect and start one hidden runtime daemon while holding
+     <workdir>/runtime/session-start.lock
+  -> ask the daemon to prepare the caller-resolved executable
+  -> start the prepared command locally with direct terminal I/O
 
-Sandbox::run
+CLI session daemon / SDK Sandbox::run
   -> validate intercept and TLS policy
   -> validate explicit fixed PEM interception CA paths when configured
   -> use the configured persistent workdir and load or generate its default CA when explicit paths are absent
@@ -209,7 +230,9 @@ Sandbox::run
   -> hook initialization authenticates one inheritable execution stream, one inheritable audit
      stream, and any configured local or remote filesystem Broker streams before ordinary hooks
      become active
-  -> start the original or prepared child as a new process-group leader
+  -> for the SDK, start the original or prepared child as a new process-group leader
+  -> for the CLI, return protected launch data to the client, which starts that
+     command as its own process-group leader
 
 intercepted child posix_spawn/exec
   -> resolve the requested executable
@@ -272,13 +295,16 @@ readiness and `SO_ERROR` describe the connection to the local proxy; a later ups
 observed by the application through subsequent I/O. Audit events still report the actual upstream
 attempt and result.
 
-Normal shutdown terminates residual processes in the run's process group, drains active relays for
-up to one second, and stops the proxy listeners, execution controller, audit controller, and optional
-NFS Broker. Prepared
+Normal SDK shutdown terminates residual processes in the run's process group. A CLI client owns and
+terminates only its command's process group; exiting one client does not stop commands belonging to
+other leases. After the final CLI lease ends, the session daemon drains active relays for up to one
+second and stops the proxy listeners, execution controller, audit controller, local encrypted
+Broker, and optional NFS Broker before acknowledging the final release. Prepared
 executables, directory metadata, CA material, and CA-keyed trust bundles remain under the configured
-work directory for reuse. The runner monitors the network listeners, execution controller, audit
-controller, and optional NFS Broker while the child is active. An unexpected service exit terminates the process group
-instead of allowing descendants to continue after their interception path has failed. A descendant
+work directory for reuse. The runtime owner monitors the network listeners, execution controller,
+audit controller, local encrypted Broker, and optional NFS Broker while any command is active. An
+unexpected service exit notifies every CLI client, which terminates its own process group, instead
+of allowing descendants to continue after their interception path has failed. A descendant
 that deliberately creates a new session or process group can leave this lifecycle boundary;
 preventing that requires the future native sandbox.
 

@@ -200,3 +200,80 @@ fn config_file_accepts_normal_permissions_but_not_a_symlink() {
             .contains("not a regular file")
     );
 }
+
+#[test]
+fn semantic_session_identity_ignores_json_formatting_but_tracks_runtime_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workdir");
+    let hook = root.path().join("hook.dylib");
+    std::fs::write(&hook, b"hook-a").unwrap();
+    let first_path = root.path().join("first.json");
+    let second_path = root.path().join("second.json");
+    let changed_path = root.path().join("changed.json");
+    std::fs::write(
+        &first_path,
+        format!(
+            r#"{{
+              "workdir": "{}",
+              "filesystem": {{ "local": {{ "encrypt": "encrypted", "key": "secret-a" }} }},
+              "log": {{ "file": "runtime/logs/sandbox.log" }}
+            }}"#,
+            workdir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &second_path,
+        format!(
+            r#"{{"log":{{"file":"runtime/logs/sandbox.log"}},"filesystem":{{"local":{{"key":"secret-a","encrypt":"encrypted"}}}},"workdir":"{}"}}"#,
+            workdir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &changed_path,
+        format!(
+            r#"{{"workdir":"{}","filesystem":{{"local":{{"encrypt":"encrypted","key":"secret-b"}}}}}}"#,
+            workdir.display()
+        ),
+    )
+    .unwrap();
+
+    let first = RunConfig::load(&first_path).unwrap();
+    let second = RunConfig::load(&second_path).unwrap();
+    let changed = RunConfig::load(&changed_path).unwrap();
+
+    let original_identity = first.session_identity(&hook).unwrap();
+    assert_eq!(original_identity, second.session_identity(&hook).unwrap());
+    assert_ne!(
+        first.session_identity(&hook).unwrap(),
+        changed.session_identity(&hook).unwrap()
+    );
+    std::fs::write(&hook, b"hook-b").unwrap();
+    assert_ne!(original_identity, first.session_identity(&hook).unwrap());
+}
+
+#[test]
+fn semantic_session_identity_normalizes_missing_path_aliases() {
+    let root = tempfile::tempdir().unwrap();
+    let hook = root.path().join("hook.dylib");
+    std::fs::write(&hook, b"hook").unwrap();
+    let first_path = root.path().join("first.json");
+    let second_path = root.path().join("second.json");
+    std::fs::write(&first_path, r#"{ "workdir": "state" }"#).unwrap();
+    std::fs::write(
+        &second_path,
+        r#"{ "workdir": "missing/../state", "log": { "file": "runtime/./logs/sandbox.log" } }"#,
+    )
+    .unwrap();
+
+    let first = RunConfig::load(&first_path).unwrap();
+    let second = RunConfig::load(&second_path).unwrap();
+
+    assert_eq!(first.workdir(), second.workdir());
+    assert_eq!(first.log_file(), second.log_file());
+    assert_eq!(
+        first.session_identity(&hook).unwrap(),
+        second.session_identity(&hook).unwrap()
+    );
+}

@@ -875,6 +875,23 @@ fn encrypted_namespace_leases_cover_file_directory_and_contention_paths() {
 }
 
 #[test]
+fn pending_plain_create_is_not_reconciled_as_an_orphan() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("pending-plain-create");
+    let (staged, existed, lease) = fixture.store.stage_file_open(&logical, true, true).unwrap();
+    let destination = staged.destination().to_path_buf();
+    assert!(!existed);
+    let lease = lease.expect("plain open should retain a staging lease");
+    std::fs::write(&destination, b"pending").unwrap();
+
+    assert!(fixture.store.prepare_read(&logical).is_err());
+    assert!(destination.is_file());
+    fixture.store.commit_created_file(staged, 0o600).unwrap();
+    drop(lease);
+    assert_eq!(fixture.store.prepare_read(&logical).unwrap(), destination);
+}
+
+#[test]
 fn pending_encrypted_exclusive_create_is_not_reconciled_as_an_orphan() {
     let (fixture, _) = Fixture::encrypted();
     let logical = fixture.lower.join("pending-create");

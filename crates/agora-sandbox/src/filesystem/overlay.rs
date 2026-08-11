@@ -1711,9 +1711,6 @@ impl OverlayStore {
     }
 
     fn write_lease_is_active(&self, destination: &Path) -> Result<bool> {
-        if self.cipher.is_none() {
-            return Ok(false);
-        }
         let path = Self::write_lease_path(destination)?;
         let lease = match OpenOptions::new().read(true).write(true).open(path) {
             Ok(lease) => lease,
@@ -1896,7 +1893,7 @@ impl OverlayStore {
     fn write_lease_path(destination: &Path) -> Result<PathBuf> {
         let name = destination
             .file_name()
-            .context("encrypted filesystem destination has no file name")?;
+            .context("filesystem destination has no file name")?;
         let mut lease = namespace::WRITE_LEASE_PREFIX.to_vec();
         lease.extend_from_slice(name.as_bytes());
         Ok(destination.with_file_name(OsString::from_vec(lease)))
@@ -1906,12 +1903,11 @@ impl OverlayStore {
         let length = lease.metadata()?.len();
         if length > super::MAX_CONTROL_PATH_BYTES as u64 {
             anyhow::bail!(
-                "encrypted filesystem write lease path exceeds {} bytes",
+                "filesystem write lease path exceeds {} bytes",
                 super::MAX_CONTROL_PATH_BYTES
             );
         }
-        let length =
-            usize::try_from(length).context("encrypted filesystem write lease path is too long")?;
+        let length = usize::try_from(length).context("filesystem write lease path is too long")?;
         if length == 0 {
             return Ok(None);
         }
@@ -1927,7 +1923,7 @@ impl OverlayStore {
         let mut excess = [0_u8; 1];
         if lease.read_at(&mut excess, length as u64)? != 0 {
             anyhow::bail!(
-                "encrypted filesystem write lease path exceeds {} bytes",
+                "filesystem write lease path exceeds {} bytes",
                 super::MAX_CONTROL_PATH_BYTES
             );
         }
@@ -1938,7 +1934,7 @@ impl OverlayStore {
         let contents = destination.as_os_str().as_bytes();
         if contents.len() > super::MAX_CONTROL_PATH_BYTES {
             anyhow::bail!(
-                "encrypted filesystem write lease path exceeds {} bytes",
+                "filesystem write lease path exceeds {} bytes",
                 super::MAX_CONTROL_PATH_BYTES
             );
         }
@@ -1960,7 +1956,7 @@ impl OverlayStore {
         destination: &Path,
         operation: libc::c_int,
     ) -> Result<Option<File>> {
-        if self.cipher.is_none() || !self.is_internal(destination) {
+        if !self.is_internal(destination) {
             return Ok(None);
         }
         let path = Self::write_lease_path(destination)?;

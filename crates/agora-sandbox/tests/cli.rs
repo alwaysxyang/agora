@@ -2,6 +2,8 @@
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 #[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -68,6 +70,7 @@ fn sandbox_cli_documents_only_available_options() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("run"));
     assert!(stdout.contains("migrate-key"));
+    assert!(!stdout.contains("__session-daemon"));
     assert!(!stdout.contains("--smb-config"));
     assert!(!stdout.contains("--filesystem-key"));
 
@@ -165,6 +168,414 @@ fn sandbox_cli_runs_with_a_plain_local_filesystem() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(workdir.join("fs").is_dir());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_cli_preserves_the_child_exit_code() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_cli_config(
+        root.path(),
+        &root.path().join("workdir"),
+        "off",
+        "plain",
+        None,
+        None,
+    );
+
+    let output = configured_command(&config, "/bin/bash -c 'exit 7'")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn shared_session_allows_a_second_command_in_the_same_workdir() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workdir");
+    let data = root.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let config = write_cli_config(root.path(), &workdir, "off", "plain", None, None);
+    let data = data.to_string_lossy();
+    let wait = format!(
+        "import os,time; os.chdir({data:?}); print('READY',flush=True); exec(\"while not os.path.exists('second-finished'): time.sleep(0.05)\")"
+    );
+    let wait = format!("/usr/bin/python3 -c {}", shell_words::quote(&wait));
+    let mut first = configured_command(&config, wait)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = String::new();
+    let mut stdout = std::io::BufReader::new(first.stdout.take().unwrap());
+    std::io::BufRead::read_line(&mut stdout, &mut output).unwrap();
+    assert_eq!(output, "READY\n");
+
+    let finish = format!("cd {} && : > second-finished", shell_words::quote(&data));
+    let finish = format!("/bin/bash -c {}", shell_words::quote(&finish));
+    let second = configured_command(&config, finish).output().unwrap();
+
+    assert!(
+        second.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(first.wait().unwrap().success());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn shared_session_accepts_a_different_direct_command() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workdir");
+    let data = root.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let config = write_cli_config(root.path(), &workdir, "off", "plain", None, None);
+    let wait = format!(
+        "import os,time; os.chdir({:?}); print('READY',flush=True); exec(\"while not os.path.exists('done'): time.sleep(0.05)\")",
+        data.to_string_lossy()
+    );
+    let wait = format!("/usr/bin/python3 -c {}", shell_words::quote(&wait));
+    let mut first = configured_command(&config, wait)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(first.stdout.take().unwrap()),
+        &mut ready,
+    )
+    .unwrap();
+    assert_eq!(ready, "READY\n");
+
+    let second = configured_command(&config, format!("/bin/ls -d {}", data.display()))
+        .output()
+        .unwrap();
+
+    assert!(second.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&second.stdout).trim(),
+        data.to_string_lossy()
+    );
+    std::fs::write(data.join("done"), b"").unwrap();
+    assert!(first.wait().unwrap().success());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn shared_session_makes_encrypted_writes_visible_between_commands() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workdir");
+    let data = root.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let config = write_cli_config(
+        root.path(),
+        &workdir,
+        "off",
+        "encrypted",
+        Some("shared-session-filesystem-key"),
+        None,
+    );
+    let data = data.to_string_lossy();
+    let data = shell_words::quote(&data);
+    let wait_script = format!(
+        "cd {data} && echo READY && while [ ! -f .session-done ]; do /bin/sleep 0.05; done && /bin/cat shared-session.txt"
+    );
+    let wait_command = format!("/bin/bash -c {}", shell_words::quote(&wait_script));
+    let mut first = configured_command(&config, wait_command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(first.stdout.take().unwrap());
+    let mut ready = String::new();
+    std::io::BufRead::read_line(&mut stdout, &mut ready).unwrap();
+    assert_eq!(ready, "READY\n");
+
+    let write_script =
+        format!("cd {data} && printf shared-value > shared-session.txt && : > .session-done");
+    let write_command = format!("/bin/bash -c {}", shell_words::quote(&write_script));
+    let second = configured_command(&config, write_command).output().unwrap();
+    assert!(
+        second.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let first_status = loop {
+        if let Some(status) = first.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = first.kill();
+            panic!("first shared-session command did not observe the peer write");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut remaining = String::new();
+    stdout.read_to_string(&mut remaining).unwrap();
+    assert!(first_status.success());
+    assert_eq!(remaining, "shared-value");
+    assert!(!root.path().join("data/shared-session.txt").exists());
+    assert!(!root.path().join("data/.session-done").exists());
+
+    let read_script = format!("cd {data} && /bin/cat shared-session.txt");
+    let read_command = format!("/bin/bash -c {}", shell_words::quote(&read_script));
+    let persisted = configured_command(&config, read_command).output().unwrap();
+    assert!(persisted.status.success());
+    assert_eq!(persisted.stdout, b"shared-value");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn shared_session_preserves_file_lock_exclusion_between_commands() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workdir");
+    let data = root.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let config = write_cli_config(
+        root.path(),
+        &workdir,
+        "off",
+        "encrypted",
+        Some("shared-session-lock-key"),
+        None,
+    );
+    let data = data.to_string_lossy();
+    let holder = format!(
+        "import fcntl, os, time; os.chdir({data:?}); f=open('locked.txt','a+'); fcntl.flock(f,fcntl.LOCK_EX); print('LOCKED',flush=True); exec(\"while not os.path.exists('lock-done'): time.sleep(0.05)\")"
+    );
+    let holder = format!("/usr/bin/python3 -c {}", shell_words::quote(&holder));
+    let mut first = configured_command(&config, holder)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(first.stdout.take().unwrap());
+    let mut ready = String::new();
+    std::io::BufRead::read_line(&mut stdout, &mut ready).unwrap();
+    assert_eq!(ready, "LOCKED\n");
+
+    let contender = format!(
+        "import fcntl, os, sys; os.chdir({data:?}); f=open('locked.txt','a+');\ntry:\n fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB); sys.exit(9)\nexcept BlockingIOError:\n open('lock-done','w').close()"
+    );
+    let contender = format!("/usr/bin/python3 -c {}", shell_words::quote(&contender));
+    let second = configured_command(&config, contender).output().unwrap();
+    assert!(
+        second.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let first_status = loop {
+        if let Some(status) = first.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = first.kill();
+            panic!("file-lock holder did not observe the peer completion file");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(first_status.success());
+    assert!(!root.path().join("data/locked.txt").exists());
+    assert!(!root.path().join("data/lock-done").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn shared_session_preserves_sqlite_wal_locking_and_commits() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workdir");
+    let data = root.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let config = write_cli_config(
+        root.path(),
+        &workdir,
+        "off",
+        "encrypted",
+        Some("shared-session-sqlite-key"),
+        None,
+    );
+    let data = data.to_string_lossy();
+    let writer = format!(
+        "import os, sqlite3, time; os.chdir({data:?}); c=sqlite3.connect('session.db',timeout=0); c.execute('PRAGMA journal_mode=WAL'); c.execute('CREATE TABLE IF NOT EXISTS records(value TEXT)'); c.commit(); c.execute('BEGIN IMMEDIATE'); c.execute(\"INSERT INTO records VALUES ('committed')\"); print('READY',flush=True); exec(\"while not os.path.exists('sqlite-done'): time.sleep(0.05)\"); c.commit()"
+    );
+    let writer = format!("/usr/bin/python3 -c {}", shell_words::quote(&writer));
+    let mut first = configured_command(&config, writer)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(first.stdout.take().unwrap());
+    let mut ready = String::new();
+    std::io::BufRead::read_line(&mut stdout, &mut ready).unwrap();
+    assert_eq!(ready, "READY\n");
+
+    let contender = format!(
+        "import os, sqlite3, sys; os.chdir({data:?}); c=sqlite3.connect('session.db',timeout=0);\ntry:\n c.execute('BEGIN IMMEDIATE'); sys.exit(9)\nexcept sqlite3.OperationalError as e:\n assert 'locked' in str(e).lower(), str(e)\nopen('sqlite-done','w').close()"
+    );
+    let contender = format!("/usr/bin/python3 -c {}", shell_words::quote(&contender));
+    let second = configured_command(&config, contender).output().unwrap();
+    assert!(
+        second.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let first_status = loop {
+        if let Some(status) = first.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = first.kill();
+            panic!("SQLite writer did not finish after the peer released it");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(first_status.success());
+
+    let reader = format!(
+        "import os, sqlite3; os.chdir({data:?}); print(sqlite3.connect('session.db').execute('SELECT value FROM records').fetchone()[0],end='')"
+    );
+    let reader = format!("/usr/bin/python3 -c {}", shell_words::quote(&reader));
+    let committed = configured_command(&config, reader).output().unwrap();
+    assert!(
+        committed.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&committed.stdout),
+        String::from_utf8_lossy(&committed.stderr)
+    );
+    assert_eq!(committed.stdout, b"committed");
+    assert!(!root.path().join("data/session.db").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn shared_session_rejects_a_different_effective_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workdir");
+    let first_config = write_cli_config(
+        &root.path().join("first"),
+        &workdir,
+        "off",
+        "plain",
+        None,
+        None,
+    );
+    let second_config = write_cli_config(
+        &root.path().join("second"),
+        &workdir,
+        "off",
+        "plain",
+        None,
+        Some(&workdir.join("runtime/logs/other.log")),
+    );
+    let mut first = configured_command(&first_config, "/bin/bash -c 'echo READY; /bin/sleep 3'")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(first.stdout.take().unwrap());
+    let mut ready = String::new();
+    std::io::BufRead::read_line(&mut stdout, &mut ready).unwrap();
+    assert_eq!(ready, "READY\n");
+
+    let rejected = configured_command(&second_config, "/usr/bin/true")
+        .output()
+        .unwrap();
+
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("sandbox session configuration mismatch"),
+        "stderr={}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(first.wait().unwrap().success());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn concurrent_first_entries_elect_one_workspace_session() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workdir");
+    let data = root.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let config = write_cli_config(
+        root.path(),
+        &workdir,
+        "off",
+        "encrypted",
+        Some("concurrent-session-election-key"),
+        None,
+    );
+    let data = data.to_string_lossy();
+    let first_script = format!(
+        "import os,time; os.chdir({data:?}); open('first-ready','w').close(); exec(\"while not os.path.exists('second-ready'): time.sleep(0.05)\")"
+    );
+    let second_script = format!(
+        "import os,time; os.chdir({data:?}); open('second-ready','w').close(); exec(\"while not os.path.exists('first-ready'): time.sleep(0.05)\")"
+    );
+    let first_command = format!("/usr/bin/python3 -c {}", shell_words::quote(&first_script));
+    let second_command = format!("/usr/bin/python3 -c {}", shell_words::quote(&second_script));
+    let mut first = configured_command(&config, first_command).spawn().unwrap();
+    let mut second = configured_command(&config, second_command).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (first_status, second_status) = loop {
+        let first_status = first.try_wait().unwrap();
+        let second_status = second.try_wait().unwrap();
+        if let (Some(first_status), Some(second_status)) = (first_status, second_status) {
+            break (first_status, second_status);
+        }
+        if Instant::now() >= deadline {
+            let _ = first.kill();
+            let _ = second.kill();
+            let _ = first.wait();
+            let _ = second.wait();
+            panic!("concurrent first entries did not join one workspace session");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(first_status.success());
+    assert!(second_status.success());
+    assert!(!root.path().join("data/first-ready").exists());
+    assert!(!root.path().join("data/second-ready").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn final_session_client_returns_after_the_workspace_lock_is_released() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workdir");
+    let config = write_cli_config(root.path(), &workdir, "off", "plain", None, None);
+
+    let output = configured_command(&config, "/usr/bin/true")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(workdir.join("fs/.fs.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "CLI returned before the session daemon released .fs.lock: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 #[cfg(target_os = "macos")]

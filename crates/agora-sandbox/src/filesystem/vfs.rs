@@ -113,6 +113,7 @@ pub(crate) enum FileLayer {
 pub(crate) struct PreparedFile {
     target: OpenTarget,
     staged: Option<StagedWrite>,
+    staging_lease: Option<File>,
     writeback: Option<Writeback>,
     publish_on_open: bool,
     overwrite_on_open: bool,
@@ -155,6 +156,7 @@ impl PreparedFile {
         Self {
             target: OpenTarget::Path(target),
             staged,
+            staging_lease: None,
             writeback: None,
             publish_on_open: false,
             overwrite_on_open: false,
@@ -534,7 +536,9 @@ impl VirtualFilesystem {
             return Ok(PreparedFile::for_path(mapped, None, FileLayer::Lower));
         }
         let Some(cipher) = self.overlay.cipher().cloned() else {
-            return Ok(PreparedFile::for_path(mapped, staged, FileLayer::Upper));
+            let mut prepared = PreparedFile::for_path(mapped, staged, FileLayer::Upper);
+            prepared.staging_lease = lease;
+            return Ok(prepared);
         };
         if mapped.exists() && !mapped.symlink_metadata()?.is_file() {
             return Ok(PreparedFile::for_path(mapped, staged, FileLayer::Upper));
@@ -553,6 +557,7 @@ impl VirtualFilesystem {
             return Ok(PreparedFile {
                 target: OpenTarget::Descriptor(target),
                 staged,
+                staging_lease: None,
                 writeback: if writes {
                     Some(Writeback {
                         plaintext: Mutex::new(plaintext),
@@ -599,6 +604,7 @@ impl VirtualFilesystem {
         Ok(PreparedFile {
             target: OpenTarget::Descriptor(exposed),
             staged,
+            staging_lease: None,
             writeback: if writes {
                 Some(Writeback {
                     plaintext: Mutex::new(plaintext),
@@ -648,6 +654,7 @@ impl VirtualFilesystem {
                 self.overlay.commit_write(staged)?;
             }
         }
+        prepared.staging_lease.take();
         Ok(())
     }
 

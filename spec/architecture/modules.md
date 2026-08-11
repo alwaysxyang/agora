@@ -104,6 +104,8 @@ Responsibility:
 - Per-run network interception controller and raw TCP proxy.
 - Versioned, caller-owned asynchronous policy and event callback contract.
 - Thin command-line delivery using `agora-sandbox run -c <config> -e '<command>'`.
+- Ephemeral per-workspace CLI session discovery, launch preparation, and final-lease runtime
+  ownership; each foreground client retains its own terminal and process group.
 - Rootless TLS termination with an explicit or workdir-local fixed CA.
 - Process-tree-scoped filesystem overlay, encrypted storage, remote filesystem roots, and native
   operation interception on supported platforms.
@@ -115,6 +117,12 @@ Current status:
   `<workdir>/fs` cache only when injection restrictions require a copy, starts IPv4/IPv6
   loopback proxies, injects the private hook dylib, preserves child stdout and stderr, and returns
   the child exit status.
+- `runner/runtime.rs` owns reusable filesystem, local and NFS Broker, network, execution, and audit
+  controller lifetime plus command preparation. The public SDK facade creates one such runtime for
+  one command. `session/{startup,protocol,server,client}.rs` lets overlapping compatible CLI
+  invocations share one runtime through a bounded owner-only UDS while commands are spawned by
+  their respective foreground clients. The hidden daemon holds `.fs.lock` and the startup-election
+  lock until the final lease has completed shutdown; no idle or persistent daemon is retained.
 - The network hook path interposes `connect` and simple `connectx`. It invokes the original
   `connectx` with an authenticated transparent CONNECT preface as initial data, without changing
   `O_NONBLOCK` or waiting for a proxy response. Covered interception failures are blocked instead
@@ -147,14 +155,20 @@ Current status:
   encrypted mode, an independent authenticated parent-side filesystem Broker owns each open content
   container and one shared anonymous plaintext vnode per ciphertext inode. Every independent open
   receives separate anonymous offset/flag state plus a separately opened descriptor for the inode's
-  shared lock anchor. The Broker batches completed ranges briefly, serializes content mutations and
-  durability per ciphertext inode, and bounds closed fork-retention handles. The libc hook selects
+  shared lock anchor. The Broker owns completed dirty ranges on that shared inode, batches them
+  briefly, and serializes content mutations and durability per ciphertext inode. Busy protocol
+  acquisition returns immediately so inherited control-stream locks are released before a bounded
+  client retry; closed fork-retention handles remain bounded. The libc hook selects
   real or effective credentials, virtualizes ordinary and positioned data I/O over the per-open
   state, preserves macOS guarded-descriptor and shared-mapping semantics, and adapts results without
   duplicating permission or encryption policy. Its narrow `control` module owns pre-authenticated
   inheritable fallback streams for internal execution, audit, and filesystem services; the service
   clients and controllers retain all protocol and operation ownership. Synchronous workspace and
   key-migration storage work runs on blocking workers behind the public asynchronous runner API.
+  Plain mutating opens retain a per-file staging lease through native descriptor creation and
+  metadata publication so concurrent CLI clients cannot reconcile a staged upper file away without
+  extending the global VFS transaction; encrypted opens continue using that lease for the lifetime
+  of their shared Broker vnode.
 - The `nfs` module owns protocol-backed network filesystem roots. Its generic storage trait and
   authenticated per-run Broker are independent of the hook; SMB2/3 is the first backend under
   `nfs/backend/smb`. `nfs/backend/mod.rs` exposes only the protocol-neutral storage boundary to
@@ -178,10 +192,11 @@ Current status:
   Broker and NFS Broker share only private IPC
   framing; their protocols, handles, and synchronization policies remain independent. A Broker
   failure is monitored alongside the other run services.
-- The CLI renders one structured JSON Lines log record per network connection attempt, intercepted
-  descendant process execution attempt, and intercepted file open or close. `log.file` selects the
-  unified log destination and defaults to `<workdir>/runtime/logs/sandbox.log`, leaving child stdout
-  and stderr inherited without Agora records. Its callback always allows requests.
+- The CLI session daemon renders one structured JSON Lines log record per network connection
+  attempt, intercepted descendant process execution attempt, and intercepted file open or close.
+  `log.file` selects the unified log destination and defaults to
+  `<workdir>/runtime/logs/sandbox.log`, leaving every client's child stdout and stderr inherited
+  without Agora records. Its callback always allows requests.
 - The interception CA is trusted by covered macOS `SecTrust` SSL evaluations and by common
   environment-aware clients through a CA-keyed trust bundle containing the interception CA and
   current native roots. TLS stacks that ignore both mechanisms require their own trust
