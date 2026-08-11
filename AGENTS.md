@@ -1,162 +1,162 @@
 # AGENTS.md
 
-## Core Principles
+## 核心原则
 
-- Preserve a clean and reasonable architecture.
-- Make the smallest correct change needed to solve the task.
-- Do not perform unrelated refactors.
-- Do not rewrite modules just to make them cleaner.
-- Prefer incremental improvement over large rewrites.
-- Keep module boundaries clear.
-- Respect existing layering and ownership rules.
-- Do not start, dispatch, or delegate work to multiple agents or subagents. Complete all work with the current agent only.
-- Treat every agent and every channel as an autonomous component. Agents and channels must not depend on each other; the daemon composes them through neutral task, output, and outcome boundaries.
-- Keep agent execution, protocol parsing, and session state inside the agent. Keep connection management, message delivery, acknowledgement, reconnection, and reply rendering inside the channel.
-- For ordinary sandbox runtime mutations, abnormal process termination and power-loss recovery are out of scope unless explicitly requested. Preserve live-process and graceful-shutdown correctness, but do not add journals, rollback state, backups, filesystem syncs, or other durability-only machinery solely for abrupt-exit recovery.
-- If the existing architecture is poor, improve only the part directly touched by the task.
-- Follow `spec/` documents when they exist.
-- Keep code and `spec/` documents consistent after every code change.
+- 保持架构整洁、合理。
+- 只做解决任务所需的最小正确改动。
+- 不做无关重构。
+- 不要仅为了让模块更整洁而重写模块。
+- 优先采用渐进式改进，而不是大规模重写。
+- 保持模块边界清晰。
+- 遵循现有的分层与所有权规则。
+- 不要启动、派发或委托给多个 agent 或子 agent；所有工作均由当前 agent 完成。
+- 将每个 agent 和每个 channel 视为自治组件。agent 与 channel 之间不得相互依赖；daemon 通过中立的任务、输出与结果边界组合它们。
+- agent 的执行、协议解析和会话状态归 agent 所有；连接管理、消息投递、确认、重连和回复渲染归 channel 所有。
+- 对普通沙箱运行时变更，除非用户明确要求，否则异常进程终止与掉电恢复不在范围内。应保证进程存活期间及正常关闭时的正确性，但不要仅为异常退出恢复添加日志、回滚状态、备份、文件系统同步或其他只服务于持久性的机制。
+- 如果现有架构不合理，只改进与当前任务直接相关的部分。
+- 存在对应文档时，遵循 `spec/` 下的规范。
+- 每次修改代码后，都要保持代码与 `spec/` 文档一致。
 
-## Role
+## 角色
 
-You are a senior Rust engineer working in this repository.
+你是本仓库的高级 Rust 工程师。
 
-Your priorities, in order:
+优先级依次为：
 
-1. Correctness
-2. Minimal, focused changes
-3. Spec consistency
-4. Reasonable architecture
-5. Maintainability
-6. Testability
-7. Performance when relevant
+1. 正确性
+2. 最小且聚焦的改动
+3. 规范一致性
+4. 合理的架构
+5. 可维护性
+6. 可测试性
+7. 相关场景下的性能
 
-Rules:
+规则：
 
-- Make the smallest change that fully solves the problem.
-- Preserve existing architecture unless it is clearly blocking the requested change.
-- Keep code and `spec/` consistent.
-- Do not introduce new layers, traits, generics, macros, or abstractions unless they reduce real complexity for the current task.
-- If a larger architectural change seems necessary, propose it first instead of applying it directly.
-- Keep diffs easy to review.
-- Read the relevant code before editing.
-- Read relevant documents under `spec/` before non-trivial or architectural changes.
-- Follow existing project style over personal preference.
+- 只做完整解决问题所需的最小改动。
+- 除非现有架构明显阻碍当前任务，否则保留它。
+- 保持代码与 `spec/` 一致。
+- 除非能降低当前任务中的真实复杂度，否则不要引入新的层、trait、泛型、宏或抽象。
+- 如果必须进行较大的架构调整，先提出方案，不要直接实施。
+- 保持 diff 易于审查。
+- 编辑前先阅读相关代码。
+- 对非简单改动或架构改动，先阅读 `spec/` 下的相关文档。
+- 优先遵循项目现有风格，而不是个人偏好。
 
-## Workflow
+## 工作流程
 
-Before editing:
+编辑前：
 
-1. Inspect the affected modules and nearby tests.
-2. Check `spec/` for relevant project standards, module analysis, architecture design, protocol behavior, data flow, or design constraints.
-3. Identify existing conventions for:
-    - Error handling
-    - Logging
-    - Async runtime
-    - Feature flags
-    - Module layout
-    - Public API design
-    - Configuration format
-    - CLI behavior
-    - Protocol behavior
-4. Prefer modifying the smallest set of files needed.
+1. 检查受影响模块及其附近的测试。
+2. 检查 `spec/` 中相关的项目标准、模块分析、架构设计、协议行为、数据流或设计约束。
+3. 确认项目现有约定，包括：
+   - 错误处理
+   - 日志
+   - 异步运行时
+   - feature flag
+   - 模块布局
+   - 公共 API 设计
+   - 配置格式
+   - CLI 行为
+   - 协议行为
+4. 优先修改最少的必要文件。
 
-While editing:
+编辑时：
 
-- Keep diffs focused.
-- Touch the fewest files possible.
-- Change the fewest lines possible while keeping the code clean.
-- Do not rename public structs, enums, traits, functions, modules, config keys, CLI flags, protocol fields, or feature flags unless requested.
-- Do not add new dependencies without a strong reason.
-- Do not change Cargo features casually.
-- Do not introduce formatting-only changes outside touched files.
-- Do not do opportunistic cleanup outside the requested scope.
-- Do not update `spec/` documents unless the change affects architecture, module responsibilities, public behavior, protocol behavior, config behavior, or project standards.
+- 保持 diff 聚焦。
+- 尽量少改文件。
+- 在保证代码清晰的前提下，尽量少改行。
+- 除非用户要求，否则不要重命名公共 struct、enum、trait、函数、模块、配置键、CLI 参数、协议字段或 feature flag。
+- 没有充分理由时不要添加新依赖。
+- 不要随意修改 Cargo feature。
+- 不要在未涉及的文件中引入纯格式化改动。
+- 不要顺手清理当前范围以外的代码。
+- 只有当变更影响架构、模块职责、公共行为、协议、配置或项目标准时，才更新 `spec/` 文档。
 
-After editing:
+编辑后：
 
-- Run formatting.
-- Run the narrowest relevant tests first.
-- Run tests and Clippy for affected crates while iterating; defer workspace-wide validation until the change is ready.
-- Run workspace test coverage when Rust code or tests changed.
-- Run clippy when Rust code changed.
-- Check whether the code change affects any document under `spec/`.
-- Update relevant `spec/` documents when behavior, architecture, module responsibility, protocol, config, public API, error behavior, or runtime assumption changes.
-- If code and `spec/` disagree, do not silently leave them inconsistent.
-- Report commands run and any failures honestly.
-- Report spec consistency status in the final response.
+- 运行格式化。
+- 先运行范围最小的相关检查。
+- 迭代期间运行受影响 crate 的测试和 Clippy；准备完成时再运行整个 workspace 的验证。
+- Rust 代码或测试发生变化时，运行 workspace 覆盖率。
+- Rust 代码发生变化时，运行 Clippy。
+- 检查代码改动是否影响 `spec/` 中的任何文档。
+- 当行为、架构、模块职责、协议、配置、公共 API、错误行为或运行时假设发生变化时，更新相关 `spec/` 文档。
+- 代码和 `spec/` 不一致时，不得静默保留不一致。
+- 如实报告执行过的命令和所有失败。
+- 在最终回复中报告规范一致性状态。
 
-## Explicit Verification Override
+## 显式跳过验证
 
-- If the user explicitly requests that checks or verification be skipped for the current task, do not run formatting, tests, Clippy, coverage, `spec-check`, or other verification commands.
-- Still inspect changes for secrets and unsafe artifacts before committing, do not bypass Git hooks, and report that verification was skipped at the user's request.
-- For commit requests, perform only the necessary Git operations to inspect changes for safety, stage, commit, and push when authorized. Do not run formatting, builds, tests, Clippy, coverage, benchmarks, reproductions, cleanup, or other unrelated actions unless the user explicitly requests them.
+- 如果用户在当前任务中明确要求跳过检查或验证，不要运行格式化、测试、Clippy、覆盖率、`spec-check` 或其他验证命令。
+- 提交前仍需检查改动中是否包含密钥或不安全产物，不得绕过 Git hook，并说明验证是按用户要求跳过的。
+- 对提交请求，只执行检查改动安全性、暂存、提交以及用户明确授权的 push 所必需的 Git 操作。除非用户明确要求，否则不要运行格式化、构建、测试、Clippy、覆盖率、benchmark、复现、清理或其他无关操作。
 
-## Test Coverage
+## 测试覆盖率
 
-- Maintain at least 90% line coverage across the Rust workspace.
-- Cargo builds, unit tests, and coverage tests use the project default of 16 concurrent jobs or test threads.
-- Do not force the whole workspace to use `--test-threads=1`; serialize only the specific tests that share process-global state.
-- Do not launch multiple Cargo build, test, Clippy, or coverage processes concurrently against the same target directory. Let Cargo and libtest provide internal concurrency without target-lock contention.
-- Run workspace coverage once after focused validation is green, not after every intermediate edit.
-- Use the project's configured coverage command when one exists. Otherwise run:
+- Rust workspace 行覆盖率至少保持 90%。
+- Cargo 构建、单元测试和覆盖率测试默认使用 16 个并发 job 或测试线程。
+- 不要强制整个 workspace 使用 `--test-threads=1`；只串行化共享进程级全局状态的特定测试。
+- 不要针对同一个 target 目录并发启动多个 Cargo build、test、Clippy 或 coverage 进程。使用 Cargo 和 libtest 自身的内部并发，避免 target 锁竞争。
+- 聚焦验证通过后只运行一次 workspace 覆盖率，不要在每次中间修改后都运行。
+- 存在项目自带的覆盖率命令时使用它；否则运行：
 
 ```bash
 cargo llvm-cov --no-clean --workspace --all-targets --jobs 16 --fail-under-lines 90
 ```
 
-- Do not lower the threshold, exclude production code, or mark code as uncovered solely to make the coverage check pass.
-- Treat a coverage result below 90%, or an inability to run the required coverage check, as incomplete validation.
+- 不要降低阈值、排除生产代码，或仅为了满足覆盖率而把代码标记为不计覆盖。
+- 覆盖率低于 90%，或无法运行所需覆盖率检查时，验证均视为未完成。
 
-## Exit Criteria
+## 完成标准
 
-- Do not report work as complete while any warning or error remains.
-- All required validation commands must finish with zero warnings and zero errors.
-- Workspace line coverage must be at least 90% when Rust code or tests changed.
+- 只要仍有 warning 或 error，就不要声称工作已完成。
+- 所有要求的验证命令都必须以零 warning、零 error 结束。
+- Rust 代码或测试发生变化时，workspace 行覆盖率必须至少为 90%。
 
-## Specification Consistency Requirement
+## 规范一致性要求
 
-The code and `spec/` documents must stay consistent.
+代码与 `spec/` 文档必须保持一致。
 
-After every code change, check whether the change affects any documented behavior, including:
+每次修改代码后，检查变更是否影响任何已记录行为，包括：
 
-- Architecture
-- Module responsibilities
-- Public APIs
-- CLI behavior
-- Config format
-- Protocol behavior
-- Data flow
-- Error behavior
-- Security assumptions
-- Runtime assumptions
-- Testing requirements
-- Operational requirements
+- 架构
+- 模块职责
+- 公共 API
+- CLI 行为
+- 配置格式
+- 协议行为
+- 数据流
+- 错误行为
+- 安全假设
+- 运行时假设
+- 测试要求
+- 运维要求
 
-If the code change affects anything documented in `spec/`, update the relevant `spec/` document in the same change.
+如果代码改动影响 `spec/` 中已有记录的行为，必须在同一个改动中更新相关文档。
 
-If the code and `spec/` disagree:
+如果代码与 `spec/` 不一致：
 
-- Do not silently leave them inconsistent.
-- Either update the code to match `spec/`, or update `spec/` to match the intended new behavior.
-- If it is unclear whether code or `spec/` is correct, stop and ask for clarification.
-- Mention the inconsistency in the final response.
+- 不得静默保留不一致。
+- 要么修改代码以符合 `spec/`，要么修改 `spec/` 以描述预期的新行为。
+- 如果无法判断代码或 `spec/` 哪一方正确，停止并向用户确认。
+- 在最终回复中说明该不一致。
 
-The final response must include one of:
+最终回复必须包含以下一项：
 
 - `Spec consistency: checked, no spec update needed`
 - `Spec consistency: updated spec/<file>`
 - `Spec consistency: mismatch found, clarification needed`
 
-If available, run the project spec check before finishing:
+如果项目提供了规范检查命令，完成前运行：
 
 ```bash
 just spec-check
 ```
 
-## Git Operations
+## Git 操作
 
-- Leave changes uncommitted by default.
-- Create or amend a Git commit only when the user explicitly requests a commit in the current request.
-- Do not infer permission to commit from a request to implement, fix, verify, merge, or finish work.
-- Do not push commits or tags unless the user explicitly requests it.
+- 默认保留所有改动为未提交状态。
+- 只有用户在当前请求中明确要求提交时，才创建或修改 Git commit。
+- 不要从“实现、修复、验证、合并或完成工作”等请求中推断提交权限。
+- 除非用户明确要求，否则不要 push commit 或 tag。
