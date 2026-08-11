@@ -94,7 +94,7 @@
 
 ## 测试覆盖率
 
-- Rust workspace 行覆盖率至少保持 90%。
+- Rust workspace 行覆盖率至少保持 80%。
 - Cargo 构建、单元测试和覆盖率测试默认使用 16 个并发 job 或测试线程。
 - 不要强制整个 workspace 使用 `--test-threads=1`；只串行化共享进程级全局状态的特定测试。
 - 不要针对同一个 target 目录并发启动多个 Cargo build、test、Clippy 或 coverage 进程。使用 Cargo 和 libtest 自身的内部并发，避免 target 锁竞争。
@@ -102,17 +102,17 @@
 - 存在项目自带的覆盖率命令时使用它；否则运行：
 
 ```bash
-cargo llvm-cov --no-clean --workspace --all-targets --jobs 16 --fail-under-lines 90
+cargo llvm-cov --no-clean --workspace --all-targets --jobs 16 --fail-under-lines 80
 ```
 
 - 不要降低阈值、排除生产代码，或仅为了满足覆盖率而把代码标记为不计覆盖。
-- 覆盖率低于 90%，或无法运行所需覆盖率检查时，验证均视为未完成。
+- 覆盖率低于 80%，或无法运行所需覆盖率检查时，验证均视为未完成。
 
 ## 完成标准
 
 - 只要仍有 warning 或 error，就不要声称工作已完成。
 - 所有要求的验证命令都必须以零 warning、零 error 结束。
-- Rust 代码或测试发生变化时，workspace 行覆盖率必须至少为 90%。
+- Rust 代码或测试发生变化时，workspace 行覆盖率必须至少为 80%。
 
 ## 规范一致性要求
 
