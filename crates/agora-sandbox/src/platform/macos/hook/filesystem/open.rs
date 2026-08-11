@@ -1,4 +1,6 @@
-use super::descriptor::{agora_sandbox_guarded_close, original_close, original_fclose};
+use super::descriptor::{
+    agora_sandbox_guarded_close, original_close, original_fclose, release_local_close_locks,
+};
 use super::*;
 
 type OpenFn = unsafe extern "C" fn(*const libc::c_char, libc::c_int, libc::mode_t) -> libc::c_int;
@@ -136,49 +138,45 @@ unsafe fn sandbox_open_with_operation(
                 }
                 let mut prepared = request.into_prepared();
                 let target_is_path = matches!(prepared.prepared.target(), OpenTarget::Path(_));
-                let descriptor = match prepared.prepared.target() {
+                let path_descriptor = match prepared.prepared.target() {
                     OpenTarget::Path(mapped) => {
                         let mapped = match CString::new(mapped.as_os_str().as_bytes()) {
                             Ok(mapped) => mapped,
                             Err(error) => return unsafe { fail(&error.into(), -1) },
                         };
-                        unsafe { operation.call(mapped.as_ptr(), flags, mode) }
+                        Some(unsafe { operation.call(mapped.as_ptr(), flags, mode) })
                     }
-                    OpenTarget::Descriptor(file) => {
-                        let descriptor = file.as_raw_fd();
-                        if let Err(error) = configure_descriptor(descriptor, flags) {
-                            return unsafe { fail(&error, -1) };
-                        }
-                        descriptor
-                    }
+                    OpenTarget::Descriptor(_) => None,
                 };
-                if descriptor < 0 {
-                    return descriptor;
+                if path_descriptor.is_some_and(|descriptor| descriptor < 0) {
+                    return path_descriptor.unwrap();
                 }
                 if let Err(error) = runtime.commit_open(&mut prepared) {
-                    if target_is_path {
+                    if let Some(descriptor) = path_descriptor {
                         unsafe { operation.close(descriptor) };
                     }
                     return unsafe { fail(&error, -1) };
                 }
-                if !target_is_path
-                    && let Err(error) = unsafe { operation.configure_anonymous(descriptor) }
-                {
-                    let errno = error.raw_os_error().unwrap_or(libc::EIO);
-                    let (target, open) = prepared.into_parts();
-                    let _ = runtime.finish_open_file(descriptor, &open);
-                    if let OpenTarget::Descriptor(file) = target {
-                        let descriptor = file.into_raw_fd();
-                        if let Some(close) = original_close() {
-                            unsafe { close(descriptor) };
-                        }
+                if !target_is_path {
+                    let descriptor = match prepared.prepared.target() {
+                        OpenTarget::Descriptor(file) => file.as_raw_fd(),
+                        OpenTarget::Path(_) => unreachable!("open target kind changed"),
+                    };
+                    let local = prepared.local.is_some();
+                    if let Err(error) =
+                        configure_descriptor(descriptor, flags, local).and_then(|()| {
+                            unsafe { operation.configure_anonymous(descriptor) }.map_err(Into::into)
+                        })
+                    {
+                        let (target, open) = prepared.into_parts();
+                        let _ = runtime.finish_open_file(descriptor, &open);
+                        drop(target);
+                        return unsafe { fail(&error, -1) };
                     }
-                    unsafe { set_errno(errno) };
-                    return -1;
                 }
                 let (target, open) = prepared.into_parts();
                 let descriptor = match target {
-                    OpenTarget::Path(_) => descriptor,
+                    OpenTarget::Path(_) => path_descriptor.expect("path target was opened"),
                     OpenTarget::Descriptor(file) => file.into_raw_fd(),
                 };
                 runtime.register(descriptor, open);
@@ -300,34 +298,44 @@ unsafe fn sandbox_openat_with_mode(
                 }
                 let mut prepared = request.into_prepared();
                 let target_is_path = matches!(prepared.prepared.target(), OpenTarget::Path(_));
-                let descriptor = match prepared.prepared.target() {
+                let path_descriptor = match prepared.prepared.target() {
                     OpenTarget::Path(mapped) => {
                         let mapped = match CString::new(mapped.as_os_str().as_bytes()) {
                             Ok(mapped) => mapped,
                             Err(error) => return unsafe { fail(&error.into(), -1) },
                         };
-                        unsafe { original(libc::AT_FDCWD, mapped.as_ptr(), flags, mode) }
+                        Some(unsafe { original(libc::AT_FDCWD, mapped.as_ptr(), flags, mode) })
                     }
-                    OpenTarget::Descriptor(file) => {
-                        let descriptor = file.as_raw_fd();
-                        if let Err(error) = configure_descriptor(descriptor, flags) {
-                            return unsafe { fail(&error, -1) };
-                        }
-                        descriptor
-                    }
+                    OpenTarget::Descriptor(_) => None,
                 };
-                if descriptor < 0 {
-                    return descriptor;
+                if path_descriptor.is_some_and(|descriptor| descriptor < 0) {
+                    return path_descriptor.unwrap();
                 }
                 if let Err(error) = runtime.commit_open(&mut prepared) {
-                    if target_is_path && let Some(close) = original_close() {
+                    if let Some(descriptor) = path_descriptor
+                        && let Some(close) = original_close()
+                    {
                         unsafe { close(descriptor) };
                     }
                     return unsafe { fail(&error, -1) };
                 }
+                if !target_is_path {
+                    let descriptor = match prepared.prepared.target() {
+                        OpenTarget::Descriptor(file) => file.as_raw_fd(),
+                        OpenTarget::Path(_) => unreachable!("open target kind changed"),
+                    };
+                    if let Err(error) =
+                        configure_descriptor(descriptor, flags, prepared.local.is_some())
+                    {
+                        let (target, open) = prepared.into_parts();
+                        let _ = runtime.finish_open_file(descriptor, &open);
+                        drop(target);
+                        return unsafe { fail(&error, -1) };
+                    }
+                }
                 let (target, open) = prepared.into_parts();
                 let descriptor = match target {
-                    OpenTarget::Path(_) => descriptor,
+                    OpenTarget::Path(_) => path_descriptor.expect("path target was opened"),
                     OpenTarget::Descriptor(file) => file.into_raw_fd(),
                 };
                 runtime.register(descriptor, open);
@@ -382,7 +390,7 @@ unsafe fn sandbox_fopen(path: *const libc::c_char, mode: *const libc::c_char) ->
                     return unsafe { fail_audit(&error, std::ptr::null_mut()) };
                 }
                 let mut prepared = request.into_prepared();
-                let stream = match prepared.prepared.target() {
+                let path_stream = match prepared.prepared.target() {
                     OpenTarget::Path(mapped) => {
                         let mapped = match CString::new(mapped.as_os_str().as_bytes()) {
                             Ok(mapped) => mapped,
@@ -390,28 +398,39 @@ unsafe fn sandbox_fopen(path: *const libc::c_char, mode: *const libc::c_char) ->
                                 return unsafe { fail(&error.into(), std::ptr::null_mut()) };
                             }
                         };
-                        unsafe { original(mapped.as_ptr(), mode) }
+                        Some(unsafe { original(mapped.as_ptr(), mode) })
                     }
+                    OpenTarget::Descriptor(_) => None,
+                };
+                if path_stream.is_some_and(|stream| stream.is_null()) {
+                    return std::ptr::null_mut();
+                }
+                if let Err(error) = runtime.commit_open(&mut prepared) {
+                    if let Some(stream) = path_stream
+                        && let Some(close) = original_fclose()
+                    {
+                        unsafe { close(stream) };
+                    }
+                    return unsafe { fail(&error, std::ptr::null_mut()) };
+                }
+                let (target, open) = prepared.into_parts();
+                let stream = match target {
+                    OpenTarget::Path(_) => path_stream.expect("path target was opened"),
                     OpenTarget::Descriptor(file) => {
                         let descriptor = file.as_raw_fd();
-                        if let Err(error) = configure_descriptor(descriptor, flags) {
+                        if let Err(error) =
+                            configure_descriptor(descriptor, flags, open.local.is_some())
+                        {
+                            let _ = runtime.finish_open_file(descriptor, &open);
                             return unsafe { fail(&error, std::ptr::null_mut()) };
                         }
-                        let duplicate = unsafe { libc::dup(descriptor) };
-                        if duplicate < 0 {
-                            return std::ptr::null_mut();
-                        }
-                        if let Err(error) = configure_descriptor(duplicate, flags) {
-                            if let Some(close) = original_close() {
-                                unsafe { close(duplicate) };
-                            }
-                            return unsafe { fail(&error, std::ptr::null_mut()) };
-                        }
-                        let stream = unsafe { libc::fdopen(duplicate, mode) };
+                        let descriptor = file.into_raw_fd();
+                        let stream = unsafe { libc::fdopen(descriptor, mode) };
                         if stream.is_null()
                             && let Some(close) = original_close()
                         {
-                            unsafe { close(duplicate) };
+                            unsafe { close(descriptor) };
+                            let _ = runtime.finish_open_file(-1, &open);
                         }
                         stream
                     }
@@ -419,14 +438,6 @@ unsafe fn sandbox_fopen(path: *const libc::c_char, mode: *const libc::c_char) ->
                 if stream.is_null() {
                     return stream;
                 }
-                if let Err(error) = runtime.commit_open(&mut prepared) {
-                    if let Some(close) = original_fclose() {
-                        unsafe { close(stream) };
-                    }
-                    return unsafe { fail(&error, std::ptr::null_mut()) };
-                }
-                let (target, open) = prepared.into_parts();
-                drop(target);
                 let descriptor = unsafe { libc::fileno(stream) };
                 if descriptor >= 0 {
                     runtime.register(descriptor, open);
@@ -476,7 +487,12 @@ unsafe fn sandbox_freopen(
                 }
                 let result = unsafe { original(native.as_ptr(), mode, stream) };
                 if descriptor >= 0 {
-                    runtime.take_descriptor(descriptor);
+                    if let Some((open, last_alias)) = runtime.take_descriptor(descriptor) {
+                        release_local_close_locks(&open, last_alias);
+                        if last_alias && !runtime.has_mapping(&open) {
+                            let _ = runtime.finish_open_file(-1, &open);
+                        }
+                    }
                     runtime.unregister_directory(descriptor);
                 }
                 return result;

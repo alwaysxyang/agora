@@ -809,6 +809,215 @@ async fn sqlite_wal_transactions_survive_encrypted_reopen() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn sqlite_wal_processes_share_locks_and_mapped_state() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-sqlite-lock-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    let script = r#"
+import sqlite3
+import subprocess
+import sys
+
+database = sqlite3.connect("state.db")
+assert database.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+database.execute("CREATE TABLE entries(value TEXT NOT NULL)")
+database.commit()
+database.close()
+
+writer_script = r'''
+import sqlite3
+import sys
+
+writer = sqlite3.connect("state.db", timeout=10)
+writer.execute("BEGIN IMMEDIATE")
+writer.execute("INSERT INTO entries VALUES('committed')")
+print("READY", flush=True)
+assert sys.stdin.buffer.read(1) == b"0"
+print("LOCKED", flush=True)
+assert sys.stdin.buffer.read(1) == b"1"
+writer.commit()
+writer.close()
+'''
+writer = subprocess.Popen(
+    [sys.executable, "-c", writer_script],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+ready = writer.stdout.readline()
+assert ready == b"READY\n", (ready, writer.stderr.read())
+writer.stdin.write(b"0")
+writer.stdin.flush()
+locked = writer.stdout.readline()
+assert locked == b"LOCKED\n", (locked, writer.stderr.read())
+contender = sqlite3.connect("state.db", timeout=0)
+try:
+    contender.execute("BEGIN IMMEDIATE")
+except sqlite3.OperationalError as error:
+    assert "locked" in str(error).lower()
+else:
+    raise AssertionError("a second process acquired SQLite's exclusive writer lock")
+assert contender.execute("SELECT count(*) FROM entries").fetchone()[0] == 0
+contender.close()
+writer.stdin.write(b"1")
+writer.stdin.close()
+assert writer.wait(timeout=15) == 0, writer.stderr.read()
+
+verified = sqlite3.connect("state.db")
+assert verified.execute("SELECT value FROM entries").fetchone()[0] == "committed"
+assert verified.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+verified.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+verified.close()
+"#;
+
+    let run = Sandbox::new(sandbox_config_in(&workdir), NoopCallback).run(
+        SandboxCommand::new(python3())
+            .args(["-c", script])
+            .current_dir(&source),
+    );
+    let outcome = tokio::time::timeout(sandbox_lifecycle_timeout(30), run)
+        .await
+        .expect("concurrent SQLite WAL test timed out")
+        .unwrap();
+
+    assert!(outcome.status().success());
+    assert!(!source.join("state.db").exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn encrypted_opens_share_file_identity_locks_and_mappings() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-shared-inode-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    std::fs::create_dir_all(&source).unwrap();
+    let script = r#"
+import fcntl
+import ctypes
+import mmap
+import os
+
+path = "shared.bin"
+first = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_RDWR, 0o600)
+assert os.write(first, b"abcdef") == 6
+second = os.open(path, os.O_RDWR)
+logical = os.stat(path)
+for opened in (os.fstat(first), os.fstat(second)):
+    assert (opened.st_dev, opened.st_ino) == (logical.st_dev, logical.st_ino)
+
+os.ftruncate(first, 4096)
+first_mapping = mmap.mmap(first, 4096, access=mmap.ACCESS_WRITE)
+second_mapping = mmap.mmap(second, 4096, access=mmap.ACCESS_WRITE)
+first_mapping[:6] = b"shared"
+first_mapping.flush()
+assert second_mapping[:6] == b"shared"
+
+fcntl.lockf(first, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0)
+child = os.fork()
+if child == 0:
+    try:
+        fcntl.lockf(second, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0)
+    except BlockingIOError:
+        os._exit(0)
+    os._exit(1)
+_, status = os.waitpid(child, 0)
+assert os.waitstatus_to_exitcode(status) == 0
+fcntl.lockf(first, fcntl.LOCK_UN, 1, 0)
+
+duplicate = os.dup(first)
+fcntl.lockf(first, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0)
+os.close(duplicate)
+child = os.fork()
+if child == 0:
+    try:
+        fcntl.lockf(second, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0)
+    except BlockingIOError:
+        os._exit(1)
+    os._exit(0)
+_, status = os.waitpid(child, 0)
+assert os.waitstatus_to_exitcode(status) == 0
+
+duplicate = os.dup(first)
+fcntl.flock(first, fcntl.LOCK_EX | fcntl.LOCK_NB)
+os.close(duplicate)
+child = os.fork()
+if child == 0:
+    try:
+        fcntl.flock(second, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os._exit(0)
+    os._exit(1)
+_, status = os.waitpid(child, 0)
+assert os.waitstatus_to_exitcode(status) == 0
+
+fcntl.flock(first, fcntl.LOCK_UN)
+first_mapping.close()
+second_mapping.close()
+os.close(first)
+os.close(second)
+
+mapped = os.open(path, os.O_RDWR)
+contender = os.open(path, os.O_RDWR)
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mmap.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_longlong,
+]
+libc.mmap.restype = ctypes.c_void_p
+address = libc.mmap(
+    None,
+    4096,
+    mmap.PROT_READ | mmap.PROT_WRITE,
+    mmap.MAP_SHARED,
+    mapped,
+    0,
+)
+assert address != ctypes.c_void_p(-1).value
+fcntl.flock(mapped, fcntl.LOCK_EX | fcntl.LOCK_NB)
+os.close(mapped)
+child = os.fork()
+if child == 0:
+    try:
+        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os._exit(1)
+    os._exit(0)
+_, status = os.waitpid(child, 0)
+assert os.waitstatus_to_exitcode(status) == 0
+ctypes.memmove(address, b"S", 1)
+assert libc.msync(ctypes.c_void_p(address), 4096, 0x10) == 0
+assert os.pread(contender, 1, 0) == b"S"
+assert libc.munmap(ctypes.c_void_p(address), 4096) == 0
+os.close(contender)
+"#;
+
+    let outcome = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(
+            SandboxCommand::new(python3())
+                .args(["-c", script])
+                .current_dir(&source),
+        )
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn system_rm_removes_lower_entries_from_an_encrypted_workspace() {
     let directory = std::env::temp_dir().join(format!(
         "agora-sandbox-system-rm-test-{}",
@@ -975,18 +1184,17 @@ async fn system_ls_observes_external_upper_directory_removal() {
             .strip_prefix("/")
             .unwrap(),
     );
-    let first_read = Arc::new(tokio::sync::Notify::new());
+    let ready_for_removal = Arc::new(tokio::sync::Notify::new());
     let callback = {
-        let first_read = Arc::clone(&first_read);
+        let ready_for_removal = Arc::clone(&ready_for_removal);
         move |event| {
             if matches!(
                 event,
-                Event::File(ref event)
-                    if event.event_type == EventType::FilesystemClose
-                        && Path::new(&event.file.path).ends_with("upper.txt")
-                        && event.file.mode.access == FileAccessMode::Read
+                Event::Process(ref event)
+                    if event.event_type == EventType::ProcessExecAttempt
+                        && event.command.executable == "/bin/sleep"
             ) {
-                first_read.notify_one();
+                ready_for_removal.notify_one();
             }
             std::future::ready(Decision::Allow)
         }
@@ -1002,9 +1210,9 @@ async fn system_ls_observes_external_upper_directory_removal() {
         ),
     );
 
-    tokio::time::timeout(sandbox_lifecycle_timeout(30), first_read.notified())
+    tokio::time::timeout(sandbox_lifecycle_timeout(30), ready_for_removal.notified())
         .await
-        .expect("sandbox child did not finish its first upper directory read");
+        .expect("sandbox child did not finish its first upper directory read and close");
     std::fs::remove_dir_all(&upper_directory).unwrap();
     std::fs::write(&release, b"continue").unwrap();
 
@@ -1692,6 +1900,13 @@ fn cloexec_default_spawn_child_process() {
         return;
     }
 
+    unsafe extern "C" {
+        fn posix_spawn_file_actions_addinherit_np(
+            actions: *mut libc::posix_spawn_file_actions_t,
+            descriptor: libc::c_int,
+        ) -> libc::c_int;
+    }
+
     const POSIX_SPAWN_CLOEXEC_DEFAULT: libc::c_short = 0x4000;
     let mut attributes: libc::posix_spawnattr_t = std::ptr::null_mut();
     assert_eq!(unsafe { libc::posix_spawnattr_init(&mut attributes) }, 0);
@@ -1699,10 +1914,23 @@ fn cloexec_default_spawn_child_process() {
         unsafe { libc::posix_spawnattr_setflags(&mut attributes, POSIX_SPAWN_CLOEXEC_DEFAULT) },
         0
     );
+    let mut actions: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { libc::posix_spawn_file_actions_init(&mut actions) },
+        0
+    );
+    for descriptor in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        if unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0 {
+            assert_eq!(
+                unsafe { posix_spawn_file_actions_addinherit_np(&mut actions, descriptor) },
+                0
+            );
+        }
+    }
     let arguments = [
         c"/bin/bash".as_ptr(),
         c"-lc".as_ptr(),
-        c"printf cloexec-control-ok > \"$AGORA_SANDBOX_TEST_CLOEXEC_PATH\" || { printf 'write failed: %s\\n' \"$?\" >&2; exit 21; }; value=$(cat \"$AGORA_SANDBOX_TEST_CLOEXEC_PATH\"); status=$?; printf 'cat status=%s value=<%s>\\n' \"$status\" \"$value\" >&2; test \"$status\" = 0 && test \"$value\" = cloexec-control-ok".as_ptr(),
+        c"printf cloexec-control-ok > \"$AGORA_SANDBOX_TEST_CLOEXEC_PATH\" && test \"$(cat \"$AGORA_SANDBOX_TEST_CLOEXEC_PATH\")\" = cloexec-control-ok".as_ptr(),
         std::ptr::null(),
     ];
     let environment = unsafe { *libc::_NSGetEnviron() };
@@ -1711,12 +1939,16 @@ fn cloexec_default_spawn_child_process() {
         libc::posix_spawn(
             &mut pid,
             arguments[0],
-            std::ptr::null(),
+            &actions,
             &attributes,
             arguments.as_ptr().cast_mut().cast(),
             environment,
         )
     };
+    assert_eq!(
+        unsafe { libc::posix_spawn_file_actions_destroy(&mut actions) },
+        0
+    );
     assert_eq!(unsafe { libc::posix_spawnattr_destroy(&mut attributes) }, 0);
     assert_eq!(result, 0);
 
@@ -1977,6 +2209,15 @@ fn filesystem_interposed_child_process() {
         assert_eq!(libc::truncate(creat.as_ptr(), -1), -1);
         assert_eq!(*libc::__error(), libc::EINVAL);
         assert_eq!(libc::truncate(creat.as_ptr(), 2), 0);
+        let creat_reader = libc::open(creat.as_ptr(), libc::O_RDONLY);
+        assert!(creat_reader >= 0);
+        let mut truncated = [0_u8; 2];
+        assert_eq!(
+            libc::read(creat_reader, truncated.as_mut_ptr().cast(), 2),
+            2
+        );
+        assert_eq!(&truncated, b"cr");
+        assert_eq!(libc::close(creat_reader), 0);
 
         let vectored_file = libc::open(
             vectored.as_ptr(),
@@ -2740,6 +2981,38 @@ fn unlinked_current_directory_child_process() {
 }
 
 #[cfg(target_os = "macos")]
+#[test]
+fn unlinked_open_file_exec_child_process() {
+    let Some(path) = std::env::var_os("AGORA_SANDBOX_TEST_UNLINKED_OPEN_FILE") else {
+        return;
+    };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0);
+    if child == 0 {
+        let arguments = [c"/usr/bin/true".as_ptr(), std::ptr::null()];
+        unsafe {
+            libc::execv(arguments[0], arguments.as_ptr());
+            libc::_exit(*libc::__error());
+        }
+    }
+
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 0);
+    drop(file);
+}
+
+#[cfg(target_os = "macos")]
 fn exchange_payload(destination: std::net::SocketAddr, payload: &[u8; 6]) -> std::io::Result<()> {
     let mut stream = TcpStream::connect(destination)?;
     stream.write_all(payload)?;
@@ -3350,6 +3623,41 @@ async fn runner_control_channels_reconnect_after_cloexec_default_spawn() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn runner_control_channels_survive_nested_sandbox_and_cloexec_default() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-nested-cloexec-control-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let logical = workspace_root().join(format!(
+        "target/agora-sandbox-nested-cloexec-control-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let executable = std::env::current_exe().unwrap();
+    let command = SandboxCommand::new("/usr/bin/sandbox-exec")
+        .args([
+            std::ffi::OsStr::new("-p"),
+            std::ffi::OsStr::new("(version 1) (allow default) (deny network*)"),
+            executable.as_os_str(),
+            std::ffi::OsStr::new("cloexec_default_spawn_child_process"),
+            std::ffi::OsStr::new("--exact"),
+            std::ffi::OsStr::new("--nocapture"),
+        ])
+        .current_dir(workspace_root())
+        .env("AGORA_SANDBOX_TEST_CLOEXEC_SPAWN", "1")
+        .env("AGORA_SANDBOX_TEST_CLOEXEC_PATH", &logical);
+
+    let outcome = Sandbox::new(sandbox_config_in(directory.join("cache")), NoopCallback)
+        .run(command)
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    assert!(!logical.exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn runner_executes_shebang_scripts_through_a_prepared_restricted_interpreter() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -3624,6 +3932,34 @@ async fn child_creation_fails_closed_from_an_unlinked_managed_current_directory(
 
     assert!(outcome.status().success());
     assert_eq!(std::fs::read(&host_target).unwrap(), b"host");
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn forked_exec_ignores_path_refresh_for_an_unlinked_open_file() {
+    let directory = std::env::temp_dir().join(format!(
+        "agora-sandbox-unlinked-open-file-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = directory.join("source");
+    let workdir = directory.join("sandbox");
+    let unlinked = source.join("unlinked.lock");
+    std::fs::create_dir_all(&source).unwrap();
+    let command = SandboxCommand::new(std::env::current_exe().unwrap())
+        .arg("unlinked_open_file_exec_child_process")
+        .arg("--exact")
+        .arg("--nocapture")
+        .current_dir(&source)
+        .env("AGORA_SANDBOX_TEST_UNLINKED_OPEN_FILE", &unlinked);
+
+    let outcome = Sandbox::new(sandbox_config_in(&workdir), NoopCallback)
+        .run(command)
+        .await
+        .unwrap();
+
+    assert!(outcome.status().success());
+    assert!(!unlinked.exists());
     std::fs::remove_dir_all(directory).unwrap();
 }
 

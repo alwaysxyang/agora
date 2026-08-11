@@ -15,6 +15,8 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 const REMOTE_REQUEST_ATTEMPTS: usize = 2;
@@ -26,6 +28,10 @@ pub(crate) struct RemoteClient {
     timeout: Duration,
     #[cfg(target_os = "macos")]
     shared: Option<Arc<InheritedControlStream<UnixStream>>>,
+    #[cfg(target_os = "macos")]
+    prefer_shared: Arc<AtomicBool>,
+    #[cfg(target_os = "macos")]
+    observed_pid: Arc<AtomicU32>,
 }
 
 impl RemoteClient {
@@ -44,6 +50,10 @@ impl RemoteClient {
             timeout,
             #[cfg(target_os = "macos")]
             shared: None,
+            #[cfg(target_os = "macos")]
+            prefer_shared: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "macos")]
+            observed_pid: Arc::new(AtomicU32::new(std::process::id())),
         }
     }
 
@@ -123,12 +133,30 @@ impl RemoteClient {
         request_id: RequestId,
         request: Request,
     ) -> Result<RemoteReply, RemoteClientError> {
+        #[cfg(target_os = "macos")]
+        let current_pid = std::process::id();
+        #[cfg(target_os = "macos")]
+        if self.observed_pid.swap(current_pid, Ordering::AcqRel) != current_pid
+            && self.shared.is_some()
+        {
+            self.prefer_shared.store(true, Ordering::Release);
+        }
+        #[cfg(target_os = "macos")]
+        if self.prefer_shared.load(Ordering::Acquire) && self.shared.is_some() {
+            let result = self.request_shared(request_id, request);
+            if result.is_err() {
+                self.prefer_shared.store(false, Ordering::Release);
+            }
+            return result;
+        }
         let mut stream = match UnixStream::connect(&self.socket) {
             Ok(stream) => stream,
             Err(error) => {
                 #[cfg(target_os = "macos")]
                 if self.shared.is_some() {
-                    return self.request_shared(request_id, request);
+                    let result = self.request_shared(request_id, request);
+                    self.prefer_shared.store(result.is_ok(), Ordering::Release);
+                    return result;
                 }
                 return Err(RemoteClientError::io(
                     "failed to connect to remote broker",

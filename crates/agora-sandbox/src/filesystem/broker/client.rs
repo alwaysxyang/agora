@@ -5,11 +5,14 @@ use crate::ipc;
 #[cfg(target_os = "macos")]
 use crate::ipc::InheritedControlStream;
 use std::fmt;
-use std::os::fd::RawFd;
+use std::fs::File;
+use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -21,10 +24,29 @@ pub(crate) struct LocalClient {
     token: String,
     #[cfg(target_os = "macos")]
     shared: Option<Arc<InheritedControlStream<UnixStream>>>,
+    #[cfg(target_os = "macos")]
+    prefer_shared: Arc<AtomicBool>,
+    #[cfg(target_os = "macos")]
+    observed_pid: Arc<AtomicU32>,
 }
 
 pub(crate) struct LocalOpen {
     pub(crate) handle: String,
+    pub(crate) descriptor: File,
+    pub(crate) state: super::LocalOpenState,
+    pub(crate) lock: File,
+    pub(crate) identity: LocalFileIdentity,
+}
+
+pub(crate) struct LocalFileIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) links: u64,
+}
+
+struct LocalReply {
+    response: Response,
+    descriptors: Vec<OwnedFd>,
 }
 
 pub(crate) struct LocalWrite {
@@ -45,6 +67,10 @@ impl LocalClient {
             token: token.into(),
             #[cfg(target_os = "macos")]
             shared: None,
+            #[cfg(target_os = "macos")]
+            prefer_shared: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "macos")]
+            observed_pid: Arc::new(AtomicU32::new(std::process::id())),
         }
     }
 
@@ -62,7 +88,13 @@ impl LocalClient {
     #[cfg(all(target_os = "macos", any(agora_sandbox_hook_build, test, coverage)))]
     pub(crate) fn ping_shared(&self) -> Result<(), LocalClientError> {
         let request_id = uuid::Uuid::new_v4().simple().to_string();
-        match self.request_shared(request_id, Request::Ping, None)? {
+        let reply = self.request_shared(request_id, Request::Ping, None)?;
+        if !reply.descriptors.is_empty() {
+            return Err(LocalClientError::protocol(
+                "local filesystem ping unexpectedly returned descriptors",
+            ));
+        }
+        match reply.response {
             Response::Success => Ok(()),
             _ => Err(LocalClientError::protocol(
                 "local filesystem ping returned an unexpected response",
@@ -73,24 +105,61 @@ impl LocalClient {
     pub(crate) fn open(
         &self,
         path: &Path,
-        descriptor: RawFd,
-        writable: bool,
+        flags: libc::c_int,
     ) -> Result<LocalOpen, LocalClientError> {
         let request_id = uuid::Uuid::new_v4().simple().to_string();
-        let response = self.request_with_id(
+        let LocalReply {
+            response,
+            mut descriptors,
+        } = self.request_with_id(
             request_id.clone(),
             Request::Open {
                 path: BackingPath::from_path(path),
-                writable,
+                flags,
             },
-            Some(descriptor),
+            None,
             IDEMPOTENT_ATTEMPTS,
         )?;
-        let Response::Open { handle } = response else {
+        let Response::Open {
+            handle,
+            device,
+            inode,
+            links,
+        } = response
+        else {
             return Err(LocalClientError::protocol(
                 "local filesystem open returned an unexpected response",
             ));
         };
+        if descriptors.len() != 3 {
+            let _ = self.success(
+                Request::Abort {
+                    handle: handle.clone(),
+                },
+                IDEMPOTENT_ATTEMPTS,
+            );
+            return Err(LocalClientError::protocol(
+                "local filesystem open did not return content, state, and lock descriptors",
+            ));
+        }
+        let lock = File::from(descriptors.pop().unwrap());
+        let state = match super::LocalOpenState::from_descriptor(descriptors.pop().unwrap()) {
+            Ok(state) => state,
+            Err(error) => {
+                let _ = self.success(
+                    Request::Abort {
+                        handle: handle.clone(),
+                    },
+                    IDEMPOTENT_ATTEMPTS,
+                );
+                return Err(LocalClientError::io(
+                    "invalid local open state",
+                    error,
+                    false,
+                ));
+            }
+        };
+        let descriptor = File::from(descriptors.pop().unwrap());
         if let Err(error) = self.success(Request::Claim { request_id }, IDEMPOTENT_ATTEMPTS) {
             let _ = self.success(
                 Request::Abort {
@@ -100,7 +169,17 @@ impl LocalClient {
             );
             return Err(error);
         }
-        Ok(LocalOpen { handle })
+        Ok(LocalOpen {
+            handle,
+            descriptor,
+            state,
+            lock,
+            identity: LocalFileIdentity {
+                device,
+                inode,
+                links,
+            },
+        })
     }
 
     pub(crate) fn sync(
@@ -148,6 +227,29 @@ impl LocalClient {
             IDEMPOTENT_ATTEMPTS,
         )?;
         Ok(LocalWrite { id: write_id })
+    }
+
+    pub(crate) fn begin_append(&self, handle: &str) -> Result<(LocalWrite, u64), LocalClientError> {
+        let write_id = uuid::Uuid::new_v4().simple().to_string();
+        let reply = self.request(
+            Request::BeginAppend {
+                handle: handle.to_string(),
+                write_id: write_id.clone(),
+            },
+            None,
+            IDEMPOTENT_ATTEMPTS,
+        )?;
+        if !reply.descriptors.is_empty() {
+            return Err(LocalClientError::protocol(
+                "local filesystem append unexpectedly returned descriptors",
+            ));
+        }
+        let Response::Offset { offset } = reply.response else {
+            return Err(LocalClientError::protocol(
+                "local filesystem append returned an unexpected response",
+            ));
+        };
+        Ok((LocalWrite { id: write_id }, offset))
     }
 
     pub(crate) fn finish_write(
@@ -209,7 +311,13 @@ impl LocalClient {
     }
 
     fn success(&self, request: Request, attempts: usize) -> Result<(), LocalClientError> {
-        match self.request(request, None, attempts)? {
+        let reply = self.request(request, None, attempts)?;
+        if !reply.descriptors.is_empty() {
+            return Err(LocalClientError::protocol(
+                "local filesystem response unexpectedly included descriptors",
+            ));
+        }
+        match reply.response {
             Response::Success => Ok(()),
             _ => Err(LocalClientError::protocol(
                 "local filesystem broker returned an unexpected response",
@@ -222,7 +330,7 @@ impl LocalClient {
         request: Request,
         descriptor: Option<RawFd>,
         attempts: usize,
-    ) -> Result<Response, LocalClientError> {
+    ) -> Result<LocalReply, LocalClientError> {
         let request_id = uuid::Uuid::new_v4().simple().to_string();
         self.request_with_id(request_id, request, descriptor, attempts)
     }
@@ -233,7 +341,7 @@ impl LocalClient {
         request: Request,
         descriptor: Option<RawFd>,
         attempts: usize,
-    ) -> Result<Response, LocalClientError> {
+    ) -> Result<LocalReply, LocalClientError> {
         let mut last = None;
         for _ in 0..attempts {
             match self.request_once(request_id.clone(), request.clone(), descriptor) {
@@ -250,13 +358,31 @@ impl LocalClient {
         request_id: String,
         request: Request,
         descriptor: Option<RawFd>,
-    ) -> Result<Response, LocalClientError> {
+    ) -> Result<LocalReply, LocalClientError> {
+        #[cfg(target_os = "macos")]
+        let current_pid = std::process::id();
+        #[cfg(target_os = "macos")]
+        if self.observed_pid.swap(current_pid, Ordering::AcqRel) != current_pid
+            && self.shared.is_some()
+        {
+            self.prefer_shared.store(true, Ordering::Release);
+        }
+        #[cfg(target_os = "macos")]
+        if self.prefer_shared.load(Ordering::Acquire) && self.shared.is_some() {
+            let result = self.request_shared(request_id, request, descriptor);
+            if result.is_err() {
+                self.prefer_shared.store(false, Ordering::Release);
+            }
+            return result;
+        }
         let mut stream = match UnixStream::connect(&self.socket) {
             Ok(stream) => stream,
             Err(error) => {
                 #[cfg(target_os = "macos")]
                 if self.shared.is_some() {
-                    return self.request_shared(request_id, request, descriptor);
+                    let result = self.request_shared(request_id, request, descriptor);
+                    self.prefer_shared.store(result.is_ok(), Ordering::Release);
+                    return result;
                 }
                 return Err(LocalClientError::io(
                     "failed to connect to local filesystem broker",
@@ -280,7 +406,7 @@ impl LocalClient {
         request_id: String,
         request: Request,
         descriptor: Option<RawFd>,
-    ) -> Result<Response, LocalClientError> {
+    ) -> Result<LocalReply, LocalClientError> {
         let shared = self.shared.as_ref().ok_or_else(|| {
             LocalClientError::protocol("shared local filesystem control stream is unavailable")
         })?;
@@ -301,7 +427,7 @@ impl LocalClient {
         request_id: String,
         request: Request,
         descriptor: Option<RawFd>,
-    ) -> Result<Response, LocalClientError> {
+    ) -> Result<LocalReply, LocalClientError> {
         ipc::send(
             stream,
             &RequestEnvelope {
@@ -315,14 +441,10 @@ impl LocalClient {
         .map_err(|error| {
             LocalClientError::io("failed to send local filesystem request", error, true)
         })?;
-        let (response, descriptor) = ipc::receive::<ResponseEnvelope>(stream).map_err(|error| {
-            LocalClientError::io("failed to receive local filesystem response", error, true)
-        })?;
-        if descriptor.is_some() {
-            return Err(LocalClientError::protocol(
-                "local filesystem response unexpectedly included a descriptor",
-            ));
-        }
+        let (response, descriptors) = ipc::receive_with_descriptors::<ResponseEnvelope>(stream)
+            .map_err(|error| {
+                LocalClientError::io("failed to receive local filesystem response", error, true)
+            })?;
         if response.version != PROTOCOL_VERSION || response.request_id != request_id {
             return Err(LocalClientError::protocol(
                 "local filesystem response did not match the request",
@@ -334,7 +456,10 @@ impl LocalClient {
                 message,
                 retryable: false,
             }),
-            response => Ok(response),
+            response => Ok(LocalReply {
+                response,
+                descriptors,
+            }),
         }
     }
 }

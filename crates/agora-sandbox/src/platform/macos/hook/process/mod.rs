@@ -20,6 +20,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 const MAX_RECORDED_ARGUMENTS: usize = 256;
@@ -41,6 +42,13 @@ type ExecveFn = unsafe extern "C" fn(
     *const *const libc::c_char,
 ) -> libc::c_int;
 
+unsafe extern "C" {
+    fn posix_spawn_file_actions_addinherit_np(
+        actions: *mut libc::posix_spawn_file_actions_t,
+        descriptor: libc::c_int,
+    ) -> libc::c_int;
+}
+
 thread_local! {
     static INSIDE_PROCESS_HOOK: Cell<bool> = const { Cell::new(false) };
     #[cfg(test)]
@@ -48,6 +56,95 @@ thread_local! {
 }
 
 struct ProcessHookGuard;
+
+struct SpawnFileActions {
+    borrowed: *const libc::posix_spawn_file_actions_t,
+    owned: Option<libc::posix_spawn_file_actions_t>,
+}
+
+impl SpawnFileActions {
+    unsafe fn prepare(
+        file_actions: *const libc::posix_spawn_file_actions_t,
+        attributes: *const libc::posix_spawnattr_t,
+    ) -> Result<Self, libc::c_int> {
+        if attributes.is_null() {
+            return Ok(Self {
+                borrowed: file_actions,
+                owned: None,
+            });
+        }
+        let mut flags = 0;
+        let result = unsafe { libc::posix_spawnattr_getflags(attributes, &mut flags) };
+        if result != 0 {
+            return Err(result);
+        }
+        if i32::from(flags) & libc::POSIX_SPAWN_CLOEXEC_DEFAULT == 0 {
+            return Ok(Self {
+                borrowed: file_actions,
+                owned: None,
+            });
+        }
+
+        let mut descriptors = super::control::inheritable_descriptors();
+        descriptors.extend(super::filesystem::inheritable_internal_descriptors());
+        descriptors.sort_unstable();
+        descriptors.dedup();
+        if descriptors.is_empty() {
+            return Ok(Self {
+                borrowed: file_actions,
+                owned: None,
+            });
+        }
+
+        let mut prepared = if file_actions.is_null() {
+            let mut owned = std::ptr::null_mut();
+            let result = unsafe { libc::posix_spawn_file_actions_init(&mut owned) };
+            if result != 0 {
+                return Err(result);
+            }
+            Self {
+                borrowed: std::ptr::null(),
+                owned: Some(owned),
+            }
+        } else {
+            Self {
+                borrowed: file_actions,
+                owned: None,
+            }
+        };
+        for descriptor in descriptors {
+            let result = unsafe {
+                posix_spawn_file_actions_addinherit_np(prepared.as_mut_ptr(), descriptor)
+            };
+            if result != 0 {
+                return Err(result);
+            }
+        }
+        Ok(prepared)
+    }
+
+    fn as_ptr(&self) -> *const libc::posix_spawn_file_actions_t {
+        self.owned
+            .as_ref()
+            .map_or(self.borrowed, |owned| owned as *const _)
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut libc::posix_spawn_file_actions_t {
+        self.owned
+            .as_mut()
+            .map_or(self.borrowed.cast_mut(), |owned| owned as *mut _)
+    }
+}
+
+impl Drop for SpawnFileActions {
+    fn drop(&mut self) {
+        if let Some(actions) = self.owned.as_mut() {
+            unsafe {
+                libc::posix_spawn_file_actions_destroy(actions);
+            }
+        }
+    }
+}
 
 impl ProcessHookGuard {
     fn enter() -> Option<Self> {
@@ -70,6 +167,8 @@ impl Drop for ProcessHookGuard {
 struct ProcessHookRuntime {
     config: HookConfig,
     audit: Option<AuditClient>,
+    prefer_shared: AtomicBool,
+    observed_pid: AtomicU32,
 }
 
 #[derive(Debug)]
@@ -298,6 +397,8 @@ impl ProcessHookRuntime {
                             )
                         },
                     )),
+                    prefer_shared: AtomicBool::new(false),
+                    observed_pid: AtomicU32::new(std::process::id()),
                     config,
                 })
             })
@@ -307,16 +408,37 @@ impl ProcessHookRuntime {
     fn prepare(&self, executable: &Path) -> Result<CString, PrepareError> {
         let request = encode_prepare_request(self.config.execution_token(), executable)
             .map_err(|error| PrepareError::new(io_errno(&error), error.to_string()))?;
-        let response = match self.prepare_fresh(&request) {
-            Err(error) if error.transport => {
-                let Some(shared) = super::control::execution() else {
-                    return Err(error);
-                };
-                shared
-                    .transact(|stream| super::control::execution_request(stream, &request))
-                    .map_err(PrepareError::from)??
+        let current_pid = std::process::id();
+        if self.observed_pid.swap(current_pid, Ordering::AcqRel) != current_pid
+            && super::control::execution().is_some()
+        {
+            self.prefer_shared.store(true, Ordering::Release);
+        }
+        let response = if self.prefer_shared.load(Ordering::Acquire) {
+            match self.prepare_shared(&request) {
+                Some(Ok(response)) => response,
+                Some(Err(error)) if error.transport => {
+                    self.prefer_shared.store(false, Ordering::Release);
+                    self.prepare_fresh(&request)?
+                }
+                Some(Err(error)) => return Err(error),
+                None => {
+                    self.prefer_shared.store(false, Ordering::Release);
+                    self.prepare_fresh(&request)?
+                }
             }
-            result => result?,
+        } else {
+            match self.prepare_fresh(&request) {
+                Err(error) if error.transport => {
+                    let Some(response) = self.prepare_shared(&request) else {
+                        return Err(error);
+                    };
+                    let response = response?;
+                    self.prefer_shared.store(true, Ordering::Release);
+                    response
+                }
+                result => result?,
+            }
         };
         match response {
             PrepareResponse::Accepted => Err(PrepareError::new(
@@ -338,6 +460,16 @@ impl ProcessHookRuntime {
         stream.set_read_timeout(timeout)?;
         stream.set_write_timeout(timeout)?;
         super::control::execution_request(&mut stream, request).map_err(PrepareError::from)
+    }
+
+    fn prepare_shared(&self, request: &[u8]) -> Option<Result<PrepareResponse, PrepareError>> {
+        let shared = super::control::execution()?;
+        Some(
+            shared
+                .transact(|stream| super::control::execution_request(stream, request))
+                .map_err(PrepareError::from)
+                .and_then(|response| response.map_err(PrepareError::from)),
+        )
     }
 
     fn prepare_executable(&self, executable: &Path) -> Result<PreparedExecutable, PrepareError> {
@@ -611,11 +743,15 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
     else {
         return libc::EACCES;
     };
+    let file_actions = match unsafe { SpawnFileActions::prepare(file_actions, attributes) } {
+        Ok(file_actions) => file_actions,
+        Err(error) => return error,
+    };
     unsafe {
         original(
             pid,
             prepared.program.as_ptr(),
-            file_actions,
+            file_actions.as_ptr(),
             attributes,
             arguments.as_posix_ptr(),
             environment.as_posix_ptr(),
@@ -671,11 +807,15 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
     else {
         return libc::EACCES;
     };
+    let file_actions = match unsafe { SpawnFileActions::prepare(file_actions, attributes) } {
+        Ok(file_actions) => file_actions,
+        Err(error) => return error,
+    };
     unsafe {
         original(
             pid,
             prepared.program.as_ptr(),
-            file_actions,
+            file_actions.as_ptr(),
             attributes,
             arguments.as_posix_ptr(),
             environment.as_posix_ptr(),

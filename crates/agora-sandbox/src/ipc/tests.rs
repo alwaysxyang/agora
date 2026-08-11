@@ -1,6 +1,6 @@
 #[cfg(target_os = "macos")]
 use super::{InheritedControlLock, InheritedControlStream, configure_no_sigpipe};
-use super::{MAX_FRAME_SIZE, receive, send};
+use super::{MAX_FRAME_SIZE, receive, receive_with_descriptors, send, send_with_descriptors};
 use crate::nfs::protocol::{PROTOCOL_VERSION, RequestId, Response, ResponseEnvelope};
 use serde::Serialize;
 use std::io::{Read, Write};
@@ -125,6 +125,34 @@ fn framed_transport_passes_one_close_on_exec_descriptor() {
 }
 
 #[test]
+fn framed_transport_passes_multiple_close_on_exec_descriptors() {
+    let first = std::fs::File::open("/dev/null").unwrap();
+    let second = std::fs::File::open("/dev/null").unwrap();
+    let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+    let response = ResponseEnvelope {
+        version: PROTOCOL_VERSION,
+        request_id: request_id(),
+        response: Response::Success,
+    };
+
+    send_with_descriptors(
+        &mut sender,
+        &response,
+        &[first.as_raw_fd(), second.as_raw_fd()],
+    )
+    .unwrap();
+    let (decoded, descriptors) =
+        receive_with_descriptors::<ResponseEnvelope>(&mut receiver).unwrap();
+
+    assert_eq!(decoded, response);
+    assert_eq!(descriptors.len(), 2);
+    for descriptor in descriptors {
+        let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
+}
+
+#[test]
 fn framed_transport_rejects_oversized_payloads_before_allocation() {
     let (mut sender, mut receiver) = UnixStream::pair().unwrap();
     sender.write_all(&[0]).unwrap();
@@ -222,7 +250,7 @@ fn framed_transport_rejects_an_invalid_descriptor() {
 
     let error = send(&mut sender, &response, Some(-1)).unwrap_err();
 
-    assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
 
 #[cfg(target_os = "macos")]
@@ -234,7 +262,7 @@ fn configuring_sigpipe_on_an_invalid_descriptor_reports_ebadf() {
 }
 
 #[test]
-fn framed_transport_rejects_truncated_descriptor_control_messages() {
+fn single_descriptor_wrapper_rejects_multiple_descriptors() {
     let (mut sender, mut receiver) = UnixStream::pair().unwrap();
     let first = std::fs::File::open("/dev/null").unwrap();
     let second = std::fs::File::open("/dev/null").unwrap();

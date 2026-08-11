@@ -144,16 +144,17 @@ Current status:
   rename, per-backing namespace leases,
   and logical Unix mode authorization. Namespace changes deliberately do not provide
   abnormal-exit or power-loss recovery. In
-  encrypted mode, an independent authenticated parent-side filesystem Broker owns the open content
-  containers and duplicate anonymous plaintext descriptors. It batches completed ranges briefly,
-  serializes synchronization and durability per ciphertext inode, propagates peer ranges with
-  fixed-size buffers, and bounds closed fork-retention handles. The libc hook selects real or
-  effective credentials, preserves macOS guarded-descriptor semantics, reports conservative
-  completed write ranges and writable mapping lifecycles, and adapts results without duplicating
-  permission or encryption policy. Its narrow `control` module owns pre-authenticated inheritable
-  fallback streams for internal execution, audit, and filesystem services; the service clients and
-  controllers retain all protocol and operation ownership. Synchronous workspace and key-migration
-  storage work runs on blocking workers behind the public asynchronous runner API.
+  encrypted mode, an independent authenticated parent-side filesystem Broker owns each open content
+  container and one shared anonymous plaintext vnode per ciphertext inode. Every independent open
+  receives separate anonymous offset/flag state plus a separately opened descriptor for the inode's
+  shared lock anchor. The Broker batches completed ranges briefly, serializes content mutations and
+  durability per ciphertext inode, and bounds closed fork-retention handles. The libc hook selects
+  real or effective credentials, virtualizes ordinary and positioned data I/O over the per-open
+  state, preserves macOS guarded-descriptor and shared-mapping semantics, and adapts results without
+  duplicating permission or encryption policy. Its narrow `control` module owns pre-authenticated
+  inheritable fallback streams for internal execution, audit, and filesystem services; the service
+  clients and controllers retain all protocol and operation ownership. Synchronous workspace and
+  key-migration storage work runs on blocking workers behind the public asynchronous runner API.
 - The `nfs` module owns protocol-backed network filesystem roots. Its generic storage trait and
   authenticated per-run Broker are independent of the hook; SMB2/3 is the first backend under
   `nfs/backend/smb`. `nfs/backend/mod.rs` exposes only the protocol-neutral storage boundary to

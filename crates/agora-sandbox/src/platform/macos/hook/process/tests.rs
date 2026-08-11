@@ -123,6 +123,8 @@ fn runtime_with_response(response: Vec<u8>) -> (ProcessHookRuntime, thread::Join
         ProcessHookRuntime {
             config: config_with_control(control),
             audit: None,
+            prefer_shared: std::sync::atomic::AtomicBool::new(false),
+            observed_pid: std::sync::atomic::AtomicU32::new(std::process::id()),
         },
         server,
     )
@@ -151,6 +153,8 @@ fn runtime_with_responses(
         ProcessHookRuntime {
             config: config_with_control(control),
             audit: None,
+            prefer_shared: std::sync::atomic::AtomicBool::new(false),
+            observed_pid: std::sync::atomic::AtomicU32::new(std::process::id()),
         },
         server,
     )
@@ -668,6 +672,8 @@ fn process_runtime_rejects_an_oversized_execution_token_before_sending() {
     let runtime = ProcessHookRuntime {
         config: config_with_control_and_token(listener.local_addr().unwrap(), &"x".repeat(65_536)),
         audit: None,
+        prefer_shared: std::sync::atomic::AtomicBool::new(false),
+        observed_pid: std::sync::atomic::AtomicU32::new(std::process::id()),
     };
     let error = runtime.prepare(Path::new("/bin/sh")).unwrap_err();
 
@@ -759,6 +765,8 @@ fn prepared_execution_distinguishes_null_and_missing_programs() {
     let runtime = ProcessHookRuntime {
         config: config(),
         audit: None,
+        prefer_shared: std::sync::atomic::AtomicBool::new(false),
+        observed_pid: std::sync::atomic::AtomicU32::new(std::process::id()),
     };
     let missing = CString::new("agora-command-that-does-not-exist").unwrap();
 

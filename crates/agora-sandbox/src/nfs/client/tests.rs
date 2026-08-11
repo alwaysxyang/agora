@@ -1,4 +1,6 @@
 use super::RemoteClient;
+#[cfg(target_os = "macos")]
+use crate::ipc::{InheritedControlLock, InheritedControlStream};
 use crate::nfs::protocol::{
     PROTOCOL_VERSION, RemoteFileType, RemoteMetadata, RemotePath, Request, RequestEnvelope,
     RequestId, Response, ResponseEnvelope,
@@ -7,7 +9,13 @@ use crate::nfs::transport;
 use std::io::{Read, Seek};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener;
+#[cfg(target_os = "macos")]
+use std::os::unix::net::UnixStream;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 #[test]
 fn client_rejects_a_missing_controller_socket() {
@@ -21,6 +29,62 @@ fn client_rejects_a_missing_controller_socket() {
         .unwrap_err();
 
     assert_eq!(error.errno(), libc::ENOENT);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn inherited_transport_failure_falls_back_to_a_fresh_connection_after_fork() {
+    let runtime = tempfile::tempdir().unwrap();
+    let socket = runtime.path().join("nfs.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let (request, descriptor) =
+                        transport::receive::<RequestEnvelope>(&mut stream).unwrap();
+                    assert!(descriptor.is_none());
+                    transport::send(
+                        &mut stream,
+                        &ResponseEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: request.request_id,
+                            response: Response::Success,
+                        },
+                        None,
+                    )
+                    .unwrap();
+                    return true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("failed to accept remote broker request: {error}"),
+            }
+        }
+    });
+    let (inherited, peer) = UnixStream::pair().unwrap();
+    drop(peer);
+    let shared =
+        InheritedControlStream::new(inherited, InheritedControlLock::anonymous().unwrap(), 0)
+            .unwrap();
+    let client = RemoteClient::with_shared(&socket, "token", shared);
+    client.observed_pid.store(0, Ordering::Release);
+
+    let result = client.request(Request::Access {
+        path: RemotePath::new(0, "file").unwrap(),
+        mode: libc::R_OK,
+    });
+    let used_fresh_connection = server.join().unwrap();
+
+    assert!(result.is_ok(), "fallback failed: {result:?}");
+    assert!(used_fresh_connection);
 }
 
 #[test]

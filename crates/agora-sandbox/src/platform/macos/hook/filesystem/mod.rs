@@ -6,7 +6,8 @@ use super::set_errno;
 use crate::audit::{AuditClient, AuditError, AuditEventRequest, FileOperation};
 use crate::callback::{FileAccessMode, FileContext, FileOpenMode, ProcessContext};
 use crate::filesystem::broker::{
-    LocalClient, LocalClientError, protocol::ByteRange as LocalByteRange,
+    LocalClient, LocalClientError, LocalFileIdentity, LocalOpenState,
+    protocol::ByteRange as LocalByteRange,
 };
 use crate::filesystem::{
     AccessPlan, AccessRequest, Credentials, DirectoryView, FileAttributes, FileLayer, MetadataPlan,
@@ -20,9 +21,11 @@ use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr, OsString};
+use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
@@ -32,7 +35,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 const NATIVE_PASSTHROUGH_ROOTS: &[&str] = &["/dev"];
 type GuardId = u64;
-const INHERITED_LOCAL_DESCRIPTOR_VERSION: u8 = 2;
+const INHERITED_LOCAL_DESCRIPTOR_VERSION: u8 = 4;
 const MAX_INHERITED_LOCAL_DESCRIPTORS: usize = 256;
 
 thread_local! {
@@ -194,10 +197,15 @@ struct InheritedLocalDescriptors {
 #[derive(Serialize, Deserialize)]
 struct InheritedLocalDescriptor {
     descriptor: libc::c_int,
+    state_descriptor: libc::c_int,
+    lock_descriptor: libc::c_int,
+    lock_device: u64,
+    lock_inode: u64,
     device: u64,
     inode: u64,
     logical_device: u64,
     logical_inode: u64,
+    logical_links: u64,
     file: FileContext,
     logical: Vec<u8>,
     handle: String,
@@ -227,6 +235,9 @@ struct RemoteRegistration {
 struct LocalRegistration {
     handle: String,
     writable: bool,
+    state: LocalOpenState,
+    lock: File,
+    identity: LocalFileIdentity,
     dirty: Mutex<Vec<LocalByteRange>>,
     mutation: Mutex<()>,
 }
@@ -744,7 +755,31 @@ impl FilesystemHookRuntime {
         self.prepare_open_request(requested, OpenIntent::new(flags, mode.into())?)
     }
 
+    fn prepare_materialized_open(
+        &self,
+        path: *const libc::c_char,
+        directory: libc::c_int,
+        flags: libc::c_int,
+        mode: libc::mode_t,
+    ) -> Result<OpenRequest> {
+        let requested = unsafe { self.logical_path(path, directory) }?;
+        self.prepare_open_request_with_broker(
+            requested,
+            OpenIntent::new(flags, mode.into())?,
+            false,
+        )
+    }
+
     fn prepare_open_request(&self, requested: PathBuf, intent: OpenIntent) -> Result<OpenRequest> {
+        self.prepare_open_request_with_broker(requested, intent, true)
+    }
+
+    fn prepare_open_request_with_broker(
+        &self,
+        requested: PathBuf,
+        intent: OpenIntent,
+        broker_managed: bool,
+    ) -> Result<OpenRequest> {
         let flags = intent.flags();
         let allowlisted = self.native_passthrough_path(&requested)?;
         let allowlisted_passthrough = allowlisted.is_some();
@@ -793,11 +828,16 @@ impl FilesystemHookRuntime {
                 let mut plan_path = requested.clone();
                 let mut synchronized = None;
                 loop {
-                    let plan = self.filesystem.prepare_authorized_open(
-                        &plan_path,
-                        intent,
-                        &credentials,
-                    )?;
+                    let plan = if self.local.is_some() && broker_managed {
+                        self.filesystem.prepare_authorized_broker_open(
+                            &plan_path,
+                            intent,
+                            &credentials,
+                        )?
+                    } else {
+                        self.filesystem
+                            .prepare_authorized_open(&plan_path, intent, &credentials)?
+                    };
                     let logical = self.logical_or_host(plan.logical())?;
                     if logical != plan.logical() {
                         drop(plan);
@@ -880,12 +920,17 @@ impl FilesystemHookRuntime {
                     .encrypted_backing_identity()?
                     .map(|(device, inode)| LogicalFileIdentity { device, inode });
                 if let Some(client) = &self.local
-                    && let Some((path, descriptor, writable)) = local.local_broker_source()?
+                    && let Some((path, flags)) = local.local_broker_request()
                 {
-                    let opened = client.open(&path, descriptor.as_raw_fd(), writable)?;
+                    let opened = client.open(&path, flags)?;
+                    let writable = flags & libc::O_ACCMODE != libc::O_RDONLY;
+                    *local.target_mut() = OpenTarget::Descriptor(opened.descriptor);
                     prepared.local = Some(LocalRegistration {
                         handle: opened.handle,
                         writable,
+                        state: opened.state,
+                        lock: opened.lock,
+                        identity: opened.identity,
                         dirty: Mutex::new(Vec::new()),
                         mutation: Mutex::new(()),
                     });
@@ -1007,15 +1052,21 @@ impl FilesystemHookRuntime {
         let close_on_exec = files
             .get(&source)
             .is_some_and(|open| open.close_on_exec && open.local.is_none());
-        match files.get(&source).cloned() {
+        let duplicated = match files.get(&source).cloned() {
             Some(open) => {
-                files.insert(destination, open);
+                files.insert(destination, Arc::clone(&open));
+                Some(open)
             }
             None => {
                 files.remove(&destination);
+                None
             }
-        }
+        };
         drop(files);
+
+        if let Some(open) = duplicated {
+            self.refresh_local_state_inheritance(&open);
+        }
 
         if close_on_exec {
             let flags = unsafe { libc::fcntl(destination, libc::F_GETFD) };
@@ -1050,15 +1101,21 @@ impl FilesystemHookRuntime {
             if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
                 continue;
             }
-            let Some(identity) = open.identity else {
+            let mut lock_status = unsafe { std::mem::zeroed::<libc::stat>() };
+            if unsafe { libc::fstat(local.lock.as_raw_fd(), &mut lock_status) } != 0 {
                 continue;
-            };
+            }
             descriptors.push(InheritedLocalDescriptor {
                 descriptor,
+                state_descriptor: local.state.as_raw_fd(),
+                lock_descriptor: local.lock.as_raw_fd(),
+                lock_device: lock_status.st_dev as u64,
+                lock_inode: lock_status.st_ino,
                 device: status.st_dev as u64,
                 inode: status.st_ino,
-                logical_device: identity.device,
-                logical_inode: identity.inode,
+                logical_device: local.identity.device,
+                logical_inode: local.identity.inode,
+                logical_links: local.identity.links,
                 file: open.file.clone(),
                 logical: open.logical().into_os_string().into_vec(),
                 handle: local.handle.clone(),
@@ -1088,7 +1145,14 @@ impl FilesystemHookRuntime {
         {
             return;
         }
-        let mut handles = HashMap::<String, Arc<OpenFile>>::new();
+        let content_descriptors = inherited
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.descriptor)
+            .collect::<HashSet<_>>();
+        let mut handles = HashMap::<String, (libc::c_int, libc::c_int, Arc<OpenFile>)>::new();
+        let mut state_owners = HashMap::<libc::c_int, String>::new();
+        let mut lock_owners = HashMap::<libc::c_int, String>::new();
         let mut files = lock(&self.open_files);
         for inherited in inherited.descriptors {
             if inherited.descriptor < 0 {
@@ -1105,30 +1169,102 @@ impl FilesystemHookRuntime {
             {
                 continue;
             }
-            let open = handles
-                .entry(inherited.handle.clone())
-                .or_insert_with(|| {
-                    Arc::new(OpenFile {
-                        file: inherited.file,
-                        logical: Mutex::new(PathBuf::from(OsString::from_vec(inherited.logical))),
-                        writeback: None,
-                        local: Some(LocalRegistration {
-                            handle: inherited.handle,
-                            writable: inherited.writable,
-                            dirty: Mutex::new(Vec::new()),
-                            mutation: Mutex::new(()),
-                        }),
-                        remote: None,
-                        identity: Some(LogicalFileIdentity {
+            let open = if let Some((state_descriptor, lock_descriptor, open)) =
+                handles.get(&inherited.handle)
+            {
+                if *state_descriptor != inherited.state_descriptor
+                    || *lock_descriptor != inherited.lock_descriptor
+                {
+                    continue;
+                }
+                Arc::clone(open)
+            } else {
+                if inherited.state_descriptor < 0
+                    || inherited.lock_descriptor < 0
+                    || inherited.state_descriptor == inherited.lock_descriptor
+                    || content_descriptors.contains(&inherited.state_descriptor)
+                    || content_descriptors.contains(&inherited.lock_descriptor)
+                    || state_owners
+                        .get(&inherited.state_descriptor)
+                        .is_some_and(|owner| owner != &inherited.handle)
+                    || state_owners
+                        .get(&inherited.lock_descriptor)
+                        .is_some_and(|owner| owner != &inherited.handle)
+                    || lock_owners
+                        .get(&inherited.lock_descriptor)
+                        .is_some_and(|owner| owner != &inherited.handle)
+                    || lock_owners
+                        .get(&inherited.state_descriptor)
+                        .is_some_and(|owner| owner != &inherited.handle)
+                {
+                    continue;
+                }
+                let state_duplicate =
+                    unsafe { libc::fcntl(inherited.state_descriptor, libc::F_DUPFD_CLOEXEC, 0) };
+                if state_duplicate < 0 {
+                    continue;
+                }
+                let state = unsafe {
+                    LocalOpenState::from_descriptor(OwnedFd::from_raw_fd(state_duplicate))
+                };
+                let Ok(state) = state else {
+                    continue;
+                };
+                let lock_duplicate =
+                    unsafe { libc::fcntl(inherited.lock_descriptor, libc::F_DUPFD_CLOEXEC, 0) };
+                if lock_duplicate < 0 {
+                    continue;
+                }
+                let lock_descriptor = unsafe { File::from(OwnedFd::from_raw_fd(lock_duplicate)) };
+                let Ok(lock_metadata) = lock_descriptor.metadata() else {
+                    continue;
+                };
+                if lock_metadata.dev() != inherited.lock_device
+                    || lock_metadata.ino() != inherited.lock_inode
+                {
+                    continue;
+                }
+                unsafe { libc::close(inherited.state_descriptor) };
+                unsafe { libc::close(inherited.lock_descriptor) };
+                let handle = inherited.handle.clone();
+                let open = Arc::new(OpenFile {
+                    file: inherited.file,
+                    logical: Mutex::new(PathBuf::from(OsString::from_vec(inherited.logical))),
+                    writeback: None,
+                    local: Some(LocalRegistration {
+                        handle: inherited.handle,
+                        writable: inherited.writable,
+                        state,
+                        lock: lock_descriptor,
+                        identity: LocalFileIdentity {
                             device: inherited.logical_device,
                             inode: inherited.logical_inode,
-                        }),
-                        layer: FileLayer::Upper,
-                        close_on_exec: true,
-                        finished: AtomicBool::new(false),
-                    })
-                })
-                .clone();
+                            links: inherited.logical_links,
+                        },
+                        dirty: Mutex::new(Vec::new()),
+                        mutation: Mutex::new(()),
+                    }),
+                    remote: None,
+                    identity: Some(LogicalFileIdentity {
+                        device: inherited.logical_device,
+                        inode: inherited.logical_inode,
+                    }),
+                    layer: FileLayer::Upper,
+                    close_on_exec: true,
+                    finished: AtomicBool::new(false),
+                });
+                state_owners.insert(inherited.state_descriptor, handle.clone());
+                lock_owners.insert(inherited.lock_descriptor, handle.clone());
+                handles.insert(
+                    handle,
+                    (
+                        inherited.state_descriptor,
+                        inherited.lock_descriptor,
+                        Arc::clone(&open),
+                    ),
+                );
+                open
+            };
             files.insert(inherited.descriptor, open);
         }
     }
@@ -1139,11 +1275,54 @@ impl FilesystemHookRuntime {
         let last_alias = !files
             .values()
             .any(|candidate| Arc::ptr_eq(candidate, &open));
+        drop(files);
+        self.refresh_local_state_inheritance(&open);
         Some((open, last_alias))
     }
 
     fn restore_descriptor(&self, descriptor: libc::c_int, open: Arc<OpenFile>) {
-        lock(&self.open_files).insert(descriptor, open);
+        lock(&self.open_files).insert(descriptor, Arc::clone(&open));
+        self.refresh_local_state_inheritance(&open);
+    }
+
+    fn refresh_local_state_inheritance(&self, open: &Arc<OpenFile>) {
+        let Some(local) = &open.local else {
+            return;
+        };
+        let inheritable = lock(&self.open_files)
+            .iter()
+            .any(|(&descriptor, candidate)| {
+                if !Arc::ptr_eq(candidate, open) {
+                    return false;
+                }
+                let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+                flags >= 0 && flags & libc::FD_CLOEXEC == 0
+            });
+        let _ = local.state.set_close_on_exec(!inheritable);
+        let _ = set_descriptor_close_on_exec(local.lock.as_raw_fd(), !inheritable);
+    }
+
+    fn inheritable_local_descriptors(&self) -> Vec<libc::c_int> {
+        let files = lock(&self.open_files);
+        let mut descriptors = Vec::new();
+        let mut states = HashSet::new();
+        for (&descriptor, open) in files.iter() {
+            let Some(local) = &open.local else {
+                continue;
+            };
+            let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+            if flags < 0 || flags & libc::FD_CLOEXEC != 0 {
+                continue;
+            }
+            descriptors.push(descriptor);
+            if states.insert(local.state.as_raw_fd()) {
+                descriptors.push(local.state.as_raw_fd());
+            }
+            if states.insert(local.lock.as_raw_fd()) {
+                descriptors.push(local.lock.as_raw_fd());
+            }
+        }
+        descriptors
     }
 
     fn writeback(&self, descriptor: libc::c_int) -> Result<()> {
@@ -1266,6 +1445,43 @@ impl FilesystemHookRuntime {
         Ok(())
     }
 
+    #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+    fn finish_all_open_files(&self) -> Result<()> {
+        // Make mapped pages visible in the shared plaintext vnode first. The
+        // subsequent Close is the sole encrypted and durable writeback owner;
+        // sending a separate Broker Sync here would encrypt every writable
+        // mapping twice during normal process exit.
+        self.flush_native_memory_mappings()?;
+        let files = lock(&self.open_files);
+        let mappings = lock(&self.mappings);
+        let mut seen = HashSet::new();
+        let mut open_files = Vec::new();
+        for (&descriptor, open) in files.iter() {
+            if seen.insert(Arc::as_ptr(open)) {
+                open_files.push((descriptor, Arc::clone(open)));
+            }
+        }
+        for mapping in mappings.iter() {
+            if seen.insert(Arc::as_ptr(&mapping.open)) {
+                open_files.push((-1, Arc::clone(&mapping.open)));
+            }
+        }
+        drop(mappings);
+        drop(files);
+        let mut first = None;
+        for (descriptor, open) in open_files {
+            if let Err(error) = self.finish_open_file(descriptor, &open)
+                && first.is_none()
+            {
+                first = Some(error);
+            }
+        }
+        match first {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn commit_local_open_file_locked(
         &self,
         descriptor: libc::c_int,
@@ -1307,7 +1523,16 @@ impl FilesystemHookRuntime {
         if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
             return Err(io::Error::last_os_error().into());
         }
-        self.filesystem.refresh_timestamps(&open.logical(), &status)
+        let logical = open.logical();
+        if let Some(identity) = open.identity {
+            match self.filesystem.visible_identity(&logical) {
+                Ok((device, inode)) if device == identity.device && inode == identity.inode => {}
+                Ok(_) => return Ok(()),
+                Err(error) if error_errno(&error) == libc::ENOENT => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        self.filesystem.refresh_timestamps(&logical, &status)
     }
 
     fn create_directory(
@@ -1761,6 +1986,22 @@ fn native_operation_result(result: libc::c_int) -> Result<()> {
     }
 }
 
+fn set_descriptor_close_on_exec(descriptor: libc::c_int, close: bool) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let flags = if close {
+        flags | libc::FD_CLOEXEC
+    } else {
+        flags & !libc::FD_CLOEXEC
+    };
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub(super) fn tracked_current_directory() -> Option<PathBuf> {
     FilesystemHookRuntime::global().map(|runtime| lock(&runtime.current_directory).logical.clone())
 }
@@ -1784,6 +2025,26 @@ pub(super) fn inherited_local_descriptors() -> Option<String> {
         .and_then(FilesystemHookRuntime::encode_inherited_local_descriptors)
 }
 
+pub(super) fn inheritable_internal_descriptors() -> Vec<libc::c_int> {
+    let Some(_guard) = FilesystemHookGuard::enter() else {
+        return Vec::new();
+    };
+    FILESYSTEM_RUNTIME
+        .get()
+        .and_then(Option::as_ref)
+        .map(FilesystemHookRuntime::inheritable_local_descriptors)
+        .unwrap_or_default()
+}
+
+fn refresh_descriptor_inheritance(descriptor: libc::c_int) {
+    let Some(runtime) = FilesystemHookRuntime::global() else {
+        return;
+    };
+    if let Some(open) = runtime.tracked_open(descriptor) {
+        runtime.refresh_local_state_inheritance(&open);
+    }
+}
+
 pub(super) fn flush_before_exec() -> Result<()> {
     let Some(_guard) = FilesystemHookGuard::enter() else {
         return Ok(());
@@ -1803,9 +2064,8 @@ pub(super) fn flush_at_exit() {
     unsafe {
         libc::fflush(std::ptr::null_mut());
     }
-    if let Some(runtime) = FILESYSTEM_RUNTIME.get().and_then(Option::as_ref) {
-        let _ = runtime.flush_memory_mappings();
-        let _ = runtime.commit_all_open_files();
+    if let Some(runtime) = FilesystemHookRuntime::global() {
+        let _ = runtime.finish_all_open_files();
     }
 }
 
@@ -1891,7 +2151,11 @@ fn insert_dirty_range(ranges: &mut Vec<LocalByteRange>, range: LocalByteRange) {
     *ranges = merged;
 }
 
-fn configure_descriptor(descriptor: libc::c_int, flags: libc::c_int) -> Result<()> {
+fn configure_descriptor(
+    descriptor: libc::c_int,
+    flags: libc::c_int,
+    virtual_status: bool,
+) -> Result<()> {
     let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
     if descriptor_flags < 0 {
         return Err(io::Error::last_os_error().into());
@@ -1904,8 +2168,12 @@ fn configure_descriptor(descriptor: libc::c_int, flags: libc::c_int) -> Result<(
     if status_flags < 0 {
         return Err(io::Error::last_os_error().into());
     }
-    let status_flags = (status_flags & !(libc::O_APPEND | libc::O_NONBLOCK))
-        | (flags & (libc::O_APPEND | libc::O_NONBLOCK));
+    let requested = if virtual_status {
+        0
+    } else {
+        flags & (libc::O_APPEND | libc::O_NONBLOCK)
+    };
+    let status_flags = (status_flags & !(libc::O_APPEND | libc::O_NONBLOCK)) | requested;
     if unsafe { libc::fcntl(descriptor, libc::F_SETFL, status_flags) } < 0 {
         return Err(io::Error::last_os_error().into());
     }

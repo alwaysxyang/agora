@@ -15,6 +15,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 pub(crate) const MAX_FRAME_SIZE: usize = 1024 * 1024;
+const MAX_DESCRIPTORS: usize = 8;
 const FRAME_MARKER: u8 = 0;
 
 #[cfg(target_os = "macos")]
@@ -30,7 +31,7 @@ impl InheritedControlLock {
         Self::from_file(file)
     }
 
-    #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+    #[cfg(test)]
     pub(crate) unsafe fn from_raw_descriptor(descriptor: RawFd) -> io::Result<Arc<Self>> {
         if descriptor < 0 || unsafe { libc::fcntl(descriptor, libc::F_GETFD) } < 0 {
             return Err(io::Error::last_os_error());
@@ -218,6 +219,15 @@ pub(crate) fn send<T: Serialize>(
     message: &T,
     descriptor: Option<RawFd>,
 ) -> io::Result<()> {
+    let descriptors = descriptor.as_slice();
+    send_with_descriptors(stream, message, descriptors)
+}
+
+pub(crate) fn send_with_descriptors<T: Serialize>(
+    stream: &mut UnixStream,
+    message: &T,
+    descriptors: &[RawFd],
+) -> io::Result<()> {
     configure_no_sigpipe(stream.as_raw_fd())?;
     let payload = serde_json::to_vec(message).map_err(invalid_data)?;
     if payload.len() > MAX_FRAME_SIZE {
@@ -226,7 +236,7 @@ pub(crate) fn send<T: Serialize>(
             "remote filesystem frame is too large",
         ));
     }
-    send_marker(stream, descriptor)?;
+    send_marker(stream, descriptors)?;
     stream.write_all(
         &u32::try_from(payload.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame is too large"))?
@@ -238,7 +248,20 @@ pub(crate) fn send<T: Serialize>(
 pub(crate) fn receive<T: DeserializeOwned>(
     stream: &mut UnixStream,
 ) -> io::Result<(T, Option<OwnedFd>)> {
-    let descriptor = receive_marker(stream)?;
+    let (message, mut descriptors) = receive_with_descriptors(stream)?;
+    if descriptors.len() > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid descriptor control message",
+        ));
+    }
+    Ok((message, descriptors.pop()))
+}
+
+pub(crate) fn receive_with_descriptors<T: DeserializeOwned>(
+    stream: &mut UnixStream,
+) -> io::Result<(T, Vec<OwnedFd>)> {
+    let descriptors = receive_marker(stream)?;
     let mut length = [0_u8; 4];
     stream.read_exact(&mut length)?;
     let length = u32::from_be_bytes(length) as usize;
@@ -251,19 +274,29 @@ pub(crate) fn receive<T: DeserializeOwned>(
     let mut payload = vec![0_u8; length];
     stream.read_exact(&mut payload)?;
     let message = serde_json::from_slice(&payload).map_err(invalid_data)?;
-    Ok((message, descriptor))
+    Ok((message, descriptors))
 }
 
-fn send_marker(stream: &UnixStream, descriptor: Option<RawFd>) -> io::Result<()> {
-    let Some(descriptor) = descriptor else {
+fn send_marker(stream: &UnixStream, descriptors: &[RawFd]) -> io::Result<()> {
+    if descriptors.is_empty() {
         return (&*stream).write_all(&[FRAME_MARKER]);
-    };
+    }
+    if descriptors.len() > MAX_DESCRIPTORS || descriptors.iter().any(|descriptor| *descriptor < 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid descriptor control message",
+        ));
+    }
     let mut marker = [FRAME_MARKER];
     let mut iov = libc::iovec {
         iov_base: marker.as_mut_ptr().cast(),
         iov_len: marker.len(),
     };
-    let control_length = unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) as usize };
+    let descriptor_bytes = descriptors
+        .len()
+        .checked_mul(size_of::<RawFd>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "too many descriptors"))?;
+    let control_length = unsafe { libc::CMSG_SPACE(descriptor_bytes as u32) as usize };
     let mut control = vec![0_u8; control_length];
     let mut header = unsafe { zeroed::<libc::msghdr>() };
     header.msg_iov = &mut iov;
@@ -279,8 +312,12 @@ fn send_marker(stream: &UnixStream, descriptor: Option<RawFd>) -> io::Result<()>
         }
         (*message).cmsg_level = libc::SOL_SOCKET;
         (*message).cmsg_type = libc::SCM_RIGHTS;
-        (*message).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as _;
-        std::ptr::write_unaligned(libc::CMSG_DATA(message).cast::<RawFd>(), descriptor);
+        (*message).cmsg_len = libc::CMSG_LEN(descriptor_bytes as u32) as _;
+        std::ptr::copy_nonoverlapping(
+            descriptors.as_ptr(),
+            libc::CMSG_DATA(message).cast::<RawFd>(),
+            descriptors.len(),
+        );
         header.msg_controllen = (*message).cmsg_len as _;
     }
     let flags = send_flags();
@@ -297,13 +334,14 @@ fn send_marker(stream: &UnixStream, descriptor: Option<RawFd>) -> io::Result<()>
     }
 }
 
-fn receive_marker(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
+fn receive_marker(stream: &UnixStream) -> io::Result<Vec<OwnedFd>> {
     let mut marker = [0_u8; 1];
     let mut iov = libc::iovec {
         iov_base: marker.as_mut_ptr().cast(),
         iov_len: marker.len(),
     };
-    let control_length = unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) as usize };
+    let control_length =
+        unsafe { libc::CMSG_SPACE((MAX_DESCRIPTORS * size_of::<RawFd>()) as u32) as usize };
     let mut control = vec![0_u8; control_length];
     let mut header = unsafe { zeroed::<libc::msghdr>() };
     header.msg_iov = &mut iov;
@@ -326,10 +364,13 @@ fn receive_marker(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
             "invalid remote filesystem frame marker",
         ));
     }
+    let reported_control_length = header.msg_controllen as usize;
     let control_start = header.msg_control as usize;
-    let control_end = control_start.saturating_add(header.msg_controllen as usize);
+    let control_end = control_start.saturating_add(reported_control_length.min(control.len()));
     let mut descriptors = Vec::new();
-    let mut invalid_control = header.msg_flags & libc::MSG_CTRUNC != 0;
+    let mut invalid_control =
+        header.msg_flags & libc::MSG_CTRUNC != 0 || reported_control_length > control.len();
+    header.msg_controllen = reported_control_length.min(control.len()) as _;
     unsafe {
         let mut message = libc::CMSG_FIRSTHDR(&header);
         while !message.is_null() {
@@ -369,6 +410,8 @@ fn receive_marker(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
                         descriptors.push(OwnedFd::from_raw_fd(raw));
                     }
                 }
+            } else {
+                invalid_control = true;
             }
             if declared_end > control_end {
                 break;
@@ -376,14 +419,13 @@ fn receive_marker(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
             message = libc::CMSG_NXTHDR(&header, message);
         }
     }
-    if invalid_control || descriptors.len() > 1 {
+    if invalid_control || descriptors.len() > MAX_DESCRIPTORS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid descriptor control message",
         ));
     }
-    let descriptor = descriptors.pop();
-    if let Some(descriptor) = descriptor.as_ref() {
+    for descriptor in &descriptors {
         let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
         if flags < 0
             || unsafe {
@@ -397,7 +439,7 @@ fn receive_marker(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
             return Err(io::Error::last_os_error());
         }
     }
-    Ok(descriptor)
+    Ok(descriptors)
 }
 
 #[cfg(target_os = "macos")]

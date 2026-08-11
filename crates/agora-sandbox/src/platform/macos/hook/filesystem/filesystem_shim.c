@@ -29,7 +29,12 @@ extern const void *agora_sandbox_original_fcntl(void);
 extern void agora_sandbox_track_fcntl_duplicate(int source, int destination);
 extern int agora_sandbox_commit_synced_descriptor(int descriptor);
 extern int agora_sandbox_fcntl_setfd_argument(int descriptor, int flags);
+extern void agora_sandbox_fcntl_commit_setfd(int descriptor);
+extern int agora_sandbox_fcntl_getfl(int descriptor, int native_flags);
+extern int agora_sandbox_fcntl_setfl_argument(int descriptor, int flags);
+extern int agora_sandbox_fcntl_commit_setfl(int descriptor, int flags);
 extern int agora_sandbox_validate_content_fcntl(int descriptor);
+extern int agora_sandbox_lock_descriptor(int descriptor);
 
 typedef int (*open_fn)(const char *, int, ...);
 typedef int (*openat_fn)(int, const char *, int, ...);
@@ -165,10 +170,16 @@ int agora_sandbox_fcntl_shim(int descriptor, int command, ...) {
         return -1;
     }
 
+    int lock_command = command == F_GETLK || command == F_SETLK || command == F_SETLKW;
+#ifdef F_OFD_GETLK
+    lock_command = lock_command || command == F_OFD_GETLK || command == F_OFD_SETLK
+        || command == F_OFD_SETLKW;
+#endif
+    int operation_descriptor =
+        lock_command ? agora_sandbox_lock_descriptor(descriptor) : descriptor;
     int result;
     switch (command) {
         case F_GETFD:
-        case F_GETFL:
         case F_GETOWN:
         case F_FLUSH_DATA:
         case F_CHKCLEAN:
@@ -182,9 +193,14 @@ int agora_sandbox_fcntl_shim(int descriptor, int command, ...) {
         case F_GETLEASE:
             result = original_fcntl(descriptor, command);
             break;
+        case F_GETFL:
+            result = original_fcntl(descriptor, command);
+            if (result >= 0) {
+                result = agora_sandbox_fcntl_getfl(descriptor, result);
+            }
+            break;
         case F_DUPFD:
         case F_DUPFD_CLOEXEC:
-        case F_SETFL:
         case F_SETOWN:
         case F_RDAHEAD:
         case F_NOCACHE:
@@ -200,7 +216,19 @@ int agora_sandbox_fcntl_shim(int descriptor, int command, ...) {
             va_start(arguments, command);
             int argument = va_arg(arguments, int);
             va_end(arguments);
-            result = original_fcntl(descriptor, command, argument);
+            result = original_fcntl(operation_descriptor, command, argument);
+            break;
+        }
+        case F_SETFL: {
+            va_list arguments;
+            va_start(arguments, command);
+            int argument = va_arg(arguments, int);
+            va_end(arguments);
+            int native_argument = agora_sandbox_fcntl_setfl_argument(descriptor, argument);
+            result = original_fcntl(descriptor, command, native_argument);
+            if (result >= 0) {
+                result = agora_sandbox_fcntl_commit_setfl(descriptor, argument);
+            }
             break;
         }
         case F_SETFD: {
@@ -213,6 +241,9 @@ int agora_sandbox_fcntl_shim(int descriptor, int command, ...) {
                 command,
                 agora_sandbox_fcntl_setfd_argument(descriptor, argument)
             );
+            if (result >= 0) {
+                agora_sandbox_fcntl_commit_setfd(descriptor);
+            }
             break;
         }
         case F_SETSIZE: {
@@ -223,7 +254,7 @@ int agora_sandbox_fcntl_shim(int descriptor, int command, ...) {
             va_start(arguments, command);
             off_t argument = va_arg(arguments, off_t);
             va_end(arguments);
-            result = original_fcntl(descriptor, command, argument);
+            result = original_fcntl(operation_descriptor, command, argument);
             break;
         }
 #ifdef F_PUNCHHOLE
@@ -244,7 +275,7 @@ int agora_sandbox_fcntl_shim(int descriptor, int command, ...) {
             va_start(arguments, command);
             void *argument = va_arg(arguments, void *);
             va_end(arguments);
-            result = original_fcntl(descriptor, command, argument);
+            result = original_fcntl(operation_descriptor, command, argument);
             break;
         }
     }

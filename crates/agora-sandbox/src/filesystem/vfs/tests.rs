@@ -3,7 +3,7 @@ use crate::filesystem::crypto::FileCipher;
 use crate::filesystem::{AccessRequest, Credentials, FileAttributes};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -589,6 +589,51 @@ fn encrypted_writeback_publishes_ciphertext_and_restores_the_next_open() {
     let mut restored = Vec::new();
     file.read_to_end(&mut restored).unwrap();
     assert_eq!(restored, marker);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn brokered_open_and_metadata_do_not_decrypt_an_existing_file_twice() {
+    let (root, filesystem) = fixture("brokered-open");
+    let logical = Path::new("/tmp/agora-vfs-brokered-open");
+    let marker = b"authenticated plaintext block";
+    let mut created = filesystem
+        .prepare_open(logical, libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC, 0o600)
+        .unwrap();
+    let OpenTarget::Descriptor(file) = created.target_mut() else {
+        panic!("encrypted regular file did not use an anonymous descriptor");
+    };
+    file.write_all(marker).unwrap();
+    filesystem.commit_open(&mut created).unwrap();
+
+    let backing = filesystem.prepare_read(logical).unwrap();
+    let ciphertext = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&backing)
+        .unwrap();
+    let offset = crate::filesystem::crypto::CONTENT_HEADER_SIZE as u64 + 12;
+    let mut byte = [0_u8; 1];
+    ciphertext.read_exact_at(&mut byte, offset).unwrap();
+    byte[0] ^= 0xff;
+    ciphertext.write_all_at(&byte, offset).unwrap();
+
+    let metadata = filesystem
+        .prepare_authorized_metadata(logical, true, &Credentials::effective())
+        .unwrap();
+    assert_eq!(metadata.into_parts().2, Some(marker.len() as u64));
+    let brokered = filesystem
+        .prepare_authorized_broker_open(
+            logical,
+            OpenIntent::new(libc::O_RDONLY, 0).unwrap(),
+            &Credentials::effective(),
+        )
+        .unwrap();
+    assert!(matches!(
+        brokered.into_parts().1.target(),
+        OpenTarget::Descriptor(_)
+    ));
+    assert!(filesystem.prepare_open(logical, libc::O_RDONLY, 0).is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
 

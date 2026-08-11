@@ -1973,6 +1973,8 @@ fn encrypted_descriptors_keep_backing_ciphertext_and_write_back_on_last_close() 
     with_test_runtime(&runtime, || unsafe {
         let descriptor = super::agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
         assert!(descriptor >= 0);
+        assert_eq!(sandbox_pwrite(descriptor, b"x".as_ptr().cast(), 1, 0), -1);
+        assert_eq!(*libc::__error(), libc::EBADF);
         let mut restored = vec![0_u8; marker.len()];
         assert_eq!(
             libc::read(descriptor, restored.as_mut_ptr().cast(), restored.len()),
@@ -2015,6 +2017,16 @@ fn guarded_file_operations_preserve_encrypted_descriptor_tracking() {
             sandbox_guarded_pwrite(descriptor, &guard, first.as_ptr().cast(), first.len(), 0,),
             first.len() as libc::ssize_t
         );
+        assert_eq!(
+            sandbox_guarded_writev(
+                descriptor,
+                &guard,
+                std::ptr::without_provenance::<libc::iovec>(1),
+                1,
+            ),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::EFAULT);
         assert_eq!(
             libc::lseek(descriptor, first.len() as libc::off_t, libc::SEEK_SET),
             7
@@ -2541,6 +2553,13 @@ fn content_mutating_fcntl_is_rejected_for_managed_descriptors() {
                 .local = Some(super::LocalRegistration {
                 handle: "local-handle".to_string(),
                 writable: true,
+                state: super::LocalOpenState::create(libc::O_RDWR).unwrap(),
+                lock: tempfile::tempfile().unwrap(),
+                identity: super::LocalFileIdentity {
+                    device: 1,
+                    inode: 2,
+                    links: 1,
+                },
                 dirty: std::sync::Mutex::new(Vec::new()),
                 mutation: std::sync::Mutex::new(()),
             });
@@ -2974,7 +2993,7 @@ fn filesystem_errors_preserve_errno_and_default_to_io_error() {
     }
     let missing_socket = PathBuf::from(format!("/tmp/agora-missing-{}.sock", uuid::Uuid::new_v4()));
     let local_error = match crate::filesystem::broker::LocalClient::new(missing_socket, "token")
-        .open(Path::new("/tmp"), -1, false)
+        .open(Path::new("/tmp"), libc::O_RDONLY)
     {
         Ok(_) => panic!("missing local broker should reject open"),
         Err(error) => error,
@@ -4456,9 +4475,38 @@ fn runtime_descriptor_helpers_cover_aliases_and_native_descriptors() {
             flush_at_exit();
         });
 
-        assert!(configure_descriptor(-1, libc::O_RDONLY).is_err());
+        assert!(configure_descriptor(-1, libc::O_RDONLY, false).is_err());
         assert_eq!(libc::close(lower_descriptor), 0);
         assert_eq!(libc::close(internal_directory_descriptor), 0);
         assert_eq!(libc::close(internal_file_descriptor), 0);
     }
+}
+
+#[test]
+fn exit_flush_finishes_each_open_local_handle_once() {
+    let fixture = Fixture::new();
+    let runtime = FilesystemHookRuntime::new_encrypted(
+        fixture.directory.join("exit-flush-workdir/fs"),
+        b"test-key",
+        b"0123456789abcdef",
+    )
+    .unwrap();
+    let logical = fixture.lower.join("exit-flush.txt");
+    let path = Fixture::c_path(&logical);
+
+    with_test_runtime(&runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(descriptor >= 0);
+        assert_eq!(libc::write(descriptor, b"saved".as_ptr().cast(), 5), 5);
+        let open = runtime.tracked_open(descriptor).unwrap();
+
+        flush_at_exit();
+
+        assert!(open.finished.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
 }

@@ -5,7 +5,7 @@ use crate::filesystem::broker::protocol::{
 };
 use crate::ipc::{InheritedControlLock, InheritedControlStream};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 
 fn cipher() -> FileCipher {
@@ -36,9 +36,6 @@ async fn controller_serves_the_complete_local_client_lifecycle() {
     let mut source = tempfile::tempfile().unwrap();
     source.write_all(b"before").unwrap();
     cipher.encrypt(&mut source, &backing).unwrap();
-    let mut plaintext = tempfile::tempfile().unwrap();
-    plaintext.write_all(b"before").unwrap();
-
     let controller = LocalController::start(&root, cipher.clone(), &runtime)
         .await
         .unwrap();
@@ -48,13 +45,12 @@ async fn controller_serves_the_complete_local_client_lifecycle() {
     );
     assert_eq!(controller.runtime().token().len(), 32);
     let client = LocalClient::new(controller.runtime().socket(), controller.runtime().token());
-    let descriptor = plaintext.as_raw_fd();
     let handle = tokio::task::spawn_blocking(move || {
-        let opened = client.open(&backing, descriptor, true).unwrap();
+        let opened = client.open(&backing, libc::O_RDWR).unwrap();
         let write = client
             .begin_write(&opened.handle, ByteRange::new(0, 6).unwrap())
             .unwrap();
-        plaintext.write_all_at(b"after!", 0).unwrap();
+        opened.descriptor.write_all_at(b"after!", 0).unwrap();
         client
             .finish_write(&opened.handle, &write, ByteRange::new(0, 6).unwrap())
             .unwrap();
@@ -122,20 +118,18 @@ async fn shutdown_drains_service_work_before_the_final_flush() {
     source.write_all(b"before").unwrap();
     cipher.encrypt(&mut source, &backing).unwrap();
 
-    let mut plaintext = tempfile::tempfile().unwrap();
-    plaintext.write_all(b"before").unwrap();
-    let descriptor: OwnedFd = plaintext.try_clone().unwrap().into();
     let broker = Arc::new(LocalBroker::new(&root, cipher.clone()).unwrap());
-    let response = broker.handle(
+    let mut response = broker.handle(
         Request::Open {
             path: BackingPath::from_path(&backing),
-            writable: true,
+            flags: libc::O_RDWR,
         },
-        Some(descriptor),
+        None,
     );
-    let Response::Open { handle } = response.response else {
+    let Response::Open { handle, .. } = response.response else {
         panic!("unexpected open response: {:?}", response.response);
     };
+    let plaintext = response.descriptors.remove(0);
 
     let (shutdown, mut receiver) = watch::channel(false);
     let mut tasks = JoinSet::new();
@@ -432,7 +426,7 @@ async fn startup_errors_and_constant_time_token_checks_are_explicit() {
 
     let request = Request::Open {
         path: BackingPath::from_path(Path::new("/tmp/example")),
-        writable: false,
+        flags: libc::O_RDONLY,
     };
     assert!(matches!(request, Request::Open { .. }));
 }

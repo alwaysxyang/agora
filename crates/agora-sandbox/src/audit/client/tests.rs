@@ -127,21 +127,23 @@ fn audit_client_reconnects_once_after_an_idle_peer_closes() {
     client.publish(file_request("/after-idle-close")).unwrap();
 
     server.join().unwrap();
-    CONNECTIONS.with(|connections| connections.borrow_mut().clear());
+    CONNECTIONS.with(|connections| connections.borrow_mut().entries.clear());
 }
 
 #[test]
-fn audit_client_replaces_a_connection_cached_by_another_process() {
+fn audit_client_abandons_connections_cached_by_another_process() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let stale_stream = TcpStream::connect(address).unwrap();
+    let stale_descriptor = std::os::fd::AsRawFd::as_raw_fd(&stale_stream);
     drop(listener.accept().unwrap());
     let client = AuditClient::new(address, "token");
     CONNECTIONS.with(|connections| {
-        connections.borrow_mut().insert(
+        let mut connections = connections.borrow_mut();
+        connections.pid = std::process::id().wrapping_add(1);
+        connections.entries.insert(
             client.endpoint.clone(),
             AuditConnection {
-                pid: std::process::id().wrapping_add(1),
                 stream: stale_stream,
             },
         );
@@ -150,8 +152,10 @@ fn audit_client_replaces_a_connection_cached_by_another_process() {
 
     client.publish(file_request("/after-fork")).unwrap();
 
+    assert_ne!(unsafe { libc::fcntl(stale_descriptor, libc::F_GETFD) }, -1);
+    assert_eq!(unsafe { libc::close(stale_descriptor) }, 0);
     server.join().unwrap();
-    CONNECTIONS.with(|connections| connections.borrow_mut().clear());
+    CONNECTIONS.with(|connections| connections.borrow_mut().entries.clear());
 }
 
 #[test]
@@ -166,7 +170,7 @@ fn audit_client_discards_a_connection_after_the_peer_disconnects() {
 
     assert!(client.publish(file_request("/disconnected")).is_err());
     CONNECTIONS.with(|connections| {
-        assert!(!connections.borrow().contains_key(&client.endpoint));
+        assert!(!connections.borrow().entries.contains_key(&client.endpoint));
     });
 
     server.join().unwrap();

@@ -20,9 +20,12 @@ use anyhow::{Context, Result, ensure};
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::fd::RawFd;
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
 use std::time::Duration;
@@ -119,6 +122,24 @@ pub(super) fn child_environment() -> Vec<(&'static str, String)> {
         environment.push((REMOTE_CONTROL_DESCRIPTOR, remote.descriptor().to_string()));
     }
     environment
+}
+
+pub(super) fn inheritable_descriptors() -> Vec<RawFd> {
+    let Some(runtime) = runtime() else {
+        return Vec::new();
+    };
+    let mut descriptors = vec![
+        runtime.lock.descriptor(),
+        runtime.execution.descriptor(),
+        runtime.audit.descriptor(),
+    ];
+    if let Some(local) = &runtime.local {
+        descriptors.push(local.descriptor());
+    }
+    if let Some(remote) = &runtime.remote {
+        descriptors.push(remote.descriptor());
+    }
+    descriptors
 }
 
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
@@ -282,6 +303,10 @@ impl ControlRuntime {
             Some(descriptor) => TcpStream::from(descriptor),
             None => TcpStream::connect(control)?,
         };
+        ensure!(
+            stream.peer_addr()? == control,
+            "inherited TCP control descriptor has an unexpected peer"
+        );
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
         Ok(InheritedControlStream::new(stream, lock, slot)?)
@@ -298,6 +323,10 @@ impl ControlRuntime {
             Some(descriptor) => UnixStream::from(descriptor),
             None => UnixStream::connect(socket)?,
         };
+        ensure!(
+            stream.peer_addr()?.as_pathname() == Some(Path::new(socket)),
+            "inherited Unix control descriptor has an unexpected peer"
+        );
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
         Ok(InheritedControlStream::new(stream, lock, slot)?)
@@ -382,6 +411,8 @@ pub(super) fn execution_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::os::unix::net::UnixListener;
 
     fn base_value(key: &str) -> Option<&'static str> {
         match key {
@@ -451,5 +482,41 @@ mod tests {
             .unwrap_err();
             assert!(error.contains(CONTROL_LOCK_DESCRIPTOR));
         }
+    }
+
+    #[test]
+    fn inherited_control_streams_reject_reused_descriptors_before_authentication() {
+        let lock = InheritedControlLock::anonymous().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        let descriptor: OwnedFd = stream.into();
+        let error = ControlRuntime::tcp_stream(
+            Some(descriptor),
+            other.local_addr().unwrap(),
+            Arc::clone(&lock),
+            EXECUTION_SLOT,
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unexpected peer"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let stream = UnixStream::connect(&socket).unwrap();
+        let descriptor: OwnedFd = stream.into();
+        let error = ControlRuntime::unix_stream(
+            Some(descriptor),
+            directory.path().join("other.sock").to_str().unwrap(),
+            lock,
+            LOCAL_SLOT,
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unexpected peer"));
+
+        drop(listener);
     }
 }

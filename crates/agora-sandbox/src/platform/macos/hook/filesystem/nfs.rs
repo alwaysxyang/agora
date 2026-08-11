@@ -52,7 +52,7 @@ pub(super) struct RemoteAnchor {
 }
 
 impl RemoteFilesystem {
-    #[cfg(any(test, coverage))]
+    #[cfg(test)]
     pub(super) fn from_json(
         socket: impl Into<PathBuf>,
         token: impl Into<String>,
@@ -71,7 +71,7 @@ impl RemoteFilesystem {
         Self::new_with_shared(socket, token, routes, shared)
     }
 
-    #[cfg(any(test, coverage))]
+    #[cfg(test)]
     pub(super) fn new(
         socket: impl Into<PathBuf>,
         token: impl Into<String>,

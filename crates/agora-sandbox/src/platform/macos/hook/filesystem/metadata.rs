@@ -311,7 +311,13 @@ unsafe fn sandbox_fstat(descriptor: libc::c_int, status: *mut libc::stat) -> lib
                 }
             };
             unsafe { patch_stat(&mut *status, None, attributes.as_ref()) };
-            if let Some(identity) = open.identity {
+            if let Some(local) = &open.local {
+                unsafe {
+                    (*status).st_dev = local.identity.device as _;
+                    (*status).st_ino = local.identity.inode;
+                    (*status).st_nlink = local.identity.links as _;
+                }
+            } else if let Some(identity) = open.identity {
                 unsafe {
                     (*status).st_dev = identity.device as _;
                     (*status).st_ino = identity.inode;

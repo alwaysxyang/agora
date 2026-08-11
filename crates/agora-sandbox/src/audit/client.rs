@@ -9,8 +9,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::fd::IntoRawFd;
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 const AUDIT_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -22,13 +25,42 @@ struct AuditEndpoint {
 }
 
 struct AuditConnection {
-    pid: u32,
     stream: TcpStream,
 }
 
+struct AuditConnections {
+    pid: u32,
+    entries: HashMap<AuditEndpoint, AuditConnection>,
+}
+
+impl AuditConnections {
+    fn new() -> Self {
+        Self {
+            pid: std::process::id(),
+            entries: HashMap::new(),
+        }
+    }
+
+    fn enter_process(&mut self, pid: u32) {
+        if self.pid == pid {
+            return;
+        }
+
+        // A fork child may reach an exec hook after the launcher has already
+        // closed descriptors that belonged to the parent. Dropping the
+        // inherited TcpStream values would then close a reused descriptor and
+        // triggers Rust's owned-FD safety check in debug-enabled runtimes.
+        // Abandon only descriptor ownership in this child; the parent still
+        // owns and eventually closes the actual connections.
+        for (_, connection) in std::mem::take(&mut self.entries) {
+            let _ = connection.stream.into_raw_fd();
+        }
+        self.pid = pid;
+    }
+}
+
 thread_local! {
-    static CONNECTIONS: RefCell<HashMap<AuditEndpoint, AuditConnection>> =
-        RefCell::new(HashMap::new());
+    static CONNECTIONS: RefCell<AuditConnections> = RefCell::new(AuditConnections::new());
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +68,10 @@ pub(crate) struct AuditClient {
     endpoint: AuditEndpoint,
     #[cfg(target_os = "macos")]
     shared: Option<Arc<InheritedControlStream<TcpStream>>>,
+    #[cfg(target_os = "macos")]
+    prefer_shared: Arc<AtomicBool>,
+    #[cfg(target_os = "macos")]
+    observed_pid: Arc<AtomicU32>,
 }
 
 impl AuditClient {
@@ -47,6 +83,10 @@ impl AuditClient {
             },
             #[cfg(target_os = "macos")]
             shared: None,
+            #[cfg(target_os = "macos")]
+            prefer_shared: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "macos")]
+            observed_pid: Arc::new(AtomicU32::new(std::process::id())),
         }
     }
 
@@ -63,10 +103,32 @@ impl AuditClient {
 
     pub(crate) fn publish(&self, event: AuditEventRequest) -> Result<(), AuditError> {
         let request = encode_request(&self.endpoint.token, event).map_err(AuditError::from_io)?;
+        #[cfg(target_os = "macos")]
+        let current_pid = std::process::id();
+        #[cfg(target_os = "macos")]
+        if self.observed_pid.swap(current_pid, Ordering::AcqRel) != current_pid
+            && self.shared.is_some()
+        {
+            self.prefer_shared.store(true, Ordering::Release);
+        }
+        self.enter_process();
+        #[cfg(target_os = "macos")]
+        if self.prefer_shared.load(Ordering::Acquire) && self.shared.is_some() {
+            let result = self.publish_shared(&request);
+            if !result.as_ref().is_err_and(AuditError::disconnects) {
+                return result;
+            }
+            self.prefer_shared.store(false, Ordering::Release);
+        }
         let result = self.publish_regular(&request);
         #[cfg(target_os = "macos")]
         if result.as_ref().is_err_and(AuditError::disconnects) && self.shared.is_some() {
-            return self.publish_shared(&request);
+            let result = self.publish_shared(&request);
+            self.prefer_shared.store(
+                !result.as_ref().is_err_and(AuditError::disconnects),
+                Ordering::Release,
+            );
+            return result;
         }
         result
     }
@@ -81,18 +143,11 @@ impl AuditClient {
         CONNECTIONS
             .try_with(|connections| {
                 let mut connections = connections.borrow_mut();
-                let pid = std::process::id();
-                if connections
-                    .get(&self.endpoint)
-                    .is_some_and(|connection| connection.pid != pid)
-                {
-                    connections.remove(&self.endpoint);
-                }
-                if !connections.contains_key(&self.endpoint) {
-                    connections.insert(
+                connections.enter_process(std::process::id());
+                if !connections.entries.contains_key(&self.endpoint) {
+                    connections.entries.insert(
                         self.endpoint.clone(),
                         AuditConnection {
-                            pid,
                             stream: Self::connect(self.endpoint.control)?,
                         },
                     );
@@ -100,6 +155,7 @@ impl AuditClient {
                 for retry in [false, true] {
                     let result = Self::publish_on(
                         &mut connections
+                            .entries
                             .get_mut(&self.endpoint)
                             .expect("audit connection was inserted")
                             .stream,
@@ -108,14 +164,13 @@ impl AuditClient {
                     if !result.as_ref().is_err_and(AuditError::disconnects) {
                         return result;
                     }
-                    connections.remove(&self.endpoint);
+                    connections.entries.remove(&self.endpoint);
                     if retry {
                         return result;
                     }
-                    connections.insert(
+                    connections.entries.insert(
                         self.endpoint.clone(),
                         AuditConnection {
-                            pid,
                             stream: Self::connect(self.endpoint.control)?,
                         },
                     );
@@ -126,6 +181,12 @@ impl AuditClient {
                 let mut stream = Self::connect(self.endpoint.control)?;
                 Self::publish_on(&mut stream, request)
             })
+    }
+
+    fn enter_process(&self) {
+        let _ = CONNECTIONS.try_with(|connections| {
+            connections.borrow_mut().enter_process(std::process::id());
+        });
     }
 
     #[cfg(target_os = "macos")]

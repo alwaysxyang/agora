@@ -119,8 +119,7 @@ pub(crate) struct PreparedFile {
     created_mode: Option<u32>,
     layer: FileLayer,
     encrypted_backing: Option<PathBuf>,
-    broker_file: Option<File>,
-    writable: bool,
+    broker_flags: Option<libc::c_int>,
 }
 
 pub(crate) struct Writeback {
@@ -162,8 +161,7 @@ impl PreparedFile {
             created_mode: None,
             layer,
             encrypted_backing: None,
-            broker_file: None,
-            writable: false,
+            broker_flags: None,
         }
     }
 
@@ -179,19 +177,11 @@ impl PreparedFile {
         (self.target, self.writeback, self.layer)
     }
 
-    pub(crate) fn local_broker_source(&self) -> Result<Option<(PathBuf, File, bool)>> {
+    pub(crate) fn local_broker_request(&self) -> Option<(PathBuf, libc::c_int)> {
         let Some(backing) = &self.encrypted_backing else {
-            return Ok(None);
+            return None;
         };
-        let descriptor = self
-            .broker_file
-            .as_ref()
-            .context("encrypted local file has no broker descriptor")?;
-        Ok(Some((
-            backing.clone(),
-            descriptor.try_clone()?,
-            self.writable,
-        )))
+        Some((backing.clone(), self.broker_flags?))
     }
 
     pub(crate) fn encrypted_backing_identity(&self) -> Result<Option<(u64, u64)>> {
@@ -223,6 +213,25 @@ impl VirtualFilesystem {
         requested: &Path,
         intent: OpenIntent,
         credentials: &Credentials,
+    ) -> Result<OpenPlan> {
+        self.prepare_authorized_open_with_materialization(requested, intent, credentials, true)
+    }
+
+    pub(crate) fn prepare_authorized_broker_open(
+        &self,
+        requested: &Path,
+        intent: OpenIntent,
+        credentials: &Credentials,
+    ) -> Result<OpenPlan> {
+        self.prepare_authorized_open_with_materialization(requested, intent, credentials, false)
+    }
+
+    fn prepare_authorized_open_with_materialization(
+        &self,
+        requested: &Path,
+        intent: OpenIntent,
+        credentials: &Credentials,
+        materialize_encrypted_content: bool,
     ) -> Result<OpenPlan> {
         let (logical, mapping) = self.overlay.transaction(|transaction| {
             if Self::native_read_eligible(intent.flags)
@@ -287,7 +296,8 @@ impl VirtualFilesystem {
             let mapping = Self::stage_open_in(transaction, &logical, intent)?;
             Ok((logical, mapping))
         })?;
-        let prepared = self.prepare_mapped_open(&logical, intent, mapping)?;
+        let prepared =
+            self.prepare_mapped_open(&logical, intent, mapping, materialize_encrypted_content)?;
         Ok(OpenPlan { logical, prepared })
     }
 
@@ -488,7 +498,7 @@ impl VirtualFilesystem {
         let mapping = self
             .overlay
             .transaction(|transaction| Self::stage_open_in(transaction, logical, intent))?;
-        self.prepare_mapped_open(logical, intent, mapping)
+        self.prepare_mapped_open(logical, intent, mapping, true)
     }
 
     fn prepare_mapped_open(
@@ -496,6 +506,7 @@ impl VirtualFilesystem {
         logical: &Path,
         intent: OpenIntent,
         mapping: OpenMapping,
+        materialize_encrypted_content: bool,
     ) -> Result<PreparedFile> {
         let flags = intent.flags;
         let mode = intent.mode;
@@ -532,6 +543,35 @@ impl VirtualFilesystem {
         let created_mode = (create && !existed)
             .then(|| Self::effective_creation_mode(mode))
             .transpose()?;
+        if !materialize_encrypted_content {
+            if !existed && !create {
+                bail!("filesystem path is not visible: {}", logical.display());
+            }
+            let plaintext = tempfile::tempfile()?;
+            let target = plaintext.try_clone()?;
+            let baseline = PlaintextIdentity::from_file(&plaintext)?;
+            return Ok(PreparedFile {
+                target: OpenTarget::Descriptor(target),
+                staged,
+                writeback: if writes {
+                    Some(Writeback {
+                        plaintext: Mutex::new(plaintext),
+                        lease: Mutex::new(
+                            lease.context("encrypted write open did not acquire a lease")?,
+                        ),
+                        baseline: Mutex::new(baseline),
+                    })
+                } else {
+                    None
+                },
+                publish_on_open: writes && (!existed || flags & libc::O_TRUNC != 0),
+                overwrite_on_open: writes && existed && flags & libc::O_TRUNC != 0,
+                created_mode,
+                layer: FileLayer::Upper,
+                encrypted_backing: Some(mapped),
+                broker_flags: Some(flags),
+            });
+        }
         let plaintext = tempfile::NamedTempFile::new()?;
         let access = flags & libc::O_ACCMODE;
         let mut exposed = OpenOptions::new();
@@ -556,7 +596,6 @@ impl VirtualFilesystem {
             plaintext.seek(SeekFrom::Start(0))?;
         }
         let baseline = PlaintextIdentity::from_file(&plaintext)?;
-        let broker_file = plaintext.try_clone()?;
         Ok(PreparedFile {
             target: OpenTarget::Descriptor(exposed),
             staged,
@@ -576,8 +615,7 @@ impl VirtualFilesystem {
             created_mode,
             layer: FileLayer::Upper,
             encrypted_backing: Some(mapped),
-            broker_file: Some(broker_file),
-            writable: writes,
+            broker_flags: None,
         })
     }
 
@@ -705,9 +743,7 @@ impl VirtualFilesystem {
             .filter(|_| self.overlay.is_internal(&mapped))
         {
             if mapped.symlink_metadata()?.is_file() {
-                let mut plaintext = tempfile::tempfile()?;
-                cipher.decrypt(&mapped, &mut plaintext)?;
-                Some(plaintext.metadata()?.len())
+                Some(cipher.open_file(&mapped)?.len())
             } else {
                 None
             }
@@ -925,6 +961,11 @@ impl VirtualFilesystem {
         };
         attributes.refresh_timestamps(status);
         self.overlay.set_attributes(path, attributes)
+    }
+
+    pub(crate) fn visible_identity(&self, path: &Path) -> Result<(u64, u64)> {
+        let metadata = self.overlay.visible_path(path)?.metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
     }
 
     #[cfg(test)]

@@ -5,6 +5,7 @@ use super::service::{LocalBroker, WRITEBACK_DELAY};
 use crate::filesystem::FileCipher;
 use crate::ipc;
 use anyhow::{Context, Result};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,7 +57,7 @@ impl LocalController {
             )
         })?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-        let broker = Arc::new(LocalBroker::new(root, cipher)?);
+        let broker = Arc::new(LocalBroker::new_in(root, cipher, runtime_directory)?);
         let runtime = LocalRuntime {
             socket,
             token: Uuid::new_v4().simple().to_string(),
@@ -213,40 +214,56 @@ impl Server {
                     && !matches!(
                         &request.request,
                         Request::BeginWrite { write_id, .. }
+                            | Request::BeginAppend { write_id, .. }
                             | Request::FinishWrite { write_id, .. }
                             | Request::CancelWrite { write_id, .. }
                             if !valid_request_id(write_id)
                     );
                 let ping = matches!(&request.request, Request::Ping) && descriptor.is_none();
-                let response = if request.version != PROTOCOL_VERSION {
-                    Response::Error {
-                        errno: libc::EPROTO,
-                        message: "unsupported local filesystem protocol version".to_string(),
+                let reply = if request.version != PROTOCOL_VERSION {
+                    super::service::BrokerReply {
+                        response: Response::Error {
+                            errno: libc::EPROTO,
+                            message: "unsupported local filesystem protocol version".to_string(),
+                        },
+                        descriptors: Vec::new(),
                     }
                 } else if !authenticated {
-                    Response::Error {
-                        errno: libc::EACCES,
-                        message: "invalid local filesystem token".to_string(),
+                    super::service::BrokerReply {
+                        response: Response::Error {
+                            errno: libc::EACCES,
+                            message: "invalid local filesystem token".to_string(),
+                        },
+                        descriptors: Vec::new(),
                     }
                 } else if !valid_id {
-                    Response::Error {
-                        errno: libc::EPROTO,
-                        message: "invalid local filesystem request ID".to_string(),
+                    super::service::BrokerReply {
+                        response: Response::Error {
+                            errno: libc::EPROTO,
+                            message: "invalid local filesystem request ID".to_string(),
+                        },
+                        descriptors: Vec::new(),
                     }
                 } else {
-                    state
-                        .broker
-                        .handle_request(request.request_id.clone(), request.request, descriptor)
-                        .response
+                    state.broker.handle_request(
+                        request.request_id.clone(),
+                        request.request,
+                        descriptor,
+                    )
                 };
-                ipc::send(
+                let descriptors = reply
+                    .descriptors
+                    .iter()
+                    .map(AsRawFd::as_raw_fd)
+                    .collect::<Vec<_>>();
+                ipc::send_with_descriptors(
                     &mut stream,
                     &ResponseEnvelope {
                         version: PROTOCOL_VERSION,
                         request_id: request.request_id,
-                        response,
+                        response: reply.response,
                     },
-                    None,
+                    &descriptors,
                 )?;
                 if !persistent && ping && authenticated && valid_id {
                     stream.set_read_timeout(None)?;

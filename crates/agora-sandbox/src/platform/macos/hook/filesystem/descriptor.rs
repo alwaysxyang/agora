@@ -8,6 +8,7 @@ type DescriptorFn = unsafe extern "C" fn(libc::c_int) -> libc::c_int;
 type Dup2Fn = unsafe extern "C" fn(libc::c_int, libc::c_int) -> libc::c_int;
 type TruncateFn = unsafe extern "C" fn(*const libc::c_char, libc::off_t) -> libc::c_int;
 type FtruncateFn = unsafe extern "C" fn(libc::c_int, libc::off_t) -> libc::c_int;
+type FlockFn = unsafe extern "C" fn(libc::c_int, libc::c_int) -> libc::c_int;
 
 unsafe fn sandbox_truncate(path: *const libc::c_char, length: libc::off_t) -> libc::c_int {
     catch_filesystem_panic(-1, || {
@@ -25,10 +26,11 @@ unsafe fn sandbox_truncate(path: *const libc::c_char, length: libc::off_t) -> li
             unsafe { set_errno(libc::EINVAL) };
             return -1;
         }
-        let request = match runtime.prepare_open(path, libc::AT_FDCWD, libc::O_WRONLY, 0) {
-            Ok(request) => request,
-            Err(error) => return unsafe { fail(&error, -1) },
-        };
+        let request =
+            match runtime.prepare_materialized_open(path, libc::AT_FDCWD, libc::O_WRONLY, 0) {
+                Ok(request) => request,
+                Err(error) => return unsafe { fail(&error, -1) },
+            };
         match request.native_path() {
             Ok(Some(native)) => return unsafe { original(native.as_ptr(), length) },
             Ok(None) => {}
@@ -110,9 +112,13 @@ unsafe fn sandbox_descriptor_mutation_with_truncate(
             unsafe { set_errno(libc::ENOTSUP) };
             return -1;
         }
-        if let (Some(length), Some(registration)) = (truncate, &open.local)
-            && registration.writable
+        if let (Some(_), Some(registration)) = (truncate, &open.local)
+            && !registration.writable
         {
+            unsafe { set_errno(libc::EBADF) };
+            return -1;
+        }
+        if let (Some(length), Some(registration)) = (truncate, &open.local) {
             let reservation = u64::try_from(status.st_size)
                 .ok()
                 .and_then(|current| truncate_reservation(current, length));
@@ -148,9 +154,15 @@ unsafe fn sandbox_descriptor_mutation_with_truncate(
                 runtime.refresh_attributes(descriptor, logical.to_string_lossy().as_ref());
             if let Some(range) = reservation
                 && active.as_ref().is_none_or(|active| {
-                    local
+                    if local
                         .finish_write(&registration.handle, active, range)
-                        .is_err()
+                        .is_ok()
+                    {
+                        false
+                    } else {
+                        let _ = local.cancel_write(&registration.handle, active);
+                        true
+                    }
                 })
             {
                 insert_dirty_range(&mut lock(&registration.dirty), range);
@@ -248,6 +260,11 @@ unsafe fn sandbox_close(
             }
         }
         let result = operation(descriptor);
+        if result == 0
+            && let Some((open, last_alias)) = &tracked
+        {
+            release_local_close_locks(open, *last_alias);
+        }
         if result != 0
             && let Some((open, _)) = tracked
         {
@@ -330,6 +347,9 @@ unsafe fn sandbox_fclose(stream: *mut libc::FILE) -> libc::c_int {
             }
         }
         let result = unsafe { original(stream) };
+        if let Some((open, last_alias)) = &tracked {
+            release_local_close_locks(open, *last_alias);
+        }
         if result != 0 {
             return result;
         }
@@ -439,6 +459,9 @@ pub unsafe extern "C" fn agora_sandbox_dup2(
         if result >= 0 {
             let replaced = runtime.take_descriptor(destination);
             runtime.duplicate_descriptor(source, destination);
+            if let Some((open, last_alias)) = &replaced {
+                release_local_close_locks(open, *last_alias);
+            }
             if let Some((open, true)) = replaced
                 && (open.remote.is_some() || open.local.is_some())
                 && !runtime.has_mapping(&open)
@@ -484,6 +507,97 @@ pub extern "C" fn agora_sandbox_fcntl_setfd_argument(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_fcntl_commit_setfd(descriptor: libc::c_int) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        refresh_descriptor_inheritance(descriptor);
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_fcntl_getfl(
+    descriptor: libc::c_int,
+    native_flags: libc::c_int,
+) -> libc::c_int {
+    match catch_unwind(AssertUnwindSafe(|| -> Result<libc::c_int> {
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return Ok(native_flags);
+        };
+        let Some(open) = runtime.tracked_open(descriptor) else {
+            return Ok(native_flags);
+        };
+        let Some(registration) = &open.local else {
+            return Ok(native_flags);
+        };
+        let _mutation = lock(&registration.mutation);
+        let state = registration.state.lock()?;
+        let logical = state.flags()?;
+        Ok(
+            (native_flags & !(libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK))
+                | (logical & (libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK)),
+        )
+    })) {
+        Ok(Ok(flags)) => flags,
+        Ok(Err(error)) => unsafe { fail(&error, -1) },
+        Err(_) => {
+            unsafe { set_errno(libc::EIO) };
+            -1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_fcntl_setfl_argument(
+    descriptor: libc::c_int,
+    flags: libc::c_int,
+) -> libc::c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        let local = FilesystemHookRuntime::global()
+            .and_then(|runtime| runtime.tracked_open(descriptor))
+            .is_some_and(|open| open.local.is_some());
+        if local {
+            flags & !(libc::O_APPEND | libc::O_NONBLOCK)
+        } else {
+            flags
+        }
+    }))
+    .unwrap_or(flags)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_fcntl_commit_setfl(
+    descriptor: libc::c_int,
+    flags: libc::c_int,
+) -> libc::c_int {
+    match catch_unwind(AssertUnwindSafe(|| -> Result<()> {
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return Ok(());
+        };
+        let Some(open) = runtime.tracked_open(descriptor) else {
+            return Ok(());
+        };
+        let Some(registration) = &open.local else {
+            return Ok(());
+        };
+        let _mutation = lock(&registration.mutation);
+        let state = registration.state.lock()?;
+        let current = state.flags()?;
+        state
+            .set_flags(
+                (current & !(libc::O_APPEND | libc::O_NONBLOCK))
+                    | (flags & (libc::O_APPEND | libc::O_NONBLOCK)),
+            )
+            .map_err(Into::into)
+    })) {
+        Ok(Ok(())) => 0,
+        Ok(Err(error)) => unsafe { fail(&error, -1) },
+        Err(_) => {
+            unsafe { set_errno(libc::EIO) };
+            -1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn agora_sandbox_validate_content_fcntl(descriptor: libc::c_int) -> libc::c_int {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(runtime) = FilesystemHookRuntime::global() else {
@@ -506,6 +620,35 @@ pub extern "C" fn agora_sandbox_validate_content_fcntl(descriptor: libc::c_int) 
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_lock_descriptor(descriptor: libc::c_int) -> libc::c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        FilesystemHookRuntime::global()
+            .and_then(|runtime| runtime.tracked_open(descriptor))
+            .and_then(|open| open.local.as_ref().map(|local| local.lock.as_raw_fd()))
+            .unwrap_or(descriptor)
+    }))
+    .unwrap_or(descriptor)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_flock(
+    descriptor: libc::c_int,
+    operation: libc::c_int,
+) -> libc::c_int {
+    catch_filesystem_panic(-1, || {
+        let Some(original) = original_flock() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return -1;
+        };
+        let Some(_guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(descriptor, operation) };
+        };
+        let descriptor = agora_sandbox_lock_descriptor(descriptor);
+        unsafe { original(descriptor, operation) }
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn agora_sandbox_original_fcntl() -> *const libc::c_void {
     INTERPOSE_FCNTL.replacee
 }
@@ -516,6 +659,32 @@ fn original_truncate() -> Option<TruncateFn> {
 
 fn original_ftruncate() -> Option<FtruncateFn> {
     function_from_interpose(&INTERPOSE_FTRUNCATE)
+}
+
+fn original_flock() -> Option<FlockFn> {
+    function_from_interpose(&INTERPOSE_FLOCK)
+}
+
+pub(super) fn release_local_close_locks(open: &OpenFile, last_alias: bool) {
+    let Some(local) = &open.local else {
+        return;
+    };
+    let errno = unsafe { *libc::__error() };
+    let mut unlock = libc::flock {
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+        l_type: libc::F_UNLCK,
+        l_whence: libc::SEEK_SET as libc::c_short,
+    };
+    unsafe {
+        libc::fcntl(local.lock.as_raw_fd(), libc::F_SETLK, &raw mut unlock);
+        if last_alias {
+            libc::fcntl(local.lock.as_raw_fd(), libc::F_OFD_SETLK, &raw mut unlock);
+            libc::flock(local.lock.as_raw_fd(), libc::LOCK_UN);
+        }
+        set_errno(errno);
+    }
 }
 
 pub(super) fn original_close() -> Option<CloseFn> {
@@ -588,3 +757,5 @@ dyld_interpose!(INTERPOSE_DUP, agora_sandbox_dup, libc::dup);
 dyld_interpose!(INTERPOSE_DUP2, agora_sandbox_dup2, libc::dup2);
 
 dyld_interpose!(INTERPOSE_FCNTL, agora_sandbox_fcntl_shim, libc::fcntl);
+
+dyld_interpose!(INTERPOSE_FLOCK, agora_sandbox_flock, libc::flock);

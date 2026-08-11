@@ -35,12 +35,27 @@ impl FilesystemHookRuntime {
         descriptor: libc::c_int,
         offset: libc::off_t,
     ) -> Result<Option<PendingMapping>> {
-        if flags & libc::MAP_SHARED == 0 || offset < 0 || length == 0 {
+        if offset < 0 || length == 0 {
             return Ok(None);
         }
         let Some(open) = self.tracked_open(descriptor) else {
             return Ok(None);
         };
+        if let Some(registration) = &open.local {
+            let _mutation = lock(&registration.mutation);
+            let state = registration.state.lock()?;
+            let access = state.flags()? & libc::O_ACCMODE;
+            if access == libc::O_WRONLY
+                || (flags & libc::MAP_SHARED != 0
+                    && protection & libc::PROT_WRITE != 0
+                    && access == libc::O_RDONLY)
+            {
+                return Err(io::Error::from_raw_os_error(libc::EACCES).into());
+            }
+        }
+        if flags & libc::MAP_SHARED == 0 {
+            return Ok(None);
+        }
         let file_offset = offset as u64;
         let file_end = file_offset
             .checked_add(u64::try_from(length).context("memory mapping length overflowed")?)
@@ -160,6 +175,11 @@ impl FilesystemHookRuntime {
     }
 
     fn flush_mapping_slices(&self, slices: &[MappingSlice], durable: bool) -> Result<()> {
+        Self::flush_native_mapping_slices(slices)?;
+        self.sync_mapping_slices(slices, durable)
+    }
+
+    fn flush_native_mapping_slices(slices: &[MappingSlice]) -> Result<()> {
         let msync = original_msync().context("msync is unavailable")?;
         for slice in slices {
             if unsafe {
@@ -173,7 +193,7 @@ impl FilesystemHookRuntime {
                 return Err(io::Error::last_os_error().into());
             }
         }
-        self.sync_mapping_slices(slices, durable)
+        Ok(())
     }
 
     fn full_mapping_slices(&self, include: impl Fn(&MemoryMapping) -> bool) -> Vec<MappingSlice> {
@@ -302,6 +322,12 @@ impl FilesystemHookRuntime {
     pub(super) fn flush_memory_mappings(&self) -> Result<()> {
         let slices = self.full_mapping_slices(|_| true);
         self.flush_mapping_slices(&slices, true)
+    }
+
+    #[cfg(any(agora_sandbox_hook_build, test, coverage))]
+    pub(super) fn flush_native_memory_mappings(&self) -> Result<()> {
+        let slices = self.full_mapping_slices(|_| true);
+        Self::flush_native_mapping_slices(&slices)
     }
 }
 
