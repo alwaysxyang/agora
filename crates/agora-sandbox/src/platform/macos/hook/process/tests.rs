@@ -1,6 +1,6 @@
 use super::{
-    ChildArguments, ChildEnvironment, MAX_RECORDED_ARGUMENT_BYTES, PrepareError,
-    PreparedExecutable, ProcessHookGuard, ProcessHookRuntime, TRUNCATED_ARGUMENTS,
+    ChildArguments, ChildEnvironment, INSIDE_PROCESS_HOOK, MAX_RECORDED_ARGUMENT_BYTES,
+    PrepareError, PreparedExecutable, ProcessHookGuard, ProcessHookRuntime, TRUNCATED_ARGUMENTS,
     agora_sandbox_execv, agora_sandbox_execve, agora_sandbox_execvp, agora_sandbox_posix_spawn,
     agora_sandbox_posix_spawnp, current_environment, execute, io_errno, prepared_executable,
     process_event_request, requested_executable, resolve_current_directory, search_path_executable,
@@ -11,6 +11,7 @@ use crate::callback::ProcessOperation;
 use crate::execution::{EXECUTION_PROTOCOL_VERSION, decode_prepare_request};
 use crate::platform::hook::config::HookConfig;
 use crate::trace::TraceContext;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io::{Read, Write};
@@ -341,10 +342,17 @@ fn child_environment_restores_tls_trust_after_the_caller_clears_it() {
 
 #[test]
 fn process_hook_guard_blocks_recursion_until_dropped() {
-    let guard = ProcessHookGuard::enter().unwrap();
-    assert!(ProcessHookGuard::enter().is_none());
+    let guard = ProcessHookGuard::enter_when_ready(true).unwrap();
+    assert!(ProcessHookGuard::enter_when_ready(true).is_none());
     drop(guard);
-    assert!(ProcessHookGuard::enter().is_some());
+    assert!(ProcessHookGuard::enter_when_ready(true).is_some());
+}
+
+#[test]
+fn process_hook_guard_does_not_touch_tls_before_initialization() {
+    INSIDE_PROCESS_HOOK.with(|inside| inside.set(false));
+    assert!(ProcessHookGuard::enter_when_ready(false).is_none());
+    assert!(!INSIDE_PROCESS_HOOK.with(Cell::get));
 }
 
 #[test]
@@ -687,7 +695,7 @@ fn process_runtime_rejects_an_oversized_execution_token_before_sending() {
 
 #[test]
 fn process_interposers_fail_closed_during_recursive_entry() {
-    let _guard = ProcessHookGuard::enter().unwrap();
+    let _guard = ProcessHookGuard::enter_when_ready(true).unwrap();
 
     assert_eq!(
         unsafe {
@@ -745,7 +753,7 @@ fn process_runtime_and_direct_execution_fail_closed_without_configuration() {
         .is_err()
     );
 
-    let _guard = ProcessHookGuard::enter().unwrap();
+    let _guard = ProcessHookGuard::enter_when_ready(true).unwrap();
     assert_eq!(
         unsafe {
             execute(

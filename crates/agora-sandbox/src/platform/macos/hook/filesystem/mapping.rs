@@ -10,6 +10,8 @@ type MmapFn = unsafe extern "C" fn(
 ) -> *mut libc::c_void;
 type MemoryFn = unsafe extern "C" fn(*mut libc::c_void, usize) -> libc::c_int;
 type MemoryFlagsFn = unsafe extern "C" fn(*mut libc::c_void, usize, libc::c_int) -> libc::c_int;
+const DESCRIPTOR_INDEX_BITS: usize = 65_536;
+const DESCRIPTOR_WORD_BITS: usize = u64::BITS as usize;
 
 #[derive(Clone)]
 struct MappingSlice {
@@ -24,6 +26,139 @@ struct PendingMapping {
     file_offset: u64,
     writable: bool,
     open: Arc<OpenFile>,
+}
+
+#[derive(Clone, Copy)]
+struct MappingRange {
+    start: usize,
+    end: usize,
+}
+
+struct AtomicSnapshot<T: Send + Sync> {
+    current: AtomicPtr<T>,
+    readers: AtomicUsize,
+    retired: Mutex<Vec<Box<T>>>,
+}
+
+struct SnapshotReadGuard<'a, T: Send + Sync> {
+    snapshot: &'a AtomicSnapshot<T>,
+}
+
+impl<T: Send + Sync> AtomicSnapshot<T> {
+    fn new(value: T) -> Self {
+        Self {
+            current: AtomicPtr::new(Box::into_raw(Box::new(value))),
+            readers: AtomicUsize::new(0),
+            retired: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn read<R>(&self, operation: impl FnOnce(&T) -> R) -> R {
+        self.readers.fetch_add(1, Ordering::SeqCst);
+        let _guard = SnapshotReadGuard { snapshot: self };
+        let current = self.current.load(Ordering::SeqCst);
+        // The reader count is incremented before loading `current`. Publishers
+        // retain every replaced allocation until no snapshot reader exists.
+        operation(unsafe { &*current })
+    }
+
+    fn publish(&self, value: T) {
+        let next = Box::into_raw(Box::new(value));
+        let previous = self.current.swap(next, Ordering::SeqCst);
+        let mut retired = lock(&self.retired);
+        // `previous` came from `Box::into_raw` and remains owned by this
+        // snapshot until all readers that could have observed it are gone.
+        retired.push(unsafe { Box::from_raw(previous) });
+        if self.readers.load(Ordering::SeqCst) == 0 {
+            retired.clear();
+        }
+    }
+}
+
+impl<T: Send + Sync> Drop for AtomicSnapshot<T> {
+    fn drop(&mut self) {
+        debug_assert_eq!(*self.readers.get_mut(), 0);
+        let current = *self.current.get_mut();
+        // The runtime can only be dropped after its readers have completed, and
+        // `current` is the one allocation not owned by `retired`.
+        drop(unsafe { Box::from_raw(current) });
+    }
+}
+
+impl<T: Send + Sync> Drop for SnapshotReadGuard<'_, T> {
+    fn drop(&mut self) {
+        self.snapshot.readers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub(super) struct MemoryStateIndex {
+    mappings: AtomicSnapshot<Vec<MappingRange>>,
+    descriptors: Box<[AtomicU64]>,
+}
+
+impl MemoryStateIndex {
+    pub(super) fn new() -> Self {
+        Self {
+            mappings: AtomicSnapshot::new(Vec::new()),
+            descriptors: (0..DESCRIPTOR_INDEX_BITS / DESCRIPTOR_WORD_BITS)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+        }
+    }
+
+    fn publish_mappings(&self, mappings: &[MemoryMapping]) {
+        self.mappings.publish(
+            mappings
+                .iter()
+                .map(|mapping| MappingRange {
+                    start: mapping.start,
+                    end: mapping.end,
+                })
+                .collect(),
+        );
+    }
+
+    pub(super) fn set_descriptor(&self, descriptor: libc::c_int, tracked: bool) {
+        let Ok(descriptor) = usize::try_from(descriptor) else {
+            return;
+        };
+        let Some(word) = self.descriptors.get(descriptor / DESCRIPTOR_WORD_BITS) else {
+            return;
+        };
+        let mask = 1_u64 << (descriptor % DESCRIPTOR_WORD_BITS);
+        if tracked {
+            word.fetch_or(mask, Ordering::Release);
+        } else {
+            word.fetch_and(!mask, Ordering::Release);
+        }
+    }
+
+    fn overlaps(&self, start: usize, end: usize) -> bool {
+        self.mappings.read(|mappings| {
+            mappings
+                .iter()
+                .any(|mapping| start < mapping.end && mapping.start < end)
+        })
+    }
+
+    fn descriptor_state(&self, descriptor: libc::c_int) -> Option<bool> {
+        let Ok(descriptor) = usize::try_from(descriptor) else {
+            return Some(false);
+        };
+        let word = self.descriptors.get(descriptor / DESCRIPTOR_WORD_BITS)?;
+        let mask = 1_u64 << (descriptor % DESCRIPTOR_WORD_BITS);
+        Some(word.load(Ordering::Acquire) & mask != 0)
+    }
+}
+
+impl FilesystemHookRuntime {
+    fn try_mapping_operation(&self) -> Option<MutexGuard<'_, ()>> {
+        match self.mapping_operations.try_lock() {
+            Ok(operation) => Some(operation),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
 }
 
 impl FilesystemHookRuntime {
@@ -84,13 +219,15 @@ impl FilesystemHookRuntime {
         let end = start
             .checked_add(length)
             .context("memory mapping address overflowed")?;
-        lock(&self.mappings).push(MemoryMapping {
+        let mut mappings = lock(&self.mappings);
+        mappings.push(MemoryMapping {
             start,
             end,
             file_offset: pending.file_offset,
             writable: pending.writable,
             open: pending.open,
         });
+        self.memory_index.publish_mappings(&mappings);
         Ok(())
     }
 
@@ -211,11 +348,13 @@ impl FilesystemHookRuntime {
     }
 
     pub(super) fn flush_open_mappings(&self, open: &Arc<OpenFile>, durable: bool) -> Result<()> {
+        let _operation = lock(&self.mapping_operations);
         let slices = self.full_mapping_slices(|mapping| Arc::ptr_eq(&mapping.open, open));
         self.flush_mapping_slices(&slices, durable)
     }
 
     pub(super) fn flush_logical_mappings(&self, logical: &Path, durable: bool) -> Result<()> {
+        let _operation = lock(&self.mapping_operations);
         let mappings = lock(&self.mappings).clone();
         let slices = mappings
             .iter()
@@ -260,6 +399,7 @@ impl FilesystemHookRuntime {
             }
         }
         *mappings = retained;
+        self.memory_index.publish_mappings(&mappings);
         affected
     }
 
@@ -320,15 +460,110 @@ impl FilesystemHookRuntime {
     }
 
     pub(super) fn flush_memory_mappings(&self) -> Result<()> {
+        let _operation = lock(&self.mapping_operations);
         let slices = self.full_mapping_slices(|_| true);
         self.flush_mapping_slices(&slices, true)
     }
 
     #[cfg(any(agora_sandbox_hook_build, test, coverage))]
     pub(super) fn flush_native_memory_mappings(&self) -> Result<()> {
+        let _operation = lock(&self.mapping_operations);
         let slices = self.full_mapping_slices(|_| true);
         Self::flush_native_mapping_slices(&slices)
     }
+}
+
+#[derive(Clone, Copy)]
+enum MemoryRuntimeState {
+    Inactive,
+    Ready(&'static FilesystemHookRuntime),
+    #[cfg(not(test))]
+    Unavailable,
+}
+
+#[derive(Clone, Copy)]
+enum MemoryRoute {
+    Native,
+    Managed(&'static FilesystemHookRuntime),
+    #[cfg_attr(test, allow(dead_code))]
+    Busy,
+}
+
+#[cfg(test)]
+fn memory_runtime_state() -> MemoryRuntimeState {
+    let runtime = TEST_FILESYSTEM_RUNTIME.with(Cell::get);
+    if runtime.is_null() {
+        MemoryRuntimeState::Inactive
+    } else {
+        MemoryRuntimeState::Ready(unsafe { &*runtime })
+    }
+}
+
+#[cfg(not(test))]
+fn memory_runtime_state() -> MemoryRuntimeState {
+    if !super::super::initialized() {
+        return MemoryRuntimeState::Inactive;
+    }
+    if super::super::config::global().is_none() {
+        return MemoryRuntimeState::Inactive;
+    }
+    match FILESYSTEM_RUNTIME.get().and_then(Option::as_ref) {
+        Some(runtime) => MemoryRuntimeState::Ready(runtime),
+        None => MemoryRuntimeState::Unavailable,
+    }
+}
+
+fn mapping_range_route(start: usize, end: usize) -> MemoryRoute {
+    let runtime = match memory_runtime_state() {
+        MemoryRuntimeState::Inactive => return MemoryRoute::Native,
+        MemoryRuntimeState::Ready(runtime) => runtime,
+        #[cfg(not(test))]
+        MemoryRuntimeState::Unavailable => return MemoryRoute::Busy,
+    };
+    if runtime.memory_index.overlaps(start, end) {
+        MemoryRoute::Managed(runtime)
+    } else {
+        MemoryRoute::Native
+    }
+}
+
+fn mmap_route(
+    address: *mut libc::c_void,
+    length: usize,
+    flags: libc::c_int,
+    descriptor: libc::c_int,
+) -> MemoryRoute {
+    let fixed = flags & libc::MAP_FIXED != 0;
+    let file_backed = flags & libc::MAP_ANON == 0;
+    if !fixed && !file_backed {
+        return MemoryRoute::Native;
+    }
+
+    let runtime = match memory_runtime_state() {
+        MemoryRuntimeState::Inactive => return MemoryRoute::Native,
+        MemoryRuntimeState::Ready(runtime) => runtime,
+        #[cfg(not(test))]
+        MemoryRuntimeState::Unavailable => return MemoryRoute::Busy,
+    };
+    if fixed {
+        let end = (address as usize) + length;
+        if runtime.memory_index.overlaps(address as usize, end) {
+            return MemoryRoute::Managed(runtime);
+        }
+    }
+    if !file_backed {
+        return MemoryRoute::Native;
+    }
+
+    match runtime.memory_index.descriptor_state(descriptor) {
+        Some(true) | None => MemoryRoute::Managed(runtime),
+        Some(false) => MemoryRoute::Native,
+    }
+}
+
+unsafe fn fail_closed_memory<T>(failure: T) -> T {
+    unsafe { set_errno(libc::EAGAIN) };
+    failure
 }
 
 unsafe fn sandbox_mmap(
@@ -339,29 +574,44 @@ unsafe fn sandbox_mmap(
     descriptor: libc::c_int,
     offset: libc::off_t,
 ) -> *mut libc::c_void {
+    let Some(original) = original_mmap() else {
+        unsafe { set_errno(libc::ENOSYS) };
+        return libc::MAP_FAILED;
+    };
+    if flags & libc::MAP_FIXED != 0 && (address as usize).checked_add(length).is_none() {
+        unsafe { set_errno(libc::EOVERFLOW) };
+        return libc::MAP_FAILED;
+    }
+    let runtime = match mmap_route(address, length, flags, descriptor) {
+        MemoryRoute::Native => {
+            return unsafe { original(address, length, protection, flags, descriptor, offset) };
+        }
+        MemoryRoute::Managed(runtime) => runtime,
+        MemoryRoute::Busy => return unsafe { fail_closed_memory(libc::MAP_FAILED) },
+    };
+
     catch_filesystem_panic(libc::MAP_FAILED, || {
-        let Some(original) = original_mmap() else {
-            unsafe { set_errno(libc::ENOSYS) };
-            return libc::MAP_FAILED;
-        };
         let Some(_guard) = FilesystemHookGuard::enter() else {
-            return unsafe { original(address, length, protection, flags, descriptor, offset) };
+            return unsafe { fail_closed_memory(libc::MAP_FAILED) };
         };
-        let Some(runtime) = FilesystemHookRuntime::global() else {
-            return unsafe { original(address, length, protection, flags, descriptor, offset) };
+        let Some(operation) = runtime.try_mapping_operation() else {
+            return unsafe { fail_closed_memory(libc::MAP_FAILED) };
         };
+        match mmap_route(address, length, flags, descriptor) {
+            MemoryRoute::Native => {
+                return unsafe { original(address, length, protection, flags, descriptor, offset) };
+            }
+            MemoryRoute::Managed(_) => {}
+            MemoryRoute::Busy => return unsafe { fail_closed_memory(libc::MAP_FAILED) },
+        }
         let pending = match runtime.prepare_mapping(length, protection, flags, descriptor, offset) {
             Ok(pending) => pending,
             Err(error) => return unsafe { fail(&error, libc::MAP_FAILED) },
         };
-        if flags & libc::MAP_FIXED != 0 {
-            let Some(_) = (address as usize).checked_add(length) else {
-                unsafe { set_errno(libc::EOVERFLOW) };
-                return libc::MAP_FAILED;
-            };
-            if let Err(error) = sync_native_mappings(runtime, address as usize, length, true) {
-                return unsafe { fail(&error, libc::MAP_FAILED) };
-            }
+        if flags & libc::MAP_FIXED != 0
+            && let Err(error) = sync_native_mappings(runtime, address as usize, length, true)
+        {
+            return unsafe { fail(&error, libc::MAP_FAILED) };
         }
         let mapped = unsafe { original(address, length, protection, flags, descriptor, offset) };
         if mapped == libc::MAP_FAILED {
@@ -384,9 +634,11 @@ unsafe fn sandbox_mmap(
             if let Some(munmap) = original_munmap() {
                 unsafe { munmap(mapped, length) };
             }
+            drop(operation);
             let _ = runtime.finish_unreferenced(replaced);
             return unsafe { fail(&error, libc::MAP_FAILED) };
         }
+        drop(operation);
         let _ = runtime.finish_unreferenced(replaced);
         mapped
     })
@@ -409,21 +661,32 @@ unsafe fn sandbox_msync(
     length: usize,
     flags: libc::c_int,
 ) -> libc::c_int {
+    let Some(original) = original_msync() else {
+        unsafe { set_errno(libc::ENOSYS) };
+        return -1;
+    };
+    let Some(end) = (address as usize).checked_add(length) else {
+        unsafe { set_errno(libc::EOVERFLOW) };
+        return -1;
+    };
+    let runtime = match mapping_range_route(address as usize, end) {
+        MemoryRoute::Native => return unsafe { original(address, length, flags) },
+        MemoryRoute::Managed(runtime) => runtime,
+        MemoryRoute::Busy => return unsafe { fail_closed_memory(-1) },
+    };
+
     catch_filesystem_panic(-1, || {
-        let Some(original) = original_msync() else {
-            unsafe { set_errno(libc::ENOSYS) };
-            return -1;
-        };
         let Some(_guard) = FilesystemHookGuard::enter() else {
-            return unsafe { original(address, length, flags) };
+            return unsafe { fail_closed_memory(-1) };
         };
-        let Some(runtime) = FilesystemHookRuntime::global() else {
-            return unsafe { original(address, length, flags) };
+        let Some(_operation) = runtime.try_mapping_operation() else {
+            return unsafe { fail_closed_memory(-1) };
         };
-        let Some(end) = (address as usize).checked_add(length) else {
-            unsafe { set_errno(libc::EOVERFLOW) };
-            return -1;
-        };
+        match mapping_range_route(address as usize, end) {
+            MemoryRoute::Native => return unsafe { original(address, length, flags) },
+            MemoryRoute::Managed(_) => {}
+            MemoryRoute::Busy => return unsafe { fail_closed_memory(-1) },
+        }
         let result = unsafe { original(address, length, flags) };
         if result != 0 {
             return result;
@@ -446,21 +709,32 @@ pub unsafe extern "C" fn agora_sandbox_msync(
 }
 
 unsafe fn sandbox_munmap(address: *mut libc::c_void, length: usize) -> libc::c_int {
+    let Some(original) = original_munmap() else {
+        unsafe { set_errno(libc::ENOSYS) };
+        return -1;
+    };
+    let Some(end) = (address as usize).checked_add(length) else {
+        unsafe { set_errno(libc::EOVERFLOW) };
+        return -1;
+    };
+    let runtime = match mapping_range_route(address as usize, end) {
+        MemoryRoute::Native => return unsafe { original(address, length) },
+        MemoryRoute::Managed(runtime) => runtime,
+        MemoryRoute::Busy => return unsafe { fail_closed_memory(-1) },
+    };
+
     catch_filesystem_panic(-1, || {
-        let Some(original) = original_munmap() else {
-            unsafe { set_errno(libc::ENOSYS) };
-            return -1;
-        };
         let Some(_guard) = FilesystemHookGuard::enter() else {
-            return unsafe { original(address, length) };
+            return unsafe { fail_closed_memory(-1) };
         };
-        let Some(runtime) = FilesystemHookRuntime::global() else {
-            return unsafe { original(address, length) };
+        let Some(operation) = runtime.try_mapping_operation() else {
+            return unsafe { fail_closed_memory(-1) };
         };
-        let Some(end) = (address as usize).checked_add(length) else {
-            unsafe { set_errno(libc::EOVERFLOW) };
-            return -1;
-        };
+        match mapping_range_route(address as usize, end) {
+            MemoryRoute::Native => return unsafe { original(address, length) },
+            MemoryRoute::Managed(_) => {}
+            MemoryRoute::Busy => return unsafe { fail_closed_memory(-1) },
+        }
         if let Err(error) = sync_native_mappings(runtime, address as usize, length, true) {
             return unsafe { fail(&error, -1) };
         }
@@ -469,6 +743,7 @@ unsafe fn sandbox_munmap(address: *mut libc::c_void, length: usize) -> libc::c_i
             return result;
         }
         let affected = runtime.remove_mappings(address as usize, end);
+        drop(operation);
         let _ = runtime.finish_unreferenced(affected);
         result
     })
@@ -487,21 +762,32 @@ unsafe fn sandbox_mprotect(
     length: usize,
     protection: libc::c_int,
 ) -> libc::c_int {
+    let Some(original) = original_mprotect() else {
+        unsafe { set_errno(libc::ENOSYS) };
+        return -1;
+    };
+    let Some(end) = (address as usize).checked_add(length) else {
+        unsafe { set_errno(libc::EOVERFLOW) };
+        return -1;
+    };
+    let runtime = match mapping_range_route(address as usize, end) {
+        MemoryRoute::Native => return unsafe { original(address, length, protection) },
+        MemoryRoute::Managed(runtime) => runtime,
+        MemoryRoute::Busy => return unsafe { fail_closed_memory(-1) },
+    };
+
     catch_filesystem_panic(-1, || {
-        let Some(original) = original_mprotect() else {
-            unsafe { set_errno(libc::ENOSYS) };
-            return -1;
-        };
         let Some(_guard) = FilesystemHookGuard::enter() else {
-            return unsafe { original(address, length, protection) };
+            return unsafe { fail_closed_memory(-1) };
         };
-        let Some(runtime) = FilesystemHookRuntime::global() else {
-            return unsafe { original(address, length, protection) };
+        let Some(_operation) = runtime.try_mapping_operation() else {
+            return unsafe { fail_closed_memory(-1) };
         };
-        let Some(end) = (address as usize).checked_add(length) else {
-            unsafe { set_errno(libc::EOVERFLOW) };
-            return -1;
-        };
+        match mapping_range_route(address as usize, end) {
+            MemoryRoute::Native => return unsafe { original(address, length, protection) },
+            MemoryRoute::Managed(_) => {}
+            MemoryRoute::Busy => return unsafe { fail_closed_memory(-1) },
+        }
         if protection & libc::PROT_WRITE == 0
             && let Err(error) = sync_native_mappings(runtime, address as usize, length, true)
         {

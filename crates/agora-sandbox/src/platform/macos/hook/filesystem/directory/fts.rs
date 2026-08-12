@@ -783,15 +783,16 @@ unsafe fn sandbox_getattrlistbulk(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        if !FtsVirtualBulk::is_active() {
+        let Some(guard) = active_fts_bulk_guard(FilesystemHookGuard::enter()) else {
             return unsafe { original(directory, attributes, buffer, size, options) };
-        }
+        };
         if attributes.is_null() || buffer.is_null() {
             unsafe { set_errno(libc::EFAULT) };
             return -1;
         }
         let attributes = unsafe { std::ptr::read(attributes.cast::<libc::attrlist>()) };
         if !fts_attributes_supported(&attributes) {
+            drop(guard);
             return unsafe {
                 original(
                     directory,
@@ -802,18 +803,8 @@ unsafe fn sandbox_getattrlistbulk(
                 )
             };
         }
-        let Some(_guard) = FilesystemHookGuard::enter() else {
-            return unsafe {
-                original(
-                    directory,
-                    (&raw const attributes).cast_mut().cast(),
-                    buffer,
-                    size,
-                    options,
-                )
-            };
-        };
         let Some(runtime) = FilesystemHookRuntime::global() else {
+            drop(guard);
             return unsafe {
                 original(
                     directory,
@@ -904,6 +895,18 @@ unsafe fn sandbox_getattrlistbulk(
         unsafe { set_errno(0) };
         count
     })
+}
+
+fn active_fts_bulk_guard(guard: Option<FilesystemHookGuard>) -> Option<FilesystemHookGuard> {
+    active_fts_bulk_guard_with(guard, FtsVirtualBulk::is_active)
+}
+
+fn active_fts_bulk_guard_with(
+    guard: Option<FilesystemHookGuard>,
+    is_active: impl FnOnce() -> bool,
+) -> Option<FilesystemHookGuard> {
+    let guard = guard?;
+    is_active().then_some(guard)
 }
 
 #[unsafe(no_mangle)]

@@ -148,6 +148,21 @@ impl Drop for SpawnFileActions {
 
 impl ProcessHookGuard {
     fn enter() -> Option<Self> {
+        Self::enter_when_ready(super::initialized() || test_process_runtime_is_set())
+    }
+
+    fn enter_when_ready(ready: bool) -> Option<Self> {
+        if !ready {
+            return None;
+        }
+        Self::enter_initialized()
+    }
+
+    // Keep Darwin TLV access out of the pre-initialization fast path. This
+    // mirrors the filesystem guard because x86_64 may call process symbols
+    // while libSystem is still bootstrapping thread-local storage.
+    #[inline(never)]
+    fn enter_initialized() -> Option<Self> {
         INSIDE_PROCESS_HOOK.with(|inside| {
             if inside.replace(true) {
                 None
@@ -156,6 +171,16 @@ impl ProcessHookGuard {
             }
         })
     }
+}
+
+#[cfg(test)]
+fn test_process_runtime_is_set() -> bool {
+    TEST_PROCESS_RUNTIME.with(|runtime| !runtime.get().is_null())
+}
+
+#[cfg(not(test))]
+const fn test_process_runtime_is_set() -> bool {
+    false
 }
 
 impl Drop for ProcessHookGuard {

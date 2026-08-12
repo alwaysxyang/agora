@@ -16,6 +16,7 @@ use crate::filesystem::{
 };
 use crate::trace::TraceContext;
 use anyhow::{Context, Result};
+use mapping::MemoryStateIndex;
 use nfs::{RemoteAnchor, RemoteDirectoryView, RemoteFilesystem, RemoteOpen};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -30,7 +31,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
 use std::sync::Once;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 const NATIVE_PASSTHROUGH_ROOTS: &[&str] = &["/dev"];
@@ -40,7 +41,6 @@ const MAX_INHERITED_LOCAL_DESCRIPTORS: usize = 256;
 
 thread_local! {
     static INSIDE_FILESYSTEM_HOOK: Cell<bool> = const { Cell::new(false) };
-    static INITIALIZING_FILESYSTEM_RUNTIME: Cell<bool> = const { Cell::new(false) };
     static FORK_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
     #[cfg(test)]
     static TEST_FILESYSTEM_RUNTIME: Cell<*const FilesystemHookRuntime> = const { Cell::new(std::ptr::null()) };
@@ -59,7 +59,7 @@ pub(super) fn initialize_process() -> Result<()> {
             Some(reset_filesystem_after_fork),
         );
     });
-    if config::global().is_some() && FilesystemHookRuntime::global().is_none() {
+    if config::global().is_some() && FilesystemHookRuntime::initialize_global().is_none() {
         anyhow::bail!("failed to initialize the filesystem hook runtime");
     }
     Ok(())
@@ -153,6 +153,8 @@ struct FilesystemHookRuntime {
     current_directory: Mutex<CurrentDirectory>,
     open_files: Mutex<HashMap<libc::c_int, Arc<OpenFile>>>,
     mappings: Mutex<Vec<MemoryMapping>>,
+    memory_index: MemoryStateIndex,
+    mapping_operations: Mutex<()>,
     directory_descriptors: Mutex<HashMap<libc::c_int, DirectoryDescriptor>>,
 }
 
@@ -382,6 +384,21 @@ impl OpenFile {
 
 impl FilesystemHookRuntime {
     fn global() -> Option<&'static Self> {
+        Self::global_when_ready(super::initialized() || test_runtime_is_set())
+    }
+
+    fn global_when_ready(ready: bool) -> Option<&'static Self> {
+        if !ready {
+            return None;
+        }
+        Self::global_initialized()
+    }
+
+    // Keep every runtime lookup, including calls from the variadic C shim, out
+    // of Darwin TLV and OnceLock initialization until the dylib initializer has
+    // completed. The initializer uses `initialize_global` directly.
+    #[inline(never)]
+    fn global_initialized() -> Option<&'static Self> {
         #[cfg(test)]
         {
             let runtime = TEST_FILESYSTEM_RUNTIME.with(Cell::get);
@@ -389,14 +406,12 @@ impl FilesystemHookRuntime {
                 return Some(unsafe { &*runtime });
             }
         }
-        if let Some(runtime) = FILESYSTEM_RUNTIME.get() {
-            return runtime.as_ref();
-        }
-        INITIALIZING_FILESYSTEM_RUNTIME.with(|initializing| {
-            if initializing.replace(true) {
-                return None;
-            }
-            let runtime = FILESYSTEM_RUNTIME.get_or_init(|| {
+        Self::initialize_global()
+    }
+
+    fn initialize_global() -> Option<&'static Self> {
+        FILESYSTEM_RUNTIME
+            .get_or_init(|| {
                 config::global().and_then(|config| {
                     let filesystem = match config.filesystem_cipher() {
                         Some(cipher) => {
@@ -448,6 +463,8 @@ impl FilesystemHookRuntime {
                             current_directory: Mutex::new(current_directory),
                             open_files: Mutex::new(HashMap::new()),
                             mappings: Mutex::new(Vec::new()),
+                            memory_index: MemoryStateIndex::new(),
+                            mapping_operations: Mutex::new(()),
                             directory_descriptors: Mutex::new(HashMap::new()),
                         };
                         runtime.restore_inherited_local_descriptors(
@@ -456,10 +473,8 @@ impl FilesystemHookRuntime {
                         Some(runtime)
                     })
                 })
-            });
-            initializing.set(false);
-            runtime.as_ref()
-        })
+            })
+            .as_ref()
     }
 
     #[cfg(test)]
@@ -480,6 +495,8 @@ impl FilesystemHookRuntime {
             }),
             open_files: Mutex::new(HashMap::new()),
             mappings: Mutex::new(Vec::new()),
+            memory_index: MemoryStateIndex::new(),
+            mapping_operations: Mutex::new(()),
             directory_descriptors: Mutex::new(HashMap::new()),
         })
     }
@@ -503,6 +520,8 @@ impl FilesystemHookRuntime {
             }),
             open_files: Mutex::new(HashMap::new()),
             mappings: Mutex::new(Vec::new()),
+            memory_index: MemoryStateIndex::new(),
+            mapping_operations: Mutex::new(()),
             directory_descriptors: Mutex::new(HashMap::new()),
         })
     }
@@ -1005,7 +1024,10 @@ impl FilesystemHookRuntime {
     }
 
     fn register(&self, descriptor: libc::c_int, open: OpenFile) {
-        lock(&self.open_files).insert(descriptor, Arc::new(open));
+        let _mapping_operation = lock(&self.mapping_operations);
+        let mut files = lock(&self.open_files);
+        files.insert(descriptor, Arc::new(open));
+        self.memory_index.set_descriptor(descriptor, true);
     }
 
     fn tracked(&self, descriptor: libc::c_int) -> Option<FileContext> {
@@ -1048,6 +1070,7 @@ impl FilesystemHookRuntime {
     }
 
     fn duplicate_descriptor(&self, source: libc::c_int, destination: libc::c_int) {
+        let _mapping_operation = lock(&self.mapping_operations);
         let mut files = lock(&self.open_files);
         let close_on_exec = files
             .get(&source)
@@ -1062,6 +1085,8 @@ impl FilesystemHookRuntime {
                 None
             }
         };
+        self.memory_index
+            .set_descriptor(destination, duplicated.is_some());
         drop(files);
 
         if let Some(open) = duplicated {
@@ -1145,6 +1170,7 @@ impl FilesystemHookRuntime {
         {
             return;
         }
+        let _mapping_operation = lock(&self.mapping_operations);
         let content_descriptors = inherited
             .descriptors
             .iter()
@@ -1266,22 +1292,29 @@ impl FilesystemHookRuntime {
                 open
             };
             files.insert(inherited.descriptor, open);
+            self.memory_index.set_descriptor(inherited.descriptor, true);
         }
     }
 
     fn take_descriptor(&self, descriptor: libc::c_int) -> Option<(Arc<OpenFile>, bool)> {
+        let _mapping_operation = lock(&self.mapping_operations);
         let mut files = lock(&self.open_files);
         let open = files.remove(&descriptor)?;
         let last_alias = !files
             .values()
             .any(|candidate| Arc::ptr_eq(candidate, &open));
+        self.memory_index.set_descriptor(descriptor, false);
         drop(files);
         self.refresh_local_state_inheritance(&open);
         Some((open, last_alias))
     }
 
     fn restore_descriptor(&self, descriptor: libc::c_int, open: Arc<OpenFile>) {
-        lock(&self.open_files).insert(descriptor, Arc::clone(&open));
+        let _mapping_operation = lock(&self.mapping_operations);
+        let mut files = lock(&self.open_files);
+        files.insert(descriptor, Arc::clone(&open));
+        self.memory_index.set_descriptor(descriptor, true);
+        drop(files);
         self.refresh_local_state_inheritance(&open);
     }
 
@@ -1414,6 +1447,7 @@ impl FilesystemHookRuntime {
     }
 
     fn commit_all_open_files(&self) -> Result<()> {
+        let _mapping_operation = lock(&self.mapping_operations);
         let mut files = lock(&self.open_files);
         let mut stale = Vec::new();
         files.retain(|&descriptor, open| {
@@ -1421,6 +1455,7 @@ impl FilesystemHookRuntime {
                 true
             } else {
                 stale.push(Arc::clone(open));
+                self.memory_index.set_descriptor(descriptor, false);
                 false
             }
         });

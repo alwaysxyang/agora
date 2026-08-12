@@ -3793,6 +3793,11 @@ fn filesystem_interposers_cover_relative_allocation_and_error_paths() {
 }
 
 #[test]
+fn runtime_lookup_does_not_enter_initialization_before_the_ready_gate() {
+    assert!(FilesystemHookRuntime::global_when_ready(false).is_none());
+}
+
+#[test]
 fn mutation_interposers_keep_path_and_spawn_action_writes_in_the_overlay() {
     let fixture = Fixture::new();
     let existing = fixture.lower.join("existing");

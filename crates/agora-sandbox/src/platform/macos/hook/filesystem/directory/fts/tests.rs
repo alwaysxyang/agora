@@ -680,3 +680,13 @@ fn virtual_bulk_delegates_unsupported_recursive_and_unmanaged_requests() {
         assert_eq!(*libc::__error(), libc::EBADF);
     });
 }
+
+#[test]
+fn virtual_bulk_delegates_before_reading_tls_when_the_hook_is_unavailable() {
+    assert!(
+        active_fts_bulk_guard_with(None, || panic!(
+            "FTS TLS must not be read before initialization"
+        ))
+        .is_none()
+    );
+}
