@@ -42,16 +42,62 @@ const MAX_INHERITED_LOCAL_DESCRIPTORS: usize = 256;
 thread_local! {
     static INSIDE_FILESYSTEM_HOOK: Cell<bool> = const { Cell::new(false) };
     static FORK_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
+    static FORK_SUSPENDED_FILESYSTEM_GUARD: Cell<bool> = const { Cell::new(false) };
     #[cfg(test)]
     static TEST_FILESYSTEM_RUNTIME: Cell<*const FilesystemHookRuntime> = const { Cell::new(std::ptr::null()) };
 }
 
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
 static FILESYSTEM_FORK_BARRIER_REGISTRATION: Once = Once::new();
+static FILESYSTEM_BARRIER_READ_KEY: OnceLock<libc::pthread_key_t> = OnceLock::new();
+static FILESYSTEM_BARRIER_READ_MARKER: u8 = 0;
 static mut FILESYSTEM_FORK_BARRIER: libc::pthread_rwlock_t = libc::PTHREAD_RWLOCK_INITIALIZER;
+
+fn require_fork_barrier(result: libc::c_int) {
+    if result != 0 {
+        unsafe { libc::abort() };
+    }
+}
+
+unsafe extern "C" fn release_filesystem_barrier_read(value: *mut libc::c_void) {
+    if !value.is_null() {
+        require_fork_barrier(unsafe {
+            libc::pthread_rwlock_unlock(&raw mut FILESYSTEM_FORK_BARRIER)
+        });
+    }
+}
+
+fn filesystem_barrier_read_key() -> libc::pthread_key_t {
+    *FILESYSTEM_BARRIER_READ_KEY.get_or_init(|| {
+        let mut key = 0;
+        require_fork_barrier(unsafe {
+            libc::pthread_key_create(&mut key, Some(release_filesystem_barrier_read))
+        });
+        key
+    })
+}
+
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
+fn filesystem_barrier_read_held() -> bool {
+    !unsafe { libc::pthread_getspecific(filesystem_barrier_read_key()) }.is_null()
+}
+
+fn set_filesystem_barrier_read_held(held: bool) {
+    let value = if held {
+        (&raw const FILESYSTEM_BARRIER_READ_MARKER)
+            .cast_mut()
+            .cast::<libc::c_void>()
+    } else {
+        std::ptr::null_mut()
+    };
+    require_fork_barrier(unsafe {
+        libc::pthread_setspecific(filesystem_barrier_read_key(), value)
+    });
+}
 
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
 pub(super) fn initialize_process() -> Result<()> {
+    filesystem_barrier_read_key();
     FILESYSTEM_FORK_BARRIER_REGISTRATION.call_once(|| unsafe {
         libc::pthread_atfork(
             Some(lock_filesystem_before_fork),
@@ -68,16 +114,21 @@ pub(super) fn initialize_process() -> Result<()> {
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
 unsafe extern "C" fn lock_filesystem_before_fork() {
     FORK_IN_PROGRESS.with(|forking| forking.set(true));
-    unsafe {
-        libc::pthread_rwlock_wrlock(&raw mut FILESYSTEM_FORK_BARRIER);
+    let suspended = filesystem_barrier_read_held();
+    set_filesystem_barrier_read_held(false);
+    FORK_SUSPENDED_FILESYSTEM_GUARD.with(|guard| guard.set(suspended));
+    if suspended {
+        require_fork_barrier(unsafe {
+            libc::pthread_rwlock_unlock(&raw mut FILESYSTEM_FORK_BARRIER)
+        });
     }
+    require_fork_barrier(unsafe { libc::pthread_rwlock_wrlock(&raw mut FILESYSTEM_FORK_BARRIER) });
 }
 
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
 unsafe extern "C" fn unlock_filesystem_after_fork() {
-    unsafe {
-        libc::pthread_rwlock_unlock(&raw mut FILESYSTEM_FORK_BARRIER);
-    }
+    require_fork_barrier(unsafe { libc::pthread_rwlock_unlock(&raw mut FILESYSTEM_FORK_BARRIER) });
+    unsafe { restore_filesystem_guard_after_fork() };
     FORK_IN_PROGRESS.with(|forking| forking.set(false));
 }
 
@@ -89,8 +140,19 @@ unsafe extern "C" fn reset_filesystem_after_fork() {
             libc::PTHREAD_RWLOCK_INITIALIZER,
         );
     }
-    FORK_IN_PROGRESS.with(|forking| forking.set(false));
     unsafe { super::control::reset_after_fork() };
+    unsafe { restore_filesystem_guard_after_fork() };
+    FORK_IN_PROGRESS.with(|forking| forking.set(false));
+}
+
+#[cfg(any(agora_sandbox_hook_build, test, coverage))]
+unsafe fn restore_filesystem_guard_after_fork() {
+    let suspended = FORK_SUSPENDED_FILESYSTEM_GUARD.with(|guard| guard.replace(false));
+    if !suspended {
+        return;
+    }
+    require_fork_barrier(unsafe { libc::pthread_rwlock_rdlock(&raw mut FILESYSTEM_FORK_BARRIER) });
+    set_filesystem_barrier_read_held(true);
 }
 
 struct FilesystemHookGuard;
@@ -120,6 +182,7 @@ impl FilesystemHookGuard {
             INSIDE_FILESYSTEM_HOOK.with(|inside| inside.set(false));
             return None;
         }
+        set_filesystem_barrier_read_held(true);
         Some(Self)
     }
 }
@@ -136,9 +199,10 @@ fn test_runtime_is_set() -> bool {
 
 impl Drop for FilesystemHookGuard {
     fn drop(&mut self) {
-        unsafe {
-            libc::pthread_rwlock_unlock(&raw mut FILESYSTEM_FORK_BARRIER);
-        }
+        set_filesystem_barrier_read_held(false);
+        require_fork_barrier(unsafe {
+            libc::pthread_rwlock_unlock(&raw mut FILESYSTEM_FORK_BARRIER)
+        });
         INSIDE_FILESYSTEM_HOOK.with(|inside| inside.set(false));
     }
 }

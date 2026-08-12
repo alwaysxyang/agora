@@ -5,12 +5,13 @@ use crate::nfs::protocol::{
 };
 use crate::nfs::transport;
 use anyhow::{Context, Result};
+use std::net::Shutdown;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixListener;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use uuid::Uuid;
@@ -228,6 +229,16 @@ where
     connections: Arc<Semaphore>,
 }
 
+struct RemoteConnectionControl {
+    stream: std::os::unix::net::UnixStream,
+}
+
+impl RemoteConnectionControl {
+    fn close(&self) {
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
+}
+
 impl<S> RemoteServer<S>
 where
     S: RemoteStorage,
@@ -242,6 +253,7 @@ where
 
     async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut connections = JoinSet::new();
+        let mut controls = Vec::new();
         let mut expiry = tokio::time::interval(Duration::from_secs(30));
         expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -252,7 +264,11 @@ where
                         break;
                     }
                 }
-                Some(_) = connections.join_next(), if !connections.is_empty() => {}
+                Some(_) = connections.join_next(), if !connections.is_empty() => {
+                    controls.retain(|control: &Weak<RemoteConnectionControl>| {
+                        control.strong_count() != 0
+                    });
+                }
                 _ = expiry.tick() => self.state.broker.expire_requests().await,
                 accepted = self.listener.accept() => {
                     let (stream, _) = accepted.context("remote filesystem accept failed")?;
@@ -260,22 +276,38 @@ where
                         drop(stream);
                         continue;
                     };
+                    let stream = stream.into_std()?;
+                    configure_server_stream(
+                        &stream,
+                        REMOTE_REQUEST_TIMEOUT,
+                        REMOTE_RESPONSE_TIMEOUT,
+                    )?;
+                    let control = Arc::new(RemoteConnectionControl {
+                        stream: stream.try_clone()?,
+                    });
+                    controls.push(Arc::downgrade(&control));
                     let state = Arc::clone(&self.state);
                     connections.spawn(async move {
                         let _permit = permit;
+                        let _control = control;
                         let _ = Self::handle(stream, state).await;
                     });
                 }
             }
         }
+        controls
+            .iter()
+            .filter_map(Weak::upgrade)
+            .for_each(|control| control.close());
         connections.abort_all();
         while connections.join_next().await.is_some() {}
         Ok(())
     }
 
-    async fn handle(stream: UnixStream, state: Arc<RemoteState<S>>) -> Result<()> {
-        let mut stream = stream.into_std()?;
-        configure_server_stream(&stream, REMOTE_REQUEST_TIMEOUT, REMOTE_RESPONSE_TIMEOUT)?;
+    async fn handle(
+        mut stream: std::os::unix::net::UnixStream,
+        state: Arc<RemoteState<S>>,
+    ) -> Result<()> {
         let mut persistent = false;
         loop {
             let (returned, received) = tokio::task::spawn_blocking(move || {

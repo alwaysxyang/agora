@@ -299,8 +299,11 @@ Normal SDK shutdown terminates residual processes in the run's process group. A 
 terminates only its command's process group; exiting one client does not stop commands belonging to
 other leases. After the final CLI lease ends, the session daemon drains active relays for up to one
 second and stops the proxy listeners, execution controller, audit controller, local encrypted
-Broker, and optional NFS Broker before acknowledging the final release. Prepared
-executables, directory metadata, CA material, and CA-keyed trust bundles remain under the configured
+Broker, and optional NFS Broker before acknowledging the final release. The Broker shutdown paths
+close inherited persistent UDS endpoints before waiting for their
+connection tasks, so an idle descendant descriptor cannot keep the session daemon or Tokio blocking
+pool alive after the final lease. Prepared executables, directory metadata, CA material, and
+CA-keyed trust bundles remain under the configured
 work directory for reuse. The runtime owner monitors the network listeners, execution controller,
 audit controller, local encrypted Broker, and optional NFS Broker while any command is active. An
 unexpected service exit notifies every CLI client, which terminates its own process group, instead

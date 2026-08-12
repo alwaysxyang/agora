@@ -196,8 +196,15 @@ lease transitions the daemon to draining:
 1. Stop accepting new joins and remove the socket; racing clients reconnect and
    repeat normal startup election.
 2. Stop accepting new controller work.
-3. Drain accepted work and perform one final encrypted flush and durable sync.
-4. Shut down NFS, network, execution, and audit controllers.
+3. Drain accepted work, close inherited persistent controller streams that are
+   idle between requests, and perform one final encrypted flush and durable
+   sync. An orphan descendant can therefore finish a request already being
+   serviced but cannot keep the daemon alive solely by retaining a Local
+   Broker control descriptor; a `Ping` accepted during draining is answered
+   once and is not promoted back into an idle persistent wait.
+4. Shut down NFS, network, execution, and audit controllers. NFS shutdown first
+   closes every accepted UDS endpoint so a persistent receive running on the
+   blocking pool cannot outlive its cancelled connection task.
 5. Remove the session socket and release `.fs.lock`.
 
 A client whose connection races final shutdown retries the ordinary startup

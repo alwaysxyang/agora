@@ -222,6 +222,44 @@ async fn authenticated_remote_control_stream_survives_new_connection_denial() {
 }
 
 #[tokio::test]
+async fn shutdown_closes_idle_persistent_remote_control_streams() {
+    let runtime = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    let controller = RemoteController::start_with_storage(storage, runtime.path())
+        .await
+        .unwrap();
+    let socket = controller.runtime().socket().to_path_buf();
+    let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    let mut observer = stream.try_clone().unwrap();
+    observer
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let shared =
+        InheritedControlStream::new(stream, InheritedControlLock::anonymous().unwrap(), 0).unwrap();
+    let client = RemoteClient::with_shared(&socket, controller.runtime().token(), shared);
+
+    let client = tokio::task::spawn_blocking(move || {
+        client.ping_shared().unwrap();
+        client
+    })
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), controller.shutdown())
+        .await
+        .expect("idle persistent remote stream blocked broker shutdown")
+        .unwrap();
+    let disconnected = tokio::task::spawn_blocking(move || {
+        let mut byte = [0_u8; 1];
+        std::io::Read::read(&mut observer, &mut byte)
+    })
+    .await
+    .unwrap();
+    assert_eq!(disconnected.unwrap(), 0);
+    drop(client);
+}
+
+#[tokio::test]
 async fn controller_rejects_an_invalid_token_before_storage_access() {
     let runtime = tempfile::tempdir().unwrap();
     let storage = Arc::new(MemoryStorage::default());

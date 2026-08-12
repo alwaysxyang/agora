@@ -5,12 +5,14 @@ use super::service::{LocalBroker, WRITEBACK_DELAY};
 use crate::filesystem::FileCipher;
 use crate::ipc;
 use anyhow::{Context, Result};
+use std::net::Shutdown;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixListener;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use uuid::Uuid;
@@ -18,6 +20,10 @@ use uuid::Uuid;
 const MAX_CONNECTIONS: usize = 128;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECTION_INITIAL: u8 = 0;
+const CONNECTION_IDLE: u8 = 1;
+const CONNECTION_BUSY: u8 = 2;
+const CONNECTION_CLOSING: u8 = 3;
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalRuntime {
@@ -134,6 +140,44 @@ struct Server {
     connections: Arc<Semaphore>,
 }
 
+struct ConnectionControl {
+    stream: std::os::unix::net::UnixStream,
+    state: AtomicU8,
+}
+
+impl ConnectionControl {
+    fn close_if_idle(&self) {
+        if self
+            .state
+            .compare_exchange(
+                CONNECTION_IDLE,
+                CONNECTION_CLOSING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let _ = self.stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn begin_request(&self) -> bool {
+        self.state
+            .compare_exchange(
+                CONNECTION_IDLE,
+                CONNECTION_BUSY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn finish_request(&self, shutdown_requested: &AtomicBool) -> bool {
+        self.state.store(CONNECTION_IDLE, Ordering::Release);
+        shutdown_requested.load(Ordering::Acquire)
+    }
+}
+
 impl Server {
     fn new(listener: UnixListener, state: Arc<ServerState>) -> Self {
         Self {
@@ -145,6 +189,8 @@ impl Server {
 
     async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut tasks = JoinSet::new();
+        let mut controls = Vec::new();
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
         let mut writebacks = JoinSet::new();
         let mut expiry = tokio::time::interval(Duration::from_secs(30));
         expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -155,10 +201,13 @@ impl Server {
                 biased;
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
+                        shutdown_requested.store(true, Ordering::Release);
                         break;
                     }
                 }
-                Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {
+                    controls.retain(|control: &Weak<ConnectionControl>| control.strong_count() != 0);
+                }
                 Some(result) = writebacks.join_next(), if !writebacks.is_empty() => {
                     result
                         .context("local filesystem writeback task failed")??;
@@ -179,14 +228,26 @@ impl Server {
                         drop(stream);
                         continue;
                     };
+                    let stream = stream.into_std()?;
+                    stream.set_nonblocking(false)?;
+                    let control = Arc::new(ConnectionControl {
+                        stream: stream.try_clone()?,
+                        state: AtomicU8::new(CONNECTION_INITIAL),
+                    });
+                    controls.push(Arc::downgrade(&control));
                     let state = Arc::clone(&self.state);
+                    let shutdown_requested = Arc::clone(&shutdown_requested);
                     tasks.spawn(async move {
                         let _permit = permit;
-                        let _ = Self::handle(stream, state).await;
+                        let _ = Self::handle(stream, state, control, shutdown_requested).await;
                     });
                 }
             }
         }
+        controls
+            .iter()
+            .filter_map(Weak::upgrade)
+            .for_each(|control| control.close_if_idle());
         while tasks.join_next().await.is_some() {}
         while let Some(result) = writebacks.join_next().await {
             result.context("local filesystem writeback task failed")??;
@@ -194,9 +255,12 @@ impl Server {
         Ok(())
     }
 
-    async fn handle(stream: UnixStream, state: Arc<ServerState>) -> Result<()> {
-        let stream = stream.into_std()?;
-        stream.set_nonblocking(false)?;
+    async fn handle(
+        stream: std::os::unix::net::UnixStream,
+        state: Arc<ServerState>,
+        control: Arc<ConnectionControl>,
+        shutdown_requested: Arc<AtomicBool>,
+    ) -> Result<()> {
         stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
         stream.set_write_timeout(Some(RESPONSE_TIMEOUT))?;
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
@@ -204,6 +268,9 @@ impl Server {
             let mut persistent = false;
             loop {
                 let (request, descriptor) = ipc::receive::<RequestEnvelope>(&mut stream)?;
+                if persistent && !control.begin_request() {
+                    return Ok(());
+                }
                 let authenticated = request.version == PROTOCOL_VERSION
                     && constant_time_equal(request.token.as_bytes(), state.token.as_bytes());
                 let valid_id = valid_request_id(&request.request_id)
@@ -256,6 +323,7 @@ impl Server {
                     .iter()
                     .map(AsRawFd::as_raw_fd)
                     .collect::<Vec<_>>();
+                let promote = !persistent && ping && authenticated && valid_id;
                 ipc::send_with_descriptors(
                     &mut stream,
                     &ResponseEnvelope {
@@ -265,10 +333,13 @@ impl Server {
                     },
                     &descriptors,
                 )?;
-                if !persistent && ping && authenticated && valid_id {
+                if promote {
                     stream.set_read_timeout(None)?;
                     persistent = true;
                 } else if !persistent || !authenticated || !valid_id {
+                    return Ok(());
+                }
+                if control.finish_request(&shutdown_requested) {
                     return Ok(());
                 }
             }

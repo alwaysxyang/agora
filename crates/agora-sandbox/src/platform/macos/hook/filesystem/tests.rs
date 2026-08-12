@@ -3306,6 +3306,88 @@ fn final_symlinks_do_not_bypass_source_ancestor_search_permissions() {
 }
 
 #[test]
+fn fork_does_not_deadlock_when_the_current_thread_owns_the_filesystem_guard() {
+    let fixture = Fixture::new();
+    with_test_runtime(&fixture.runtime, || {
+        let probe = unsafe { libc::fork() };
+        assert!(
+            probe >= 0,
+            "probe fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if probe == 0 {
+            unsafe { libc::alarm(2) };
+            let _guard = FilesystemHookGuard::enter().unwrap();
+            let child = unsafe { libc::fork() };
+            if child == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            let mut status = 0;
+            let waited = if child < 0 {
+                -1
+            } else {
+                unsafe { libc::waitpid(child, &mut status, 0) }
+            };
+            let successful =
+                waited == child && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+            unsafe { libc::_exit(i32::from(!successful)) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(probe, &mut status, 0) }, probe);
+        assert!(
+            libc::WIFEXITED(status),
+            "fork deadlocked while the current thread held the filesystem guard"
+        );
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    });
+}
+
+#[test]
+fn exiting_thread_cannot_leave_the_filesystem_fork_barrier_read_locked() {
+    let fixture = Fixture::new();
+    with_test_runtime(&fixture.runtime, || {
+        let probe = unsafe { libc::fork() };
+        assert!(
+            probe >= 0,
+            "probe fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if probe == 0 {
+            unsafe { libc::alarm(2) };
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    with_test_runtime(&fixture.runtime, || {
+                        std::mem::forget(FilesystemHookGuard::enter().unwrap());
+                    });
+                });
+            });
+            let child = unsafe { libc::fork() };
+            if child == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            let mut status = 0;
+            let waited = if child < 0 {
+                -1
+            } else {
+                unsafe { libc::waitpid(child, &mut status, 0) }
+            };
+            let successful =
+                waited == child && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+            unsafe { libc::_exit(i32::from(!successful)) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(probe, &mut status, 0) }, probe);
+        assert!(
+            libc::WIFEXITED(status),
+            "an exited hook thread left the filesystem fork barrier locked"
+        );
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    });
+}
+
+#[test]
 fn recursive_filesystem_hooks_delegate_to_the_native_operations() {
     let fixture = Fixture::new();
     let file = fixture.lower.join("file");

@@ -111,6 +111,29 @@ async fn authenticated_local_control_stream_survives_new_connection_denial() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_closes_idle_persistent_control_streams() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fs");
+    std::fs::create_dir(&root).unwrap();
+    let controller = LocalController::start(&root, cipher(), &directory.path().join("runtime"))
+        .await
+        .unwrap();
+    let socket = controller.runtime().socket().to_path_buf();
+    let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    let shared =
+        InheritedControlStream::new(stream, InheritedControlLock::anonymous().unwrap(), 0).unwrap();
+    let client = LocalClient::with_shared(&socket, controller.runtime().token(), shared);
+
+    client.ping_shared().unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), controller.shutdown())
+        .await
+        .expect("idle persistent control stream blocked broker shutdown")
+        .unwrap();
+    assert!(client.close("missing", Vec::new()).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_drains_service_work_before_the_final_flush() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("fs");
@@ -228,6 +251,60 @@ async fn server_shutdown_waits_for_an_accepted_request() {
     .unwrap();
     assert_eq!(response.response, Response::Success);
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_shutdown_does_not_miss_a_late_persistent_handshake() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("fs");
+    std::fs::create_dir(&root).unwrap();
+    let socket = directory.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let token = "token".to_string();
+    let state = Arc::new(ServerState {
+        token: token.clone(),
+        broker: Arc::new(LocalBroker::new(&root, cipher()).unwrap()),
+    });
+    let server = Server::new(listener, state);
+    let connections = Arc::clone(&server.connections);
+    let (shutdown, receiver) = watch::channel(false);
+    let task = tokio::spawn(server.run(receiver));
+    let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while connections.available_permits() == MAX_CONNECTIONS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    shutdown.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (response, stream) = tokio::task::spawn_blocking(move || {
+        let mut stream = stream;
+        ipc::send(
+            &mut stream,
+            &RequestEnvelope {
+                version: PROTOCOL_VERSION,
+                token,
+                request_id: "0".repeat(32),
+                request: Request::Ping,
+            },
+            None,
+        )
+        .unwrap();
+        let response = ipc::receive::<ResponseEnvelope>(&mut stream).unwrap().0;
+        (response, stream)
+    })
+    .await
+    .unwrap();
+    assert_eq!(response.response, Response::Success);
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("late persistent handshake escaped broker shutdown")
+        .unwrap()
+        .unwrap();
+    drop(stream);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
