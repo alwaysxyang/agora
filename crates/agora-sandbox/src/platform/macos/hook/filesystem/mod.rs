@@ -6,13 +6,13 @@ use super::set_errno;
 use crate::audit::{AuditClient, AuditError, AuditEventRequest, FileOperation};
 use crate::callback::{FileAccessMode, FileContext, FileOpenMode, ProcessContext};
 use crate::filesystem::broker::{
-    LocalClient, LocalClientError, LocalFileIdentity, LocalOpenState,
+    ByteRangeSet, LocalClient, LocalClientError, LocalFileIdentity, LocalOpenState,
     protocol::ByteRange as LocalByteRange,
 };
 use crate::filesystem::{
     AccessPlan, AccessRequest, Credentials, DirectoryView, FileAttributes, FileLayer, MetadataPlan,
-    OpenIntent, OpenTarget, PreparedFile, StagedWrite, VirtualFilesystem, Writeback,
-    normalize_path,
+    NativeDirectorySnapshot, OpenIntent, OpenTarget, PreparedFile, StagedWrite, VirtualFilesystem,
+    Writeback, normalize_path,
 };
 use crate::trace::TraceContext;
 use anyhow::{Context, Result};
@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 const NATIVE_PASSTHROUGH_ROOTS: &[&str] = &["/dev"];
 type GuardId = u64;
-const INHERITED_LOCAL_DESCRIPTOR_VERSION: u8 = 4;
+const INHERITED_LOCAL_DESCRIPTOR_VERSION: u8 = 5;
 const MAX_INHERITED_LOCAL_DESCRIPTORS: usize = 256;
 
 thread_local! {
@@ -162,6 +162,7 @@ struct FilesystemHookRuntime {
 struct DirectoryDescriptor {
     logical: PathBuf,
     remote: bool,
+    native_snapshot: Option<NativeDirectorySnapshot>,
 }
 
 struct CurrentDirectory {
@@ -212,6 +213,7 @@ struct InheritedLocalDescriptor {
     logical: Vec<u8>,
     handle: String,
     writable: bool,
+    lazy: bool,
 }
 
 #[derive(Clone)]
@@ -237,10 +239,12 @@ struct RemoteRegistration {
 struct LocalRegistration {
     handle: String,
     writable: bool,
+    lazy: bool,
     state: LocalOpenState,
     lock: File,
     identity: LocalFileIdentity,
-    dirty: Mutex<Vec<LocalByteRange>>,
+    dirty: Mutex<ByteRangeSet>,
+    materialized: Mutex<ByteRangeSet>,
     mutation: Mutex<()>,
 }
 
@@ -947,10 +951,12 @@ impl FilesystemHookRuntime {
                     prepared.local = Some(LocalRegistration {
                         handle: opened.handle,
                         writable,
+                        lazy: opened.lazy,
                         state: opened.state,
                         lock: opened.lock,
                         identity: opened.identity,
-                        dirty: Mutex::new(Vec::new()),
+                        dirty: Mutex::new(ByteRangeSet::default()),
+                        materialized: Mutex::new(ByteRangeSet::default()),
                         mutation: Mutex::new(()),
                     });
                 }
@@ -1102,8 +1108,8 @@ impl FilesystemHookRuntime {
 
         let mut directories = lock(&self.directory_descriptors);
         match directories.get(&source).cloned() {
-            Some(logical) => {
-                directories.insert(destination, logical);
+            Some(registration) => {
+                directories.insert(destination, registration);
             }
             None => {
                 directories.remove(&destination);
@@ -1145,6 +1151,7 @@ impl FilesystemHookRuntime {
                 logical: open.logical().into_os_string().into_vec(),
                 handle: local.handle.clone(),
                 writable: local.writable,
+                lazy: local.lazy,
             });
         }
         if descriptors.is_empty() {
@@ -1260,6 +1267,7 @@ impl FilesystemHookRuntime {
                     local: Some(LocalRegistration {
                         handle: inherited.handle,
                         writable: inherited.writable,
+                        lazy: inherited.lazy,
                         state,
                         lock: lock_descriptor,
                         identity: LocalFileIdentity {
@@ -1267,7 +1275,8 @@ impl FilesystemHookRuntime {
                             inode: inherited.logical_inode,
                             links: inherited.logical_links,
                         },
-                        dirty: Mutex::new(Vec::new()),
+                        dirty: Mutex::new(ByteRangeSet::default()),
+                        materialized: Mutex::new(ByteRangeSet::default()),
                         mutation: Mutex::new(()),
                     }),
                     remote: None,
@@ -1374,7 +1383,31 @@ impl FilesystemHookRuntime {
         let Ok(range) = LocalByteRange::new(start, end) else {
             return;
         };
-        insert_dirty_range(&mut lock(&registration.dirty), range);
+        lock(&registration.dirty).insert(range);
+    }
+
+    fn materialize_local(
+        &self,
+        registration: &LocalRegistration,
+        range: Option<LocalByteRange>,
+    ) -> Result<()> {
+        if !registration.lazy {
+            return Ok(());
+        }
+        let requested = range.unwrap_or(LocalByteRange {
+            start: 0,
+            end: u64::MAX,
+        });
+        let mut materialized = lock(&registration.materialized);
+        if materialized.covers(requested) {
+            return Ok(());
+        }
+        self.local
+            .as_ref()
+            .context("local filesystem runtime is unavailable")?
+            .materialize(&registration.handle, range)?;
+        materialized.insert(requested);
+        Ok(())
     }
 
     fn commit_open_file(
@@ -1427,7 +1460,7 @@ impl FilesystemHookRuntime {
                 self.local
                     .as_ref()
                     .context("local filesystem runtime is unavailable")?
-                    .close(&registration.handle, dirty.clone())?;
+                    .close(&registration.handle, dirty.to_vec())?;
                 dirty.clear();
                 return Ok(());
             }
@@ -1529,7 +1562,7 @@ impl FilesystemHookRuntime {
             .as_ref()
             .context("local filesystem runtime is unavailable")?;
         let mut dirty = lock(&registration.dirty);
-        local.sync(&registration.handle, dirty.clone(), durable)?;
+        local.sync(&registration.handle, dirty.to_vec(), durable)?;
         dirty.clear();
         if descriptor >= 0 {
             self.refresh_open_attributes(descriptor, open)
@@ -1916,9 +1949,32 @@ impl FilesystemHookRuntime {
         }
     }
 
-    fn register_directory(&self, descriptor: libc::c_int, logical: PathBuf, remote: bool) {
-        lock(&self.directory_descriptors)
-            .insert(descriptor, DirectoryDescriptor { logical, remote });
+    fn register_directory(
+        &self,
+        descriptor: libc::c_int,
+        logical: PathBuf,
+        remote: bool,
+        native_snapshot: Option<NativeDirectorySnapshot>,
+    ) {
+        lock(&self.directory_descriptors).insert(
+            descriptor,
+            DirectoryDescriptor {
+                logical,
+                remote,
+                native_snapshot,
+            },
+        );
+    }
+
+    fn native_directory_snapshot_is_current(&self, descriptor: libc::c_int) -> bool {
+        let snapshot = lock(&self.directory_descriptors)
+            .get(&descriptor)
+            .and_then(|registration| registration.native_snapshot.clone());
+        snapshot.is_some_and(|snapshot| {
+            self.filesystem
+                .native_directory_snapshot_is_current(&snapshot)
+                .unwrap_or(false)
+        })
     }
 
     fn unregister_directory(&self, descriptor: libc::c_int) {
@@ -2168,22 +2224,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn insert_dirty_range(ranges: &mut Vec<LocalByteRange>, range: LocalByteRange) {
-    ranges.push(range);
-    ranges.sort_unstable_by_key(|range| range.start);
-    let mut merged: Vec<LocalByteRange> = Vec::with_capacity(ranges.len());
-    for range in ranges.drain(..) {
-        if let Some(last) = merged.last_mut()
-            && range.start <= last.end
-        {
-            last.end = last.end.max(range.end);
-        } else {
-            merged.push(range);
-        }
-    }
-    *ranges = merged;
 }
 
 fn configure_descriptor(

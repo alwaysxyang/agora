@@ -38,6 +38,7 @@ pub(crate) struct LocalOpen {
     pub(crate) state: super::LocalOpenState,
     pub(crate) lock: File,
     pub(crate) identity: LocalFileIdentity,
+    pub(crate) lazy: bool,
 }
 
 pub(crate) struct LocalFileIdentity {
@@ -128,6 +129,7 @@ impl LocalClient {
             device,
             inode,
             links,
+            lazy,
         } = response
         else {
             return Err(LocalClientError::protocol(
@@ -182,7 +184,22 @@ impl LocalClient {
                 inode,
                 links,
             },
+            lazy,
         })
+    }
+
+    pub(crate) fn materialize(
+        &self,
+        handle: &str,
+        range: Option<ByteRange>,
+    ) -> Result<(), LocalClientError> {
+        self.success_until_ready(
+            Request::Materialize {
+                handle: handle.to_string(),
+                range,
+            },
+            IDEMPOTENT_ATTEMPTS,
+        )
     }
 
     pub(crate) fn sync(

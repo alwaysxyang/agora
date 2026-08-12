@@ -11,6 +11,7 @@ use crate::callback::{CommandContext, ProcessContext, ProcessOperation};
 use crate::execution::{
     DEFAULT_EXECUTABLE_PATH, PrepareResponse, encode_prepare_request, resolve_shebang,
 };
+use crate::ipc::InheritedControlStream;
 use crate::trace::TraceContext;
 use std::cell::Cell;
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -19,8 +20,8 @@ use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 const MAX_RECORDED_ARGUMENTS: usize = 256;
@@ -192,6 +193,7 @@ impl Drop for ProcessHookGuard {
 struct ProcessHookRuntime {
     config: HookConfig,
     audit: Option<AuditClient>,
+    execution: Option<Arc<InheritedControlStream<TcpStream>>>,
     prefer_shared: AtomicBool,
     observed_pid: AtomicU32,
 }
@@ -411,20 +413,24 @@ impl ProcessHookRuntime {
         static RUNTIME: OnceLock<Option<ProcessHookRuntime>> = OnceLock::new();
         RUNTIME
             .get_or_init(|| {
-                config::global().cloned().map(|config| Self {
-                    audit: Some(super::control::audit().map_or_else(
-                        || AuditClient::new(config.audit_control(), config.audit_token()),
-                        |shared| {
-                            AuditClient::with_shared(
-                                config.audit_control(),
-                                config.audit_token(),
-                                shared,
-                            )
-                        },
-                    )),
-                    prefer_shared: AtomicBool::new(false),
-                    observed_pid: AtomicU32::new(std::process::id()),
-                    config,
+                config::global().cloned().map(|config| {
+                    let execution = super::control::execution();
+                    Self {
+                        audit: Some(super::control::audit().map_or_else(
+                            || AuditClient::new(config.audit_control(), config.audit_token()),
+                            |shared| {
+                                AuditClient::with_shared(
+                                    config.audit_control(),
+                                    config.audit_token(),
+                                    shared,
+                                )
+                            },
+                        )),
+                        prefer_shared: AtomicBool::new(execution.is_some()),
+                        observed_pid: AtomicU32::new(std::process::id()),
+                        execution,
+                        config,
+                    }
                 })
             })
             .as_ref()
@@ -435,7 +441,7 @@ impl ProcessHookRuntime {
             .map_err(|error| PrepareError::new(io_errno(&error), error.to_string()))?;
         let current_pid = std::process::id();
         if self.observed_pid.swap(current_pid, Ordering::AcqRel) != current_pid
-            && super::control::execution().is_some()
+            && self.execution.is_some()
         {
             self.prefer_shared.store(true, Ordering::Release);
         }
@@ -488,7 +494,7 @@ impl ProcessHookRuntime {
     }
 
     fn prepare_shared(&self, request: &[u8]) -> Option<Result<PrepareResponse, PrepareError>> {
-        let shared = super::control::execution()?;
+        let shared = self.execution.as_ref()?;
         Some(
             shared
                 .transact(|stream| super::control::execution_request(stream, request))

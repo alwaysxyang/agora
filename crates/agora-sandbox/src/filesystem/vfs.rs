@@ -480,7 +480,7 @@ impl VirtualFilesystem {
     }
 
     #[cfg(test)]
-    fn transaction_count_for_test(&self) -> usize {
+    pub(crate) fn transaction_count_for_test(&self) -> usize {
         self.overlay.transaction_count_for_test()
     }
 
@@ -776,7 +776,7 @@ impl VirtualFilesystem {
             let visible = transaction.visible_path(&resolved)?;
             let canonical = visible.canonicalize()?;
             if self.overlay.is_internal(&canonical) {
-                self.overlay.logical_path(&canonical)
+                transaction.logical_path(&canonical)
             } else {
                 Ok(canonical)
             }
@@ -995,6 +995,13 @@ impl VirtualFilesystem {
 
     pub(crate) fn directory_view(&self, path: &Path) -> Result<DirectoryView> {
         self.overlay.directory_view(path)
+    }
+
+    pub(crate) fn native_directory_snapshot_is_current(
+        &self,
+        snapshot: &super::NativeDirectorySnapshot,
+    ) -> Result<bool> {
+        self.overlay.native_directory_snapshot_is_current(snapshot)
     }
 
     #[cfg(test)]

@@ -12,6 +12,11 @@ use std::process::{Command, Output};
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
+#[cfg(test)]
+thread_local! {
+    static ARCHITECTURE_INSPECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 use super::DEFAULT_EXECUTABLE_PATH;
 
 const MACH_64_MAGIC: u32 = 0xfeed_facf;
@@ -200,16 +205,16 @@ impl ExecutableStore {
     }
 
     fn prepare_copy(&self, source: &Path, metadata: &Metadata) -> Result<PathBuf> {
-        let architectures = Self::architectures(source)?;
-        let selected = Self::select_architecture(Self::native_architecture(), &architectures)
-            .with_context(|| {
+        self.overlay.prepare_executable(source, |temporary| {
+            let architectures = Self::architectures(source)?;
+            let selected = Self::select_architecture(Self::native_architecture(), &architectures)
+                .with_context(|| {
                 format!(
                     "executable {} is incompatible with sandbox build target {}",
                     source.display(),
                     Self::native_architecture()
                 )
             })?;
-        self.overlay.prepare_executable(source, |temporary| {
             Self::prepare_executable_contents(
                 source,
                 temporary,
@@ -335,6 +340,8 @@ impl ExecutableStore {
     }
 
     fn architectures(source: &Path) -> Result<Vec<String>> {
+        #[cfg(test)]
+        ARCHITECTURE_INSPECTIONS.with(|inspections| inspections.set(inspections.get() + 1));
         let output = Command::new("/usr/bin/lipo")
             .arg("-archs")
             .arg(source)

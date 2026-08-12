@@ -164,6 +164,7 @@ fn client_rejects_unexpected_success_shapes_and_maps_broker_errors() {
                     device: 1,
                     inode: 2,
                     links: 1,
+                    lazy: false,
                 },
             },
             None,
@@ -261,6 +262,7 @@ fn client_open_retries_and_claims_a_response_lost_after_execution() {
                     device: 1,
                     inode: 2,
                     links: 1,
+                    lazy: true,
                 },
             },
             &[content.as_raw_fd(), state.as_raw_fd(), lock.as_raw_fd()],
@@ -295,6 +297,7 @@ fn client_open_retries_and_claims_a_response_lost_after_execution() {
     assert_eq!(opened.handle, "opened-handle");
     assert_eq!(opened.identity.device, 1);
     assert_eq!(opened.identity.inode, 2);
+    assert!(opened.lazy);
     server.join().unwrap();
 }
 
@@ -326,6 +329,7 @@ fn client_open_aborts_incomplete_invalid_and_unclaimable_replies() {
                     device: 1,
                     inode: 2,
                     links: 1,
+                    lazy: false,
                 },
             };
             if failure == 0 {

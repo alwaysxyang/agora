@@ -26,6 +26,18 @@ pub(super) type FtsCompareFn =
     unsafe extern "C" fn(*const *const DarwinFtsEntry, *const *const DarwinFtsEntry) -> libc::c_int;
 
 unsafe extern "C" {
+    #[link_name = "mach_task_self_"]
+    pub(super) static darwin_mach_task_self: libc::mach_port_t;
+
+    #[link_name = "mach_vm_read_overwrite"]
+    pub(super) fn darwin_mach_vm_read_overwrite(
+        task: libc::mach_port_t,
+        address: libc::mach_vm_address_t,
+        size: libc::mach_vm_size_t,
+        destination: libc::mach_vm_address_t,
+        copied: *mut libc::mach_vm_size_t,
+    ) -> libc::kern_return_t;
+
     #[link_name = "close"]
     pub(super) fn darwin_close(descriptor: libc::c_int) -> libc::c_int;
 

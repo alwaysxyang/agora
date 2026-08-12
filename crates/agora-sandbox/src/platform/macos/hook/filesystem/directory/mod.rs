@@ -496,6 +496,14 @@ unsafe fn sandbox_opendir(path: *const libc::c_char) -> *mut libc::DIR {
                     return directory;
                 }
                 if view.is_passthrough() && remote_roots.is_empty() {
+                    if let Some(snapshot) = view.native_snapshot().cloned() {
+                        runtime.register_directory(
+                            unsafe { libc::dirfd(directory) },
+                            view.logical().into(),
+                            false,
+                            Some(snapshot),
+                        );
+                    }
                     return directory;
                 }
                 let layer = if runtime.filesystem.is_internal(view.primary()) {
@@ -562,7 +570,12 @@ unsafe fn register_remote_directory_cursor(
 ) {
     register_active_fts_mapping(&prepared.physical, &prepared.logical);
     lock(directory_cursors()).insert(directory as usize, prepared.cursor);
-    runtime.register_directory(unsafe { libc::dirfd(directory) }, prepared.logical, true);
+    runtime.register_directory(
+        unsafe { libc::dirfd(directory) },
+        prepared.logical,
+        true,
+        None,
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -638,6 +651,7 @@ unsafe fn register_directory_cursor(
         unsafe { libc::dirfd(directory) },
         view.logical().into(),
         false,
+        None,
     );
 }
 
@@ -683,7 +697,18 @@ unsafe fn sandbox_fdopendir(descriptor: libc::c_int) -> *mut libc::DIR {
             Err(error) => return unsafe { fail(&error, std::ptr::null_mut()) },
         };
         if view.is_passthrough() && layer == FileLayer::Lower && remote_roots.is_empty() {
-            return unsafe { original(descriptor) };
+            let directory = unsafe { original(descriptor) };
+            if !directory.is_null()
+                && let Some(snapshot) = view.native_snapshot().cloned()
+            {
+                runtime.register_directory(
+                    unsafe { libc::dirfd(directory) },
+                    view.logical().into(),
+                    false,
+                    Some(snapshot),
+                );
+            }
+            return directory;
         }
         let auxiliary = match unsafe { open_auxiliary_directory(&view, layer) } {
             Ok(auxiliary) => auxiliary,

@@ -71,6 +71,323 @@ fn assert_error(response: Response, errno: libc::c_int) {
 }
 
 #[test]
+fn large_read_only_open_materializes_only_requested_ranges() {
+    let fixture = Fixture::new();
+    let contents = vec![b'x'; 2 * 1024 * 1024];
+    let path = fixture.encrypted("lazy-read", &contents);
+    let mut reply = fixture.broker.handle(
+        Request::Open {
+            path: BackingPath::from_path(&path),
+            flags: libc::O_RDONLY,
+        },
+        None,
+    );
+    let Response::Open {
+        handle, lazy: true, ..
+    } = reply.response
+    else {
+        panic!("unexpected lazy open response: {:?}", reply.response);
+    };
+    let plaintext = reply.descriptors.remove(0);
+    assert_eq!(plaintext.metadata().unwrap().len(), contents.len() as u64);
+
+    let offset = 512 * 1024 + 17;
+    let mut cold = [1_u8; 32];
+    read_exact_at(&plaintext, &mut cold, offset).unwrap();
+    assert_eq!(cold, [0_u8; 32]);
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Materialize {
+                    handle,
+                    range: Some(ByteRange::new(offset, offset + cold.len() as u64).unwrap()),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    read_exact_at(&plaintext, &mut cold, offset).unwrap();
+    assert_eq!(
+        &cold,
+        &contents[offset as usize..offset as usize + cold.len()]
+    );
+
+    let mut untouched = [1_u8; 32];
+    read_exact_at(&plaintext, &mut untouched, 1536 * 1024).unwrap();
+    assert_eq!(untouched, [0_u8; 32]);
+}
+
+#[test]
+fn small_read_only_open_remains_eager() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("eager-read", b"plaintext");
+    let mut reply = fixture.broker.handle(
+        Request::Open {
+            path: BackingPath::from_path(&path),
+            flags: libc::O_RDONLY,
+        },
+        None,
+    );
+    assert!(matches!(reply.response, Response::Open { lazy: false, .. }));
+    let plaintext = reply.descriptors.remove(0);
+    let mut contents = [0_u8; 9];
+    read_exact_at(&plaintext, &mut contents, 0).unwrap();
+    assert_eq!(&contents, b"plaintext");
+}
+
+#[test]
+fn lazy_read_reports_corruption_only_when_the_block_is_materialized() {
+    let fixture = Fixture::new();
+    let contents = vec![b'x'; 2 * 1024 * 1024];
+    let path = fixture.encrypted("lazy-corruption", &contents);
+    let corrupted_plaintext_offset = 1536 * 1024_u64;
+    let ciphertext_offset = CONTENT_HEADER_SIZE as u64
+        + (corrupted_plaintext_offset / crate::filesystem::crypto::PLAINTEXT_BLOCK_SIZE as u64)
+            * crate::filesystem::crypto::CIPHERTEXT_BLOCK_SIZE as u64
+        + 12;
+    let ciphertext = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut byte = [0_u8; 1];
+    ciphertext
+        .read_exact_at(&mut byte, ciphertext_offset)
+        .unwrap();
+    byte[0] ^= 0xff;
+    ciphertext.write_all_at(&byte, ciphertext_offset).unwrap();
+
+    let mut reply = fixture.broker.handle(
+        Request::Open {
+            path: BackingPath::from_path(&path),
+            flags: libc::O_RDONLY,
+        },
+        None,
+    );
+    let Response::Open {
+        handle, lazy: true, ..
+    } = reply.response
+    else {
+        panic!("unexpected lazy open response: {:?}", reply.response);
+    };
+    let plaintext = reply.descriptors.remove(0);
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Materialize {
+                    handle: handle.clone(),
+                    range: Some(ByteRange::new(0, 32).unwrap()),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    let mut prefix = [0_u8; 32];
+    read_exact_at(&plaintext, &mut prefix, 0).unwrap();
+    assert_eq!(prefix, [b'x'; 32]);
+
+    assert_error(
+        fixture
+            .broker
+            .handle(
+                Request::Materialize {
+                    handle,
+                    range: Some(
+                        ByteRange::new(corrupted_plaintext_offset, corrupted_plaintext_offset + 32)
+                            .unwrap(),
+                    ),
+                },
+                None,
+            )
+            .response,
+        libc::EIO,
+    );
+}
+
+#[test]
+fn lazy_materialization_does_not_hide_an_unreported_plaintext_change() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("lazy-baseline", &vec![b'x'; 2 * 1024 * 1024]);
+    let mut reply = fixture.broker.handle(
+        Request::Open {
+            path: BackingPath::from_path(&path),
+            flags: libc::O_RDONLY,
+        },
+        None,
+    );
+    let Response::Open { handle, .. } = reply.response else {
+        panic!("unexpected open response: {:?}", reply.response);
+    };
+    let plaintext = reply.descriptors.remove(0);
+    write_all_at(&plaintext, b"changed", 0).unwrap();
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Materialize {
+                    handle: handle.clone(),
+                    range: Some(ByteRange::new(1024 * 1024, 1024 * 1024 + 32).unwrap()),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    assert_error(
+        fixture
+            .broker
+            .handle(
+                Request::Close {
+                    handle,
+                    ranges: Vec::new(),
+                },
+                None,
+            )
+            .response,
+        libc::EBADF,
+    );
+}
+
+#[test]
+fn large_writable_first_open_is_lazy() {
+    let fixture = Fixture::new();
+    let contents = vec![b'x'; 2 * 1024 * 1024];
+    let path = fixture.encrypted("lazy-writable-first-open", &contents);
+    let mut reply = fixture.broker.handle(
+        Request::Open {
+            path: BackingPath::from_path(&path),
+            flags: libc::O_RDWR,
+        },
+        None,
+    );
+    assert!(matches!(reply.response, Response::Open { lazy: true, .. }));
+    let plaintext = reply.descriptors.remove(0);
+    let mut cold = [1_u8; 32];
+    read_exact_at(&plaintext, &mut cold, contents.len() as u64 - 32).unwrap();
+    assert_eq!(cold, [0_u8; 32]);
+}
+
+#[test]
+fn large_writable_open_reuses_a_live_lazy_plaintext_vnode_without_materializing_it() {
+    let fixture = Fixture::new();
+    let contents = vec![b'x'; 2 * 1024 * 1024];
+    let path = fixture.encrypted("lazy-writable", &contents);
+    let (read_handle, reader) = fixture.open(&path, false);
+
+    let mut reply = fixture.broker.handle(
+        Request::Open {
+            path: BackingPath::from_path(&path),
+            flags: libc::O_RDWR,
+        },
+        None,
+    );
+    let Response::Open {
+        handle: write_handle,
+        lazy: true,
+        ..
+    } = reply.response
+    else {
+        panic!("unexpected writable lazy open: {:?}", reply.response);
+    };
+    let writer = reply.descriptors.remove(0);
+
+    let mut untouched = [1_u8; 32];
+    read_exact_at(&reader, &mut untouched, contents.len() as u64 - 32).unwrap();
+    assert_eq!(untouched, [0_u8; 32]);
+
+    let offset = 512 * 1024 + 17;
+    let replacement = b"changed";
+    let range = ByteRange::new(offset, offset + replacement.len() as u64).unwrap();
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::BeginWrite {
+                    handle: write_handle.clone(),
+                    write_id: "partial".to_string(),
+                    range,
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    write_all_at(&writer, replacement, offset).unwrap();
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::FinishWrite {
+                    handle: write_handle.clone(),
+                    write_id: "partial".to_string(),
+                    range,
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+
+    let block_start = offset - offset % PLAINTEXT_BLOCK_SIZE as u64;
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Materialize {
+                    handle: read_handle,
+                    range: Some(
+                        ByteRange::new(block_start, block_start + PLAINTEXT_BLOCK_SIZE as u64)
+                            .unwrap(),
+                    ),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    let mut materialized = vec![0_u8; PLAINTEXT_BLOCK_SIZE];
+    read_exact_at(&reader, &mut materialized, block_start).unwrap();
+    let within = (offset - block_start) as usize;
+    assert_eq!(
+        &materialized[..within],
+        &contents[block_start as usize..offset as usize]
+    );
+    assert_eq!(
+        &materialized[within..within + replacement.len()],
+        replacement
+    );
+    assert_eq!(
+        &materialized[within + replacement.len()..],
+        &contents[offset as usize + replacement.len()..block_start as usize + PLAINTEXT_BLOCK_SIZE]
+    );
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Sync {
+                    handle: write_handle,
+                    ranges: Vec::new(),
+                    durable: true,
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    let mut expected = contents;
+    expected[offset as usize..offset as usize + replacement.len()].copy_from_slice(replacement);
+    assert_eq!(fixture.decrypt(&path), expected);
+}
+
+#[test]
 fn sync_encrypts_only_reported_ranges_and_propagates_them_to_peer_handles() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("file", b"abcdef");
@@ -1005,9 +1322,22 @@ fn broker_rejects_invalid_descriptors_paths_and_handle_operations() {
             .broker
             .handle(
                 Request::Sync {
-                    handle,
+                    handle: handle.clone(),
                     ranges: vec![invalid_range],
                     durable: false,
+                },
+                None,
+            )
+            .response,
+        libc::EPROTO,
+    );
+    assert_error(
+        fixture
+            .broker
+            .handle(
+                Request::Materialize {
+                    handle,
+                    range: Some(invalid_range),
                 },
                 None,
             )
@@ -1352,12 +1682,6 @@ fn retain_overflow_is_atomic_and_internal_error_helpers_preserve_context() {
         read_exact_at(&file, &mut [0_u8; 1], 0).unwrap_err().kind(),
         std::io::ErrorKind::UnexpectedEof
     );
-
-    let mut ranges = RangeSet::default();
-    ranges.insert(ByteRange { start: 3, end: 3 });
-    ranges.insert(ByteRange { start: 3, end: 6 });
-    ranges.insert(ByteRange { start: 1, end: 4 });
-    assert_eq!(ranges.ranges, vec![ByteRange { start: 1, end: 6 }]);
 }
 
 #[test]

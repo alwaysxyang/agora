@@ -109,7 +109,7 @@ pub(crate) use encrypted::{EncryptedWorkspace, KeyMigrationStage};
 #[cfg(target_os = "macos")]
 pub(crate) use metadata::{EntryState, FileAttributes, Materializer};
 #[cfg(target_os = "macos")]
-pub(crate) use overlay::{DirectoryView, OverlayStore, StagedWrite};
+pub(crate) use overlay::{DirectoryView, NativeDirectorySnapshot, OverlayStore, StagedWrite};
 #[cfg(target_os = "macos")]
 pub(crate) use permissions::{AccessRequest, Credentials};
 #[cfg(target_os = "macos")]

@@ -5,10 +5,37 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 fn c_path(path: &Path) -> CString {
     CString::new(path.as_os_str().as_bytes()).unwrap()
+}
+
+unsafe fn raw_pread(
+    descriptor: libc::c_int,
+    buffer: *mut libc::c_void,
+    length: usize,
+    offset: libc::off_t,
+) -> libc::ssize_t {
+    const DARWIN_SYS_PREAD: libc::c_int = 153;
+    unsafe { libc::syscall(DARWIN_SYS_PREAD, descriptor, buffer, length, offset) as libc::ssize_t }
+}
+
+unsafe fn write_managed_file(path: &CString, contents: &[u8]) {
+    let descriptor = unsafe {
+        super::super::agora_sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+            0o600,
+        )
+    };
+    assert!(descriptor >= 0);
+    assert_eq!(
+        unsafe { agora_sandbox_write(descriptor, contents.as_ptr().cast(), contents.len()) },
+        contents.len() as libc::ssize_t
+    );
+    assert_eq!(unsafe { super::super::agora_sandbox_close(descriptor) }, 0);
 }
 
 async fn broker_runtime(directory: &Path) -> (FilesystemHookRuntime, LocalController) {
@@ -29,6 +56,39 @@ async fn broker_runtime(directory: &Path) -> (FilesystemHookRuntime, LocalContro
         controller.runtime().token(),
     ));
     (runtime, controller)
+}
+
+#[test]
+fn lazy_read_ranges_apply_bounded_readahead_and_conservative_sendfile_fallbacks() {
+    assert_eq!(local_read_materialization_length(1), 16 * 1024);
+    assert_eq!(local_read_materialization_length(8 * 1024), 32 * 1024);
+    assert_eq!(local_read_materialization_length(128 * 1024), 256 * 1024);
+    assert_eq!(local_read_materialization_length(512 * 1024), 512 * 1024);
+
+    let exact_length = 32;
+    assert_eq!(
+        unsafe { sendfile_materialization_range(7, &exact_length, std::ptr::null()) },
+        Ok(Some(LocalByteRange { start: 7, end: 39 }))
+    );
+    let empty_headers = unsafe { std::mem::zeroed::<libc::sf_hdtr>() };
+    assert_eq!(
+        unsafe { sendfile_materialization_range(7, &exact_length, &empty_headers) },
+        Ok(Some(LocalByteRange { start: 7, end: 39 }))
+    );
+    let mut actual_headers = unsafe { std::mem::zeroed::<libc::sf_hdtr>() };
+    actual_headers.hdr_cnt = 1;
+    assert_eq!(
+        unsafe { sendfile_materialization_range(7, &exact_length, &actual_headers) },
+        Ok(None)
+    );
+    let through_eof = 0;
+    assert_eq!(
+        unsafe { sendfile_materialization_range(7, &through_eof, std::ptr::null()) },
+        Ok(Some(LocalByteRange {
+            start: 7,
+            end: u64::MAX,
+        }))
+    );
 }
 
 #[test]
@@ -482,6 +542,497 @@ async fn broker_managed_descriptors_preserve_complete_posix_io_semantics() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_broker_reads_materialize_ranges_before_native_io() {
+    let directory = tempfile::tempdir().unwrap();
+    let logical = directory.path().join("lazy-read.bin");
+    let path = c_path(&logical);
+    let sendfile_logical = directory.path().join("lazy-sendfile.bin");
+    let sendfile_path = c_path(&sendfile_logical);
+    let copyfile_logical = directory.path().join("lazy-copyfile.bin");
+    let copyfile_path = c_path(&copyfile_logical);
+    let copyfile_destination_logical = directory.path().join("copyfile-destination.bin");
+    let copyfile_destination_path = c_path(&copyfile_destination_logical);
+    let aio_logical = directory.path().join("lazy-aio.bin");
+    let aio_path = c_path(&aio_logical);
+    let lio_logical = directory.path().join("lazy-lio.bin");
+    let lio_path = c_path(&lio_logical);
+    let contents = (0..2 * 1024 * 1024)
+        .map(|index| (index % 251 + 1) as u8)
+        .collect::<Vec<_>>();
+
+    let (writer_runtime, writer_controller) = broker_runtime(directory.path()).await;
+    with_test_runtime(&writer_runtime, || unsafe {
+        write_managed_file(&path, &contents);
+        write_managed_file(&sendfile_path, &contents);
+        write_managed_file(&copyfile_path, &contents);
+        write_managed_file(&aio_path, &contents);
+        write_managed_file(&lio_path, &contents);
+    });
+    writer_controller.shutdown().await.unwrap();
+    drop(writer_runtime);
+
+    let (runtime, controller) = broker_runtime(directory.path()).await;
+    with_test_runtime(&runtime, || unsafe {
+        let reader = super::super::agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(reader >= 0);
+        assert!(
+            runtime
+                .tracked_open(reader)
+                .unwrap()
+                .local
+                .as_ref()
+                .unwrap()
+                .lazy
+        );
+
+        let first_offset = 512 * 1024_i64 + 17;
+        let mut first = [1_u8; 32];
+        assert_eq!(
+            raw_pread(reader, first.as_mut_ptr().cast(), first.len(), first_offset),
+            first.len() as libc::ssize_t
+        );
+        assert_eq!(first, [0_u8; 32]);
+        assert_eq!(
+            agora_sandbox_pread(reader, first.as_mut_ptr().cast(), first.len(), first_offset),
+            first.len() as libc::ssize_t
+        );
+        assert_eq!(
+            &first,
+            &contents[first_offset as usize..first_offset as usize + first.len()]
+        );
+        let open = runtime.tracked_open(reader).unwrap();
+        let cached = lock(&open.local.as_ref().unwrap().materialized);
+        assert!(cached.iter().any(|range| {
+            range.start <= first_offset as u64
+                && range.end >= first_offset as u64 + 16 * 1024
+                && range.end < first_offset as u64 + LOCAL_READ_AHEAD_MAX_BYTES
+        }));
+        drop(cached);
+        let mut readahead = [0_u8; 16];
+        let readahead_offset = first_offset + 64;
+        assert_eq!(
+            raw_pread(
+                reader,
+                readahead.as_mut_ptr().cast(),
+                readahead.len(),
+                readahead_offset,
+            ),
+            readahead.len() as libc::ssize_t
+        );
+        assert_eq!(
+            &readahead,
+            &contents[readahead_offset as usize..readahead_offset as usize + readahead.len()]
+        );
+        let adaptive_cold_offset = first_offset + 32 * 1024;
+        let mut adaptive_cold = [1_u8; 16];
+        assert_eq!(
+            raw_pread(
+                reader,
+                adaptive_cold.as_mut_ptr().cast(),
+                adaptive_cold.len(),
+                adaptive_cold_offset,
+            ),
+            adaptive_cold.len() as libc::ssize_t
+        );
+        assert_eq!(adaptive_cold, [0_u8; 16]);
+
+        let sequential_offset = 768 * 1024_i64 + 23;
+        assert_eq!(
+            agora_sandbox_lseek(reader, sequential_offset, libc::SEEK_SET),
+            sequential_offset
+        );
+        let mut sequential = [0_u8; 16];
+        assert_eq!(
+            agora_sandbox_read(reader, sequential.as_mut_ptr().cast(), sequential.len()),
+            sequential.len() as libc::ssize_t
+        );
+        assert_eq!(
+            &sequential,
+            &contents[sequential_offset as usize..sequential_offset as usize + sequential.len()]
+        );
+
+        let vector_offset = 1024 * 1024_i64 + 29;
+        let mut left = [0_u8; 7];
+        let mut right = [0_u8; 11];
+        let vectors = [
+            libc::iovec {
+                iov_base: left.as_mut_ptr().cast(),
+                iov_len: left.len(),
+            },
+            libc::iovec {
+                iov_base: right.as_mut_ptr().cast(),
+                iov_len: right.len(),
+            },
+        ];
+        assert_eq!(
+            agora_sandbox_preadv(
+                reader,
+                vectors.as_ptr(),
+                vectors.len() as libc::c_int,
+                vector_offset
+            ),
+            (left.len() + right.len()) as libc::ssize_t
+        );
+        assert_eq!(
+            [&left[..], &right[..]].concat(),
+            contents[vector_offset as usize..vector_offset as usize + left.len() + right.len()]
+        );
+
+        let far_offset = 1792 * 1024_i64 + 31;
+        let mut far = [1_u8; 16];
+        assert_eq!(
+            raw_pread(reader, far.as_mut_ptr().cast(), far.len(), far_offset),
+            far.len() as libc::ssize_t
+        );
+        assert_eq!(far, [0_u8; 16]);
+
+        let mapping_offset = 1792 * 1024_i64;
+        let mapping = super::super::mapping::agora_sandbox_mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            reader,
+            mapping_offset,
+        );
+        assert_ne!(mapping, libc::MAP_FAILED);
+        assert_eq!(
+            std::slice::from_raw_parts(mapping.cast::<u8>(), 32),
+            &contents[mapping_offset as usize..mapping_offset as usize + 32]
+        );
+        assert_eq!(
+            super::super::mapping::agora_sandbox_munmap(mapping, 4096),
+            0
+        );
+
+        let far_offset = 1984 * 1024_i64 + 31;
+        assert_eq!(agora_sandbox_lseek(reader, 0, libc::SEEK_DATA), 0);
+        assert_eq!(
+            raw_pread(reader, far.as_mut_ptr().cast(), far.len(), far_offset),
+            far.len() as libc::ssize_t
+        );
+        assert_eq!(
+            &far,
+            &contents[far_offset as usize..far_offset as usize + far.len()]
+        );
+        assert_eq!(super::super::agora_sandbox_close(reader), 0);
+
+        let copyfile_reader =
+            super::super::agora_sandbox_open_with_mode(copyfile_path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(copyfile_reader >= 0);
+        let destination = tempfile::tempfile().unwrap();
+        assert_eq!(
+            agora_sandbox_fcopyfile(
+                copyfile_reader,
+                destination.as_raw_fd(),
+                std::ptr::null_mut(),
+                libc::COPYFILE_DATA,
+            ),
+            0
+        );
+        let mut copied = [0_u8; 32];
+        destination.read_exact_at(&mut copied, 0).unwrap();
+        assert_eq!(&copied, &contents[..copied.len()]);
+
+        let managed_destination = super::super::agora_sandbox_open_with_mode(
+            copyfile_destination_path.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(managed_destination >= 0);
+        assert_eq!(
+            agora_sandbox_fcopyfile(
+                copyfile_reader,
+                managed_destination,
+                std::ptr::null_mut(),
+                libc::COPYFILE_DATA,
+            ),
+            -1
+        );
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(super::super::agora_sandbox_close(managed_destination), 0);
+        assert_eq!(super::super::agora_sandbox_close(copyfile_reader), 0);
+
+        let aio_reader =
+            super::super::agora_sandbox_open_with_mode(aio_path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(aio_reader >= 0);
+        let mut aio_contents = [0_u8; 32];
+        let aio_offset = 256 * 1024_i64 + 13;
+        let mut control = std::mem::zeroed::<libc::aiocb>();
+        control.aio_fildes = aio_reader;
+        control.aio_offset = aio_offset;
+        control.aio_buf = aio_contents.as_mut_ptr().cast();
+        control.aio_nbytes = aio_contents.len();
+        assert_eq!(agora_sandbox_aio_read(&mut control), 0);
+        let controls = [&control as *const libc::aiocb];
+        while libc::aio_error(&control) == libc::EINPROGRESS {
+            assert_eq!(
+                libc::aio_suspend(
+                    controls.as_ptr(),
+                    controls.len() as libc::c_int,
+                    std::ptr::null()
+                ),
+                0
+            );
+        }
+        assert_eq!(
+            libc::aio_return(&mut control),
+            aio_contents.len() as libc::ssize_t
+        );
+        assert_eq!(
+            &aio_contents,
+            &contents[aio_offset as usize..aio_offset as usize + aio_contents.len()]
+        );
+        let mut aio_cold = [1_u8; 16];
+        assert_eq!(
+            raw_pread(
+                aio_reader,
+                aio_cold.as_mut_ptr().cast(),
+                aio_cold.len(),
+                768 * 1024,
+            ),
+            aio_cold.len() as libc::ssize_t
+        );
+        assert_eq!(aio_cold, [0_u8; 16]);
+        assert_eq!(super::super::agora_sandbox_close(aio_reader), 0);
+
+        let lio_reader =
+            super::super::agora_sandbox_open_with_mode(lio_path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(lio_reader >= 0);
+        let mut lio_contents = [0_u8; 32];
+        let lio_offset = 512 * 1024_i64 + 19;
+        let mut lio_control = std::mem::zeroed::<libc::aiocb>();
+        lio_control.aio_fildes = lio_reader;
+        lio_control.aio_offset = lio_offset;
+        lio_control.aio_buf = lio_contents.as_mut_ptr().cast();
+        lio_control.aio_nbytes = lio_contents.len();
+        lio_control.aio_lio_opcode = libc::LIO_READ;
+        let lio_controls = [&mut lio_control as *mut libc::aiocb];
+        assert_eq!(
+            agora_sandbox_lio_listio(
+                libc::LIO_WAIT,
+                lio_controls.as_ptr(),
+                lio_controls.len() as libc::c_int,
+                std::ptr::null_mut(),
+            ),
+            0
+        );
+        assert_eq!(
+            &lio_contents,
+            &contents[lio_offset as usize..lio_offset as usize + lio_contents.len()]
+        );
+        let mut lio_cold = [1_u8; 16];
+        assert_eq!(
+            raw_pread(
+                lio_reader,
+                lio_cold.as_mut_ptr().cast(),
+                lio_cold.len(),
+                1024 * 1024,
+            ),
+            lio_cold.len() as libc::ssize_t
+        );
+        assert_eq!(lio_cold, [0_u8; 16]);
+        assert_eq!(super::super::agora_sandbox_close(lio_reader), 0);
+
+        let sendfile_reader =
+            super::super::agora_sandbox_open_with_mode(sendfile_path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(sendfile_reader >= 0);
+        let mut cold = [1_u8; 32];
+        assert_eq!(
+            raw_pread(sendfile_reader, cold.as_mut_ptr().cast(), cold.len(), 0),
+            cold.len() as libc::ssize_t
+        );
+        assert_eq!(cold, [0_u8; 32]);
+        let mut sockets = [-1; 2];
+        assert_eq!(
+            libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sockets.as_mut_ptr()),
+            0
+        );
+        let sendfile_offset = 1024 * 1024_i64 + 23;
+        let mut sent = 32;
+        assert_eq!(
+            agora_sandbox_sendfile(
+                sendfile_reader,
+                sockets[0],
+                sendfile_offset,
+                &mut sent,
+                std::ptr::null_mut(),
+                0,
+            ),
+            0
+        );
+        assert_eq!(sent, 32);
+        let mut received = [0_u8; 32];
+        assert_eq!(
+            libc::read(sockets[1], received.as_mut_ptr().cast(), received.len()),
+            received.len() as libc::ssize_t
+        );
+        assert_eq!(
+            &received,
+            &contents[sendfile_offset as usize..sendfile_offset as usize + received.len()]
+        );
+        let mut sendfile_cold = [1_u8; 16];
+        assert_eq!(
+            raw_pread(
+                sendfile_reader,
+                sendfile_cold.as_mut_ptr().cast(),
+                sendfile_cold.len(),
+                1536 * 1024,
+            ),
+            sendfile_cold.len() as libc::ssize_t
+        );
+        assert_eq!(sendfile_cold, [0_u8; 16]);
+
+        let empty_headers_offset = 1280 * 1024_i64 + 29;
+        let mut empty_headers = std::mem::zeroed::<libc::sf_hdtr>();
+        sent = 32;
+        assert_eq!(
+            agora_sandbox_sendfile(
+                sendfile_reader,
+                sockets[0],
+                empty_headers_offset,
+                &mut sent,
+                &mut empty_headers,
+                0,
+            ),
+            0
+        );
+        assert_eq!(sent, 32);
+        assert_eq!(
+            libc::read(sockets[1], received.as_mut_ptr().cast(), received.len()),
+            received.len() as libc::ssize_t
+        );
+        assert_eq!(
+            &received,
+            &contents
+                [empty_headers_offset as usize..empty_headers_offset as usize + received.len()]
+        );
+        assert_eq!(
+            raw_pread(
+                sendfile_reader,
+                sendfile_cold.as_mut_ptr().cast(),
+                sendfile_cold.len(),
+                1984 * 1024,
+            ),
+            sendfile_cold.len() as libc::ssize_t
+        );
+        assert_eq!(sendfile_cold, [0_u8; 16]);
+        assert_eq!(libc::close(sockets[0]), 0);
+        assert_eq!(libc::close(sockets[1]), 0);
+        assert_eq!(super::super::agora_sandbox_close(sendfile_reader), 0);
+    });
+
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_writable_open_preserves_partial_blocks_and_append_data() {
+    let directory = tempfile::tempdir().unwrap();
+    let logical = directory.path().join("lazy-write.bin");
+    let path = c_path(&logical);
+    let contents = vec![b'x'; 2 * 1024 * 1024];
+
+    let (writer_runtime, writer_controller) = broker_runtime(directory.path()).await;
+    with_test_runtime(&writer_runtime, || unsafe {
+        write_managed_file(&path, &contents);
+    });
+    writer_controller.shutdown().await.unwrap();
+    drop(writer_runtime);
+
+    let (runtime, controller) = broker_runtime(directory.path()).await;
+    with_test_runtime(&runtime, || unsafe {
+        let writer = super::super::agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR, 0);
+        assert!(writer >= 0);
+        assert!(
+            runtime
+                .tracked_open(writer)
+                .unwrap()
+                .local
+                .as_ref()
+                .unwrap()
+                .lazy
+        );
+
+        let mut cold = [1_u8; 16];
+        assert_eq!(
+            raw_pread(
+                writer,
+                cold.as_mut_ptr().cast(),
+                cold.len(),
+                contents.len() as libc::off_t - cold.len() as libc::off_t,
+            ),
+            cold.len() as libc::ssize_t
+        );
+        assert_eq!(cold, [0_u8; 16]);
+
+        let offset = 512 * 1024_i64 + 17;
+        let replacement = b"changed";
+        assert_eq!(
+            agora_sandbox_pwrite(
+                writer,
+                replacement.as_ptr().cast(),
+                replacement.len(),
+                offset,
+            ),
+            replacement.len() as libc::ssize_t
+        );
+        let mut around = [0_u8; 9];
+        assert_eq!(
+            agora_sandbox_pread(writer, around.as_mut_ptr().cast(), around.len(), offset - 1,),
+            around.len() as libc::ssize_t
+        );
+        assert_eq!(&around, b"xchangedx");
+        assert_eq!(super::super::agora_sandbox_close(writer), 0);
+
+        let appender = super::super::agora_sandbox_open_with_mode(
+            path.as_ptr(),
+            libc::O_WRONLY | libc::O_APPEND,
+            0,
+        );
+        assert!(appender >= 0);
+        assert!(
+            runtime
+                .tracked_open(appender)
+                .unwrap()
+                .local
+                .as_ref()
+                .unwrap()
+                .lazy
+        );
+        assert_eq!(agora_sandbox_write(appender, b"tail".as_ptr().cast(), 4), 4);
+        assert_eq!(super::super::agora_sandbox_close(appender), 0);
+
+        let reader = super::super::agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(reader >= 0);
+        let mut changed = [0_u8; 9];
+        assert_eq!(
+            agora_sandbox_pread(
+                reader,
+                changed.as_mut_ptr().cast(),
+                changed.len(),
+                offset - 1,
+            ),
+            changed.len() as libc::ssize_t
+        );
+        assert_eq!(&changed, b"xchangedx");
+        let mut tail = [0_u8; 4];
+        assert_eq!(
+            agora_sandbox_pread(
+                reader,
+                tail.as_mut_ptr().cast(),
+                tail.len(),
+                contents.len() as libc::off_t,
+            ),
+            tail.len() as libc::ssize_t
+        );
+        assert_eq!(&tail, b"tail");
+        assert_eq!(super::super::agora_sandbox_close(reader), 0);
+    });
+
+    controller.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn broker_managed_io_failures_preserve_errno_and_recoverable_state() {
     let directory = tempfile::tempdir().unwrap();
     let (runtime, controller) = broker_runtime(directory.path()).await;
@@ -590,14 +1141,17 @@ async fn broker_managed_io_failures_preserve_errno_and_recoverable_state() {
         let open = runtime.tracked_open(descriptor).unwrap();
         let registration = open.local.as_ref().unwrap();
         assert_eq!(
-            *lock(&registration.dirty),
-            vec![LocalByteRange::new(9, 10).unwrap()]
+            lock(&registration.dirty).as_slice(),
+            &[LocalByteRange::new(9, 10).unwrap()]
         );
         {
             let state = registration.state.lock().unwrap();
             state.set_offset(-1).unwrap();
         }
-        assert_eq!(local_sequential_io(descriptor, false, |_| 0), Some(-1));
+        assert_eq!(
+            local_read_io(descriptor, LocalReadOffset::Sequential, || Ok(0), |_| 0),
+            Some(-1)
+        );
         assert_eq!(local_sequential_write(descriptor, Some(0), |_| 0), Some(-1));
         assert_eq!(local_sequential_write(descriptor, Some(1), |_| 0), Some(-1));
         assert_eq!(agora_sandbox_lseek(descriptor, 0, libc::SEEK_CUR), -1);
@@ -606,7 +1160,10 @@ async fn broker_managed_io_failures_preserve_errno_and_recoverable_state() {
             let state = registration.state.lock().unwrap();
             state.set_offset(libc::off_t::MAX).unwrap();
         }
-        assert_eq!(local_sequential_io(descriptor, false, |_| 1), Some(-1));
+        assert_eq!(
+            local_read_io(descriptor, LocalReadOffset::Sequential, || Ok(0), |_| 1),
+            Some(-1)
+        );
         assert_eq!(*libc::__error(), libc::EOVERFLOW);
         {
             let state = registration.state.lock().unwrap();
@@ -636,9 +1193,11 @@ async fn broker_managed_io_failures_preserve_errno_and_recoverable_state() {
         assert_eq!(inherited.len(), 3);
 
         assert_eq!(libc::ftruncate(registration.state.as_raw_fd(), 0), 0);
-        assert_eq!(local_sequential_io(descriptor, false, |_| 0), Some(-1));
+        assert_eq!(
+            local_read_io(descriptor, LocalReadOffset::Sequential, || Ok(0), |_| 0),
+            Some(-1)
+        );
         assert_eq!(local_sequential_write(descriptor, Some(1), |_| 0), Some(-1));
-        assert!(!local_access_allowed(descriptor, false));
         assert_eq!(agora_sandbox_lseek(descriptor, 0, libc::SEEK_CUR), -1);
         assert_eq!(super::super::agora_sandbox_close(descriptor), 0);
     });

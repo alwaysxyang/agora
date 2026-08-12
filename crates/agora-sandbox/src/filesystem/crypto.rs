@@ -21,10 +21,9 @@ const PBKDF2_ITERATIONS: u32 = 100_000;
 
 mod content;
 
-pub(crate) use content::EncryptedFile;
-use content::PLAINTEXT_BLOCK_SIZE;
 #[cfg(test)]
 pub(super) use content::{CIPHERTEXT_BLOCK_SIZE, CONTENT_HEADER_SIZE};
+pub(crate) use content::{EncryptedFile, PLAINTEXT_BLOCK_SIZE};
 
 #[derive(Clone)]
 pub(crate) struct FileCipher {

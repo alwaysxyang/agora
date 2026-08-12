@@ -124,6 +124,7 @@ fn key_migration_ignores_persistent_executable_caches() {
                 materializer: Materializer::Executable,
                 source: None,
                 variant: None,
+                destination: None,
             },
         )
         .unwrap();

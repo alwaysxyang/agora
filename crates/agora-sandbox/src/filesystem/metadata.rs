@@ -41,6 +41,8 @@ pub(crate) enum EntryState {
         source: Option<SourceIdentity>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         variant: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        destination: Option<SourceIdentity>,
     },
     Cow,
     Whiteout,
@@ -1202,7 +1204,7 @@ impl MetadataStore {
         Ok(())
     }
 
-    fn current_generation(&self) -> Result<u64> {
+    pub(super) fn current_generation(&self) -> Result<u64> {
         let mut bytes = [0_u8; 8];
         let mut offset = 0;
         while offset < bytes.len() {

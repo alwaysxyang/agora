@@ -176,6 +176,10 @@ impl FilesystemHookRuntime {
         let Some(open) = self.tracked_open(descriptor) else {
             return Ok(None);
         };
+        let file_offset = offset as u64;
+        let file_end = file_offset
+            .checked_add(u64::try_from(length).context("memory mapping length overflowed")?)
+            .context("memory mapping file range overflowed")?;
         if let Some(registration) = &open.local {
             let _mutation = lock(&registration.mutation);
             let state = registration.state.lock()?;
@@ -187,14 +191,14 @@ impl FilesystemHookRuntime {
             {
                 return Err(io::Error::from_raw_os_error(libc::EACCES).into());
             }
+            self.materialize_local(
+                registration,
+                Some(LocalByteRange::new(file_offset, file_end)?),
+            )?;
         }
         if flags & libc::MAP_SHARED == 0 {
             return Ok(None);
         }
-        let file_offset = offset as u64;
-        let file_end = file_offset
-            .checked_add(u64::try_from(length).context("memory mapping length overflowed")?)
-            .context("memory mapping file range overflowed")?;
         let writable = protection & libc::PROT_WRITE != 0;
         if writable {
             self.register_potential_range(&open, file_offset, file_end)?;
@@ -296,10 +300,8 @@ impl FilesystemHookRuntime {
             if let Some(registration) = &slice.open.local
                 && registration.writable
             {
-                insert_dirty_range(
-                    &mut lock(&registration.dirty),
-                    LocalByteRange::new(slice.file_start, slice.file_end)?,
-                );
+                lock(&registration.dirty)
+                    .insert(LocalByteRange::new(slice.file_start, slice.file_end)?);
             }
             if !files.iter().any(|open| Arc::ptr_eq(open, &slice.open)) {
                 files.push(Arc::clone(&slice.open));

@@ -165,7 +165,7 @@ unsafe fn sandbox_descriptor_mutation_with_truncate(
                     }
                 })
             {
-                insert_dirty_range(&mut lock(&registration.dirty), range);
+                lock(&registration.dirty).insert(range);
             }
             if let Err(error) = attributes {
                 return unsafe { fail(&error, -1) };

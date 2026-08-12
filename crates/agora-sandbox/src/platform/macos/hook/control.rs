@@ -176,7 +176,7 @@ impl ControlRuntime {
                     return Ok(runtime);
                 }
                 Err(inherited_error) => {
-                    return Self::from_descriptors(config, OwnedControlDescriptors::default())
+                    return Self::connect(config)
                         .with_context(|| {
                             format!(
                                 "failed to reconnect sandbox control streams after inherited descriptors became unavailable: {inherited_error:#}"
@@ -185,7 +185,13 @@ impl ControlRuntime {
                 }
             }
         }
-        Self::from_descriptors(config, OwnedControlDescriptors::default())
+        Self::connect(config)
+    }
+
+    fn connect(config: &HookConfig) -> Result<Self> {
+        let runtime = Self::from_descriptors(config, OwnedControlDescriptors::default())?;
+        runtime.authenticate(config)?;
+        Ok(runtime)
     }
 
     fn from_descriptors(config: &HookConfig, descriptors: OwnedControlDescriptors) -> Result<Self> {
@@ -237,15 +243,13 @@ impl ControlRuntime {
             })
             .transpose()
             .context("failed to initialize the remote filesystem control stream")?;
-        let runtime = Self {
+        Ok(Self {
             lock,
             execution,
             audit,
             local,
             remote,
-        };
-        runtime.authenticate(config)?;
-        Ok(runtime)
+        })
     }
 
     fn validate_descriptors(config: &HookConfig) -> Result<InheritedControlDescriptors> {
@@ -411,8 +415,12 @@ pub(super) fn execution_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::EXECUTION_PROTOCOL_VERSION;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::os::fd::IntoRawFd;
     use std::os::unix::net::UnixListener;
+    use std::thread;
 
     fn base_value(key: &str) -> Option<&'static str> {
         match key {
@@ -439,6 +447,93 @@ mod tests {
                 .or_else(|| base_value(key).map(ToString::to_string))
         })
         .unwrap()
+    }
+
+    fn framed(body: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(4 + body.len());
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    fn count_requests(mut stream: TcpStream, response: Vec<u8>) -> thread::JoinHandle<usize> {
+        thread::spawn(move || {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut requests = 0;
+            loop {
+                let mut prefix = [0_u8; 4];
+                match stream.read_exact(&mut prefix) {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        return requests;
+                    }
+                    Err(error) => panic!("failed to read control request: {error}"),
+                }
+                let mut request = vec![0_u8; u32::from_be_bytes(prefix) as usize];
+                stream.read_exact(&mut request).unwrap();
+                stream.write_all(&response).unwrap();
+                requests += 1;
+            }
+        })
+    }
+
+    fn execution_accepted() -> Vec<u8> {
+        let mut body = Vec::with_capacity(7);
+        body.extend_from_slice(&EXECUTION_PROTOCOL_VERSION.to_be_bytes());
+        body.push(0);
+        body.extend_from_slice(&0_u32.to_be_bytes());
+        framed(&body)
+    }
+
+    fn audit_accepted() -> Vec<u8> {
+        framed(br#""Accepted""#)
+    }
+
+    #[test]
+    fn inherited_control_streams_do_not_repeat_authentication() {
+        let execution_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let execution_address = execution_listener.local_addr().unwrap();
+        let execution_client = TcpStream::connect(execution_address).unwrap();
+        let (execution_server, _) = execution_listener.accept().unwrap();
+
+        let audit_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let audit_address = audit_listener.local_addr().unwrap();
+        let audit_client = TcpStream::connect(audit_address).unwrap();
+        let (audit_server, _) = audit_listener.accept().unwrap();
+
+        let execution_requests = count_requests(execution_server, execution_accepted());
+        let audit_requests = count_requests(audit_server, audit_accepted());
+        let lock = tempfile::tempfile().unwrap().into_raw_fd();
+        let execution = execution_client.into_raw_fd();
+        let audit = audit_client.into_raw_fd();
+        let execution_address = execution_address.to_string();
+        let audit_address = audit_address.to_string();
+        let lock = lock.to_string();
+        let execution = execution.to_string();
+        let audit = audit.to_string();
+        let config = config(&[
+            ("AGORA_SANDBOX_EXECUTION_CONTROL", &execution_address),
+            ("AGORA_SANDBOX_AUDIT_CONTROL", &audit_address),
+            (CONTROL_LOCK_DESCRIPTOR, &lock),
+            (EXECUTION_CONTROL_DESCRIPTOR, &execution),
+            (AUDIT_CONTROL_DESCRIPTOR, &audit),
+        ]);
+
+        let runtime = ControlRuntime::new(&config).unwrap();
+        drop(runtime);
+
+        assert_eq!(execution_requests.join().unwrap(), 0);
+        assert_eq!(audit_requests.join().unwrap(), 0);
     }
 
     #[test]

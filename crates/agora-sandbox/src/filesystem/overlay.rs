@@ -61,6 +61,10 @@ pub(super) struct OverlayTransaction<'a> {
 }
 
 impl OverlayTransaction<'_> {
+    pub(super) fn logical_path(&self, path: &Path) -> Result<PathBuf> {
+        self.store.logical_path_locked(path)
+    }
+
     pub(super) fn prepare_read(&self, path: &Path) -> Result<PathBuf> {
         let path = self.store.normalize(path)?;
         if self.store.is_internal(&path) {
@@ -80,12 +84,12 @@ impl OverlayTransaction<'_> {
     }
 
     pub(super) fn visible_path(&self, path: &Path) -> Result<PathBuf> {
-        let path = self.store.logical_entry_path(path)?;
+        let path = self.store.logical_entry_path_locked(path)?;
         self.store.visible_path_locked(&path)
     }
 
     pub(super) fn attributes(&self, path: &Path) -> Result<Option<FileAttributes>> {
-        let path = self.store.logical_entry_path(path)?;
+        let path = self.store.logical_entry_path_locked(path)?;
         let state = self.store.reconciled_state_locked(&path)?;
         let attributes = self.store.metadata.attributes(&path)?;
         match (state.as_ref(), attributes) {
@@ -231,7 +235,7 @@ impl OverlayTransaction<'_> {
     }
 
     pub(super) fn set_attributes(&self, path: &Path, attributes: FileAttributes) -> Result<()> {
-        let path = self.store.logical_entry_path(path)?;
+        let path = self.store.logical_entry_path_locked(path)?;
         self.store.set_attributes_locked(&path, attributes)
     }
 
@@ -263,6 +267,13 @@ pub(crate) struct DirectoryView {
     lower: Option<PathBuf>,
     hidden: BTreeSet<OsString>,
     aliases: HashMap<OsString, OsString>,
+    native_snapshot: Option<NativeDirectorySnapshot>,
+}
+
+#[derive(Clone)]
+pub(crate) struct NativeDirectorySnapshot {
+    generation: u64,
+    absent_upper: PathBuf,
 }
 
 pub(crate) struct StagedWrite {
@@ -343,6 +354,7 @@ impl DirectoryView {
             lower: None,
             hidden: BTreeSet::new(),
             aliases: HashMap::new(),
+            native_snapshot: None,
         }
     }
 
@@ -371,6 +383,12 @@ impl DirectoryView {
             && self.lower.is_none()
             && self.hidden.is_empty()
             && self.aliases.is_empty()
+    }
+
+    pub(crate) fn native_snapshot(&self) -> Option<&NativeDirectorySnapshot> {
+        self.is_passthrough()
+            .then_some(self.native_snapshot.as_ref())
+            .flatten()
     }
 }
 
@@ -486,6 +504,10 @@ impl OverlayStore {
     }
 
     pub(crate) fn logical_path(&self, path: &Path) -> Result<PathBuf> {
+        self.with_lock(|| self.logical_path_locked(path))
+    }
+
+    fn logical_path_locked(&self, path: &Path) -> Result<PathBuf> {
         let logical = namespace::logical_path(&self.root, path)
             .or_else(|_| namespace::logical_path(&self.canonical_root, path))?;
         let Some(encrypted_name) = path.file_name() else {
@@ -505,9 +527,9 @@ impl OverlayStore {
         Ok(logical)
     }
 
-    fn logical_entry_path(&self, path: &Path) -> Result<PathBuf> {
+    fn logical_entry_path_locked(&self, path: &Path) -> Result<PathBuf> {
         if self.is_internal(path) {
-            self.logical_path(path)
+            self.logical_path_locked(path)
         } else {
             self.normalize(path)
         }
@@ -528,8 +550,10 @@ impl OverlayStore {
     }
 
     pub(crate) fn state(&self, path: &Path) -> Result<Option<EntryState>> {
-        let path = self.logical_entry_path(path)?;
-        self.with_lock(|| self.reconciled_state_locked(&path))
+        self.with_lock(|| {
+            let path = self.logical_entry_path_locked(path)?;
+            self.reconciled_state_locked(&path)
+        })
     }
 
     pub(crate) fn attributes(&self, path: &Path) -> Result<Option<FileAttributes>> {
@@ -576,8 +600,8 @@ impl OverlayStore {
     }
 
     pub(crate) fn mark_executable(&self, path: &Path) -> Result<()> {
-        let path = self.logical_entry_path(path)?;
         self.with_lock(|| {
+            let path = self.logical_entry_path_locked(path)?;
             if let Some(EntryState::Cached {
                 checksum, source, ..
             }) = self.reconciled_state_locked(&path)?
@@ -589,6 +613,7 @@ impl OverlayStore {
                         materializer: Materializer::Executable,
                         source,
                         variant: Some(Self::executable_variant()),
+                        destination: None,
                     },
                 )?;
             }
@@ -740,6 +765,20 @@ impl OverlayStore {
         self.transaction(|transaction| transaction.directory_view(path))
     }
 
+    pub(crate) fn native_directory_snapshot_is_current(
+        &self,
+        snapshot: &NativeDirectorySnapshot,
+    ) -> Result<bool> {
+        if self.metadata.current_generation()? != snapshot.generation {
+            return Ok(false);
+        }
+        match snapshot.absent_upper.symlink_metadata() {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn create_directory(&self, path: &Path, mode: u32) -> Result<PathBuf> {
         self.transaction(|transaction| transaction.create_directory(path, mode))
@@ -765,23 +804,40 @@ impl OverlayStore {
             let source_identity = SourceIdentity::from_metadata(&source.metadata()?);
             let variant = Self::executable_variant();
             let cached = self.reconciled_state_locked(&source)?;
-            let reusable_destination = destination
+            let destination_metadata = destination
                 .symlink_metadata()
-                .is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0);
-            if reusable_destination
-                && matches!(
-                    cached,
-                    Some(EntryState::Cached {
-                        checksum: Some(ref checksum),
-                        materializer: Materializer::Executable,
-                        source: Some(ref cached_source),
-                        variant: Some(ref cached_variant),
-                    }) if cached_source == &source_identity
-                        && cached_variant == &variant
-                        && Self::checksum(&destination).is_ok_and(|current| &current == checksum)
-                )
+                .ok()
+                .filter(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0);
+            if let (
+                Some(destination_metadata),
+                Some(EntryState::Cached {
+                    checksum: Some(checksum),
+                    materializer: Materializer::Executable,
+                    source: Some(cached_source),
+                    variant: Some(cached_variant),
+                    destination: cached_destination,
+                }),
+            ) = (destination_metadata, cached)
+                && cached_source == source_identity
+                && cached_variant == variant
             {
-                return Ok(destination);
+                let destination_identity = SourceIdentity::from_metadata(&destination_metadata);
+                if cached_destination == Some(destination_identity) {
+                    return Ok(destination);
+                }
+                if Self::checksum(&destination).is_ok_and(|current| current == checksum) {
+                    self.metadata.set(
+                        &source,
+                        EntryState::Cached {
+                            checksum: Some(checksum),
+                            materializer: Materializer::Executable,
+                            source: Some(source_identity),
+                            variant: Some(variant),
+                            destination: Some(destination_identity),
+                        },
+                    )?;
+                    return Ok(destination);
+                }
             }
             let parent = destination
                 .parent()
@@ -794,6 +850,8 @@ impl OverlayStore {
                 let checksum = Self::checksum(&temporary)?;
                 Self::remove_existing(&destination)?;
                 fs::rename(&temporary, &destination)?;
+                let destination_identity =
+                    SourceIdentity::from_metadata(&destination.symlink_metadata()?);
                 self.metadata.set(
                     &source,
                     EntryState::Cached {
@@ -801,6 +859,7 @@ impl OverlayStore {
                         materializer: Materializer::Executable,
                         source: Some(source_identity),
                         variant: Some(variant),
+                        destination: Some(destination_identity),
                     },
                 )?;
                 Ok(destination.clone())
@@ -833,8 +892,10 @@ impl OverlayStore {
 
     #[cfg(test)]
     pub(crate) fn state_for_test(&self, path: &Path) -> Result<Option<EntryState>> {
-        let path = self.logical_entry_path(path)?;
-        self.with_lock(|| self.metadata.state(&path))
+        self.with_lock(|| {
+            let path = self.logical_entry_path_locked(path)?;
+            self.metadata.state(&path)
+        })
     }
 
     #[cfg(test)]
@@ -1226,12 +1287,21 @@ impl OverlayStore {
                 }
             }
         }
+        let native_snapshot = if upper_exists {
+            None
+        } else {
+            Some(NativeDirectorySnapshot {
+                generation: self.metadata.current_generation()?,
+                absent_upper: upper,
+            })
+        };
         Ok(DirectoryView {
             logical: path.to_path_buf(),
             primary,
             lower,
             hidden,
             aliases,
+            native_snapshot,
         })
     }
 
@@ -1308,6 +1378,7 @@ impl OverlayStore {
                     materializer,
                     source: Some(SourceIdentity::from_metadata(&source_metadata)),
                     variant: None,
+                    destination: None,
                 },
                 Some(attributes),
             )?;

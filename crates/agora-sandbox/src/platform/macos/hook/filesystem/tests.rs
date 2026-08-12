@@ -9,7 +9,7 @@ use super::directory::{
     fts_read_returns_virtual_entry_for_test,
 };
 use super::{
-    DirectoryCursor, FilesystemHookGuard, FilesystemHookRuntime, LocalByteRange,
+    ByteRangeSet, DirectoryCursor, FilesystemHookGuard, FilesystemHookRuntime, LocalByteRange,
     agora_sandbox_access as sandbox_access, agora_sandbox_chdir as sandbox_chdir,
     agora_sandbox_chflags as sandbox_chflags, agora_sandbox_chmod as sandbox_chmod,
     agora_sandbox_chown as sandbox_chown, agora_sandbox_clonefile as sandbox_clonefile,
@@ -51,8 +51,8 @@ use super::{
     agora_sandbox_unlink as sandbox_unlink, agora_sandbox_unlinkat as sandbox_unlinkat,
     agora_sandbox_utimensat as sandbox_utimensat, agora_sandbox_utimes as sandbox_utimes,
     catch_filesystem_panic, configure_descriptor, error_errno, flush_at_exit, flush_before_exec,
-    insert_dirty_range, intent_from_fopen_mode, sandbox_descriptor_mutation,
-    sandbox_unsupported_path_mutation, truncate_reservation, with_test_runtime,
+    intent_from_fopen_mode, sandbox_descriptor_mutation, sandbox_unsupported_path_mutation,
+    truncate_reservation, with_test_runtime,
 };
 use crate::audit::AuditClient;
 use crate::filesystem::{EntryState, FileAttributes, FileLayer};
@@ -2553,6 +2553,7 @@ fn content_mutating_fcntl_is_rejected_for_managed_descriptors() {
                 .local = Some(super::LocalRegistration {
                 handle: "local-handle".to_string(),
                 writable: true,
+                lazy: false,
                 state: super::LocalOpenState::create(libc::O_RDWR).unwrap(),
                 lock: tempfile::tempfile().unwrap(),
                 identity: super::LocalFileIdentity {
@@ -2560,7 +2561,8 @@ fn content_mutating_fcntl_is_rejected_for_managed_descriptors() {
                     inode: 2,
                     links: 1,
                 },
-                dirty: std::sync::Mutex::new(Vec::new()),
+                dirty: std::sync::Mutex::new(ByteRangeSet::default()),
+                materialized: std::sync::Mutex::new(ByteRangeSet::default()),
                 mutation: std::sync::Mutex::new(()),
             });
         }
@@ -2616,7 +2618,7 @@ fn directory_descriptor_duplicates_keep_logical_paths_and_close_clears_tracking(
         assert!(descriptor >= 0);
         fixture
             .runtime
-            .register_directory(descriptor, logical.clone(), false);
+            .register_directory(descriptor, logical.clone(), false, None);
 
         let duplicate = sandbox_dup(descriptor);
         assert!(duplicate >= 0);
@@ -2763,6 +2765,50 @@ fn successful_stat_calls_preserve_errno() {
         assert_eq!(sandbox_fstat(descriptor, &mut status), 0);
         assert_eq!(*libc::__error(), libc::ERANGE);
         assert_eq!(sandbox_close(descriptor), 0);
+    });
+}
+
+#[test]
+fn fstatat_reuses_an_unchanged_passthrough_directory_snapshot() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("entry");
+    std::fs::write(&logical, b"lower").unwrap();
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let directory = sandbox_opendir(Fixture::c_path(&fixture.lower).as_ptr());
+        assert!(!directory.is_null());
+        let descriptor = libc::dirfd(directory);
+        let mut status = std::mem::zeroed::<libc::stat>();
+        let before = fixture.runtime.filesystem.transaction_count_for_test();
+
+        assert_eq!(
+            sandbox_fstatat(descriptor, c"entry".as_ptr(), &mut status, 0),
+            0
+        );
+        assert_eq!(status.st_size, 5);
+        assert_eq!(
+            fixture.runtime.filesystem.transaction_count_for_test(),
+            before,
+            "an unchanged passthrough directory should not re-enter the overlay transaction"
+        );
+
+        let writable = sandbox_open_with_mode(
+            Fixture::c_path(&logical).as_ptr(),
+            libc::O_WRONLY | libc::O_TRUNC,
+            0,
+        );
+        assert!(writable >= 0);
+        assert_eq!(libc::write(writable, b"sandbox".as_ptr().cast(), 7), 7);
+        assert_eq!(sandbox_close(writable), 0);
+        let before = fixture.runtime.filesystem.transaction_count_for_test();
+
+        assert_eq!(
+            sandbox_fstatat(descriptor, c"entry".as_ptr(), &mut status, 0),
+            0
+        );
+        assert_eq!(status.st_size, 7);
+        assert!(fixture.runtime.filesystem.transaction_count_for_test() > before);
+        assert_eq!(sandbox_closedir(directory), 0);
     });
 }
 
@@ -3005,14 +3051,15 @@ fn filesystem_errors_preserve_errno_and_default_to_io_error() {
 
 #[test]
 fn dirty_ranges_merge_overlaps_and_keep_disjoint_ranges() {
-    let mut ranges = vec![LocalByteRange::new(0, 4).unwrap()];
+    let mut ranges = ByteRangeSet::default();
+    ranges.insert(LocalByteRange::new(0, 4).unwrap());
 
-    insert_dirty_range(&mut ranges, LocalByteRange::new(3, 8).unwrap());
-    insert_dirty_range(&mut ranges, LocalByteRange::new(12, 16).unwrap());
+    ranges.insert(LocalByteRange::new(3, 8).unwrap());
+    ranges.insert(LocalByteRange::new(12, 16).unwrap());
 
     assert_eq!(
-        ranges,
-        [
+        ranges.as_slice(),
+        &[
             LocalByteRange::new(0, 8).unwrap(),
             LocalByteRange::new(12, 16).unwrap(),
         ]

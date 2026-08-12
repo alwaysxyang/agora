@@ -47,6 +47,9 @@ async fn controller_serves_the_complete_local_client_lifecycle() {
     let client = LocalClient::new(controller.runtime().socket(), controller.runtime().token());
     let handle = tokio::task::spawn_blocking(move || {
         let opened = client.open(&backing, libc::O_RDWR).unwrap();
+        client
+            .materialize(&opened.handle, Some(ByteRange::new(0, 3).unwrap()))
+            .unwrap();
         let write = client
             .begin_write(&opened.handle, ByteRange::new(0, 6).unwrap())
             .unwrap();

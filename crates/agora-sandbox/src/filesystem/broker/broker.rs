@@ -1,5 +1,6 @@
-use super::LocalOpenState;
 use super::protocol::{ByteRange, Request, Response};
+use super::{ByteRangeSet, LocalOpenState};
+use crate::filesystem::crypto::PLAINTEXT_BLOCK_SIZE;
 use crate::filesystem::{EncryptedFile, FileCipher};
 use ring::digest::{SHA256, digest};
 use std::collections::HashMap;
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
+const LAZY_PLAINTEXT_THRESHOLD: u64 = 1024 * 1024;
 pub(super) const WRITEBACK_DELAY: Duration = Duration::from_millis(10);
 const CLOSED_HANDLE_TTL: Duration = Duration::from_secs(120);
 const CLOSED_HANDLE_CAPACITY: usize = 128;
@@ -68,7 +70,7 @@ enum CacheDecision {
 
 struct LocalHandle {
     writable: bool,
-    potentially_dirty: RangeSet,
+    potentially_dirty: ByteRangeSet,
     active_writes: HashMap<String, ByteRange>,
     references: usize,
     closed_at: Option<Instant>,
@@ -86,8 +88,9 @@ struct SharedPlaintext {
 struct SharedFile {
     plaintext: File,
     encrypted: EncryptedFile,
+    resident: ByteRangeSet,
     baseline: PlaintextIdentity,
-    pending_writes: RangeSet,
+    pending_writes: ByteRangeSet,
     pending_since: Option<Instant>,
     needs_durable_sync: bool,
 }
@@ -118,11 +121,6 @@ struct PlaintextIdentity {
     modified_nanoseconds: i64,
     changed_seconds: i64,
     changed_nanoseconds: i64,
-}
-
-#[derive(Clone, Default)]
-struct RangeSet {
-    ranges: Vec<ByteRange>,
 }
 
 struct BrokerError {
@@ -423,6 +421,15 @@ impl LocalBroker {
                 Self::reject_descriptor(descriptor)?;
                 self.open(&path.to_path().map_err(BrokerError::protocol_error)?, flags)
             }
+            Request::Materialize { handle, range } => {
+                Self::reject_descriptor(descriptor)?;
+                if let Some(range) = range {
+                    Self::validate_range(range)?;
+                }
+                self.activate(&handle)?;
+                self.materialize(&handle, range)?;
+                Ok(Response::Success)
+            }
             Request::Sync {
                 handle,
                 ranges,
@@ -558,6 +565,7 @@ impl LocalBroker {
                 if valid {
                     let mut shared_file = lock(&shared.inner);
                     shared_file.pending_writes.insert(range);
+                    shared_file.resident.insert(range);
                     shared_file.pending_since.get_or_insert_with(Instant::now);
                     self.writeback_pending.store(true, Ordering::Release);
                 }
@@ -743,6 +751,7 @@ impl LocalBroker {
                         BrokerError::io("failed to inspect shared local plaintext file", error)
                     })?;
                     shared.encrypted = replacement;
+                    shared.resident = ByteRangeSet::default();
                     shared.baseline = PlaintextIdentity::from_metadata(&metadata);
                     shared.needs_durable_sync = true;
                 }
@@ -750,28 +759,37 @@ impl LocalBroker {
             } else {
                 drop(files);
                 let mut encrypted = encrypted.take().expect("encrypted file is available");
-                let plaintext = if flags & libc::O_TRUNC != 0 {
+                let truncated = flags & libc::O_TRUNC != 0;
+                if truncated {
                     encrypted.set_len(0).map_err(|error| {
                         BrokerError::anyhow("failed to truncate encrypted local file", error)
                     })?;
-                    tempfile::tempfile().map_err(|error| {
-                        BrokerError::io("failed to create shared local plaintext file", error)
-                    })?
-                } else {
-                    decrypt_plaintext(&encrypted)?
-                };
+                }
+                let length = encrypted.len();
+                let lazy = !truncated && length > LAZY_PLAINTEXT_THRESHOLD;
+                let plaintext = tempfile::tempfile().map_err(|error| {
+                    BrokerError::io("failed to create shared local plaintext file", error)
+                })?;
+                plaintext.set_len(length).map_err(|error| {
+                    BrokerError::io("failed to size shared local plaintext file", error)
+                })?;
                 let plaintext_metadata = plaintext.metadata().map_err(|error| {
                     BrokerError::io("failed to inspect local plaintext file", error)
                 })?;
+                let mut shared_file = SharedFile {
+                    plaintext,
+                    encrypted,
+                    resident: ByteRangeSet::default(),
+                    baseline: PlaintextIdentity::from_metadata(&plaintext_metadata),
+                    pending_writes: ByteRangeSet::default(),
+                    pending_since: None,
+                    needs_durable_sync: truncated,
+                };
+                if !lazy {
+                    Self::materialize_locked(&mut shared_file, None)?;
+                }
                 let file = Arc::new(SharedPlaintext {
-                    inner: Mutex::new(SharedFile {
-                        plaintext,
-                        encrypted,
-                        baseline: PlaintextIdentity::from_metadata(&plaintext_metadata),
-                        pending_writes: RangeSet::default(),
-                        pending_since: None,
-                        needs_durable_sync: flags & libc::O_TRUNC != 0,
-                    }),
+                    inner: Mutex::new(shared_file),
                     lock_anchor: tempfile::NamedTempFile::new_in(self.lock_directory.path())
                         .map_err(|error| {
                             BrokerError::io("failed to create local lock anchor", error)
@@ -783,6 +801,10 @@ impl LocalBroker {
                 file
             }
         };
+        let lazy = {
+            let shared = lock(&shared.inner);
+            !shared.fully_resident()
+        };
         let state = LocalOpenState::create(open_status_flags(flags))
             .map_err(|error| BrokerError::io("failed to create local open state", error))?;
         let id = Uuid::new_v4().simple().to_string();
@@ -790,7 +812,7 @@ impl LocalBroker {
             id.clone(),
             Arc::new(Mutex::new(LocalHandle {
                 writable: access != libc::O_RDONLY,
-                potentially_dirty: RangeSet::default(),
+                potentially_dirty: ByteRangeSet::default(),
                 active_writes: HashMap::new(),
                 references: 1,
                 closed_at: None,
@@ -803,7 +825,87 @@ impl LocalBroker {
             device: identity.device,
             inode: identity.inode,
             links: metadata.nlink(),
+            lazy,
         })
+    }
+
+    fn materialize(&self, id: &str, range: Option<ByteRange>) -> Result<(), BrokerError> {
+        let handle = self.lookup_handle(id)?;
+        let shared = Arc::clone(&lock(&handle).shared);
+        let _sync = shared.try_begin_sync().ok_or_else(BrokerError::busy)?;
+        let mut shared = lock(&shared.inner);
+        Self::materialize_locked(&mut shared, range)
+    }
+
+    fn materialize_locked(
+        shared: &mut SharedFile,
+        range: Option<ByteRange>,
+    ) -> Result<(), BrokerError> {
+        let length = shared.encrypted.len();
+        if length == 0 {
+            return Ok(());
+        }
+        let requested = range.unwrap_or(ByteRange {
+            start: 0,
+            end: length,
+        });
+        let start = requested.start.min(length);
+        let end = requested.end.min(length);
+        if start >= end {
+            return Ok(());
+        }
+        let block = PLAINTEXT_BLOCK_SIZE as u64;
+        let aligned = ByteRange {
+            start: start - start % block,
+            end: end.div_ceil(block).saturating_mul(block).min(length),
+        };
+        let missing = shared.resident.missing(aligned);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let before = shared
+            .plaintext
+            .metadata()
+            .map_err(|error| BrokerError::io("failed to inspect local plaintext file", error))?;
+        let baseline_clean = PlaintextIdentity::from_metadata(&before) == shared.baseline;
+        let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
+        let result = (|| {
+            for range in missing {
+                let mut offset = range.start;
+                while offset < range.end {
+                    let count = usize::try_from((range.end - offset).min(buffer.len() as u64))
+                        .expect("materialization chunk length fits usize");
+                    let read = shared
+                        .encrypted
+                        .read_at(&mut buffer[..count], offset)
+                        .map_err(|error| {
+                            BrokerError::anyhow("failed to decrypt local plaintext range", error)
+                        })?;
+                    if read != count {
+                        return Err(BrokerError::new(
+                            libc::EIO,
+                            "encrypted local file ended before its logical length",
+                        ));
+                    }
+                    write_all_at(&shared.plaintext, &buffer[..read], offset).map_err(|error| {
+                        BrokerError::io("failed to materialize local plaintext range", error)
+                    })?;
+                    offset += read as u64;
+                }
+                shared.resident.insert(range);
+            }
+            Ok(())
+        })();
+        let refreshed = if baseline_clean {
+            shared
+                .plaintext
+                .metadata()
+                .map(|metadata| shared.baseline = PlaintextIdentity::from_metadata(&metadata))
+                .map_err(|error| BrokerError::io("failed to inspect local plaintext file", error))
+        } else {
+            Ok(())
+        };
+        result.and(refreshed)
     }
 
     fn open_descriptors(&self, id: &str) -> Result<Vec<File>, BrokerError> {
@@ -856,7 +958,7 @@ impl LocalBroker {
         let current = PlaintextIdentity::from_metadata(&metadata);
         if include_potential
             && !handle.writable
-            && shared.pending_writes.ranges.is_empty()
+            && shared.pending_writes.is_empty()
             && current != shared.baseline
         {
             return Err(BrokerError::new(
@@ -872,20 +974,21 @@ impl LocalBroker {
         }
         for range in ranges {
             shared.pending_writes.insert(range);
+            shared.resident.insert(range);
         }
-        if !shared.pending_writes.ranges.is_empty() {
+        if !shared.pending_writes.is_empty() {
             shared.pending_since.get_or_insert_with(Instant::now);
         }
         let mut candidates = shared.pending_writes.clone();
         if include_potential {
-            for range in &handle.potentially_dirty.ranges {
+            for range in handle.potentially_dirty.iter() {
                 candidates.insert(*range);
             }
         }
         debug_assert!(handle.active_writes.is_empty());
         if include_potential
             && handle.writable
-            && candidates.ranges.is_empty()
+            && candidates.is_empty()
             && current != shared.baseline
             && current.length > 0
         {
@@ -894,9 +997,9 @@ impl LocalBroker {
                 end: current.length,
             });
         }
-        let ranges = candidates.ranges.clone();
+        let ranges = candidates.to_vec();
         let length = current.length;
-        if include_potential && !handle.potentially_dirty.ranges.is_empty() && !handle.writable {
+        if include_potential && !handle.potentially_dirty.is_empty() && !handle.writable {
             return Err(BrokerError::new(
                 libc::EBADF,
                 "local filesystem handle is not writable",
@@ -940,10 +1043,10 @@ impl LocalBroker {
             })?;
             shared.needs_durable_sync = false;
         }
-        shared.pending_writes.ranges.clear();
+        shared.pending_writes.clear();
         shared.pending_since = None;
         if include_potential {
-            handle.potentially_dirty.ranges.clear();
+            handle.potentially_dirty.clear();
         }
         shared.baseline = current;
         Ok(())
@@ -1244,24 +1347,14 @@ impl PlaintextIdentity {
     }
 }
 
-impl RangeSet {
-    fn insert(&mut self, range: ByteRange) {
-        if range.start >= range.end {
-            return;
-        }
-        self.ranges.push(range);
-        self.ranges.sort_unstable_by_key(|range| range.start);
-        let mut merged: Vec<ByteRange> = Vec::with_capacity(self.ranges.len());
-        for range in self.ranges.drain(..) {
-            if let Some(last) = merged.last_mut()
-                && range.start <= last.end
-            {
-                last.end = last.end.max(range.end);
-            } else {
-                merged.push(range);
-            }
-        }
-        self.ranges = merged;
+impl SharedFile {
+    fn fully_resident(&self) -> bool {
+        let length = self.encrypted.len();
+        length == 0
+            || self.resident.covers(ByteRange {
+                start: 0,
+                end: length,
+            })
     }
 }
 
@@ -1323,31 +1416,6 @@ fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> std::io
         buffer = &mut buffer[read..];
     }
     Ok(())
-}
-
-fn decrypt_plaintext(encrypted: &EncryptedFile) -> Result<File, BrokerError> {
-    let plaintext = tempfile::tempfile()
-        .map_err(|error| BrokerError::io("failed to create shared local plaintext file", error))?;
-    let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
-    let mut offset = 0_u64;
-    while offset < encrypted.len() {
-        let count = encrypted.read_at(&mut buffer, offset).map_err(|error| {
-            BrokerError::anyhow("failed to decrypt shared local plaintext file", error)
-        })?;
-        if count == 0 {
-            return Err(BrokerError::new(
-                libc::EIO,
-                "encrypted local file ended before its logical length",
-            ));
-        }
-        write_all_at(&plaintext, &buffer[..count], offset).map_err(|error| {
-            BrokerError::io("failed to write shared local plaintext file", error)
-        })?;
-        offset = offset
-            .checked_add(count as u64)
-            .ok_or_else(|| BrokerError::new(libc::EFBIG, "local plaintext file is too large"))?;
-    }
-    Ok(plaintext)
 }
 
 fn write_all_at(file: &File, mut buffer: &[u8], mut offset: u64) -> std::io::Result<()> {

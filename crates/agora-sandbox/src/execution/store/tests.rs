@@ -87,6 +87,7 @@ fn executable_store_prepares_and_caches_a_native_copy() {
         materializer,
         source: source_identity,
         variant,
+        destination,
     }) = store.overlay.state_for_test(&source).unwrap()
     else {
         panic!("missing executable cache metadata");
@@ -94,6 +95,7 @@ fn executable_store_prepares_and_caches_a_native_copy() {
     assert!(checksum.is_some());
     assert_eq!(materializer, Materializer::Executable);
     assert!(source_identity.is_some());
+    assert!(destination.is_some());
     assert_eq!(
         variant.as_deref(),
         Some(format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH).as_str())
@@ -126,9 +128,26 @@ fn executable_store_prepares_and_caches_a_native_copy() {
     assert_eq!(metadata["version"], 3);
     assert!(metadata["entries"].get("sh").is_some());
     assert!(metadata["entries"]["sh"]["entry"]["checksum"].is_string());
+    assert!(metadata["entries"]["sh"]["entry"]["destination"].is_object());
     assert_eq!(
         metadata["entries"]["sh"]["entry"]["variant"],
         format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH)
+    );
+}
+
+#[test]
+fn executable_store_cache_hit_skips_architecture_inspection() {
+    let root = TestDirectory::new();
+    let store = ExecutableStore::new(root.path().join("prepared")).unwrap();
+
+    store.prepare(Path::new("/bin/sh")).unwrap();
+    super::ARCHITECTURE_INSPECTIONS.with(|inspections| inspections.set(0));
+
+    store.prepare(Path::new("/bin/sh")).unwrap();
+
+    assert_eq!(
+        super::ARCHITECTURE_INSPECTIONS.with(std::cell::Cell::get),
+        0
     );
 }
 

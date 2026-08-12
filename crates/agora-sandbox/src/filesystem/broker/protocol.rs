@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 7;
+pub(crate) const PROTOCOL_VERSION: u16 = 8;
 
 pub(crate) fn valid_request_id(value: &str) -> bool {
     value.len() == 32
@@ -35,6 +35,10 @@ pub(crate) enum Request {
     Open {
         path: BackingPath,
         flags: libc::c_int,
+    },
+    Materialize {
+        handle: String,
+        range: Option<ByteRange>,
     },
     Sync {
         handle: String,
@@ -90,6 +94,7 @@ pub(crate) enum Response {
         device: u64,
         inode: u64,
         links: u64,
+        lazy: bool,
     },
     Offset {
         offset: u64,

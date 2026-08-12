@@ -9,15 +9,17 @@ use super::{
 use crate::audit::AuditEventRequest;
 use crate::callback::ProcessOperation;
 use crate::execution::{EXECUTION_PROTOCOL_VERSION, decode_prepare_request};
+use crate::ipc::{InheritedControlLock, InheritedControlStream};
 use crate::platform::hook::config::HookConfig;
 use crate::trace::TraceContext;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::thread;
 use uuid::Uuid;
 
@@ -124,6 +126,7 @@ fn runtime_with_response(response: Vec<u8>) -> (ProcessHookRuntime, thread::Join
         ProcessHookRuntime {
             config: config_with_control(control),
             audit: None,
+            execution: None,
             prefer_shared: std::sync::atomic::AtomicBool::new(false),
             observed_pid: std::sync::atomic::AtomicU32::new(std::process::id()),
         },
@@ -154,11 +157,65 @@ fn runtime_with_responses(
         ProcessHookRuntime {
             config: config_with_control(control),
             audit: None,
+            execution: None,
             prefer_shared: std::sync::atomic::AtomicBool::new(false),
             observed_pid: std::sync::atomic::AtomicU32::new(std::process::id()),
         },
         server,
     )
+}
+
+#[test]
+fn process_runtime_reuses_the_inherited_execution_stream() {
+    let fallback = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    fallback.set_nonblocking(true).unwrap();
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let mut prefix = [0_u8; 4];
+            stream.read_exact(&mut prefix).unwrap();
+            let mut request = vec![0_u8; u32::from_be_bytes(prefix) as usize];
+            stream.read_exact(&mut request).unwrap();
+            stream.write_all(&response(1, b"/tmp/prepared-sh")).unwrap();
+            requests.push(request);
+        }
+        requests
+    });
+    let execution =
+        InheritedControlStream::new(client, InheritedControlLock::anonymous().unwrap(), 0).unwrap();
+    let runtime = ProcessHookRuntime {
+        config: config_with_control(fallback.local_addr().unwrap()),
+        audit: None,
+        execution: Some(Arc::clone(&execution)),
+        prefer_shared: std::sync::atomic::AtomicBool::new(true),
+        observed_pid: std::sync::atomic::AtomicU32::new(std::process::id()),
+    };
+
+    assert_eq!(
+        runtime.prepare(Path::new("/bin/sh")).unwrap(),
+        CString::new("/tmp/prepared-sh").unwrap()
+    );
+    assert_eq!(
+        runtime.prepare(Path::new("/usr/bin/true")).unwrap(),
+        CString::new("/tmp/prepared-sh").unwrap()
+    );
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        decode_prepare_request(&requests[0]).unwrap().executable,
+        Path::new("/bin/sh")
+    );
+    assert_eq!(
+        decode_prepare_request(&requests[1]).unwrap().executable,
+        Path::new("/usr/bin/true")
+    );
+    assert_eq!(
+        fallback.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 #[test]
@@ -680,6 +737,7 @@ fn process_runtime_rejects_an_oversized_execution_token_before_sending() {
     let runtime = ProcessHookRuntime {
         config: config_with_control_and_token(listener.local_addr().unwrap(), &"x".repeat(65_536)),
         audit: None,
+        execution: None,
         prefer_shared: std::sync::atomic::AtomicBool::new(false),
         observed_pid: std::sync::atomic::AtomicU32::new(std::process::id()),
     };
@@ -773,6 +831,7 @@ fn prepared_execution_distinguishes_null_and_missing_programs() {
     let runtime = ProcessHookRuntime {
         config: config(),
         audit: None,
+        execution: None,
         prefer_shared: std::sync::atomic::AtomicBool::new(false),
         observed_pid: std::sync::atomic::AtomicU32::new(std::process::id()),
     };

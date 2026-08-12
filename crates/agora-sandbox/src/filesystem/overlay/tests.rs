@@ -1,4 +1,4 @@
-use super::{OverlayStore, StagedWrite, WriteReservation};
+use super::{OverlayStore, SourceIdentity, StagedWrite, WriteReservation};
 use crate::filesystem::{EntryState, FileAttributes, FileCipher, Materializer};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt as _;
@@ -1607,6 +1607,62 @@ fn checksum_matches_standard_md5_and_executable_publication_is_reused() {
 }
 
 #[test]
+fn executable_publication_skips_checksum_when_the_destination_identity_is_unchanged() {
+    let fixture = Fixture::new();
+    let source = fixture.lower.join("large-tool");
+    std::fs::write(&source, b"source").unwrap();
+    let mut preparations = 0;
+    let destination = fixture
+        .store
+        .prepare_executable(&source, |temporary| {
+            preparations += 1;
+            std::fs::write(temporary, b"prepared")?;
+            std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        })
+        .unwrap();
+
+    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o111)).unwrap();
+    let state = fixture.store.state_for_test(&source).unwrap().unwrap();
+    let EntryState::Cached {
+        checksum,
+        materializer,
+        source: cached_source,
+        variant,
+        destination: _,
+    } = state
+    else {
+        panic!("unexpected executable state");
+    };
+    fixture
+        .store
+        .set_state_for_test(
+            &source,
+            EntryState::Cached {
+                checksum,
+                materializer,
+                source: cached_source,
+                variant,
+                destination: Some(SourceIdentity::from_metadata(
+                    &destination.symlink_metadata().unwrap(),
+                )),
+            },
+        )
+        .unwrap();
+
+    fixture
+        .store
+        .prepare_executable(&source, |_| {
+            preparations += 1;
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(preparations, 1);
+    assert_eq!(std::fs::read(&source).unwrap(), b"source");
+}
+
+#[test]
 fn directory_rename_materializes_the_visible_tree_without_changing_the_lower_tree() {
     let fixture = Fixture::new();
     let source = fixture.lower.join("source-directory");
@@ -1873,6 +1929,7 @@ fn executable_cache_rebuilds_when_the_recorded_checksum_is_wrong() {
                     std::env::consts::OS,
                     std::env::consts::ARCH
                 )),
+                destination: None,
             },
         )
         .unwrap();
@@ -1884,6 +1941,37 @@ fn executable_cache_rebuilds_when_the_recorded_checksum_is_wrong() {
     });
 
     assert_eq!(rebuilt.unwrap(), destination);
+    assert_eq!(std::fs::read(destination).unwrap(), b"rebuilt executable");
+}
+
+#[test]
+fn executable_cache_rebuilds_when_the_destination_content_changes() {
+    let fixture = Fixture::new();
+    let source = fixture.lower.join("tampered-tool");
+    std::fs::write(&source, b"source executable").unwrap();
+    let destination = fixture
+        .store
+        .prepare_executable(&source, |temporary| {
+            std::fs::write(temporary, b"prepared executable")?;
+            std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        })
+        .unwrap();
+    std::fs::write(&destination, b"tampered executable").unwrap();
+    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut preparations = 0;
+    fixture
+        .store
+        .prepare_executable(&source, |temporary| {
+            preparations += 1;
+            std::fs::write(temporary, b"rebuilt executable")?;
+            std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(preparations, 1);
     assert_eq!(std::fs::read(destination).unwrap(), b"rebuilt executable");
 }
 

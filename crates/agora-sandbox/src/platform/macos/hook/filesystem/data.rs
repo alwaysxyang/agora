@@ -1,4 +1,16 @@
+use super::super::abi::{darwin_mach_task_self, darwin_mach_vm_read_overwrite};
 use super::*;
+
+const LOCAL_READ_AHEAD_MIN_BYTES: u64 = 16 * 1024;
+const LOCAL_READ_AHEAD_MAX_BYTES: u64 = 256 * 1024;
+const LOCAL_READ_AHEAD_MULTIPLIER: u64 = 4;
+const MAX_VECTOR_COUNT: usize = 1024;
+
+#[derive(Clone, Copy)]
+enum LocalReadOffset {
+    Sequential,
+    Positioned(libc::off_t),
+}
 
 type ReadFn = unsafe extern "C" fn(libc::c_int, *mut libc::c_void, usize) -> libc::ssize_t;
 type PreadFn =
@@ -21,6 +33,27 @@ type PwritevFn = unsafe extern "C" fn(
     libc::off_t,
 ) -> libc::ssize_t;
 type LseekFn = unsafe extern "C" fn(libc::c_int, libc::off_t, libc::c_int) -> libc::off_t;
+type SendfileFn = unsafe extern "C" fn(
+    libc::c_int,
+    libc::c_int,
+    libc::off_t,
+    *mut libc::off_t,
+    *mut libc::sf_hdtr,
+    libc::c_int,
+) -> libc::c_int;
+type FcopyfileFn = unsafe extern "C" fn(
+    libc::c_int,
+    libc::c_int,
+    libc::copyfile_state_t,
+    libc::copyfile_flags_t,
+) -> libc::c_int;
+type AioReadFn = unsafe extern "C" fn(*mut libc::aiocb) -> libc::c_int;
+type LioListioFn = unsafe extern "C" fn(
+    libc::c_int,
+    *const *mut libc::aiocb,
+    libc::c_int,
+    *mut libc::sigevent,
+) -> libc::c_int;
 type GuardedWriteFn =
     unsafe extern "C" fn(libc::c_int, *const GuardId, *const libc::c_void, usize) -> libc::ssize_t;
 type GuardedPwriteFn = unsafe extern "C" fn(
@@ -53,14 +86,19 @@ unsafe fn sandbox_read_with(
             return unsafe { original(descriptor, buffer, length) };
         };
         match unsafe {
-            local_sequential_io(descriptor, false, |offset| {
-                positioned
-                    .map(|pread| pread(descriptor, buffer, length, offset))
-                    .unwrap_or_else(|| {
-                        set_errno(libc::ENOSYS);
-                        -1
-                    })
-            })
+            local_read_io(
+                descriptor,
+                LocalReadOffset::Sequential,
+                || Ok(length),
+                |offset| {
+                    positioned
+                        .map(|pread| pread(descriptor, buffer, length, offset))
+                        .unwrap_or_else(|| {
+                            set_errno(libc::ENOSYS);
+                            -1
+                        })
+                },
+            )
         } {
             Some(result) => result,
             None => unsafe { original(descriptor, buffer, length) },
@@ -100,8 +138,15 @@ unsafe fn sandbox_pread_with(
         let Some(_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, buffer, length, offset) };
         };
-        if !local_access_allowed(descriptor, false) {
-            return -1;
+        if let Some(result) = unsafe {
+            local_read_io(
+                descriptor,
+                LocalReadOffset::Positioned(offset),
+                || Ok(length),
+                |offset| original(descriptor, buffer, length, offset),
+            )
+        } {
+            return result;
         }
         unsafe { original(descriptor, buffer, length, offset) }
     })
@@ -133,14 +178,19 @@ unsafe fn sandbox_readv_with(
             return unsafe { original(descriptor, vectors, count) };
         };
         match unsafe {
-            local_sequential_io(descriptor, false, |offset| {
-                positioned
-                    .map(|preadv| preadv(descriptor, vectors, count, offset))
-                    .unwrap_or_else(|| {
-                        set_errno(libc::ENOSYS);
-                        -1
-                    })
-            })
+            local_read_io(
+                descriptor,
+                LocalReadOffset::Sequential,
+                || vector_read_length(vectors, count),
+                |offset| {
+                    positioned
+                        .map(|preadv| preadv(descriptor, vectors, count, offset))
+                        .unwrap_or_else(|| {
+                            set_errno(libc::ENOSYS);
+                            -1
+                        })
+                },
+            )
         } {
             Some(result) => result,
             None => unsafe { original(descriptor, vectors, count) },
@@ -180,8 +230,15 @@ unsafe fn sandbox_preadv_with(
         let Some(_guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, vectors, count, offset) };
         };
-        if !local_access_allowed(descriptor, false) {
-            return -1;
+        if let Some(result) = unsafe {
+            local_read_io(
+                descriptor,
+                LocalReadOffset::Positioned(offset),
+                || vector_read_length(vectors, count),
+                |offset| original(descriptor, vectors, count, offset),
+            )
+        } {
+            return result;
         }
         unsafe { original(descriptor, vectors, count, offset) }
     })
@@ -492,9 +549,10 @@ pub unsafe extern "C" fn agora_sandbox_guarded_writev(
     })
 }
 
-unsafe fn local_sequential_io(
+unsafe fn local_read_io(
     descriptor: libc::c_int,
-    write: bool,
+    requested_offset: LocalReadOffset,
+    requested_length: impl FnOnce() -> std::result::Result<usize, libc::c_int>,
     operation: impl FnOnce(libc::off_t) -> libc::ssize_t,
 ) -> Option<libc::ssize_t> {
     let runtime = FilesystemHookRuntime::global()?;
@@ -516,23 +574,49 @@ unsafe fn local_sequential_io(
         }
     };
     let access = flags & libc::O_ACCMODE;
-    if (!write && access == libc::O_WRONLY) || (write && access == libc::O_RDONLY) {
+    if access == libc::O_WRONLY {
         unsafe { set_errno(libc::EBADF) };
         return Some(-1);
     }
-    let offset = match state.offset() {
-        Ok(offset) if offset >= 0 => offset,
-        Ok(_) => {
+    let offset = match requested_offset {
+        LocalReadOffset::Sequential => match state.offset() {
+            Ok(offset) if offset >= 0 => offset,
+            Ok(_) => {
+                unsafe { set_errno(libc::EINVAL) };
+                return Some(-1);
+            }
+            Err(error) => {
+                unsafe { set_errno(error.raw_os_error().unwrap_or(libc::EIO)) };
+                return Some(-1);
+            }
+        },
+        LocalReadOffset::Positioned(offset) if offset >= 0 => offset,
+        LocalReadOffset::Positioned(_) => {
             unsafe { set_errno(libc::EINVAL) };
             return Some(-1);
         }
-        Err(error) => {
-            unsafe { set_errno(error.raw_os_error().unwrap_or(libc::EIO)) };
-            return Some(-1);
-        }
     };
+    if registration.lazy {
+        let length = match requested_length() {
+            Ok(length) => length,
+            Err(errno) => {
+                unsafe { set_errno(errno) };
+                return Some(-1);
+            }
+        };
+        if length != 0 {
+            let start = offset as u64;
+            let requested = u64::try_from(length).unwrap_or(u64::MAX);
+            let end = start.saturating_add(local_read_materialization_length(requested));
+            let range = LocalByteRange::new(start, end).expect("non-empty read range");
+            if let Err(error) = runtime.materialize_local(registration, Some(range)) {
+                unsafe { set_errno(error_errno(&error)) };
+                return Some(-1);
+            }
+        }
+    }
     let result = operation(offset);
-    if result > 0 {
+    if result > 0 && matches!(requested_offset, LocalReadOffset::Sequential) {
         let Some(next) = offset.checked_add(result as libc::off_t) else {
             unsafe { set_errno(libc::EOVERFLOW) };
             return Some(-1);
@@ -543,6 +627,14 @@ unsafe fn local_sequential_io(
         }
     }
     Some(result)
+}
+
+fn local_read_materialization_length(requested: u64) -> u64 {
+    requested.max(
+        requested
+            .saturating_mul(LOCAL_READ_AHEAD_MULTIPLIER)
+            .clamp(LOCAL_READ_AHEAD_MIN_BYTES, LOCAL_READ_AHEAD_MAX_BYTES),
+    )
 }
 
 unsafe fn local_sequential_write(
@@ -677,40 +769,6 @@ unsafe fn local_sequential_write(
     Some(result)
 }
 
-fn local_access_allowed(descriptor: libc::c_int, write: bool) -> bool {
-    let Some(runtime) = FilesystemHookRuntime::global() else {
-        return true;
-    };
-    let Some(open) = runtime.tracked_open(descriptor) else {
-        return true;
-    };
-    let Some(registration) = open.local.as_ref() else {
-        return true;
-    };
-    let _mutation = lock(&registration.mutation);
-    let state = match registration.state.lock() {
-        Ok(state) => state,
-        Err(error) => {
-            unsafe { set_errno(error.raw_os_error().unwrap_or(libc::EIO)) };
-            return false;
-        }
-    };
-    let flags = match state.flags() {
-        Ok(flags) => flags,
-        Err(error) => {
-            unsafe { set_errno(error.raw_os_error().unwrap_or(libc::EIO)) };
-            return false;
-        }
-    };
-    let access = flags & libc::O_ACCMODE;
-    if (!write && access == libc::O_WRONLY) || (write && access == libc::O_RDONLY) {
-        unsafe { set_errno(libc::EBADF) };
-        false
-    } else {
-        true
-    }
-}
-
 unsafe fn sandbox_lseek(
     descriptor: libc::c_int,
     offset: libc::off_t,
@@ -755,6 +813,10 @@ unsafe fn sandbox_lseek(
                 Ok(status.st_size.checked_add(offset))
             }
             libc::SEEK_DATA | libc::SEEK_HOLE => {
+                if let Err(error) = runtime.materialize_local(registration, None) {
+                    unsafe { set_errno(error_errno(&error)) };
+                    return -1;
+                }
                 let next = unsafe { original(descriptor, offset, whence) };
                 if next < 0 {
                     return -1;
@@ -794,6 +856,74 @@ unsafe fn sandbox_lseek(
     })
 }
 
+unsafe fn vector_read_length(
+    vectors: *const libc::iovec,
+    count: libc::c_int,
+) -> std::result::Result<usize, libc::c_int> {
+    let count = usize::try_from(count).map_err(|_| libc::EINVAL)?;
+    if count > MAX_VECTOR_COUNT {
+        return Err(libc::EINVAL);
+    }
+    if count == 0 {
+        return Ok(0);
+    }
+    let copied_vectors = unsafe { copy_process_slice(vectors, count) }?;
+    copied_vectors
+        .into_iter()
+        .try_fold(0_usize, |total, vector| {
+            total
+                .checked_add(vector.iov_len)
+                .filter(|total| *total <= libc::ssize_t::MAX as usize)
+                .ok_or(libc::EINVAL)
+        })
+}
+
+unsafe fn copy_process_value<T>(pointer: *const T) -> std::result::Result<T, libc::c_int> {
+    let bytes = unsafe { copy_process_bytes(pointer.cast(), std::mem::size_of::<T>()) }?;
+    Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
+}
+
+unsafe fn copy_process_slice<T>(
+    pointer: *const T,
+    count: usize,
+) -> std::result::Result<Vec<T>, libc::c_int> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let item_size = std::mem::size_of::<T>();
+    let size = count.checked_mul(item_size).ok_or(libc::EINVAL)?;
+    let bytes = unsafe { copy_process_bytes(pointer.cast(), size) }?;
+    Ok((0..count)
+        .map(|index| unsafe {
+            std::ptr::read_unaligned(bytes.as_ptr().add(index * item_size).cast())
+        })
+        .collect())
+}
+
+unsafe fn copy_process_bytes(
+    pointer: *const libc::c_void,
+    size: usize,
+) -> std::result::Result<Vec<u8>, libc::c_int> {
+    if pointer.is_null() {
+        return Err(libc::EFAULT);
+    }
+    let mut bytes = vec![0_u8; size];
+    let mut copied = 0_u64;
+    let status = unsafe {
+        darwin_mach_vm_read_overwrite(
+            darwin_mach_task_self,
+            pointer as u64,
+            size as u64,
+            bytes.as_mut_ptr() as u64,
+            &mut copied,
+        )
+    };
+    if status != 0 || copied != size as u64 {
+        return Err(libc::EFAULT);
+    }
+    Ok(bytes)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn agora_sandbox_lseek(
     descriptor: libc::c_int,
@@ -801,6 +931,213 @@ pub unsafe extern "C" fn agora_sandbox_lseek(
     whence: libc::c_int,
 ) -> libc::off_t {
     unsafe { sandbox_lseek(descriptor, offset, whence) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_sendfile(
+    descriptor: libc::c_int,
+    socket: libc::c_int,
+    offset: libc::off_t,
+    length: *mut libc::off_t,
+    headers: *mut libc::sf_hdtr,
+    flags: libc::c_int,
+) -> libc::c_int {
+    catch_filesystem_panic(-1, || {
+        let Some(original) = original_sendfile() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return -1;
+        };
+        let Some(_guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(descriptor, socket, offset, length, headers, flags) };
+        };
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return unsafe { original(descriptor, socket, offset, length, headers, flags) };
+        };
+        let Some(open) = runtime.tracked_open(descriptor) else {
+            return unsafe { original(descriptor, socket, offset, length, headers, flags) };
+        };
+        let Some(registration) = &open.local else {
+            return unsafe { original(descriptor, socket, offset, length, headers, flags) };
+        };
+        if offset < 0 {
+            return unsafe { original(descriptor, socket, offset, length, headers, flags) };
+        }
+        let range = match unsafe { sendfile_materialization_range(offset, length, headers) } {
+            Ok(range) => range,
+            Err(errno) => {
+                unsafe { set_errno(errno) };
+                return -1;
+            }
+        };
+        let _mutation = lock(&registration.mutation);
+        if let Err(error) = runtime.materialize_local(registration, range) {
+            return unsafe { fail(&error, -1) };
+        }
+        unsafe { original(descriptor, socket, offset, length, headers, flags) }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_fcopyfile(
+    source: libc::c_int,
+    destination: libc::c_int,
+    state: libc::copyfile_state_t,
+    flags: libc::copyfile_flags_t,
+) -> libc::c_int {
+    catch_filesystem_panic(-1, || {
+        let Some(original) = original_fcopyfile() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return -1;
+        };
+        let Some(_guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(source, destination, state, flags) };
+        };
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return unsafe { original(source, destination, state, flags) };
+        };
+        if runtime
+            .tracked_open(destination)
+            .is_some_and(|open| open.local.is_some())
+        {
+            unsafe { set_errno(libc::ENOTSUP) };
+            return -1;
+        }
+        if let Some(open) = runtime.tracked_open(source)
+            && let Some(registration) = &open.local
+        {
+            let _mutation = lock(&registration.mutation);
+            if let Err(error) = runtime.materialize_local(registration, None) {
+                return unsafe { fail(&error, -1) };
+            }
+        }
+        unsafe { original(source, destination, state, flags) }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_aio_read(control: *mut libc::aiocb) -> libc::c_int {
+    catch_filesystem_panic(-1, || {
+        let Some(original) = original_aio_read() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return -1;
+        };
+        let Some(_guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(control) };
+        };
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return unsafe { original(control) };
+        };
+        let copied = match unsafe { copy_process_value(control.cast_const()) } {
+            Ok(copied) => copied,
+            Err(errno) => {
+                unsafe { set_errno(errno) };
+                return -1;
+            }
+        };
+        if let Some(range) = aio_read_range(&copied)
+            && let Err(error) =
+                materialize_local_descriptor(runtime, copied.aio_fildes, Some(range))
+        {
+            return unsafe { fail(&error, -1) };
+        }
+        unsafe { original(control) }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_lio_listio(
+    mode: libc::c_int,
+    controls: *const *mut libc::aiocb,
+    count: libc::c_int,
+    event: *mut libc::sigevent,
+) -> libc::c_int {
+    catch_filesystem_panic(-1, || {
+        let Some(original) = original_lio_listio() else {
+            unsafe { set_errno(libc::ENOSYS) };
+            return -1;
+        };
+        let Some(_guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(mode, controls, count, event) };
+        };
+        let Some(runtime) = FilesystemHookRuntime::global() else {
+            return unsafe { original(mode, controls, count, event) };
+        };
+        let copied = match usize::try_from(count) {
+            Ok(count) if count <= MAX_VECTOR_COUNT => unsafe {
+                copy_process_slice(controls, count)
+            },
+            _ => Err(libc::EINVAL),
+        };
+        let copied = match copied {
+            Ok(copied) => copied,
+            Err(errno) => {
+                unsafe { set_errno(errno) };
+                return -1;
+            }
+        };
+        for control in copied.into_iter().filter(|control| !control.is_null()) {
+            let control = match unsafe { copy_process_value(control.cast_const()) } {
+                Ok(control) => control,
+                Err(errno) => {
+                    unsafe { set_errno(errno) };
+                    return -1;
+                }
+            };
+            if control.aio_lio_opcode == libc::LIO_READ
+                && let Some(range) = aio_read_range(&control)
+                && let Err(error) =
+                    materialize_local_descriptor(runtime, control.aio_fildes, Some(range))
+            {
+                return unsafe { fail(&error, -1) };
+            }
+        }
+        unsafe { original(mode, controls, count, event) }
+    })
+}
+
+fn materialize_local_descriptor(
+    runtime: &FilesystemHookRuntime,
+    descriptor: libc::c_int,
+    range: Option<LocalByteRange>,
+) -> Result<()> {
+    let Some(open) = runtime.tracked_open(descriptor) else {
+        return Ok(());
+    };
+    let Some(registration) = &open.local else {
+        return Ok(());
+    };
+    let _mutation = lock(&registration.mutation);
+    runtime.materialize_local(registration, range)
+}
+
+fn aio_read_range(control: &libc::aiocb) -> Option<LocalByteRange> {
+    let start = u64::try_from(control.aio_offset).ok()?;
+    let length = u64::try_from(control.aio_nbytes).unwrap_or(u64::MAX);
+    LocalByteRange::new(start, start.saturating_add(length)).ok()
+}
+
+unsafe fn sendfile_materialization_range(
+    offset: libc::off_t,
+    length: *const libc::off_t,
+    headers: *const libc::sf_hdtr,
+) -> std::result::Result<Option<LocalByteRange>, libc::c_int> {
+    if !headers.is_null() {
+        let headers = unsafe { copy_process_value(headers) }?;
+        if headers.hdr_cnt != 0 || headers.trl_cnt != 0 {
+            return Ok(None);
+        }
+    }
+    let requested = unsafe { copy_process_value(length) }?;
+    let start = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
+    let end = if requested == 0 {
+        u64::MAX
+    } else {
+        let requested = u64::try_from(requested).map_err(|_| libc::EINVAL)?;
+        start.checked_add(requested).ok_or(libc::EOVERFLOW)?
+    };
+    LocalByteRange::new(start, end)
+        .map(Some)
+        .map_err(|_| libc::EINVAL)
 }
 
 unsafe fn guarded_writev_at(
@@ -979,6 +1316,22 @@ fn original_lseek() -> Option<LseekFn> {
     function_from_interpose(&INTERPOSE_LSEEK)
 }
 
+fn original_sendfile() -> Option<SendfileFn> {
+    function_from_interpose(&INTERPOSE_SENDFILE)
+}
+
+fn original_fcopyfile() -> Option<FcopyfileFn> {
+    function_from_interpose(&INTERPOSE_FCOPYFILE)
+}
+
+fn original_aio_read() -> Option<AioReadFn> {
+    function_from_interpose(&INTERPOSE_AIO_READ)
+}
+
+fn original_lio_listio() -> Option<LioListioFn> {
+    function_from_interpose(&INTERPOSE_LIO_LISTIO)
+}
+
 fn original_read_nocancel() -> Option<ReadFn> {
     function_from_interpose(&INTERPOSE_READ_NOCANCEL)
 }
@@ -1032,6 +1385,18 @@ dyld_interpose!(INTERPOSE_PWRITE, agora_sandbox_pwrite, libc::pwrite);
 dyld_interpose!(INTERPOSE_WRITEV, agora_sandbox_writev, libc::writev);
 dyld_interpose!(INTERPOSE_PWRITEV, agora_sandbox_pwritev, libc::pwritev);
 dyld_interpose!(INTERPOSE_LSEEK, agora_sandbox_lseek, libc::lseek);
+dyld_interpose!(INTERPOSE_SENDFILE, agora_sandbox_sendfile, libc::sendfile);
+dyld_interpose!(
+    INTERPOSE_FCOPYFILE,
+    agora_sandbox_fcopyfile,
+    libc::fcopyfile
+);
+dyld_interpose!(INTERPOSE_AIO_READ, agora_sandbox_aio_read, libc::aio_read);
+dyld_interpose!(
+    INTERPOSE_LIO_LISTIO,
+    agora_sandbox_lio_listio,
+    libc::lio_listio
+);
 
 unsafe extern "C" {
     #[link_name = "guarded_write_np"]

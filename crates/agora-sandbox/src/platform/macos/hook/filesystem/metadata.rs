@@ -259,6 +259,19 @@ unsafe fn sandbox_fstatat(
             return unsafe { original(directory, path, status, flags) };
         };
         let caller_errno = unsafe { *libc::__error() };
+        if let Some(result) = unsafe {
+            native_directory_fstatat(
+                runtime,
+                directory,
+                path,
+                status,
+                flags,
+                original,
+                caller_errno,
+            )
+        } {
+            return result;
+        }
         let follow_final = flags & libc::AT_SYMLINK_NOFOLLOW == 0;
         match runtime.map_metadata(path, directory, follow_final, &Credentials::effective()) {
             Ok((mapped, plaintext_size, attributes, _anchor)) => {
@@ -274,6 +287,58 @@ unsafe fn sandbox_fstatat(
             Err(error) => unsafe { fail(&error, -1) },
         }
     })
+}
+
+unsafe fn native_directory_fstatat(
+    runtime: &FilesystemHookRuntime,
+    directory: libc::c_int,
+    path: *const libc::c_char,
+    status: *mut libc::stat,
+    flags: libc::c_int,
+    original: FstatAtFn,
+    caller_errno: libc::c_int,
+) -> Option<libc::c_int> {
+    if directory == libc::AT_FDCWD
+        || path.is_null()
+        || status.is_null()
+        || flags & !libc::AT_SYMLINK_NOFOLLOW != 0
+        || !runtime.native_directory_snapshot_is_current(directory)
+    {
+        return None;
+    }
+    let path = unsafe { CStr::from_ptr(path) };
+    let name = path.to_bytes();
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+        return None;
+    }
+    if flags & libc::AT_SYMLINK_NOFOLLOW != 0 {
+        let result = unsafe { original(directory, path.as_ptr(), status, flags) };
+        if result == 0 {
+            unsafe { set_errno(caller_errno) };
+        }
+        return Some(result);
+    }
+    let mut probe = unsafe { std::mem::zeroed::<libc::stat>() };
+    let result = unsafe {
+        original(
+            directory,
+            path.as_ptr(),
+            &mut probe,
+            flags | libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Some(result);
+    }
+    if probe.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        unsafe { set_errno(caller_errno) };
+        return None;
+    }
+    unsafe {
+        *status = probe;
+        set_errno(caller_errno);
+    }
+    Some(0)
 }
 
 unsafe fn sandbox_fstat(descriptor: libc::c_int, status: *mut libc::stat) -> libc::c_int {
