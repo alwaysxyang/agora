@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Clone)]
 struct MemoryEntry {
@@ -12,14 +12,23 @@ struct MemoryEntry {
     generation: u64,
 }
 
+type SharedMemoryEntry = Arc<Mutex<MemoryEntry>>;
+
+pub(crate) struct MemoryFileHandle {
+    entry: SharedMemoryEntry,
+    readable: bool,
+    writable: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct MemoryStorage {
-    entries: Mutex<HashMap<(u32, String), MemoryEntry>>,
+    entries: Mutex<HashMap<(u32, String), SharedMemoryEntry>>,
     connection_errors: Mutex<HashMap<u32, (libc::c_int, String)>>,
     connections_blocked: AtomicBool,
     connection_release: tokio::sync::Notify,
     yield_operations: AtomicBool,
     stat_operations: AtomicUsize,
+    flush_operations: AtomicUsize,
     list_visits: AtomicUsize,
     reset_operations: AtomicUsize,
     resets_blocked: AtomicBool,
@@ -29,33 +38,34 @@ pub(crate) struct MemoryStorage {
     reads_blocked: AtomicBool,
     read_started: tokio::sync::Notify,
     read_release: tokio::sync::Notify,
+    snapshot_replacement: Mutex<Option<Vec<u8>>>,
 }
 
 impl MemoryStorage {
     pub(crate) fn insert_file(&self, root: u32, path: &str, data: &[u8]) {
         lock(&self.entries).insert(
             (root, path.to_string()),
-            MemoryEntry {
+            Arc::new(Mutex::new(MemoryEntry {
                 data: Some(data.to_vec()),
                 generation: 1,
-            },
+            })),
         );
     }
 
     pub(crate) fn insert_directory(&self, root: u32, path: &str) {
         lock(&self.entries).insert(
             (root, path.to_string()),
-            MemoryEntry {
+            Arc::new(Mutex::new(MemoryEntry {
                 data: None,
                 generation: 1,
-            },
+            })),
         );
     }
 
     pub(crate) fn data(&self, root: u32, path: &str) -> Option<Vec<u8>> {
         lock(&self.entries)
             .get(&(root, path.to_string()))
-            .and_then(|entry| entry.data.clone())
+            .and_then(|entry| lock(entry).data.clone())
     }
 
     pub(crate) fn exists(&self, root: u32, path: &str) -> bool {
@@ -63,8 +73,9 @@ impl MemoryStorage {
     }
 
     pub(crate) fn replace(&self, root: u32, path: &str, data: &[u8]) {
-        let mut entries = lock(&self.entries);
-        let entry = entries.get_mut(&(root, path.to_string())).unwrap();
+        let entries = lock(&self.entries);
+        let entry = entries.get(&(root, path.to_string())).unwrap();
+        let mut entry = lock(entry);
         entry.data = Some(data.to_vec());
         entry.generation += 1;
     }
@@ -75,6 +86,10 @@ impl MemoryStorage {
 
     pub(crate) fn stat_operations(&self) -> usize {
         self.stat_operations.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn flush_operations(&self) -> usize {
+        self.flush_operations.load(Ordering::Relaxed)
     }
 
     pub(crate) fn list_visits(&self) -> usize {
@@ -114,6 +129,10 @@ impl MemoryStorage {
     pub(crate) fn release_reads(&self) {
         self.reads_blocked.store(false, Ordering::Release);
         self.read_release.notify_waiters();
+    }
+
+    pub(crate) fn replace_during_snapshot_read(&self, data: &[u8]) {
+        *lock(&self.snapshot_replacement) = Some(data.to_vec());
     }
 
     pub(crate) fn fail_connection(
@@ -201,6 +220,8 @@ impl MemoryStorage {
 }
 
 impl RemoteStorage for MemoryStorage {
+    type FileHandle = MemoryFileHandle;
+
     async fn reset(&self, _root: u32) {
         self.reset_operations.fetch_add(1, Ordering::Relaxed);
         self.wait_for_reset_release().await;
@@ -216,21 +237,190 @@ impl RemoteStorage for MemoryStorage {
         self.yield_if_requested().await;
         lock(&self.entries)
             .get(&(path.root(), path.path().to_string()))
-            .map(Self::metadata)
+            .map(|entry| Self::metadata(&lock(entry)))
             .ok_or_else(StorageError::not_found)
+    }
+
+    async fn open_file(
+        &self,
+        path: &RemotePath,
+        flags: libc::c_int,
+        _mode: u32,
+    ) -> StorageResult<(Self::FileHandle, RemoteMetadata, bool)> {
+        let access = flags & libc::O_ACCMODE;
+        let (readable, writable) = match access {
+            libc::O_RDONLY => (true, false),
+            libc::O_WRONLY => (false, true),
+            libc::O_RDWR => (true, true),
+            _ => return Err(StorageError::new(libc::EINVAL, "invalid open access mode")),
+        };
+        if flags & libc::O_TRUNC != 0 && !writable {
+            return Err(StorageError::new(
+                libc::EINVAL,
+                "O_TRUNC requires write access",
+            ));
+        }
+        let key = (path.root(), path.path().to_string());
+        let mut entries = lock(&self.entries);
+        let existing = entries.get(&key).cloned();
+        let created = existing.is_none();
+        if existing.is_some()
+            && flags & (libc::O_CREAT | libc::O_EXCL) == libc::O_CREAT | libc::O_EXCL
+        {
+            return Err(StorageError::new(libc::EEXIST, "path already exists"));
+        }
+        let entry = match existing {
+            Some(entry) => entry,
+            None if flags & libc::O_CREAT != 0 => {
+                let entry = Arc::new(Mutex::new(MemoryEntry {
+                    data: Some(Vec::new()),
+                    generation: 1,
+                }));
+                entries.insert(key, Arc::clone(&entry));
+                entry
+            }
+            None => return Err(StorageError::not_found()),
+        };
+        drop(entries);
+        {
+            let mut entry = lock(&entry);
+            if entry.data.is_none() {
+                return Err(StorageError::new(libc::EISDIR, "path is a directory"));
+            }
+            if flags & libc::O_TRUNC != 0 {
+                entry.data = Some(Vec::new());
+                entry.generation += 1;
+            }
+        }
+        let metadata = Self::metadata(&lock(&entry));
+        Ok((
+            MemoryFileHandle {
+                entry,
+                readable,
+                writable,
+            },
+            metadata,
+            created,
+        ))
+    }
+
+    async fn read_at(
+        &self,
+        handle: &mut Self::FileHandle,
+        offset: u64,
+        length: u32,
+        destination: &mut File,
+    ) -> StorageResult<u32> {
+        if !handle.readable {
+            return Err(StorageError::new(
+                libc::EBADF,
+                "file is not open for reading",
+            ));
+        }
+        let entry = lock(&handle.entry);
+        let data = entry
+            .data
+            .as_deref()
+            .ok_or_else(|| StorageError::new(libc::EISDIR, "path is a directory"))?;
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(data.len());
+        let end = start.saturating_add(length as usize).min(data.len());
+        destination
+            .set_len(0)
+            .and_then(|()| destination.seek(SeekFrom::Start(0)).map(|_| ()))
+            .and_then(|()| destination.write_all(&data[start..end]))
+            .map_err(|error| memory_io("failed to stream memory file range", error))?;
+        Ok(u32::try_from(end - start).expect("read length is bounded by u32"))
+    }
+
+    async fn write_at(
+        &self,
+        handle: &mut Self::FileHandle,
+        offset: u64,
+        source: &mut File,
+        length: u32,
+    ) -> StorageResult<(u32, u64)> {
+        if !handle.writable {
+            return Err(StorageError::new(
+                libc::EBADF,
+                "file is not open for writing",
+            ));
+        }
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| memory_io("failed to rewind memory write payload", error))?;
+        let mut bytes = vec![0_u8; length as usize];
+        source
+            .read_exact(&mut bytes)
+            .map_err(|error| memory_io("failed to read memory write payload", error))?;
+        let mut entry = lock(&handle.entry);
+        let data = entry
+            .data
+            .as_mut()
+            .ok_or_else(|| StorageError::new(libc::EISDIR, "path is a directory"))?;
+        let start = usize::try_from(offset)
+            .map_err(|_| StorageError::new(libc::EFBIG, "write offset is too large"))?;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or_else(|| StorageError::new(libc::EFBIG, "write range is too large"))?;
+        if data.len() < end {
+            data.resize(end, 0);
+        }
+        data[start..end].copy_from_slice(&bytes);
+        entry.generation += 1;
+        Ok((
+            length,
+            entry.data.as_ref().map_or(0, |data| data.len() as u64),
+        ))
+    }
+
+    async fn set_length(&self, handle: &mut Self::FileHandle, length: u64) -> StorageResult<u64> {
+        if !handle.writable {
+            return Err(StorageError::new(
+                libc::EBADF,
+                "file is not open for writing",
+            ));
+        }
+        let length = usize::try_from(length)
+            .map_err(|_| StorageError::new(libc::EFBIG, "file length is too large"))?;
+        let mut entry = lock(&handle.entry);
+        entry
+            .data
+            .as_mut()
+            .ok_or_else(|| StorageError::new(libc::EISDIR, "path is a directory"))?
+            .resize(length, 0);
+        entry.generation += 1;
+        Ok(length as u64)
+    }
+
+    async fn flush_file(&self, handle: &mut Self::FileHandle) -> StorageResult<RemoteMetadata> {
+        self.flush_operations.fetch_add(1, Ordering::Relaxed);
+        Ok(Self::metadata(&lock(&handle.entry)))
+    }
+
+    async fn file_metadata(&self, handle: &mut Self::FileHandle) -> StorageResult<RemoteMetadata> {
+        Ok(Self::metadata(&lock(&handle.entry)))
+    }
+
+    async fn close_file(&self, _handle: &mut Self::FileHandle) -> StorageResult<()> {
+        Ok(())
     }
 
     async fn read_into(
         &self,
-        path: &RemotePath,
+        handle: &mut Self::FileHandle,
         destination: &mut File,
         max_length: u64,
     ) -> StorageResult<RemoteMetadata> {
         self.wait_for_read_release().await;
-        let entries = lock(&self.entries);
-        let entry = entries
-            .get(&(path.root(), path.path().to_string()))
-            .ok_or_else(StorageError::not_found)?;
+        if !handle.readable {
+            return Err(StorageError::new(
+                libc::EBADF,
+                "file is not open for reading",
+            ));
+        }
+        let entry = lock(&handle.entry);
         let data = entry
             .data
             .as_deref()
@@ -246,7 +436,20 @@ impl RemoteStorage for MemoryStorage {
             .and_then(|()| destination.seek(SeekFrom::Start(0)).map(|_| ()))
             .and_then(|()| destination.write_all(data))
             .map_err(|error| memory_io("failed to stream memory file", error))?;
-        Ok(Self::metadata(entry))
+        let metadata = Self::metadata(&entry);
+        drop(entry);
+        if let Some(replacement) = lock(&self.snapshot_replacement).take() {
+            let mut entry = lock(&handle.entry);
+            entry.data = Some(replacement);
+            entry.generation += 1;
+        }
+        if Self::metadata(&lock(&handle.entry)).identity != metadata.identity {
+            return Err(StorageError::new(
+                libc::ESTALE,
+                "remote file changed while creating a snapshot",
+            ));
+        }
+        Ok(metadata)
     }
 
     async fn write_from_if_unchanged(
@@ -273,7 +476,7 @@ impl RemoteStorage for MemoryStorage {
         }
         let mut entries = lock(&self.entries);
         let key = (path.root(), path.path().to_string());
-        let current = entries.get(&key).map(Self::metadata);
+        let current = entries.get(&key).map(|entry| Self::metadata(&lock(entry)));
         let unchanged = match (expected, current.as_ref()) {
             (None, None) => true,
             (Some(expected), Some(current)) => expected.identity == current.identity,
@@ -285,13 +488,15 @@ impl RemoteStorage for MemoryStorage {
                 "remote file changed since it was opened",
             ));
         }
-        let generation = entries.get(&key).map_or(1, |entry| entry.generation + 1);
+        let generation = entries
+            .get(&key)
+            .map_or(1, |entry| lock(entry).generation + 1);
         let entry = MemoryEntry {
             data: Some(data),
             generation,
         };
         let metadata = Self::metadata(&entry);
-        entries.insert(key, entry);
+        entries.insert(key, Arc::new(Mutex::new(entry)));
         Ok(metadata)
     }
 
@@ -304,7 +509,7 @@ impl RemoteStorage for MemoryStorage {
         let directory = entries
             .get(&(path.root(), path.path().to_string()))
             .ok_or_else(StorageError::not_found)?;
-        if directory.data.is_some() {
+        if lock(directory).data.is_some() {
             return Err(StorageError::new(libc::ENOTDIR, "path is not a directory"));
         }
         let prefix = if path.path().is_empty() {
@@ -323,7 +528,7 @@ impl RemoteStorage for MemoryStorage {
             self.list_visits.fetch_add(1, Ordering::Relaxed);
             emit(RemoteEntry {
                 name: name.to_string(),
-                metadata: Self::metadata(entry),
+                metadata: Self::metadata(&lock(entry)),
             })?;
         }
         Ok(())
@@ -337,10 +542,10 @@ impl RemoteStorage for MemoryStorage {
         }
         entries.insert(
             key,
-            MemoryEntry {
+            Arc::new(Mutex::new(MemoryEntry {
                 data: None,
                 generation: 1,
-            },
+            })),
         );
         Ok(())
     }
@@ -349,7 +554,7 @@ impl RemoteStorage for MemoryStorage {
         let mut entries = lock(&self.entries);
         let key = (path.root(), path.path().to_string());
         let entry = entries.get(&key).ok_or_else(StorageError::not_found)?;
-        if directory != entry.data.is_none() {
+        if directory != lock(entry).data.is_none() {
             return Err(StorageError::new(
                 if directory {
                     libc::ENOTDIR
@@ -380,7 +585,7 @@ impl RemoteStorage for MemoryStorage {
         let entry = entries
             .remove(&(from.root(), from.path().to_string()))
             .ok_or_else(StorageError::not_found)?;
-        let descendants = if entry.data.is_none() {
+        let descendants = if lock(&entry).data.is_none() {
             let prefix = format!("{}/", from.path());
             entries
                 .keys()
@@ -498,8 +703,9 @@ mod tests {
         storage.insert_file(0, "file", b"remote");
 
         let mut downloaded = tempfile::tempfile().unwrap();
+        let (mut handle, _, _) = storage.open_file(&path, libc::O_RDONLY, 0).await.unwrap();
         let baseline = storage
-            .read_into(&path, &mut downloaded, u64::MAX)
+            .read_into(&mut handle, &mut downloaded, u64::MAX)
             .await
             .unwrap();
         downloaded.seek(SeekFrom::Start(0)).unwrap();

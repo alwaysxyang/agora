@@ -33,10 +33,11 @@ where
 {
     storage: Arc<S>,
     staging: PathBuf,
-    handles: Mutex<HashMap<String, Arc<Mutex<RemoteHandle>>>>,
+    handles: Mutex<HashMap<String, SharedRemoteHandle<S::FileHandle>>>,
     requests: Mutex<RequestCache>,
     closed_handles: Mutex<HandleTombstones>,
     list_payloads: Mutex<HashMap<String, File>>,
+    read_payloads: Mutex<HashMap<String, File>>,
     root_mutations: Mutex<HashMap<u32, Arc<Mutex<()>>>>,
     limits: RemoteLimits,
 }
@@ -62,16 +63,21 @@ impl Default for RemoteLimits {
     }
 }
 
-struct RemoteHandle {
+struct RemoteHandle<H> {
     path: RemotePath,
+    backend: Option<H>,
     file: Option<File>,
     application: File,
-    publishable: bool,
+    created: bool,
+    pending_truncate: bool,
+    writable: bool,
+    snapshot: bool,
     unlinked: bool,
-    force_publish: bool,
     checksum: [u8; 16],
     baseline: Option<RemoteMetadata>,
 }
+
+type SharedRemoteHandle<H> = Arc<Mutex<RemoteHandle<H>>>;
 
 #[derive(Default)]
 struct RequestCache {
@@ -101,6 +107,7 @@ enum CacheDecision {
 enum AbandonedResource {
     Handle(String),
     Anchor(String),
+    Payload(String),
 }
 
 #[derive(Default)]
@@ -131,15 +138,27 @@ where
             requests: Mutex::new(RequestCache::default()),
             closed_handles: Mutex::new(HandleTombstones::default()),
             list_payloads: Mutex::new(HashMap::new()),
+            read_payloads: Mutex::new(HashMap::new()),
             root_mutations: Mutex::new(HashMap::new()),
             limits,
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn handle_request(
         &self,
         request_id: RequestId,
         request: Request,
+    ) -> BrokerReply {
+        self.handle_request_with_descriptor(request_id, request, None)
+            .await
+    }
+
+    pub(crate) async fn handle_request_with_descriptor(
+        &self,
+        request_id: RequestId,
+        request: Request,
+        descriptor: Option<OwnedFd>,
     ) -> BrokerReply {
         let fingerprint = match request_fingerprint(&request) {
             Ok(fingerprint) => fingerprint,
@@ -156,7 +175,7 @@ where
             .begin(request_id.clone(), fingerprint);
         match decision {
             CacheDecision::Execute => {
-                let reply = self.handle(request).await;
+                let reply = self.handle_with_descriptor(request, descriptor).await;
                 let abandoned = self
                     .requests
                     .lock()
@@ -176,7 +195,16 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn handle(&self, request: Request) -> BrokerReply {
+        self.handle_with_descriptor(request, None).await
+    }
+
+    async fn handle_with_descriptor(
+        &self,
+        request: Request,
+        descriptor: Option<OwnedFd>,
+    ) -> BrokerReply {
         let started = Instant::now();
         let deadline = started + self.limits.operation_timeout;
         let root =
@@ -190,7 +218,8 @@ where
             .limits
             .operation_timeout
             .saturating_sub(started.elapsed());
-        let result = tokio::time::timeout(remaining, self.dispatch(request, deadline)).await;
+        let result =
+            tokio::time::timeout(remaining, self.dispatch(request, descriptor, deadline)).await;
         let result = match result {
             Ok(result) => result,
             Err(_) => {
@@ -215,7 +244,12 @@ where
             | Request::CreateDirectory { path, .. }
             | Request::Remove { path, .. } => Some(path.root()),
             Request::Rename { from, .. } => Some(from.root()),
-            Request::Sync { handle } | Request::Close { handle } => {
+            Request::Read { handle, .. }
+            | Request::Write { handle, .. }
+            | Request::SetLength { handle, .. }
+            | Request::Materialize { handle }
+            | Request::Sync { handle }
+            | Request::Close { handle } => {
                 let handle = self.handles.lock().await.get(handle).cloned()?;
                 Some(handle.lock().await.path.root())
             }
@@ -223,7 +257,19 @@ where
         }
     }
 
-    async fn dispatch(&self, request: Request, deadline: Instant) -> StorageResult<BrokerReply> {
+    async fn dispatch(
+        &self,
+        request: Request,
+        descriptor: Option<OwnedFd>,
+        deadline: Instant,
+    ) -> StorageResult<BrokerReply> {
+        let expects_descriptor = matches!(&request, Request::Write { .. });
+        if expects_descriptor != descriptor.is_some() {
+            return Err(StorageError::new(
+                libc::EPROTO,
+                "remote request descriptor did not match operation",
+            ));
+        }
         match request {
             Request::Ping => Ok(success()),
             Request::Open { path, flags, mode } => self.open(path, flags, mode, deadline).await,
@@ -248,6 +294,29 @@ where
                 }
                 Ok(success())
             }
+            Request::Read {
+                handle,
+                offset,
+                length,
+            } => self.read(&handle, offset, length).await,
+            Request::Write {
+                handle,
+                offset,
+                length,
+                checksum,
+            } => {
+                self.write(
+                    &handle,
+                    offset,
+                    length,
+                    checksum,
+                    descriptor.expect("write descriptor was validated"),
+                    deadline,
+                )
+                .await
+            }
+            Request::SetLength { handle, length } => self.set_length(&handle, length).await,
+            Request::Materialize { handle } => self.materialize(&handle, deadline).await,
             Request::Sync { handle } => {
                 let metadata = self.sync(&handle, deadline).await?;
                 Ok(BrokerReply {
@@ -317,7 +386,7 @@ where
     }
 
     async fn claim_request(&self, request_id: &RequestId) -> StorageResult<()> {
-        let list_payload = self
+        let resource = self
             .requests
             .lock()
             .await
@@ -328,8 +397,9 @@ where
                     "remote resource request is not available to claim",
                 )
             })?;
-        if let Some(anchor) = list_payload {
-            self.list_payloads.lock().await.remove(&anchor);
+        if let Some(resource) = resource {
+            self.list_payloads.lock().await.remove(&resource);
+            self.read_payloads.lock().await.remove(&resource);
         }
         Ok(())
     }
@@ -349,6 +419,18 @@ where
                 }
             },
             Response::List { anchor } => match self.list_descriptor(anchor).await {
+                Ok(descriptor) => Some(descriptor),
+                Err(error) => {
+                    return BrokerReply {
+                        response: Response::Error {
+                            errno: error.errno,
+                            message: error.message,
+                        },
+                        descriptor: None,
+                    };
+                }
+            },
+            Response::Read { payload, .. } => match self.read_descriptor(payload).await {
                 Ok(descriptor) => Some(descriptor),
                 Err(error) => {
                     return BrokerReply {
@@ -396,19 +478,29 @@ where
             .map_err(|error| storage_io("failed to duplicate remote list payload", error))
     }
 
+    async fn read_descriptor(&self, payload: &str) -> StorageResult<OwnedFd> {
+        self.read_payloads
+            .lock()
+            .await
+            .get(payload)
+            .ok_or_else(|| StorageError::new(libc::EPROTO, "remote read payload is unavailable"))?
+            .try_clone()
+            .map(Into::into)
+            .map_err(|error| storage_io("failed to duplicate remote read payload", error))
+    }
+
     async fn discard_abandoned_resources(&self, resources: Vec<AbandonedResource>) {
-        let mut open = self.handles.lock().await;
-        let mut closed = self.closed_handles.lock().await;
-        let mut list_payloads = self.list_payloads.lock().await;
+        let mut abandoned_handles = Vec::new();
         for resource in resources {
             match resource {
                 AbandonedResource::Handle(handle) => {
-                    if open.remove(&handle).is_some() {
-                        closed.insert(handle);
+                    if let Some(open) = self.handles.lock().await.remove(&handle) {
+                        self.closed_handles.lock().await.insert(handle);
+                        abandoned_handles.push(open);
                     }
                 }
                 AbandonedResource::Anchor(anchor) => {
-                    list_payloads.remove(&anchor);
+                    self.list_payloads.lock().await.remove(&anchor);
                     let path = self.staging.join(anchor);
                     let removed = std::fs::remove_file(&path)
                         .or_else(|file_error| std::fs::remove_dir(&path).map_err(|_| file_error));
@@ -419,7 +511,13 @@ where
                         // when the controller exits.
                     }
                 }
+                AbandonedResource::Payload(payload) => {
+                    self.read_payloads.lock().await.remove(&payload);
+                }
             }
+        }
+        for handle in abandoned_handles {
+            let _ = self.discard_handle(&handle).await;
         }
     }
 
@@ -432,8 +530,8 @@ where
         &self,
         path: RemotePath,
         flags: libc::c_int,
-        _mode: u32,
-        deadline: Instant,
+        mode: u32,
+        _deadline: Instant,
     ) -> StorageResult<BrokerReply> {
         let access = flags & libc::O_ACCMODE;
         let (readable, writable) = match access {
@@ -486,55 +584,26 @@ where
                 "remote path is not a directory",
             ));
         }
-        let force_publish = existing.is_none() || flags & libc::O_TRUNC != 0;
-        if existing
-            .as_ref()
-            .is_some_and(|metadata| metadata.size > self.limits.max_file_bytes)
-        {
-            return Err(file_too_large());
-        }
+        let backend_flags = flags & !libc::O_TRUNC;
+        let (backend, metadata, created) =
+            self.storage.open_file(&path, backend_flags, mode).await?;
         let mut temporary = tempfile::NamedTempFile::new_in(&self.staging)
             .map_err(|error| storage_io("failed to create anonymous remote file", error))?;
-        let (mut metadata, baseline) = if force_publish {
-            let metadata = existing.clone().unwrap_or_else(empty_file_metadata);
-            (
-                RemoteMetadata {
-                    size: 0,
-                    ..metadata
-                },
-                existing,
-            )
-        } else {
-            let metadata = self
-                .storage
-                .read_into(&path, temporary.as_file_mut(), self.limits.max_file_bytes)
-                .await?;
-            (metadata.clone(), Some(metadata))
-        };
+        temporary
+            .as_file_mut()
+            .set_len(metadata.size)
+            .map_err(|error| storage_io("failed to size remote placeholder", error))?;
         temporary
             .flush()
             .map_err(|error| storage_io("failed to flush anonymous remote file", error))?;
-        metadata.size = temporary
-            .as_file()
-            .metadata()
-            .map_err(|error| storage_io("failed to inspect anonymous remote file", error))?
-            .len();
-        let checksum = checksum_file(
-            temporary.as_file().try_clone().map_err(|error| {
-                storage_io("failed to clone remote snapshot for checksum", error)
-            })?,
-            deadline,
-        )
-        .await?;
         let retained = temporary
             .reopen()
             .map_err(|error| storage_io("failed to retain anonymous remote file", error))?;
         let mut options = OpenOptions::new();
-        options
-            .read(readable)
-            .write(writable)
-            .append(flags & libc::O_APPEND != 0)
-            .custom_flags(libc::O_CLOEXEC);
+        options.read(readable).write(writable).custom_flags(
+            libc::O_CLOEXEC
+                | (flags & (libc::O_APPEND | libc::O_NONBLOCK | libc::O_SYNC | libc::O_DSYNC)),
+        );
         let application = options
             .open(temporary.path())
             .map_err(|error| storage_io("failed to open anonymous remote file", error))?;
@@ -550,13 +619,16 @@ where
             handle.clone(),
             Arc::new(Mutex::new(RemoteHandle {
                 path,
+                backend: Some(backend),
                 file: Some(retained),
                 application: replay,
-                publishable: writable || force_publish,
+                created,
+                pending_truncate: flags & libc::O_TRUNC != 0 && !created,
+                writable,
+                snapshot: false,
                 unlinked: false,
-                force_publish,
-                checksum,
-                baseline,
+                checksum: Md5::digest([]).into(),
+                baseline: Some(metadata.clone()),
             })),
         );
         Ok(BrokerReply {
@@ -585,11 +657,14 @@ where
             handle.clone(),
             Arc::new(Mutex::new(RemoteHandle {
                 path,
+                backend: None,
                 file: None,
                 application: replay,
-                publishable: false,
+                created: false,
+                pending_truncate: false,
+                writable: false,
+                snapshot: false,
                 unlinked: false,
-                force_publish: false,
                 checksum: Md5::digest([]).into(),
                 baseline: Some(metadata.clone()),
             })),
@@ -693,6 +768,221 @@ where
         Ok(anchor)
     }
 
+    async fn read(&self, id: &str, offset: u64, length: u32) -> StorageResult<BrokerReply> {
+        if length > crate::nfs::protocol::MAX_REMOTE_IO_BYTES {
+            return Err(StorageError::new(
+                libc::EINVAL,
+                "remote read exceeds the per-operation limit",
+            ));
+        }
+        let handle = self.open_handle(id).await?;
+        let mut handle = handle.lock().await;
+        if handle.snapshot {
+            return Err(StorageError::new(
+                libc::EBUSY,
+                "remote handle is using a local mmap snapshot",
+            ));
+        }
+        let backend = handle
+            .backend
+            .as_mut()
+            .ok_or_else(|| StorageError::new(libc::EISDIR, "remote handle is a directory"))?;
+        let mut payload = tempfile::tempfile_in(&self.staging)
+            .map_err(|error| storage_io("failed to create remote read payload", error))?;
+        let length = self
+            .storage
+            .read_at(backend, offset, length, &mut payload)
+            .await?;
+        payload
+            .flush()
+            .and_then(|()| payload.seek(SeekFrom::Start(0)).map(|_| ()))
+            .map_err(|error| storage_io("failed to prepare remote read payload", error))?;
+        let descriptor = payload
+            .try_clone()
+            .map_err(|error| storage_io("failed to duplicate remote read payload", error))?;
+        let payload_id = Uuid::new_v4().simple().to_string();
+        self.read_payloads
+            .lock()
+            .await
+            .insert(payload_id.clone(), payload);
+        Ok(BrokerReply {
+            response: Response::Read {
+                payload: payload_id,
+                length,
+            },
+            descriptor: Some(descriptor.into()),
+        })
+    }
+
+    async fn write(
+        &self,
+        id: &str,
+        offset: Option<u64>,
+        length: u32,
+        checksum: [u8; 16],
+        descriptor: OwnedFd,
+        deadline: Instant,
+    ) -> StorageResult<BrokerReply> {
+        if length > crate::nfs::protocol::MAX_REMOTE_IO_BYTES {
+            return Err(StorageError::new(
+                libc::EINVAL,
+                "remote write exceeds the per-operation limit",
+            ));
+        }
+        let mut source = File::from(descriptor);
+        let source_length = source
+            .metadata()
+            .map_err(|error| storage_io("failed to inspect remote write payload", error))?
+            .len();
+        if source_length != u64::from(length) {
+            return Err(StorageError::new(
+                libc::EPROTO,
+                "remote write payload length did not match its request",
+            ));
+        }
+        if checksum_file(
+            source
+                .try_clone()
+                .map_err(|error| storage_io("failed to clone remote write payload", error))?,
+            deadline,
+        )
+        .await?
+            != checksum
+        {
+            return Err(StorageError::new(
+                libc::EPROTO,
+                "remote write payload checksum did not match its request",
+            ));
+        }
+        let handle = self.open_handle(id).await?;
+        let root = handle.lock().await.path.root();
+        let _append_mutation = if offset.is_none() {
+            Some(self.lock_root(root).await)
+        } else {
+            None
+        };
+        let mut handle = handle.lock().await;
+        if handle.snapshot {
+            return Err(StorageError::new(
+                libc::EBUSY,
+                "remote handle is using a local mmap snapshot",
+            ));
+        }
+        let offset = if let Some(offset) = offset {
+            offset
+        } else {
+            let backend = handle
+                .backend
+                .as_mut()
+                .ok_or_else(|| StorageError::new(libc::EISDIR, "remote handle is a directory"))?;
+            let metadata = self.storage.file_metadata(backend).await?;
+            let offset = metadata.size;
+            handle.baseline = Some(metadata);
+            offset
+        };
+        let backend = handle
+            .backend
+            .as_mut()
+            .ok_or_else(|| StorageError::new(libc::EISDIR, "remote handle is a directory"))?;
+        let (length, size) = self
+            .storage
+            .write_at(backend, offset, &mut source, length)
+            .await?;
+        if let Some(metadata) = handle.baseline.as_mut() {
+            metadata.size = size;
+        }
+        Ok(BrokerReply {
+            response: Response::Written {
+                offset,
+                length,
+                size,
+            },
+            descriptor: None,
+        })
+    }
+
+    async fn set_length(&self, id: &str, length: u64) -> StorageResult<BrokerReply> {
+        let handle = self.open_handle(id).await?;
+        let mut handle = handle.lock().await;
+        if handle.snapshot {
+            return Err(StorageError::new(
+                libc::EBUSY,
+                "remote handle is using a local mmap snapshot",
+            ));
+        }
+        let backend = handle
+            .backend
+            .as_mut()
+            .ok_or_else(|| StorageError::new(libc::EISDIR, "remote handle is a directory"))?;
+        let size = self.storage.set_length(backend, length).await?;
+        if let Some(metadata) = handle.baseline.as_mut() {
+            metadata.size = size;
+        }
+        Ok(BrokerReply {
+            response: Response::Resized { size },
+            descriptor: None,
+        })
+    }
+
+    async fn materialize(&self, id: &str, deadline: Instant) -> StorageResult<BrokerReply> {
+        let handle = self.open_handle(id).await?;
+        let root = handle.lock().await.path.root();
+        let _mutation = self.lock_root(root).await;
+        let mut handle = handle.lock().await;
+        if handle.snapshot {
+            let metadata = handle
+                .baseline
+                .clone()
+                .ok_or_else(|| StorageError::new(libc::EBADF, "remote metadata is unavailable"))?;
+            return Ok(BrokerReply {
+                response: Response::Materialized { metadata },
+                descriptor: None,
+            });
+        }
+        let (metadata, checksum) = {
+            let RemoteHandle { backend, file, .. } = &mut *handle;
+            let backend = backend
+                .as_mut()
+                .ok_or_else(|| StorageError::new(libc::EISDIR, "remote handle is a directory"))?;
+            let file = file.as_mut().ok_or_else(|| {
+                StorageError::new(libc::EBADF, "remote placeholder is unavailable")
+            })?;
+            let metadata = self
+                .storage
+                .read_into(backend, file, self.limits.max_file_bytes)
+                .await?;
+            file.flush()
+                .map_err(|error| storage_io("failed to flush remote mmap snapshot", error))?;
+            let checksum = checksum_file(
+                file.try_clone()
+                    .map_err(|error| storage_io("failed to clone remote mmap snapshot", error))?,
+                deadline,
+            )
+            .await?;
+            (metadata, checksum)
+        };
+        if let Some(backend) = handle.backend.as_mut() {
+            self.storage.close_file(backend).await?;
+        }
+        handle.backend = None;
+        handle.snapshot = true;
+        handle.checksum = checksum;
+        handle.baseline = Some(metadata.clone());
+        Ok(BrokerReply {
+            response: Response::Materialized { metadata },
+            descriptor: None,
+        })
+    }
+
+    async fn open_handle(&self, id: &str) -> StorageResult<SharedRemoteHandle<S::FileHandle>> {
+        self.handles
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| StorageError::new(libc::EBADF, "unknown remote handle"))
+    }
+
     async fn sync(&self, id: &str, deadline: Instant) -> StorageResult<Option<RemoteMetadata>> {
         let handle = self
             .handles
@@ -706,7 +996,7 @@ where
 
     async fn sync_handle(
         &self,
-        handle: &Arc<Mutex<RemoteHandle>>,
+        handle: &SharedRemoteHandle<S::FileHandle>,
         deadline: Instant,
     ) -> StorageResult<Option<RemoteMetadata>> {
         let root = handle.lock().await.path.root();
@@ -717,13 +1007,45 @@ where
 
     async fn sync_locked(
         &self,
-        handle: &mut RemoteHandle,
+        handle: &mut RemoteHandle<S::FileHandle>,
         deadline: Instant,
     ) -> StorageResult<Option<RemoteMetadata>> {
+        if !handle.snapshot {
+            if handle.pending_truncate {
+                let backend = handle.backend.as_mut().ok_or_else(|| {
+                    StorageError::new(libc::EBADF, "remote file handle is closed")
+                })?;
+                self.storage.set_length(backend, 0).await?;
+                handle
+                    .file
+                    .as_ref()
+                    .ok_or_else(|| {
+                        StorageError::new(libc::EBADF, "remote placeholder is unavailable")
+                    })?
+                    .set_len(0)
+                    .map_err(|error| storage_io("failed to truncate remote placeholder", error))?;
+                if let Some(metadata) = handle.baseline.as_mut() {
+                    metadata.size = 0;
+                }
+                handle.pending_truncate = false;
+            }
+            if !handle.writable {
+                return Ok((!handle.unlinked)
+                    .then(|| handle.baseline.clone())
+                    .flatten());
+            }
+            let backend = handle
+                .backend
+                .as_mut()
+                .ok_or_else(|| StorageError::new(libc::EBADF, "remote file handle is closed"))?;
+            let metadata = self.storage.flush_file(backend).await?;
+            handle.baseline = Some(metadata.clone());
+            return Ok((!handle.unlinked).then_some(metadata));
+        }
         if handle.unlinked {
             return Ok(None);
         }
-        if !handle.publishable {
+        if !handle.writable {
             return Ok(handle.baseline.clone());
         }
         let file = handle
@@ -750,7 +1072,7 @@ where
             deadline,
         )
         .await?;
-        if !handle.force_publish && checksum == handle.checksum {
+        if checksum == handle.checksum {
             return Ok(handle.baseline.clone());
         }
         let metadata = self
@@ -764,7 +1086,6 @@ where
             .await?;
         handle.baseline = Some(metadata.clone());
         handle.checksum = checksum;
-        handle.force_publish = false;
         Ok(Some(metadata))
     }
 
@@ -775,6 +1096,12 @@ where
             None => return Err(StorageError::new(libc::EBADF, "unknown remote handle")),
         };
         self.sync_handle(&handle, deadline).await?;
+        {
+            let mut handle = handle.lock().await;
+            if let Some(backend) = handle.backend.as_mut() {
+                self.storage.close_file(backend).await?;
+            }
+        }
         let mut handles = self.handles.lock().await;
         if handles
             .get(id)
@@ -787,7 +1114,10 @@ where
     }
 
     async fn abort(&self, id: &str) -> StorageResult<()> {
-        if self.handles.lock().await.remove(id).is_some() {
+        let handle = { self.handles.lock().await.get(id).cloned() };
+        if let Some(handle) = handle {
+            self.discard_handle(&handle).await?;
+            self.handles.lock().await.remove(id);
             self.closed_handles.lock().await.insert(id.to_string());
             return Ok(());
         }
@@ -795,6 +1125,38 @@ where
             Ok(())
         } else {
             Err(StorageError::new(libc::EBADF, "unknown remote handle"))
+        }
+    }
+
+    async fn discard_handle(
+        &self,
+        handle: &SharedRemoteHandle<S::FileHandle>,
+    ) -> StorageResult<()> {
+        let (path, created, baseline) = {
+            let mut handle = handle.lock().await;
+            if let Some(mut backend) = handle.backend.take()
+                && let Err(error) = self.storage.close_file(&mut backend).await
+            {
+                handle.backend = Some(backend);
+                return Err(error);
+            }
+            (handle.path.clone(), handle.created, handle.baseline.clone())
+        };
+        if !created {
+            return Ok(());
+        }
+        let _mutation = self.lock_root(path.root()).await;
+        match self.storage.stat(&path).await {
+            Ok(current)
+                if baseline
+                    .as_ref()
+                    .is_some_and(|baseline| baseline.identity == current.identity) =>
+            {
+                self.storage.remove(&path, false).await
+            }
+            Ok(_) => Ok(()),
+            Err(error) if error.errno() == libc::ENOENT => Ok(()),
+            Err(error) => Err(error),
         }
     }
 
@@ -809,9 +1171,7 @@ where
         for handle in handles {
             let mut handle = handle.lock().await;
             if path_is_at_or_below(&handle.path, to) {
-                handle.publishable = false;
                 handle.unlinked = true;
-                handle.force_publish = false;
             } else if let Some(retargeted) = retarget_path(&handle.path, from, to) {
                 handle.path = retargeted;
             }
@@ -829,9 +1189,7 @@ where
         for handle in handles {
             let mut handle = handle.lock().await;
             if handle.path == *path {
-                handle.publishable = false;
                 handle.unlinked = true;
-                handle.force_publish = false;
             }
         }
     }
@@ -986,6 +1344,7 @@ impl RequestCache {
         *claimed = true;
         Some(match response {
             Response::List { anchor } => Some(anchor.clone()),
+            Response::Read { payload, .. } => Some(payload.clone()),
             _ => None,
         })
     }
@@ -1070,6 +1429,7 @@ fn response_resource(response: &Response) -> Option<AbandonedResource> {
         Response::Stat { anchor, .. } | Response::List { anchor } => {
             Some(AbandonedResource::Anchor(anchor.clone()))
         }
+        Response::Read { payload, .. } => Some(AbandonedResource::Payload(payload.clone())),
         _ => None,
     }
 }
@@ -1119,6 +1479,7 @@ fn error_reply(error: StorageError) -> BrokerReply {
     }
 }
 
+#[cfg(test)]
 fn empty_file_metadata() -> RemoteMetadata {
     RemoteMetadata {
         file_type: RemoteFileType::File,

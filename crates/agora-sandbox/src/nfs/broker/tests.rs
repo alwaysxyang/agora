@@ -3,6 +3,7 @@ use crate::nfs::backend::RemoteStorage;
 use crate::nfs::protocol::{RemotePath, Request, RequestId, Response};
 use crate::nfs::testing::MemoryStorage;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 
 fn path(value: &str) -> RemotePath {
     RemotePath::new(0, value).unwrap()
@@ -24,6 +25,42 @@ fn assert_errno(response: Response, errno: libc::c_int) {
         matches!(response, Response::Error { errno: actual, .. } if actual == errno),
         "unexpected response: {response:?}"
     );
+}
+
+fn write_payload(contents: &[u8]) -> (OwnedFd, [u8; 16]) {
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(contents).unwrap();
+    (file.into(), Md5::digest(contents).into())
+}
+
+async fn direct_write(
+    broker: &Broker<MemoryStorage>,
+    handle: &str,
+    offset: Option<u64>,
+    contents: &[u8],
+) -> Response {
+    let (descriptor, checksum) = write_payload(contents);
+    broker
+        .handle_with_descriptor(
+            Request::Write {
+                handle: handle.to_string(),
+                offset,
+                length: contents.len() as u32,
+                checksum,
+            },
+            Some(descriptor),
+        )
+        .await
+        .response
+}
+
+async fn materialize(broker: &Broker<MemoryStorage>, handle: &str) -> Response {
+    broker
+        .handle(Request::Materialize {
+            handle: handle.to_string(),
+        })
+        .await
+        .response
 }
 
 #[tokio::test]
@@ -161,7 +198,7 @@ async fn broker_rejects_reusing_a_request_id_for_a_different_operation() {
 }
 
 #[tokio::test]
-async fn broker_opens_remote_content_through_an_unlinked_descriptor() {
+async fn broker_reads_remote_content_on_demand_through_a_payload_descriptor() {
     let root = tempfile::tempdir().unwrap();
     let storage = std::sync::Arc::new(MemoryStorage::default());
     storage.insert_file(0, "notes.txt", b"remote contents");
@@ -176,7 +213,17 @@ async fn broker_opens_remote_content_through_an_unlinked_descriptor() {
         .await;
 
     let handle = open_handle(&reply.response);
-    let mut file = std::fs::File::from(reply.descriptor.unwrap());
+    let placeholder = std::fs::File::from(reply.descriptor.unwrap());
+    assert_eq!(placeholder.metadata().unwrap().len(), 15);
+    let read = broker
+        .handle(Request::Read {
+            handle: handle.clone(),
+            offset: 0,
+            length: 64,
+        })
+        .await;
+    assert!(matches!(read.response, Response::Read { length: 15, .. }));
+    let mut file = std::fs::File::from(read.descriptor.unwrap());
     let mut data = String::new();
     file.read_to_string(&mut data).unwrap();
     assert_eq!(data, "remote contents");
@@ -188,7 +235,50 @@ async fn broker_opens_remote_content_through_an_unlinked_descriptor() {
 }
 
 #[tokio::test]
-async fn broker_rejects_remote_files_above_the_snapshot_limit_before_download() {
+async fn broker_open_does_not_download_remote_file_contents() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = std::sync::Arc::new(MemoryStorage::default());
+    storage.insert_file(0, "large.bin", b"remote contents");
+    storage.block_reads();
+    let broker = Broker::new(std::sync::Arc::clone(&storage), root.path()).unwrap();
+
+    let opened = tokio::time::timeout(
+        Duration::from_millis(100),
+        broker.handle(Request::Open {
+            path: path("large.bin"),
+            flags: libc::O_RDONLY,
+            mode: 0,
+        }),
+    )
+    .await
+    .expect("ordinary open must not wait for a whole-file download");
+
+    assert!(matches!(opened.response, Response::Open { .. }));
+}
+
+#[tokio::test]
+async fn broker_rejects_a_snapshot_changed_during_download() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = std::sync::Arc::new(MemoryStorage::default());
+    storage.insert_file(0, "changing.txt", b"before");
+    storage.replace_during_snapshot_read(b"after");
+    let broker = Broker::new(std::sync::Arc::clone(&storage), root.path()).unwrap();
+    let reply = broker
+        .handle(Request::Open {
+            path: path("changing.txt"),
+            flags: libc::O_RDONLY,
+            mode: 0,
+        })
+        .await;
+    let handle = open_handle(&reply.response);
+
+    let response = materialize(&broker, &handle).await;
+
+    assert_errno(response, libc::ESTALE);
+}
+
+#[tokio::test]
+async fn broker_applies_the_snapshot_limit_only_when_mmap_materializes_the_file() {
     let root = tempfile::tempdir().unwrap();
     let storage = std::sync::Arc::new(MemoryStorage::default());
     storage.insert_file(0, "large.bin", b"12345");
@@ -202,17 +292,19 @@ async fn broker_rejects_remote_files_above_the_snapshot_limit_before_download() 
     )
     .unwrap();
 
-    let response = broker
+    let opened = broker
         .handle(Request::Open {
             path: path("large.bin"),
             flags: libc::O_RDONLY,
             mode: 0,
         })
-        .await
-        .response;
+        .await;
+    let handle = open_handle(&opened.response);
+    assert!(matches!(opened.response, Response::Open { .. }));
+    let response = materialize(&broker, &handle).await;
 
     assert_errno(response, libc::EFBIG);
-    assert_eq!(broker.handle_count_for_test().await, 0);
+    assert_eq!(broker.handle_count_for_test().await, 1);
 }
 
 #[tokio::test]
@@ -231,18 +323,22 @@ async fn broker_rejects_grown_snapshots_before_checksum_or_upload() {
     let mut opened = broker
         .handle(Request::Open {
             path: path("large.bin"),
-            flags: libc::O_WRONLY | libc::O_CREAT,
+            flags: libc::O_RDWR | libc::O_CREAT,
             mode: 0o600,
         })
         .await;
     let handle = open_handle(&opened.response);
     let mut descriptor = std::fs::File::from(opened.descriptor.take().unwrap());
+    assert!(matches!(
+        materialize(&broker, &handle).await,
+        Response::Materialized { .. }
+    ));
     descriptor.write_all(b"12345").unwrap();
 
     let response = broker.handle(Request::Sync { handle }).await.response;
 
     assert_errno(response, libc::EFBIG);
-    assert!(!storage.exists(0, "large.bin"));
+    assert_eq!(storage.data(0, "large.bin"), Some(Vec::new()));
 }
 
 #[tokio::test]
@@ -294,9 +390,12 @@ async fn broker_writes_on_sync_and_last_close_with_posix_open_flags() {
         })
         .await;
     let handle = open_handle(&reply.response);
-    let mut file = std::fs::File::from(reply.descriptor.take().unwrap());
-    file.write_all(b"first").unwrap();
-    file.sync_all().unwrap();
+    let _file = std::fs::File::from(reply.descriptor.take().unwrap());
+    assert!(matches!(
+        direct_write(&broker, &handle, Some(0), b"first").await,
+        Response::Written { length: 5, .. }
+    ));
+    assert_eq!(storage.data(0, "created.txt").unwrap(), b"first");
 
     assert!(matches!(
         broker
@@ -308,8 +407,10 @@ async fn broker_writes_on_sync_and_last_close_with_posix_open_flags() {
         Response::Synced { metadata: Some(_) }
     ));
     assert_eq!(storage.data(0, "created.txt").unwrap(), b"first");
-    file.write_all(b" second").unwrap();
-    drop(file);
+    assert!(matches!(
+        direct_write(&broker, &handle, Some(5), b" second").await,
+        Response::Written { length: 7, .. }
+    ));
     assert_eq!(
         broker.handle(Request::Close { handle }).await.response,
         Response::Success
@@ -347,6 +448,19 @@ async fn broker_refuses_to_overwrite_a_remotely_changed_file() {
         .await;
     let handle = open_handle(&reply.response);
     let mut file = std::fs::File::from(reply.descriptor.take().unwrap());
+    assert!(matches!(
+        broker
+            .handle(Request::Sync {
+                handle: handle.clone(),
+            })
+            .await
+            .response,
+        Response::Synced { .. }
+    ));
+    assert!(matches!(
+        materialize(&broker, &handle).await,
+        Response::Materialized { .. }
+    ));
     file.write_all(b"sandbox change").unwrap();
     file.sync_all().unwrap();
     storage.replace(0, "shared.txt", b"outside change");
@@ -398,6 +512,10 @@ async fn broker_serializes_version_check_and_writeback_per_root() {
         .await;
     let first_handle = open_handle(&first.response);
     let mut first_file = std::fs::File::from(first.descriptor.take().unwrap());
+    assert!(matches!(
+        materialize(&broker, &first_handle).await,
+        Response::Materialized { .. }
+    ));
     first_file.write_all(b"1").unwrap();
 
     let mut second = broker
@@ -409,6 +527,10 @@ async fn broker_serializes_version_check_and_writeback_per_root() {
         .await;
     let second_handle = open_handle(&second.response);
     let mut second_file = std::fs::File::from(second.descriptor.take().unwrap());
+    assert!(matches!(
+        materialize(&broker, &second_handle).await,
+        Response::Materialized { .. }
+    ));
     second_file.write_all(b"2").unwrap();
     storage.yield_operations();
 
@@ -445,25 +567,24 @@ async fn broker_serializes_version_check_and_writeback_per_root() {
 }
 
 #[tokio::test]
-async fn broker_registers_an_open_snapshot_before_namespace_mutation() {
+async fn broker_registers_a_materialized_snapshot_before_namespace_mutation() {
     let root = tempfile::tempdir().unwrap();
     let storage = std::sync::Arc::new(MemoryStorage::default());
     storage.insert_file(0, "shared.txt", b"original");
-    storage.block_reads();
     let broker =
         std::sync::Arc::new(Broker::new(std::sync::Arc::clone(&storage), root.path()).unwrap());
-
-    let opening = {
-        let broker = std::sync::Arc::clone(&broker);
-        tokio::spawn(async move {
-            broker
-                .handle(Request::Open {
-                    path: path("shared.txt"),
-                    flags: libc::O_RDWR,
-                    mode: 0,
-                })
-                .await
+    let opened = broker
+        .handle(Request::Open {
+            path: path("shared.txt"),
+            flags: libc::O_RDWR,
+            mode: 0,
         })
+        .await;
+    let handle = open_handle(&opened.response);
+    storage.block_reads();
+    let materializing = {
+        let broker = std::sync::Arc::clone(&broker);
+        tokio::spawn(async move { broker.handle(Request::Materialize { handle }).await })
     };
     storage.wait_until_read_started().await;
 
@@ -482,12 +603,14 @@ async fn broker_registers_an_open_snapshot_before_namespace_mutation() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert!(
         !removing.is_finished(),
-        "remove must wait until open has registered its snapshot"
+        "remove must wait until mmap materialization has registered its snapshot"
     );
 
     storage.release_reads();
-    let opened = opening.await.unwrap();
-    assert!(matches!(opened.response, Response::Open { .. }));
+    assert!(matches!(
+        materializing.await.unwrap().response,
+        Response::Materialized { .. }
+    ));
     assert_eq!(removing.await.unwrap().response, Response::Success);
 }
 
@@ -790,6 +913,7 @@ async fn replaced_target_handle_cannot_recreate_or_overwrite_the_new_target() {
             .response,
         Response::Success
     );
+    let flushes_before_sync = storage.flush_operations();
     assert_eq!(
         broker
             .handle(Request::Sync {
@@ -799,6 +923,7 @@ async fn replaced_target_handle_cannot_recreate_or_overwrite_the_new_target() {
             .response,
         Response::Synced { metadata: None }
     );
+    assert_eq!(storage.flush_operations(), flushes_before_sync + 1);
     assert_eq!(
         broker.handle(Request::Close { handle }).await.response,
         Response::Success
@@ -877,8 +1002,20 @@ async fn broker_retargets_open_descendants_when_a_directory_is_renamed() {
         })
         .await;
     let handle = open_handle(&reply.response);
-    let mut file = std::fs::File::from(reply.descriptor.unwrap());
-    file.write_all(b"new").unwrap();
+    drop(reply.descriptor.unwrap());
+    assert!(matches!(
+        broker
+            .handle(Request::Sync {
+                handle: handle.clone(),
+            })
+            .await
+            .response,
+        Response::Synced { .. }
+    ));
+    assert!(matches!(
+        direct_write(&broker, &handle, Some(0), b"new").await,
+        Response::Written { .. }
+    ));
 
     assert_eq!(
         broker
@@ -913,6 +1050,15 @@ async fn broker_discards_an_open_snapshot_after_the_path_is_removed() {
         .await;
     let handle = open_handle(&reply.response);
     let mut file = std::fs::File::from(reply.descriptor.unwrap());
+    assert!(matches!(
+        broker
+            .handle(Request::Sync {
+                handle: handle.clone(),
+            })
+            .await
+            .response,
+        Response::Synced { .. }
+    ));
     file.write_all(b"unlinked data").unwrap();
 
     assert_eq!(
@@ -966,6 +1112,22 @@ async fn broker_validates_open_access_directory_and_sync_semantics() {
             errno,
         );
     }
+    let appended = broker
+        .handle(Request::Open {
+            path: path("file.txt"),
+            flags: libc::O_RDONLY | libc::O_APPEND,
+            mode: 0,
+        })
+        .await;
+    let handle = open_handle(&appended.response);
+    let descriptor = std::fs::File::from(appended.descriptor.unwrap());
+    let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+    assert_ne!(flags & libc::O_APPEND, 0);
+    assert_eq!(
+        broker.handle(Request::Close { handle }).await.response,
+        Response::Success
+    );
     assert_errno(
         broker
             .handle(Request::Open {

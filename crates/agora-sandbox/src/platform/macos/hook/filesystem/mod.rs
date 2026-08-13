@@ -298,6 +298,8 @@ struct RemoteRegistration {
     handle: String,
     metadata: Mutex<crate::nfs::protocol::RemoteMetadata>,
     writable: bool,
+    snapshot: AtomicBool,
+    mutation: Mutex<()>,
 }
 
 struct LocalRegistration {
@@ -385,6 +387,8 @@ impl PreparedOpenFile {
                         handle,
                         metadata: Mutex::new(metadata),
                         writable,
+                        snapshot: AtomicBool::new(false),
+                        mutation: Mutex::new(()),
                     }),
                     FileLayer::Upper,
                 )
@@ -1474,6 +1478,20 @@ impl FilesystemHookRuntime {
         Ok(())
     }
 
+    fn materialize_remote_locked(&self, registration: &RemoteRegistration) -> Result<()> {
+        if registration.snapshot.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let metadata = self
+            .remote
+            .as_ref()
+            .context("remote filesystem runtime is unavailable")?
+            .materialize(&registration.handle)?;
+        *lock(&registration.metadata) = metadata;
+        registration.snapshot.store(true, Ordering::Release);
+        Ok(())
+    }
+
     fn commit_open_file(
         &self,
         descriptor: libc::c_int,
@@ -1485,6 +1503,7 @@ impl FilesystemHookRuntime {
             return self.commit_local_open_file_locked(descriptor, open, registration, durable);
         }
         if let Some(registration) = &open.remote {
+            let _mutation = lock(&registration.mutation);
             let remote = self
                 .remote
                 .as_ref()
@@ -1529,6 +1548,7 @@ impl FilesystemHookRuntime {
                 return Ok(());
             }
             if let Some(registration) = &open.remote {
+                let _mutation = lock(&registration.mutation);
                 return self
                     .remote
                     .as_ref()

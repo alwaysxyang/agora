@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::os::fd::OwnedFd;
+use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -72,7 +72,7 @@ impl RemoteClient {
     pub(crate) fn ping_shared(&self) -> Result<(), RemoteClientError> {
         let request_id = RequestId::new(uuid::Uuid::new_v4().simple().to_string())
             .expect("UUID is a valid remote request ID");
-        let reply = self.request_shared(request_id, Request::Ping)?;
+        let reply = self.request_shared(request_id, Request::Ping, None)?;
         if reply.response == Response::Success && reply.descriptor.is_none() {
             Ok(())
         } else {
@@ -84,14 +84,31 @@ impl RemoteClient {
     }
 
     pub(crate) fn request(&self, request: Request) -> Result<RemoteReply, RemoteClientError> {
+        self.request_with_optional_descriptor(request, None)
+    }
+
+    pub(crate) fn request_with_descriptor(
+        &self,
+        request: Request,
+        descriptor: RawFd,
+    ) -> Result<RemoteReply, RemoteClientError> {
+        self.request_with_optional_descriptor(request, Some(descriptor))
+    }
+
+    fn request_with_optional_descriptor(
+        &self,
+        request: Request,
+        descriptor: Option<RawFd>,
+    ) -> Result<RemoteReply, RemoteClientError> {
         let request_id = RequestId::new(uuid::Uuid::new_v4().simple().to_string())
             .expect("UUID is a valid remote request ID");
-        let reply = self.request_with_id(request_id.clone(), request)?;
+        let reply = self.request_with_id(request_id.clone(), request, descriptor)?;
         let resource = match &reply.response {
             Response::Open { handle, .. } => Some((Some(handle.clone()), None)),
             Response::Stat { anchor, .. } | Response::List { anchor } => {
                 Some((None, Some(anchor.clone())))
             }
+            Response::Read { payload, .. } => Some((None, Some(payload.clone()))),
             _ => None,
         };
         if let Some((handle, anchor)) = resource
@@ -99,6 +116,7 @@ impl RemoteClient {
                 RequestId::new(uuid::Uuid::new_v4().simple().to_string())
                     .expect("UUID is a valid remote request ID"),
                 Request::Claim { request_id },
+                None,
             )
         {
             if let Some(handle) = handle {
@@ -116,10 +134,11 @@ impl RemoteClient {
         &self,
         request_id: RequestId,
         request: Request,
+        descriptor: Option<RawFd>,
     ) -> Result<RemoteReply, RemoteClientError> {
         let mut last_error = None;
         for _ in 0..REMOTE_REQUEST_ATTEMPTS {
-            match self.request_once(request_id.clone(), request.clone()) {
+            match self.request_once(request_id.clone(), request.clone(), descriptor) {
                 Ok(reply) => return Ok(reply),
                 Err(error) if error.retryable => last_error = Some(error),
                 Err(error) => return Err(error),
@@ -132,6 +151,7 @@ impl RemoteClient {
         &self,
         request_id: RequestId,
         request: Request,
+        descriptor: Option<RawFd>,
     ) -> Result<RemoteReply, RemoteClientError> {
         #[cfg(target_os = "macos")]
         let current_pid = std::process::id();
@@ -143,7 +163,7 @@ impl RemoteClient {
         }
         #[cfg(target_os = "macos")]
         if self.prefer_shared.load(Ordering::Acquire) && self.shared.is_some() {
-            let result = self.request_shared(request_id, request);
+            let result = self.request_shared(request_id, request, descriptor);
             if result.is_err() {
                 self.prefer_shared.store(false, Ordering::Release);
             }
@@ -154,7 +174,7 @@ impl RemoteClient {
             Err(error) => {
                 #[cfg(target_os = "macos")]
                 if self.shared.is_some() {
-                    let result = self.request_shared(request_id, request);
+                    let result = self.request_shared(request_id, request, descriptor);
                     self.prefer_shared.store(result.is_ok(), Ordering::Release);
                     return result;
                 }
@@ -175,7 +195,7 @@ impl RemoteClient {
             .map_err(|error| {
                 RemoteClientError::io("failed to configure remote broker", error, false)
             })?;
-        Self::exchange(&mut stream, &self.token, request_id, request)
+        Self::exchange(&mut stream, &self.token, request_id, request, descriptor)
     }
 
     #[cfg(target_os = "macos")]
@@ -183,6 +203,7 @@ impl RemoteClient {
         &self,
         request_id: RequestId,
         request: Request,
+        descriptor: Option<RawFd>,
     ) -> Result<RemoteReply, RemoteClientError> {
         let shared = self.shared.as_ref().ok_or_else(|| {
             RemoteClientError::new(
@@ -191,7 +212,7 @@ impl RemoteClient {
             )
         })?;
         shared
-            .transact(|stream| Self::exchange(stream, &self.token, request_id, request))
+            .transact(|stream| Self::exchange(stream, &self.token, request_id, request, descriptor))
             .map_err(|error| {
                 RemoteClientError::io(
                     "failed to serialize inherited remote filesystem request",
@@ -206,6 +227,7 @@ impl RemoteClient {
         token: &str,
         request_id: RequestId,
         request: Request,
+        descriptor: Option<RawFd>,
     ) -> Result<RemoteReply, RemoteClientError> {
         let request = RequestEnvelope {
             version: PROTOCOL_VERSION,
@@ -213,7 +235,7 @@ impl RemoteClient {
             request_id: request_id.clone(),
             request,
         };
-        transport::send(stream, &request, None)
+        transport::send(stream, &request, descriptor)
             .map_err(|error| RemoteClientError::io("failed to send remote request", error, true))?;
         let (response, descriptor) =
             transport::receive::<ResponseEnvelope>(stream).map_err(|error| {
@@ -323,7 +345,10 @@ fn response_result(
     if let Response::Error { errno, message } = response {
         return Err(RemoteClientError::new(errno, message));
     }
-    let expects_descriptor = matches!(response, Response::Open { .. } | Response::List { .. });
+    let expects_descriptor = matches!(
+        &response,
+        Response::Open { .. } | Response::List { .. } | Response::Read { .. }
+    );
     if expects_descriptor != descriptor.is_some() {
         return Err(RemoteClientError::new(
             libc::EPROTO,

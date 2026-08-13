@@ -1,12 +1,20 @@
 use super::data::{
+    agora_sandbox_aio_write as sandbox_aio_write,
     agora_sandbox_guarded_pwrite as sandbox_guarded_pwrite,
-    agora_sandbox_guarded_writev as sandbox_guarded_writev, agora_sandbox_pwrite as sandbox_pwrite,
-    agora_sandbox_pwritev as sandbox_pwritev, agora_sandbox_writev as sandbox_writev,
+    agora_sandbox_guarded_writev as sandbox_guarded_writev,
+    agora_sandbox_lio_listio as sandbox_lio_listio, agora_sandbox_lseek as sandbox_lseek,
+    agora_sandbox_pwrite as sandbox_pwrite, agora_sandbox_pwritev as sandbox_pwritev,
+    agora_sandbox_read as sandbox_read, agora_sandbox_write as sandbox_write,
+    agora_sandbox_writev as sandbox_writev,
 };
 use super::directory::{
     fts_bulk_entry_names_for_test, fts_directory_descent_path_for_test,
     fts_getattrlistbulk_for_test as sandbox_getattrlistbulk,
     fts_read_returns_virtual_entry_for_test,
+};
+use super::mapping::{
+    agora_sandbox_mmap as sandbox_mmap, agora_sandbox_msync as sandbox_msync,
+    agora_sandbox_munmap as sandbox_munmap,
 };
 use super::{
     ByteRangeSet, DirectoryCursor, FilesystemHookGuard, FilesystemHookRuntime, LocalByteRange,
@@ -135,6 +143,21 @@ impl Fixture {
     }
 }
 
+unsafe fn materialize_remote_snapshot(descriptor: libc::c_int) {
+    let mapping = unsafe {
+        sandbox_mmap(
+            std::ptr::null_mut(),
+            1,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            descriptor,
+            0,
+        )
+    };
+    assert_ne!(mapping, libc::MAP_FAILED);
+    assert_eq!(unsafe { sandbox_munmap(mapping, 1) }, 0);
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.directory).unwrap();
@@ -219,7 +242,7 @@ fn nfs_files_use_anonymous_descriptors_without_overlay_state() {
         assert!(descriptor >= 0);
         let mut content = [0_u8; 14];
         assert_eq!(
-            libc::read(descriptor, content.as_mut_ptr().cast(), content.len()),
+            sandbox_read(descriptor, content.as_mut_ptr().cast(), content.len()),
             14
         );
         assert_eq!(&content, b"remote content");
@@ -234,8 +257,8 @@ fn nfs_files_use_anonymous_descriptors_without_overlay_state() {
         assert_eq!(*libc::__error(), libc::EACCES);
 
         assert_eq!(sandbox_ftruncate(descriptor, 0), 0);
-        assert_eq!(libc::lseek(descriptor, 0, libc::SEEK_SET), 0);
-        assert_eq!(libc::write(descriptor, b"sandbox".as_ptr().cast(), 7), 7);
+        assert_eq!(sandbox_lseek(descriptor, 0, libc::SEEK_SET), 0);
+        assert_eq!(sandbox_write(descriptor, b"sandbox".as_ptr().cast(), 7), 7);
         assert_eq!(sandbox_stat(path.as_ptr(), &mut status), 0);
         assert_eq!(status.st_size, 7);
         assert_eq!(
@@ -264,7 +287,11 @@ fn nfs_files_use_anonymous_descriptors_without_overlay_state() {
         assert!(!stream.is_null());
         let mut reopened = [0_u8; 7];
         assert_eq!(
-            libc::fread(reopened.as_mut_ptr().cast(), 1, reopened.len(), stream),
+            sandbox_read(
+                libc::fileno(stream),
+                reopened.as_mut_ptr().cast(),
+                reopened.len(),
+            ),
             7
         );
         assert_eq!(&reopened, b"sandbox");
@@ -272,6 +299,34 @@ fn nfs_files_use_anonymous_descriptors_without_overlay_state() {
 
         assert_eq!(sandbox_truncate(path.as_ptr(), 3), 0);
         assert_eq!(nfs.storage.data(0, "docs/file.txt"), Some(b"san".to_vec()));
+
+        let appender = sandbox_open_with_mode(path.as_ptr(), libc::O_WRONLY | libc::O_APPEND, 0);
+        assert!(appender >= 0);
+        nfs.storage
+            .replace(0, "docs/file.txt", b"external append base");
+        assert_eq!(sandbox_write(appender, b"!".as_ptr().cast(), 1), 1);
+        assert_eq!(sandbox_close(appender), 0);
+        assert_eq!(
+            nfs.storage.data(0, "docs/file.txt"),
+            Some(b"external append base!".to_vec())
+        );
+
+        let dynamic_appender = sandbox_open_with_mode(path.as_ptr(), libc::O_WRONLY, 0);
+        assert!(dynamic_appender >= 0);
+        let flags = libc::fcntl(dynamic_appender, libc::F_GETFL);
+        assert!(flags >= 0);
+        assert_eq!(
+            libc::fcntl(dynamic_appender, libc::F_SETFL, flags | libc::O_APPEND),
+            0
+        );
+        nfs.storage
+            .replace(0, "docs/file.txt", b"dynamic append base");
+        assert_eq!(sandbox_write(dynamic_appender, b"!".as_ptr().cast(), 1), 1);
+        assert_eq!(sandbox_close(dynamic_appender), 0);
+        assert_eq!(
+            nfs.storage.data(0, "docs/file.txt"),
+            Some(b"dynamic append base!".to_vec())
+        );
 
         let created_path = Fixture::c_path(&nfs.logical_root.join("created.txt"));
         let created =
@@ -300,7 +355,7 @@ fn nfs_positioned_and_vectored_writes_preserve_offsets_and_flush_exact_content()
         assert!(descriptor >= 0);
         assert_eq!(sandbox_pwrite(descriptor, b"AB".as_ptr().cast(), 2, 2), 2);
 
-        assert_eq!(libc::lseek(descriptor, 4, libc::SEEK_SET), 4);
+        assert_eq!(sandbox_lseek(descriptor, 4, libc::SEEK_SET), 4);
         let sequential = [b"CD".as_slice(), b"EF".as_slice()];
         let sequential = sequential.map(|part| libc::iovec {
             iov_base: part.as_ptr().cast_mut().cast(),
@@ -331,6 +386,10 @@ fn nfs_positioned_and_vectored_writes_preserve_offsets_and_flush_exact_content()
         );
         assert_eq!(sandbox_fchmod(descriptor, 0o600), -1);
         assert_eq!(*libc::__error(), libc::ENOTSUP);
+        assert_eq!(sandbox_lseek(descriptor, 0, libc::SEEK_CUR), 8);
+        let mut tail = [0_u8; 4];
+        assert_eq!(sandbox_read(descriptor, tail.as_mut_ptr().cast(), 4), 4);
+        assert_eq!(&tail, b"GHIJ");
         assert_eq!(sandbox_fsync(descriptor), 0);
         assert_eq!(sandbox_close(descriptor), 0);
     });
@@ -338,6 +397,160 @@ fn nfs_positioned_and_vectored_writes_preserve_offsets_and_flush_exact_content()
     assert_eq!(
         nfs.storage.data(0, "writes.bin"),
         Some(b"..ABCDEFGHIJ".to_vec())
+    );
+}
+
+#[test]
+fn nfs_synchronous_open_flushes_each_direct_write() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_file(0, "synchronous.bin", b"remote");
+    let path = Fixture::c_path(&nfs.logical_root.join("synchronous.bin"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR | libc::O_SYNC, 0);
+        assert!(descriptor >= 0);
+        let flags = libc::fcntl(descriptor, libc::F_GETFL);
+        assert_ne!(flags & libc::O_SYNC, 0);
+        let flushes = nfs.storage.flush_operations();
+        assert_eq!(sandbox_pwrite(descriptor, b"sync".as_ptr().cast(), 4, 0), 4);
+        assert_eq!(nfs.storage.flush_operations(), flushes + 1);
+        materialize_remote_snapshot(descriptor);
+        assert_eq!(sandbox_pwrite(descriptor, b"!".as_ptr().cast(), 1, 4), 1);
+        assert_eq!(
+            nfs.storage.data(0, "synchronous.bin"),
+            Some(b"sync!e".to_vec())
+        );
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+
+    assert_eq!(
+        nfs.storage.data(0, "synchronous.bin"),
+        Some(b"sync!e".to_vec())
+    );
+}
+
+#[test]
+fn nfs_shared_mmap_writes_back_while_private_mmap_stays_private() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_file(0, "shared-map.bin", b"original");
+    nfs.storage.insert_file(0, "private-map.bin", b"original");
+    let shared = Fixture::c_path(&nfs.logical_root.join("shared-map.bin"));
+    let private = Fixture::c_path(&nfs.logical_root.join("private-map.bin"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(shared.as_ptr(), libc::O_RDWR, 0);
+        assert!(descriptor >= 0);
+        let mapping = sandbox_mmap(
+            std::ptr::null_mut(),
+            8,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            descriptor,
+            0,
+        );
+        assert_ne!(mapping, libc::MAP_FAILED);
+        std::ptr::copy_nonoverlapping(b"sandbox!".as_ptr(), mapping.cast(), 8);
+        assert_eq!(sandbox_msync(mapping, 8, libc::MS_SYNC), 0);
+        assert_eq!(
+            nfs.storage.data(0, "shared-map.bin"),
+            Some(b"sandbox!".to_vec())
+        );
+        assert_eq!(sandbox_munmap(mapping, 8), 0);
+        assert_eq!(sandbox_close(descriptor), 0);
+
+        let descriptor = sandbox_open_with_mode(private.as_ptr(), libc::O_RDWR, 0);
+        assert!(descriptor >= 0);
+        let mapping = sandbox_mmap(
+            std::ptr::null_mut(),
+            8,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE,
+            descriptor,
+            0,
+        );
+        assert_ne!(mapping, libc::MAP_FAILED);
+        std::ptr::copy_nonoverlapping(b"private!".as_ptr(), mapping.cast(), 8);
+        assert_eq!(sandbox_munmap(mapping, 8), 0);
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+
+    assert_eq!(
+        nfs.storage.data(0, "private-map.bin"),
+        Some(b"original".to_vec())
+    );
+}
+
+#[test]
+fn nfs_async_writes_transition_to_a_writeback_snapshot() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_file(0, "lio-write.bin", b"original");
+    nfs.storage.insert_file(0, "aio-write.bin", b"original");
+    let path = Fixture::c_path(&nfs.logical_root.join("lio-write.bin"));
+    let aio_path = Fixture::c_path(&nfs.logical_root.join("aio-write.bin"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR, 0);
+        assert!(descriptor >= 0);
+        let contents = *b"async";
+        let mut control = std::mem::zeroed::<libc::aiocb>();
+        control.aio_fildes = descriptor;
+        control.aio_offset = 0;
+        control.aio_buf = contents.as_ptr().cast_mut().cast();
+        control.aio_nbytes = contents.len();
+        control.aio_lio_opcode = libc::LIO_WRITE;
+        let mut controls = [std::ptr::addr_of_mut!(control)];
+
+        assert_eq!(
+            sandbox_lio_listio(
+                libc::LIO_WAIT,
+                controls.as_mut_ptr(),
+                controls.len() as libc::c_int,
+                std::ptr::null_mut(),
+            ),
+            0
+        );
+        assert_eq!(
+            libc::aio_return(&mut control),
+            contents.len() as libc::ssize_t
+        );
+        assert_eq!(sandbox_close(descriptor), 0);
+
+        let descriptor = sandbox_open_with_mode(aio_path.as_ptr(), libc::O_RDWR, 0);
+        assert!(descriptor >= 0);
+        let mut control = std::mem::zeroed::<libc::aiocb>();
+        control.aio_fildes = descriptor;
+        control.aio_offset = 0;
+        control.aio_buf = contents.as_ptr().cast_mut().cast();
+        control.aio_nbytes = contents.len();
+        assert_eq!(sandbox_aio_write(&mut control), 0);
+        while libc::aio_error(&control) == libc::EINPROGRESS {
+            let controls = [std::ptr::addr_of!(control)];
+            assert_eq!(
+                libc::aio_suspend(
+                    controls.as_ptr(),
+                    controls.len() as libc::c_int,
+                    std::ptr::null(),
+                ),
+                0
+            );
+        }
+        assert_eq!(
+            libc::aio_return(&mut control),
+            contents.len() as libc::ssize_t
+        );
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+
+    assert_eq!(
+        nfs.storage.data(0, "lio-write.bin"),
+        Some(b"asyncnal".to_vec())
+    );
+    assert_eq!(
+        nfs.storage.data(0, "aio-write.bin"),
+        Some(b"asyncnal".to_vec())
     );
 }
 
@@ -608,7 +821,7 @@ fn nfs_entries_override_overlay_entries_and_missing_entries_fall_back() {
             assert!(descriptor >= 0);
             let mut content = vec![0_u8; expected.len()];
             assert_eq!(
-                libc::read(descriptor, content.as_mut_ptr().cast(), content.len()),
+                sandbox_read(descriptor, content.as_mut_ptr().cast(), content.len()),
                 expected.len() as isize
             );
             assert_eq!(content, expected);
@@ -632,7 +845,7 @@ fn nfs_entries_override_overlay_entries_and_missing_entries_fall_back() {
         let descriptor = sandbox_open_with_mode(upper.as_ptr(), libc::O_RDWR | libc::O_TRUNC, 0);
         assert!(descriptor >= 0);
         assert_eq!(
-            libc::write(descriptor, b"upper only".as_ptr().cast(), 10),
+            sandbox_write(descriptor, b"upper only".as_ptr().cast(), 10),
             10
         );
         assert_eq!(sandbox_close(descriptor), 0);
@@ -707,13 +920,13 @@ fn nfs_entries_override_overlay_entries_and_missing_entries_fall_back() {
         let child = sandbox_openat_with_mode(descriptor, c"lower.txt".as_ptr(), libc::O_RDONLY, 0);
         assert!(child >= 0);
         let mut content = [0_u8; 10];
-        assert_eq!(libc::read(child, content.as_mut_ptr().cast(), 10), 10);
+        assert_eq!(sandbox_read(child, content.as_mut_ptr().cast(), 10), 10);
         assert_eq!(&content, b"lower only");
         assert_eq!(sandbox_close(child), 0);
         let child = sandbox_openat_with_mode(descriptor, c"shared.txt".as_ptr(), libc::O_RDONLY, 0);
         assert!(child >= 0);
         let mut content = [0_u8; 13];
-        assert_eq!(libc::read(child, content.as_mut_ptr().cast(), 13), 13);
+        assert_eq!(sandbox_read(child, content.as_mut_ptr().cast(), 13), 13);
         assert_eq!(&content, b"remote shared");
         assert_eq!(sandbox_close(child), 0);
         let directory = sandbox_fdopendir(descriptor);
@@ -763,6 +976,7 @@ fn nfs_fclose_keeps_the_stream_open_when_writeback_conflicts() {
         assert!(!stream.is_null());
         let descriptor = libc::fileno(stream);
         assert!(descriptor >= 0);
+        materialize_remote_snapshot(descriptor);
         assert_eq!(libc::fwrite(b"sandbox".as_ptr().cast(), 1, 7, stream), 7);
         nfs.storage.replace(0, "shared.txt", b"outside");
 
@@ -787,6 +1001,7 @@ fn nfs_sync_close_and_dup2_preserve_descriptors_after_writeback_conflicts() {
     with_test_runtime(&fixture.runtime, || unsafe {
         let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR, 0);
         assert!(descriptor >= 0);
+        materialize_remote_snapshot(descriptor);
         assert_eq!(
             libc::pwrite(descriptor, b"sandbox".as_ptr().cast(), 7, 0),
             7
@@ -828,7 +1043,7 @@ fn nfs_dup2_closes_the_replaced_remote_handle() {
         let destination = sandbox_open_with_mode(destination_path.as_ptr(), libc::O_RDWR, 0);
         assert!(destination >= 0);
         assert_eq!(sandbox_ftruncate(destination, 0), 0);
-        assert_eq!(libc::write(destination, b"saved".as_ptr().cast(), 5), 5);
+        assert_eq!(sandbox_write(destination, b"saved".as_ptr().cast(), 5), 5);
         let old_handle = fixture
             .runtime
             .tracked_open(destination)
@@ -869,7 +1084,10 @@ fn nfs_unlink_discards_an_open_snapshot_without_recreating_the_path() {
     with_test_runtime(&fixture.runtime, || unsafe {
         let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR | libc::O_TRUNC, 0);
         assert!(descriptor >= 0);
-        assert_eq!(libc::write(descriptor, b"discarded".as_ptr().cast(), 9), 9);
+        assert_eq!(
+            sandbox_write(descriptor, b"discarded".as_ptr().cast(), 9),
+            9
+        );
         assert_eq!(sandbox_unlink(path.as_ptr()), 0);
         assert_eq!(sandbox_close(descriptor), 0);
     });
@@ -899,6 +1117,30 @@ fn nfs_failed_open_audit_aborts_a_staged_remote_create() {
     });
 
     assert!(!nfs.storage.exists(0, "denied.txt"));
+}
+
+#[test]
+fn nfs_failed_open_audit_does_not_truncate_an_existing_remote_file() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_file(0, "preserved.txt", b"preserved");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    fixture.runtime.audit = Some(AuditClient::new(address, "audit-token"));
+    let path = Fixture::c_path(&nfs.logical_root.join("preserved.txt"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        assert_eq!(
+            sandbox_open_with_mode(path.as_ptr(), libc::O_WRONLY | libc::O_TRUNC, 0),
+            -1
+        );
+    });
+
+    assert_eq!(
+        nfs.storage.data(0, "preserved.txt"),
+        Some(b"preserved".to_vec())
+    );
 }
 
 #[test]
@@ -1077,6 +1319,8 @@ fn nfs_file_descriptors_reject_directory_operations() {
         assert_eq!(*libc::__error(), libc::ENOTDIR);
         assert!(sandbox_fdopendir(descriptor).is_null());
         assert_eq!(*libc::__error(), libc::ENOTDIR);
+        assert_eq!(super::agora_sandbox_validate_content_fcntl(descriptor), -1);
+        assert_eq!(*libc::__error(), libc::ENOTSUP);
         assert_eq!(sandbox_close(descriptor), 0);
     });
 }
@@ -1112,7 +1356,7 @@ fn nfs_directory_rename_retargets_open_descendants() {
     with_test_runtime(&fixture.runtime, || unsafe {
         let descriptor = sandbox_open_with_mode(file.as_ptr(), libc::O_RDWR | libc::O_TRUNC, 0);
         assert!(descriptor >= 0);
-        assert_eq!(libc::write(descriptor, b"new".as_ptr().cast(), 3), 3);
+        assert_eq!(sandbox_write(descriptor, b"new".as_ptr().cast(), 3), 3);
         assert_eq!(
             sandbox_rename(source_directory.as_ptr(), destination_directory.as_ptr()),
             0

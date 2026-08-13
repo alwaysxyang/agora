@@ -3,7 +3,8 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 5;
+pub(crate) const PROTOCOL_VERSION: u16 = 6;
+pub(crate) const MAX_REMOTE_IO_BYTES: u32 = 64 * 1024;
 #[cfg(not(agora_sandbox_hook_build))]
 pub(crate) const MAX_REMOTE_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub(crate) const MAX_REMOTE_DIRECTORY_ENTRIES: usize = 100_000;
@@ -78,6 +79,24 @@ pub(crate) enum Request {
         path: RemotePath,
         mode: i32,
     },
+    Read {
+        handle: String,
+        offset: u64,
+        length: u32,
+    },
+    Write {
+        handle: String,
+        offset: Option<u64>,
+        length: u32,
+        checksum: [u8; 16],
+    },
+    SetLength {
+        handle: String,
+        length: u64,
+    },
+    Materialize {
+        handle: String,
+    },
     Sync {
         handle: String,
     },
@@ -110,6 +129,21 @@ pub(crate) enum Response {
     Success,
     Open {
         handle: String,
+        metadata: RemoteMetadata,
+    },
+    Read {
+        payload: String,
+        length: u32,
+    },
+    Written {
+        offset: u64,
+        length: u32,
+        size: u64,
+    },
+    Resized {
+        size: u64,
+    },
+    Materialized {
         metadata: RemoteMetadata,
     },
     Synced {

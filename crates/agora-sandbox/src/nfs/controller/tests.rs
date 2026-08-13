@@ -165,8 +165,9 @@ async fn controller_authenticates_requests_and_transfers_open_descriptors() {
         .unwrap();
     let client = RemoteClient::new(controller.runtime().socket(), controller.runtime().token());
 
+    let open_client = client.clone();
     let reply = tokio::task::spawn_blocking(move || {
-        client.request(Request::Open {
+        open_client.request(Request::Open {
             path: RemotePath::new(0, "file.txt").unwrap(),
             flags: libc::O_RDONLY,
             mode: 0,
@@ -176,8 +177,21 @@ async fn controller_authenticates_requests_and_transfers_open_descriptors() {
     .unwrap()
     .unwrap();
 
-    assert!(matches!(reply.response, Response::Open { .. }));
-    let mut file = std::fs::File::from(reply.descriptor.unwrap());
+    let Response::Open { handle, .. } = reply.response else {
+        panic!("expected open response");
+    };
+    let read = tokio::task::spawn_blocking(move || {
+        client.request(Request::Read {
+            handle,
+            offset: 0,
+            length: 64,
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(read.response, Response::Read { length: 14, .. }));
+    let mut file = std::fs::File::from(read.descriptor.unwrap());
     let mut contents = String::new();
     std::io::Read::read_to_string(&mut file, &mut contents).unwrap();
     assert_eq!(contents, "through broker");

@@ -322,13 +322,15 @@ where
             let request_id = request.request_id.clone();
             let authenticated = request.version == PROTOCOL_VERSION
                 && constant_time_equal(request.token.as_bytes(), state.token.as_bytes());
-            let valid = authenticated && descriptor.is_none();
+            let expects_descriptor = matches!(&request.request, Request::Write { .. });
+            let descriptor_valid = expects_descriptor == descriptor.is_some();
+            let valid = authenticated && descriptor_valid;
             let ping = matches!(&request.request, Request::Ping);
-            let reply = if descriptor.is_some() {
+            let reply = if !descriptor_valid {
                 crate::nfs::broker::BrokerReply {
                     response: Response::Error {
                         errno: libc::EPROTO,
-                        message: "remote request unexpectedly included a descriptor".to_string(),
+                        message: "remote request descriptor did not match operation".to_string(),
                     },
                     descriptor: None,
                 }
@@ -351,7 +353,7 @@ where
             } else {
                 state
                     .broker
-                    .handle_request(request_id.clone(), request.request)
+                    .handle_request_with_descriptor(request_id.clone(), request.request, descriptor)
                     .await
             };
             let response = ResponseEnvelope {

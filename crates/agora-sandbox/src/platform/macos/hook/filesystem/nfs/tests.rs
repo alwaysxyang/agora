@@ -197,6 +197,7 @@ fn remote_metadata_rejects_invalid_anchors_and_exposes_mutable_open_targets() {
         handle: None,
         metadata: metadata(RemoteFileType::File),
         writable: false,
+        truncate: false,
     };
     assert!(matches!(
         open.target_mut(),

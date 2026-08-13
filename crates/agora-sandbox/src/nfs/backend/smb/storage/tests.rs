@@ -270,13 +270,13 @@ async fn smb_storage_rejects_direct_access_to_reserved_transaction_artifacts() {
     let storage = SmbStorage::new(&[]);
     let control = RemotePath::new(0, ".agora-write-0123456789abcdef0123456789abcdef.tmp").unwrap();
     let ordinary = RemotePath::new(0, ".agora-write-report.tmp").unwrap();
-    let mut file = tempfile::tempfile().unwrap();
 
     assert_errno(storage.stat(&control).await, libc::EACCES);
     assert_errno(
-        storage.read_into(&control, &mut file, u64::MAX).await,
+        storage.open_file(&control, libc::O_RDONLY, 0).await,
         libc::EACCES,
     );
+    let mut file = tempfile::tempfile().unwrap();
     assert_errno(
         storage
             .write_from_if_unchanged(&control, None, &mut file, 0)
@@ -317,14 +317,14 @@ fn smb_publication_verification_uses_the_server_file_index() {
 async fn smb_storage_rejects_unknown_roots_before_network_access() {
     let storage = SmbStorage::new(&[]);
     let path = RemotePath::new(0, "file.txt").unwrap();
-    let mut file = tempfile::tempfile().unwrap();
 
     assert_errno(storage.connect(0).await, libc::EINVAL);
     assert_errno(storage.stat(&path).await, libc::EINVAL);
     assert_errno(
-        storage.read_into(&path, &mut file, u64::MAX).await,
+        storage.open_file(&path, libc::O_RDONLY, 0).await,
         libc::EINVAL,
     );
+    let mut file = tempfile::tempfile().unwrap();
     assert_errno(
         storage
             .write_from_if_unchanged(&path, None, &mut file, 0)
@@ -361,11 +361,11 @@ async fn smb_storage_propagates_connection_failures_for_every_remote_operation()
     let storage = SmbStorage::new(&[config]);
     let path = RemotePath::new(0, "file.txt").unwrap();
     let renamed = RemotePath::new(0, "renamed.txt").unwrap();
-    let mut file = tempfile::tempfile().unwrap();
 
     assert!(storage.connect(0).await.is_err());
     assert!(storage.stat(&path).await.is_err());
-    assert!(storage.read_into(&path, &mut file, u64::MAX).await.is_err());
+    assert!(storage.open_file(&path, libc::O_RDONLY, 0).await.is_err());
+    let mut file = tempfile::tempfile().unwrap();
     assert!(
         storage
             .write_from_if_unchanged(&path, None, &mut file, 0)
@@ -508,3 +508,5 @@ fn smb_frame_and_error_translation_covers_protocol_and_transport_failures() {
     assert!(error.to_string().contains("SMB operation failed"));
     assert_eq!(stale_file().errno(), libc::ESTALE);
 }
+
+mod mock;

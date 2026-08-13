@@ -196,6 +196,22 @@ impl FilesystemHookRuntime {
                 Some(LocalByteRange::new(file_offset, file_end)?),
             )?;
         }
+        if let Some(registration) = &open.remote {
+            let _mutation = lock(&registration.mutation);
+            let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+            if descriptor_flags < 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            let access = descriptor_flags & libc::O_ACCMODE;
+            if access == libc::O_WRONLY
+                || (flags & libc::MAP_SHARED != 0
+                    && protection & libc::PROT_WRITE != 0
+                    && access == libc::O_RDONLY)
+            {
+                return Err(io::Error::from_raw_os_error(libc::EACCES).into());
+            }
+            self.materialize_remote_locked(registration)?;
+        }
         if flags & libc::MAP_SHARED == 0 {
             return Ok(None);
         }

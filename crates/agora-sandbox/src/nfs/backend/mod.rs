@@ -18,15 +18,57 @@ pub(crate) type StorageResult<T> = Result<T, StorageError>;
 
 #[cfg(all(not(agora_sandbox_hook_build), any(feature = "remote-smb", test)))]
 pub(crate) trait RemoteStorage: Send + Sync + 'static {
+    type FileHandle: Send;
+
     /// Drops backend state after the Broker cancels an operation at its
     /// deadline, so protocol handles from the abandoned future cannot leak.
     fn reset(&self, root: u32) -> impl Future<Output = ()> + Send;
     fn connect(&self, root: u32) -> impl Future<Output = StorageResult<()>> + Send;
     fn stat(&self, path: &RemotePath)
     -> impl Future<Output = StorageResult<RemoteMetadata>> + Send;
-    fn read_into(
+    fn open_file(
         &self,
         path: &RemotePath,
+        flags: libc::c_int,
+        mode: u32,
+    ) -> impl Future<Output = StorageResult<(Self::FileHandle, RemoteMetadata, bool)>> + Send;
+    fn read_at(
+        &self,
+        handle: &mut Self::FileHandle,
+        offset: u64,
+        length: u32,
+        destination: &mut File,
+    ) -> impl Future<Output = StorageResult<u32>> + Send;
+    fn write_at(
+        &self,
+        handle: &mut Self::FileHandle,
+        offset: u64,
+        source: &mut File,
+        length: u32,
+    ) -> impl Future<Output = StorageResult<(u32, u64)>> + Send;
+    fn set_length(
+        &self,
+        handle: &mut Self::FileHandle,
+        length: u64,
+    ) -> impl Future<Output = StorageResult<u64>> + Send;
+    fn file_metadata(
+        &self,
+        handle: &mut Self::FileHandle,
+    ) -> impl Future<Output = StorageResult<RemoteMetadata>> + Send;
+    fn flush_file(
+        &self,
+        handle: &mut Self::FileHandle,
+    ) -> impl Future<Output = StorageResult<RemoteMetadata>> + Send;
+    fn close_file(
+        &self,
+        handle: &mut Self::FileHandle,
+    ) -> impl Future<Output = StorageResult<()>> + Send;
+    /// Streams one coherent whole-file snapshot. Implementations must compare
+    /// the opened object's identity before and after the transfer and return
+    /// `ESTALE` rather than exposing mixed-version contents.
+    fn read_into(
+        &self,
+        handle: &mut Self::FileHandle,
         destination: &mut File,
         max_length: u64,
     ) -> impl Future<Output = StorageResult<RemoteMetadata>> + Send;

@@ -40,6 +40,16 @@ unsafe fn sandbox_truncate(path: *const libc::c_char, length: libc::off_t) -> li
             return unsafe { fail_audit(&error, -1) };
         }
         let mut prepared = request.into_prepared();
+        if let PreparedOpenFile::Remote(remote) = &mut prepared.prepared {
+            let result = match u64::try_from(length) {
+                Ok(length) => remote.set_length(length).map(|()| 0),
+                Err(_) => Err(io::Error::from_raw_os_error(libc::EINVAL).into()),
+            };
+            return match result {
+                Ok(result) => result,
+                Err(error) => unsafe { fail(&error, -1) },
+            };
+        }
         let result = match prepared.prepared.target_mut() {
             OpenTarget::Path(mapped) => {
                 let mapped = match CString::new(mapped.as_os_str().as_bytes()) {
@@ -171,6 +181,35 @@ unsafe fn sandbox_descriptor_mutation_with_truncate(
                 return unsafe { fail(&error, -1) };
             }
             return result;
+        }
+        if let (Some(length), Some(registration)) = (truncate, &open.remote) {
+            if !registration.writable {
+                unsafe { set_errno(libc::EBADF) };
+                return -1;
+            }
+            let Ok(length) = u64::try_from(length) else {
+                unsafe { set_errno(libc::EINVAL) };
+                return -1;
+            };
+            let _mutation = lock(&registration.mutation);
+            if !registration.snapshot.load(Ordering::Acquire) {
+                let remote = match runtime.remote.as_ref() {
+                    Some(remote) => remote,
+                    None => {
+                        unsafe { set_errno(libc::EIO) };
+                        return -1;
+                    }
+                };
+                let size = match remote.set_length(&registration.handle, length) {
+                    Ok(size) => size,
+                    Err(error) => return unsafe { fail(&error, -1) },
+                };
+                let result = operation(descriptor);
+                if result == 0 {
+                    lock(&registration.metadata).size = size;
+                }
+                return result;
+            }
         }
         let result = operation(descriptor);
         if result == 0 {
@@ -605,7 +644,7 @@ pub extern "C" fn agora_sandbox_validate_content_fcntl(descriptor: libc::c_int) 
         };
         if runtime
             .tracked_open(descriptor)
-            .is_some_and(|open| open.local.is_some())
+            .is_some_and(|open| open.local.is_some() || open.remote.is_some())
         {
             unsafe { set_errno(libc::ENOTSUP) };
             -1

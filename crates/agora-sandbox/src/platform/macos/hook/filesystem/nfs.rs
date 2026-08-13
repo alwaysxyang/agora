@@ -5,11 +5,13 @@ use crate::nfs::protocol::{
     RemoteMetadata, RemotePath, RemoteRoute, Request, Response,
 };
 use anyhow::{Context, Result, bail};
+use md5::{Digest, Md5};
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -38,6 +40,7 @@ pub(super) struct RemoteOpen {
     handle: Option<String>,
     metadata: RemoteMetadata,
     writable: bool,
+    truncate: bool,
 }
 
 pub(super) struct RemoteDirectoryView {
@@ -205,6 +208,7 @@ impl RemoteFilesystem {
             handle: Some(handle),
             metadata,
             writable: flags & libc::O_ACCMODE != libc::O_RDONLY,
+            truncate: flags & libc::O_TRUNC != 0,
         })
     }
 
@@ -278,13 +282,73 @@ impl RemoteFilesystem {
     }
 
     pub(super) fn sync(&self, handle: &str) -> Result<Option<RemoteMetadata>> {
-        let reply = self.request(Request::Sync {
+        request_sync(&self.client, handle)
+    }
+
+    pub(super) fn read(&self, handle: &str, offset: u64, length: u32) -> Result<(OwnedFd, u32)> {
+        let mut reply = self.request(Request::Read {
+            handle: handle.to_string(),
+            offset,
+            length,
+        })?;
+        match reply.response {
+            Response::Read { length, .. } => Ok((
+                reply
+                    .descriptor
+                    .take()
+                    .context("remote read response did not include a descriptor")?,
+                length,
+            )),
+            _ => Err(protocol_error(
+                "remote read returned an unexpected response",
+            )),
+        }
+    }
+
+    pub(super) fn write(
+        &self,
+        handle: &str,
+        offset: Option<u64>,
+        payload: &File,
+        length: u32,
+    ) -> Result<(u64, u32, u64)> {
+        let checksum = checksum_payload(payload, length)?;
+        let reply = self
+            .client
+            .request_with_descriptor(
+                Request::Write {
+                    handle: handle.to_string(),
+                    offset,
+                    length,
+                    checksum,
+                },
+                payload.as_raw_fd(),
+            )
+            .map_err(client_error)?;
+        match reply.response {
+            Response::Written {
+                offset,
+                length,
+                size,
+            } => Ok((offset, length, size)),
+            _ => Err(protocol_error(
+                "remote write returned an unexpected response",
+            )),
+        }
+    }
+
+    pub(super) fn set_length(&self, handle: &str, length: u64) -> Result<u64> {
+        request_set_length(&self.client, handle, length)
+    }
+
+    pub(super) fn materialize(&self, handle: &str) -> Result<RemoteMetadata> {
+        let reply = self.request(Request::Materialize {
             handle: handle.to_string(),
         })?;
         match reply.response {
-            Response::Synced { metadata } => Ok(metadata),
+            Response::Materialized { metadata } => Ok(metadata),
             _ => Err(protocol_error(
-                "remote filesystem sync returned an unexpected response",
+                "remote materialization returned an unexpected response",
             )),
         }
     }
@@ -400,6 +464,61 @@ impl RemoteFilesystem {
     }
 }
 
+fn checksum_payload(file: &File, length: u32) -> Result<[u8; 16]> {
+    let actual = file
+        .metadata()
+        .context("failed to inspect remote write payload")?
+        .len();
+    if actual != u64::from(length) {
+        bail!("remote write payload length did not match its request");
+    }
+    let mut digest = Md5::new();
+    let mut offset = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    while offset < actual {
+        let requested = usize::try_from((actual - offset).min(buffer.len() as u64))
+            .context("remote write payload chunk overflowed")?;
+        let read = file
+            .read_at(&mut buffer[..requested], offset)
+            .context("failed to read remote write payload")?;
+        if read == 0 {
+            bail!("remote write payload ended before its declared length");
+        }
+        digest.update(&buffer[..read]);
+        offset += read as u64;
+    }
+    Ok(digest.finalize().into())
+}
+
+fn request_sync(client: &RemoteClient, handle: &str) -> Result<Option<RemoteMetadata>> {
+    let reply = client
+        .request(Request::Sync {
+            handle: handle.to_string(),
+        })
+        .map_err(client_error)?;
+    match reply.response {
+        Response::Synced { metadata } => Ok(metadata),
+        _ => Err(protocol_error(
+            "remote filesystem sync returned an unexpected response",
+        )),
+    }
+}
+
+fn request_set_length(client: &RemoteClient, handle: &str, length: u64) -> Result<u64> {
+    let reply = client
+        .request(Request::SetLength {
+            handle: handle.to_string(),
+            length,
+        })
+        .map_err(client_error)?;
+    match reply.response {
+        Response::Resized { size } => Ok(size),
+        _ => Err(protocol_error(
+            "remote resize returned an unexpected response",
+        )),
+    }
+}
+
 fn logical_name_capacity(path: &Path) -> Result<u16> {
     u16::try_from(
         path.file_name()
@@ -410,28 +529,34 @@ fn logical_name_capacity(path: &Path) -> Result<u16> {
 }
 
 impl RemoteOpen {
+    pub(super) fn set_length(&mut self, length: u64) -> Result<()> {
+        let handle = self
+            .handle
+            .as_ref()
+            .context("remote open handle was already consumed")?;
+        let size = request_set_length(&self.client, handle, length)?;
+        let super::OpenTarget::Descriptor(file) = self.target_mut() else {
+            return Err(protocol_error("remote open did not return a descriptor"));
+        };
+        file.set_len(size)
+            .context("failed to resize remote placeholder")?;
+        self.metadata.size = size;
+        Ok(())
+    }
+
     pub(super) fn commit(&mut self) -> Result<()> {
         let handle = self
             .handle
             .as_ref()
             .context("remote open handle was already consumed")?;
-        let reply = self
-            .client
-            .request(Request::Sync {
-                handle: handle.clone(),
-            })
-            .map_err(client_error)?;
-        match reply.response {
-            Response::Synced { metadata } => {
-                if let Some(metadata) = metadata {
-                    self.metadata = metadata;
-                }
-                Ok(())
-            }
-            _ => Err(protocol_error(
-                "remote open commit returned an unexpected response",
-            )),
+        if !self.truncate {
+            return Ok(());
         }
+        let metadata = request_sync(&self.client, handle)?;
+        if let Some(metadata) = metadata {
+            self.metadata = metadata;
+        }
+        Ok(())
     }
 
     pub(super) fn target(&self) -> &super::OpenTarget {
