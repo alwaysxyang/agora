@@ -1,9 +1,10 @@
 //! Broker protocol shared by the sandbox hook and parent process.
 
+use crate::filesystem::ByteRange;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 6;
+pub(crate) const PROTOCOL_VERSION: u16 = 7;
 pub(crate) const MAX_REMOTE_IO_BYTES: u32 = 64 * 1024;
 #[cfg(not(agora_sandbox_hook_build))]
 pub(crate) const MAX_REMOTE_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -96,12 +97,15 @@ pub(crate) enum Request {
     },
     Materialize {
         handle: String,
+        range: Option<ByteRange>,
     },
     Sync {
         handle: String,
+        ranges: Vec<ByteRange>,
     },
     Close {
         handle: String,
+        ranges: Vec<ByteRange>,
     },
     Abort {
         handle: String,

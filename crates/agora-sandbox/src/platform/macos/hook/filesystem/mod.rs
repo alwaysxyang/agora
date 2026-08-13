@@ -5,14 +5,11 @@ use super::dyld::{dyld_interpose, function_from_interpose};
 use super::set_errno;
 use crate::audit::{AuditClient, AuditError, AuditEventRequest, FileOperation};
 use crate::callback::{FileAccessMode, FileContext, FileOpenMode, ProcessContext};
-use crate::filesystem::broker::{
-    ByteRangeSet, LocalClient, LocalClientError, LocalFileIdentity, LocalOpenState,
-    protocol::ByteRange as LocalByteRange,
-};
+use crate::filesystem::broker::{LocalClient, LocalClientError, LocalFileIdentity, LocalOpenState};
 use crate::filesystem::{
-    AccessPlan, AccessRequest, Credentials, DirectoryView, FileAttributes, FileLayer, MetadataPlan,
-    NativeDirectorySnapshot, OpenIntent, OpenTarget, PreparedFile, StagedWrite, VirtualFilesystem,
-    Writeback, normalize_path,
+    AccessPlan, AccessRequest, ByteRange as LocalByteRange, ByteRangeSet, Credentials,
+    DirectoryView, FileAttributes, FileLayer, MetadataPlan, NativeDirectorySnapshot, OpenIntent,
+    OpenTarget, PreparedFile, StagedWrite, VirtualFilesystem, Writeback, normalize_path,
 };
 use crate::trace::TraceContext;
 use anyhow::{Context, Result};
@@ -299,6 +296,8 @@ struct RemoteRegistration {
     metadata: Mutex<crate::nfs::protocol::RemoteMetadata>,
     writable: bool,
     snapshot: AtomicBool,
+    dirty: Mutex<ByteRangeSet>,
+    materialized: Mutex<ByteRangeSet>,
     mutation: Mutex<()>,
 }
 
@@ -388,6 +387,8 @@ impl PreparedOpenFile {
                         metadata: Mutex::new(metadata),
                         writable,
                         snapshot: AtomicBool::new(false),
+                        dirty: Mutex::new(ByteRangeSet::default()),
+                        materialized: Mutex::new(ByteRangeSet::default()),
                         mutation: Mutex::new(()),
                     }),
                     FileLayer::Upper,
@@ -1454,6 +1455,17 @@ impl FilesystemHookRuntime {
         lock(&registration.dirty).insert(range);
     }
 
+    fn record_remote_write_locked(&self, registration: &RemoteRegistration, start: u64, end: u64) {
+        if !registration.writable || start >= end {
+            return;
+        }
+        let Ok(range) = LocalByteRange::new(start, end) else {
+            return;
+        };
+        lock(&registration.materialized).insert(range);
+        lock(&registration.dirty).insert(range);
+    }
+
     fn materialize_local(
         &self,
         registration: &LocalRegistration,
@@ -1478,15 +1490,31 @@ impl FilesystemHookRuntime {
         Ok(())
     }
 
-    fn materialize_remote_locked(&self, registration: &RemoteRegistration) -> Result<()> {
-        if registration.snapshot.load(Ordering::Acquire) {
+    fn materialize_remote_locked(
+        &self,
+        registration: &RemoteRegistration,
+        range: Option<LocalByteRange>,
+    ) -> Result<()> {
+        if let Some(range) = range
+            && lock(&registration.materialized).covers(range)
+        {
             return Ok(());
         }
         let metadata = self
             .remote
             .as_ref()
             .context("remote filesystem runtime is unavailable")?
-            .materialize(&registration.handle)?;
+            .materialize(&registration.handle, range)?;
+        let materialized = range.unwrap_or(LocalByteRange {
+            start: 0,
+            end: metadata.size,
+        });
+        if materialized.start < metadata.size {
+            lock(&registration.materialized).insert(LocalByteRange {
+                start: materialized.start,
+                end: materialized.end.min(metadata.size),
+            });
+        }
         *lock(&registration.metadata) = metadata;
         registration.snapshot.store(true, Ordering::Release);
         Ok(())
@@ -1508,9 +1536,11 @@ impl FilesystemHookRuntime {
                 .remote
                 .as_ref()
                 .context("remote filesystem runtime is unavailable")?;
-            if let Some(metadata) = remote.sync(&registration.handle)? {
+            let mut dirty = lock(&registration.dirty);
+            if let Some(metadata) = remote.sync(&registration.handle, dirty.to_vec())? {
                 *lock(&registration.metadata) = metadata;
             }
+            dirty.clear();
             return Ok(());
         }
         let Some(writeback) = &open.writeback else {
@@ -1549,11 +1579,16 @@ impl FilesystemHookRuntime {
             }
             if let Some(registration) = &open.remote {
                 let _mutation = lock(&registration.mutation);
-                return self
+                let mut dirty = lock(&registration.dirty);
+                let result = self
                     .remote
                     .as_ref()
                     .context("remote filesystem runtime is unavailable")?
-                    .close(&registration.handle);
+                    .close(&registration.handle, dirty.to_vec());
+                if result.is_ok() {
+                    dirty.clear();
+                }
+                return result;
             }
             self.commit_open_file(descriptor, open, true)
         })();

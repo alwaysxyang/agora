@@ -2,9 +2,9 @@ use super::super::abi::{darwin_mach_task_self, darwin_mach_vm_read_overwrite};
 use super::*;
 use crate::nfs::protocol::MAX_REMOTE_IO_BYTES;
 
-const LOCAL_READ_AHEAD_MIN_BYTES: u64 = 16 * 1024;
-const LOCAL_READ_AHEAD_MAX_BYTES: u64 = 256 * 1024;
-const LOCAL_READ_AHEAD_MULTIPLIER: u64 = 4;
+const READ_AHEAD_MIN_BYTES: u64 = 16 * 1024;
+const READ_AHEAD_MAX_BYTES: u64 = 256 * 1024;
+const READ_AHEAD_MULTIPLIER: u64 = 4;
 const MAX_VECTOR_COUNT: usize = 1024;
 
 #[derive(Clone, Copy)]
@@ -38,9 +38,6 @@ unsafe fn remote_read_io(
         unsafe { set_errno(libc::EBADF) };
         return Some(-1);
     }
-    if registration.snapshot.load(Ordering::Acquire) {
-        return Some(snapshot_operation());
-    }
     let offset = match requested_offset {
         RemoteIoOffset::Sequential => match current_offset(descriptor) {
             Some(offset) => offset,
@@ -58,7 +55,7 @@ unsafe fn remote_read_io(
         },
     };
     let length = match requested_length() {
-        Ok(length) => length.min(MAX_REMOTE_IO_BYTES as usize),
+        Ok(length) => length,
         Err(errno) => {
             unsafe { set_errno(errno) };
             return Some(-1);
@@ -67,6 +64,16 @@ unsafe fn remote_read_io(
     if length == 0 {
         return Some(0);
     }
+    if registration.snapshot.load(Ordering::Acquire) {
+        let requested = u64::try_from(length).unwrap_or(u64::MAX);
+        let end = offset.saturating_add(read_materialization_length(requested));
+        let range = LocalByteRange::new(offset, end).expect("non-empty remote read range");
+        if let Err(error) = runtime.materialize_remote_locked(registration, Some(range)) {
+            return Some(unsafe { fail(&error, -1) });
+        }
+        return Some(snapshot_operation());
+    }
+    let length = length.min(MAX_REMOTE_IO_BYTES as usize);
     let remote = match runtime.remote.as_ref() {
         Some(remote) => remote,
         None => {
@@ -112,7 +119,17 @@ unsafe fn remote_write_io(
         return Some(-1);
     }
     if registration.snapshot.load(Ordering::Acquire) {
+        let before = current_offset(descriptor);
         let result = snapshot_operation();
+        if result > 0 {
+            let written = match requested_offset {
+                RemoteIoOffset::Sequential => sequential_write_range(descriptor, before, result),
+                RemoteIoOffset::Positioned(offset) => positional_write_range(offset, result),
+            };
+            if let Some((start, end)) = written {
+                runtime.record_remote_write_locked(registration, start, end);
+            }
+        }
         if result > 0 && flags & (libc::O_SYNC | libc::O_DSYNC) != 0 {
             let remote = match runtime.remote.as_ref() {
                 Some(remote) => remote,
@@ -121,9 +138,13 @@ unsafe fn remote_write_io(
                     return Some(-1);
                 }
             };
-            match remote.sync(&registration.handle) {
-                Ok(Some(metadata)) => *lock(&registration.metadata) = metadata,
-                Ok(None) => {}
+            let mut dirty = lock(&registration.dirty);
+            match remote.sync(&registration.handle, dirty.to_vec()) {
+                Ok(Some(metadata)) => {
+                    *lock(&registration.metadata) = metadata;
+                    dirty.clear();
+                }
+                Ok(None) => dirty.clear(),
                 Err(error) => return Some(unsafe { fail(&error, -1) }),
             }
         }
@@ -189,7 +210,7 @@ unsafe fn remote_write_io(
         return Some(-1);
     }
     if flags & (libc::O_SYNC | libc::O_DSYNC) != 0 {
-        match remote.sync(&registration.handle) {
+        match remote.sync(&registration.handle, Vec::new()) {
             Ok(Some(metadata)) => size = metadata.size,
             Ok(None) => {}
             Err(error) => return Some(unsafe { fail(&error, -1) }),
@@ -955,7 +976,7 @@ unsafe fn local_read_io(
         if length != 0 {
             let start = offset as u64;
             let requested = u64::try_from(length).unwrap_or(u64::MAX);
-            let end = start.saturating_add(local_read_materialization_length(requested));
+            let end = start.saturating_add(read_materialization_length(requested));
             let range = LocalByteRange::new(start, end).expect("non-empty read range");
             if let Err(error) = runtime.materialize_local(registration, Some(range)) {
                 unsafe { set_errno(error_errno(&error)) };
@@ -977,11 +998,11 @@ unsafe fn local_read_io(
     Some(result)
 }
 
-fn local_read_materialization_length(requested: u64) -> u64 {
+fn read_materialization_length(requested: u64) -> u64 {
     requested.max(
         requested
-            .saturating_mul(LOCAL_READ_AHEAD_MULTIPLIER)
-            .clamp(LOCAL_READ_AHEAD_MIN_BYTES, LOCAL_READ_AHEAD_MAX_BYTES),
+            .saturating_mul(READ_AHEAD_MULTIPLIER)
+            .clamp(READ_AHEAD_MIN_BYTES, READ_AHEAD_MAX_BYTES),
     )
 }
 
@@ -1139,7 +1160,7 @@ unsafe fn sandbox_lseek(
         if let Some(registration) = &open.remote {
             if matches!(whence, libc::SEEK_DATA | libc::SEEK_HOLE) {
                 let _mutation = lock(&registration.mutation);
-                if let Err(error) = runtime.materialize_remote_locked(registration) {
+                if let Err(error) = runtime.materialize_remote_locked(registration, None) {
                     return unsafe { fail(&error, -1) };
                 }
             }
@@ -1337,16 +1358,6 @@ pub unsafe extern "C" fn agora_sandbox_sendfile(
         let Some(open) = runtime.tracked_open(descriptor) else {
             return unsafe { original(descriptor, socket, offset, length, headers, flags) };
         };
-        if let Some(registration) = &open.remote {
-            let _mutation = lock(&registration.mutation);
-            if let Err(error) = runtime.materialize_remote_locked(registration) {
-                return unsafe { fail(&error, -1) };
-            }
-            return unsafe { original(descriptor, socket, offset, length, headers, flags) };
-        }
-        let Some(registration) = &open.local else {
-            return unsafe { original(descriptor, socket, offset, length, headers, flags) };
-        };
         if offset < 0 {
             return unsafe { original(descriptor, socket, offset, length, headers, flags) };
         }
@@ -1356,6 +1367,16 @@ pub unsafe extern "C" fn agora_sandbox_sendfile(
                 unsafe { set_errno(errno) };
                 return -1;
             }
+        };
+        if let Some(registration) = &open.remote {
+            let _mutation = lock(&registration.mutation);
+            if let Err(error) = runtime.materialize_remote_locked(registration, range) {
+                return unsafe { fail(&error, -1) };
+            }
+            return unsafe { original(descriptor, socket, offset, length, headers, flags) };
+        }
+        let Some(registration) = &open.local else {
+            return unsafe { original(descriptor, socket, offset, length, headers, flags) };
         };
         let _mutation = lock(&registration.mutation);
         if let Err(error) = runtime.materialize_local(registration, range) {
@@ -1403,7 +1424,15 @@ pub unsafe extern "C" fn agora_sandbox_fcopyfile(
                 return unsafe { fail(&error, -1) };
             }
         }
-        unsafe { original(source, destination, state, flags) }
+        let result = unsafe { original(source, destination, state, flags) };
+        if result == 0 {
+            record_remote_dirty_descriptor(
+                runtime,
+                destination,
+                descriptor_file_range(destination),
+            );
+        }
+        result
     })
 }
 
@@ -1459,6 +1488,7 @@ pub unsafe extern "C" fn agora_sandbox_aio_write(control: *mut libc::aiocb) -> l
         if let Err(error) = materialize_remote_descriptor(runtime, copied.aio_fildes) {
             return unsafe { fail(&error, -1) };
         }
+        record_remote_dirty_descriptor(runtime, copied.aio_fildes, aio_read_range(&copied));
         unsafe { original(control) }
     })
 }
@@ -1507,7 +1537,15 @@ pub unsafe extern "C" fn agora_sandbox_lio_listio(
                     .map(|range| materialize_descriptor(runtime, control.aio_fildes, Some(range)))
                     .transpose(),
                 libc::LIO_WRITE => {
-                    Some(materialize_remote_descriptor(runtime, control.aio_fildes)).transpose()
+                    let materialized = materialize_remote_descriptor(runtime, control.aio_fildes);
+                    if materialized.is_ok() {
+                        record_remote_dirty_descriptor(
+                            runtime,
+                            control.aio_fildes,
+                            aio_read_range(&control),
+                        );
+                    }
+                    Some(materialized).transpose()
                 }
                 _ => Ok(None),
             };
@@ -1533,7 +1571,7 @@ fn materialize_descriptor(
     }
     if let Some(registration) = &open.remote {
         let _mutation = lock(&registration.mutation);
-        runtime.materialize_remote_locked(registration)?;
+        runtime.materialize_remote_locked(registration, range)?;
     }
     Ok(())
 }
@@ -1549,7 +1587,34 @@ fn materialize_remote_descriptor(
         return Ok(());
     };
     let _mutation = lock(&registration.mutation);
-    runtime.materialize_remote_locked(registration)
+    runtime.materialize_remote_locked(registration, None)
+}
+
+fn record_remote_dirty_descriptor(
+    runtime: &FilesystemHookRuntime,
+    descriptor: libc::c_int,
+    range: Option<LocalByteRange>,
+) {
+    let Some(range) = range else {
+        return;
+    };
+    let Some(open) = runtime.tracked_open(descriptor) else {
+        return;
+    };
+    let Some(registration) = &open.remote else {
+        return;
+    };
+    let _mutation = lock(&registration.mutation);
+    runtime.record_remote_write_locked(registration, range.start, range.end);
+}
+
+fn descriptor_file_range(descriptor: libc::c_int) -> Option<LocalByteRange> {
+    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
+        return None;
+    }
+    let end = u64::try_from(status.st_size).ok()?;
+    LocalByteRange::new(0, end).ok()
 }
 
 fn aio_read_range(control: &libc::aiocb) -> Option<LocalByteRange> {
@@ -1695,6 +1760,20 @@ unsafe fn tracked_write(
     let Some(open) = runtime.tracked_open(descriptor) else {
         return operation();
     };
+    if let Some(registration) = &open.remote {
+        if !registration.writable {
+            unsafe { set_errno(libc::EBADF) };
+            return -1;
+        }
+        let _mutation = lock(&registration.mutation);
+        let result = operation();
+        if result > 0
+            && let Some((start, end)) = written_range(result)
+        {
+            runtime.record_remote_write_locked(registration, start, end);
+        }
+        return result;
+    }
     let Some(registration) = &open.local else {
         return operation();
     };

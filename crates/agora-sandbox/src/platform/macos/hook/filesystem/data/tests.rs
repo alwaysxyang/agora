@@ -60,10 +60,10 @@ async fn broker_runtime(directory: &Path) -> (FilesystemHookRuntime, LocalContro
 
 #[test]
 fn lazy_read_ranges_apply_bounded_readahead_and_conservative_sendfile_fallbacks() {
-    assert_eq!(local_read_materialization_length(1), 16 * 1024);
-    assert_eq!(local_read_materialization_length(8 * 1024), 32 * 1024);
-    assert_eq!(local_read_materialization_length(128 * 1024), 256 * 1024);
-    assert_eq!(local_read_materialization_length(512 * 1024), 512 * 1024);
+    assert_eq!(read_materialization_length(1), 16 * 1024);
+    assert_eq!(read_materialization_length(8 * 1024), 32 * 1024);
+    assert_eq!(read_materialization_length(128 * 1024), 256 * 1024);
+    assert_eq!(read_materialization_length(512 * 1024), 512 * 1024);
 
     let exact_length = 32;
     assert_eq!(
@@ -605,7 +605,7 @@ async fn lazy_broker_reads_materialize_ranges_before_native_io() {
         assert!(cached.iter().any(|range| {
             range.start <= first_offset as u64
                 && range.end >= first_offset as u64 + 16 * 1024
-                && range.end < first_offset as u64 + LOCAL_READ_AHEAD_MAX_BYTES
+                && range.end < first_offset as u64 + READ_AHEAD_MAX_BYTES
         }));
         drop(cached);
         let mut readahead = [0_u8; 16];

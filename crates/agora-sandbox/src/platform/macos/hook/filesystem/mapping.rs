@@ -210,7 +210,10 @@ impl FilesystemHookRuntime {
             {
                 return Err(io::Error::from_raw_os_error(libc::EACCES).into());
             }
-            self.materialize_remote_locked(registration)?;
+            self.materialize_remote_locked(
+                registration,
+                Some(LocalByteRange::new(file_offset, file_end)?),
+            )?;
         }
         if flags & libc::MAP_SHARED == 0 {
             return Ok(None);
@@ -318,6 +321,11 @@ impl FilesystemHookRuntime {
             {
                 lock(&registration.dirty)
                     .insert(LocalByteRange::new(slice.file_start, slice.file_end)?);
+            }
+            if let Some(registration) = &slice.open.remote
+                && registration.writable
+            {
+                self.record_remote_write_locked(registration, slice.file_start, slice.file_end);
             }
             if !files.iter().any(|open| Arc::ptr_eq(open, &slice.open)) {
                 files.push(Arc::clone(&slice.open));

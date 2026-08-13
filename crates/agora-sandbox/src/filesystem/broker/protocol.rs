@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+pub(crate) use crate::filesystem::ByteRange;
+
 pub(crate) const PROTOCOL_VERSION: u16 = 8;
 
 pub(crate) fn valid_request_id(value: &str) -> bool {
@@ -103,21 +105,6 @@ pub(crate) enum Response {
         errno: i32,
         message: String,
     },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ByteRange {
-    pub(crate) start: u64,
-    pub(crate) end: u64,
-}
-
-impl ByteRange {
-    pub(crate) fn new(start: u64, end: u64) -> Result<Self> {
-        if start >= end {
-            bail!("invalid local filesystem byte range");
-        }
-        Ok(Self { start, end })
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

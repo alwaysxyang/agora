@@ -1,4 +1,20 @@
-use super::protocol::ByteRange;
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ByteRange {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+}
+
+impl ByteRange {
+    pub(crate) fn new(start: u64, end: u64) -> Result<Self> {
+        if start >= end {
+            bail!("invalid filesystem byte range");
+        }
+        Ok(Self { start, end })
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ByteRangeSet {
@@ -128,9 +144,7 @@ mod tests {
                 end: index * 2 + 1,
             });
         }
-        assert!(
-            disjoint.insertion_visits() < 2_048,
-            "inserting ordered disjoint ranges should not rescan the complete set"
-        );
+        assert_eq!(disjoint.as_slice().len(), 512);
+        assert_eq!(disjoint.insertion_visits(), 0);
     }
 }

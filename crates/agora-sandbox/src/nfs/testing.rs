@@ -1,3 +1,4 @@
+use crate::filesystem::ByteRange;
 use crate::nfs::backend::{RemoteStorage, StorageError, StorageResult};
 use crate::nfs::protocol::{RemoteEntry, RemoteFileType, RemoteMetadata, RemotePath};
 use std::collections::HashMap;
@@ -39,6 +40,7 @@ pub(crate) struct MemoryStorage {
     read_started: tokio::sync::Notify,
     read_release: tokio::sync::Notify,
     snapshot_replacement: Mutex<Option<Vec<u8>>>,
+    read_ranges: Mutex<Vec<ByteRange>>,
 }
 
 impl MemoryStorage {
@@ -133,6 +135,10 @@ impl MemoryStorage {
 
     pub(crate) fn replace_during_snapshot_read(&self, data: &[u8]) {
         *lock(&self.snapshot_replacement) = Some(data.to_vec());
+    }
+
+    pub(crate) fn read_ranges(&self) -> Vec<ByteRange> {
+        lock(&self.read_ranges).clone()
     }
 
     pub(crate) fn fail_connection(
@@ -317,6 +323,10 @@ impl RemoteStorage for MemoryStorage {
                 "file is not open for reading",
             ));
         }
+        lock(&self.read_ranges).push(ByteRange {
+            start: offset,
+            end: offset.saturating_add(u64::from(length)),
+        });
         let entry = lock(&handle.entry);
         let data = entry
             .data
@@ -331,7 +341,14 @@ impl RemoteStorage for MemoryStorage {
             .and_then(|()| destination.seek(SeekFrom::Start(0)).map(|_| ()))
             .and_then(|()| destination.write_all(&data[start..end]))
             .map_err(|error| memory_io("failed to stream memory file range", error))?;
-        Ok(u32::try_from(end - start).expect("read length is bounded by u32"))
+        let actual = u32::try_from(end - start).expect("read length is bounded by u32");
+        drop(entry);
+        if let Some(replacement) = lock(&self.snapshot_replacement).take() {
+            let mut entry = lock(&handle.entry);
+            entry.data = Some(replacement);
+            entry.generation += 1;
+        }
+        Ok(actual)
     }
 
     async fn write_at(

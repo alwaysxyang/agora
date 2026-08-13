@@ -12,6 +12,7 @@ mod namespace;
 mod overlay;
 #[cfg(target_os = "macos")]
 mod permissions;
+mod ranges;
 #[cfg(target_os = "macos")]
 mod vfs;
 #[cfg(target_os = "macos")]
@@ -21,6 +22,8 @@ use anyhow::{Context, Result, bail};
 #[cfg(target_os = "macos")]
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+
+pub(crate) use ranges::{ByteRange, ByteRangeSet};
 
 #[cfg(target_os = "macos")]
 const MAX_CONTROL_PATH_BYTES: usize = 16 * 1024;

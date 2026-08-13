@@ -1,9 +1,11 @@
 use super::*;
+use crate::filesystem::ByteRange;
 use crate::nfs::backend::RemoteStorage;
 use crate::nfs::protocol::{RemotePath, Request, RequestId, Response};
 use crate::nfs::testing::MemoryStorage;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::FileExt;
 
 fn path(value: &str) -> RemotePath {
     RemotePath::new(0, value).unwrap()
@@ -58,9 +60,290 @@ async fn materialize(broker: &Broker<MemoryStorage>, handle: &str) -> Response {
     broker
         .handle(Request::Materialize {
             handle: handle.to_string(),
+            range: None,
         })
         .await
         .response
+}
+
+#[tokio::test]
+async fn broker_materializes_only_missing_snapshot_ranges() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    storage.insert_file(0, "large.bin", b"0123456789abcdef");
+    let broker = Broker::new(Arc::clone(&storage), root.path()).unwrap();
+    let opened = broker
+        .handle(Request::Open {
+            path: path("large.bin"),
+            flags: libc::O_RDONLY,
+            mode: 0,
+        })
+        .await;
+    let handle = open_handle(&opened.response);
+    let snapshot = File::from(opened.descriptor.unwrap());
+
+    let response = broker
+        .handle(Request::Materialize {
+            handle: handle.clone(),
+            range: Some(ByteRange::new(4, 8).unwrap()),
+        })
+        .await
+        .response;
+    assert!(matches!(response, Response::Materialized { .. }));
+    let mut contents = [0_u8; 12];
+    snapshot.read_exact_at(&mut contents, 0).unwrap();
+    assert_eq!(&contents[..4], &[0; 4]);
+    assert_eq!(&contents[4..8], b"4567");
+    assert_eq!(&contents[8..], &[0; 4]);
+
+    let response = broker
+        .handle(Request::Materialize {
+            handle: handle.clone(),
+            range: Some(ByteRange::new(6, 12).unwrap()),
+        })
+        .await
+        .response;
+    assert!(matches!(response, Response::Materialized { .. }));
+    snapshot.read_exact_at(&mut contents, 0).unwrap();
+    assert_eq!(&contents[4..12], b"456789ab");
+    assert_eq!(
+        storage.read_ranges(),
+        vec![
+            ByteRange { start: 4, end: 8 },
+            ByteRange { start: 8, end: 12 },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn broker_partial_snapshot_includes_direct_writes_from_the_same_handle() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    storage.insert_file(0, "mixed.bin", b"original");
+    let broker = Broker::new(Arc::clone(&storage), root.path()).unwrap();
+    let opened = broker
+        .handle(Request::Open {
+            path: path("mixed.bin"),
+            flags: libc::O_RDWR,
+            mode: 0,
+        })
+        .await;
+    let handle = open_handle(&opened.response);
+    let snapshot = File::from(opened.descriptor.unwrap());
+    assert!(matches!(
+        direct_write(&broker, &handle, Some(0), b"sandbox").await,
+        Response::Written { .. }
+    ));
+
+    let response = broker
+        .handle(Request::Materialize {
+            handle,
+            range: Some(ByteRange::new(0, 7).unwrap()),
+        })
+        .await
+        .response;
+
+    assert!(matches!(response, Response::Materialized { .. }));
+    let mut contents = [0_u8; 7];
+    snapshot.read_exact_at(&mut contents, 0).unwrap();
+    assert_eq!(&contents, b"sandbox");
+}
+
+#[tokio::test]
+async fn broker_rejects_a_version_change_during_partial_materialization() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    storage.insert_file(0, "changing.bin", b"old contents");
+    storage.replace_during_snapshot_read(b"new contents");
+    let broker = Broker::new(Arc::clone(&storage), root.path()).unwrap();
+    let opened = broker
+        .handle(Request::Open {
+            path: path("changing.bin"),
+            flags: libc::O_RDONLY,
+            mode: 0,
+        })
+        .await;
+    let handle = open_handle(&opened.response);
+
+    let response = broker
+        .handle(Request::Materialize {
+            handle: handle.clone(),
+            range: Some(ByteRange::new(0, 4).unwrap()),
+        })
+        .await
+        .response;
+
+    assert_errno(response, libc::ESTALE);
+    let response = broker
+        .handle(Request::Materialize {
+            handle,
+            range: Some(ByteRange::new(0, 4).unwrap()),
+        })
+        .await
+        .response;
+    assert_errno(response, libc::ESTALE);
+}
+
+#[tokio::test]
+async fn broker_rejects_invalid_snapshot_ranges() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    storage.insert_file(0, "ranges.bin", b"contents");
+    let broker = Broker::new(storage, root.path()).unwrap();
+    let opened = broker
+        .handle(Request::Open {
+            path: path("ranges.bin"),
+            flags: libc::O_RDWR,
+            mode: 0,
+        })
+        .await;
+    let handle = open_handle(&opened.response);
+
+    let response = broker
+        .handle(Request::Materialize {
+            handle: handle.clone(),
+            range: Some(ByteRange { start: 4, end: 4 }),
+        })
+        .await
+        .response;
+    assert_errno(response, libc::EINVAL);
+
+    let response = broker
+        .handle(Request::Sync {
+            handle,
+            ranges: vec![ByteRange { start: 8, end: 2 }],
+        })
+        .await
+        .response;
+    assert_errno(response, libc::EINVAL);
+}
+
+#[tokio::test]
+async fn broker_fills_only_missing_baseline_ranges_before_snapshot_writeback() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    storage.insert_file(0, "edited.bin", b"0123456789abcdef");
+    let broker = Broker::new(Arc::clone(&storage), root.path()).unwrap();
+    let opened = broker
+        .handle(Request::Open {
+            path: path("edited.bin"),
+            flags: libc::O_RDWR,
+            mode: 0,
+        })
+        .await;
+    let handle = open_handle(&opened.response);
+    let snapshot = File::from(opened.descriptor.unwrap());
+    assert!(matches!(
+        broker
+            .handle(Request::Materialize {
+                handle: handle.clone(),
+                range: Some(ByteRange::new(4, 8).unwrap()),
+            })
+            .await
+            .response,
+        Response::Materialized { .. }
+    ));
+    snapshot.write_all_at(b"XX", 5).unwrap();
+
+    let response = broker
+        .handle(Request::Sync {
+            handle,
+            ranges: vec![ByteRange::new(5, 7).unwrap()],
+        })
+        .await
+        .response;
+
+    assert!(matches!(response, Response::Synced { .. }));
+    assert_eq!(storage.data(0, "edited.bin").unwrap(), b"01234XX789abcdef");
+    assert_eq!(
+        storage.read_ranges(),
+        vec![
+            ByteRange { start: 4, end: 8 },
+            ByteRange { start: 0, end: 4 },
+            ByteRange { start: 8, end: 16 },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn broker_full_materialization_does_not_rebaseline_dirty_partial_snapshot_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    storage.insert_file(0, "mapped.bin", b"0123456789abcdef");
+    let broker = Broker::new(Arc::clone(&storage), root.path()).unwrap();
+    let opened = broker
+        .handle(Request::Open {
+            path: path("mapped.bin"),
+            flags: libc::O_RDWR,
+            mode: 0,
+        })
+        .await;
+    let handle = open_handle(&opened.response);
+    let snapshot = File::from(opened.descriptor.unwrap());
+    assert!(matches!(
+        broker
+            .handle(Request::Materialize {
+                handle: handle.clone(),
+                range: Some(ByteRange::new(4, 8).unwrap()),
+            })
+            .await
+            .response,
+        Response::Materialized { .. }
+    ));
+    snapshot.write_all_at(b"XX", 5).unwrap();
+    assert!(matches!(
+        materialize(&broker, &handle).await,
+        Response::Materialized { .. }
+    ));
+
+    let response = broker
+        .handle(Request::Sync {
+            handle,
+            ranges: vec![ByteRange::new(5, 7).unwrap()],
+        })
+        .await
+        .response;
+
+    assert!(matches!(response, Response::Synced { .. }));
+    assert_eq!(storage.data(0, "mapped.bin").unwrap(), b"01234XX789abcdef");
+}
+
+#[tokio::test]
+async fn broker_closes_a_clean_partial_snapshot_without_downloading_the_remainder() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    storage.insert_file(0, "private.bin", b"0123456789abcdef");
+    let broker = Broker::new(Arc::clone(&storage), root.path()).unwrap();
+    let opened = broker
+        .handle(Request::Open {
+            path: path("private.bin"),
+            flags: libc::O_RDWR,
+            mode: 0,
+        })
+        .await;
+    let handle = open_handle(&opened.response);
+    assert!(matches!(
+        broker
+            .handle(Request::Materialize {
+                handle: handle.clone(),
+                range: Some(ByteRange::new(4, 8).unwrap()),
+            })
+            .await
+            .response,
+        Response::Materialized { .. }
+    ));
+
+    let response = broker
+        .handle(Request::Close {
+            handle,
+            ranges: Vec::new(),
+        })
+        .await
+        .response;
+
+    assert_eq!(response, Response::Success);
+    assert_eq!(storage.read_ranges(), vec![ByteRange { start: 4, end: 8 }]);
+    assert_eq!(storage.data(0, "private.bin").unwrap(), b"0123456789abcdef");
 }
 
 #[tokio::test]
@@ -145,6 +428,7 @@ async fn broker_treats_close_as_idempotent_across_request_ids() {
                 request_id(3),
                 Request::Close {
                     handle: handle.clone(),
+                    ranges: Vec::new()
                 },
             )
             .await
@@ -153,7 +437,13 @@ async fn broker_treats_close_as_idempotent_across_request_ids() {
     );
     assert_eq!(
         broker
-            .handle_request(request_id(4), Request::Close { handle })
+            .handle_request(
+                request_id(4),
+                Request::Close {
+                    handle,
+                    ranges: Vec::new()
+                }
+            )
             .await
             .response,
         Response::Success
@@ -229,7 +519,13 @@ async fn broker_reads_remote_content_on_demand_through_a_payload_descriptor() {
     assert_eq!(data, "remote contents");
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     assert_eq!(
-        broker.handle(Request::Close { handle }).await.response,
+        broker
+            .handle(Request::Close {
+                handle,
+                ranges: Vec::new()
+            })
+            .await
+            .response,
         Response::Success
     );
 }
@@ -335,7 +631,13 @@ async fn broker_rejects_grown_snapshots_before_checksum_or_upload() {
     ));
     descriptor.write_all(b"12345").unwrap();
 
-    let response = broker.handle(Request::Sync { handle }).await.response;
+    let response = broker
+        .handle(Request::Sync {
+            handle,
+            ranges: Vec::new(),
+        })
+        .await
+        .response;
 
     assert_errno(response, libc::EFBIG);
     assert_eq!(storage.data(0, "large.bin"), Some(Vec::new()));
@@ -400,7 +702,8 @@ async fn broker_writes_on_sync_and_last_close_with_posix_open_flags() {
     assert!(matches!(
         broker
             .handle(Request::Sync {
-                handle: handle.clone()
+                handle: handle.clone(),
+                ranges: Vec::new()
             })
             .await
             .response,
@@ -412,7 +715,13 @@ async fn broker_writes_on_sync_and_last_close_with_posix_open_flags() {
         Response::Written { length: 7, .. }
     ));
     assert_eq!(
-        broker.handle(Request::Close { handle }).await.response,
+        broker
+            .handle(Request::Close {
+                handle,
+                ranges: Vec::new()
+            })
+            .await
+            .response,
         Response::Success
     );
     assert_eq!(storage.data(0, "created.txt").unwrap(), b"first second");
@@ -452,6 +761,7 @@ async fn broker_refuses_to_overwrite_a_remotely_changed_file() {
         broker
             .handle(Request::Sync {
                 handle: handle.clone(),
+                ranges: Vec::new()
             })
             .await
             .response,
@@ -465,7 +775,13 @@ async fn broker_refuses_to_overwrite_a_remotely_changed_file() {
     file.sync_all().unwrap();
     storage.replace(0, "shared.txt", b"outside change");
 
-    let response = broker.handle(Request::Sync { handle }).await.response;
+    let response = broker
+        .handle(Request::Sync {
+            handle,
+            ranges: Vec::new(),
+        })
+        .await
+        .response;
 
     assert!(matches!(
         response,
@@ -537,9 +853,11 @@ async fn broker_serializes_version_check_and_writeback_per_root() {
     let (first, second) = tokio::join!(
         broker.handle(Request::Sync {
             handle: first_handle,
+            ranges: Vec::new()
         }),
         broker.handle(Request::Sync {
             handle: second_handle,
+            ranges: Vec::new()
         }),
     );
 
@@ -584,7 +902,14 @@ async fn broker_registers_a_materialized_snapshot_before_namespace_mutation() {
     storage.block_reads();
     let materializing = {
         let broker = std::sync::Arc::clone(&broker);
-        tokio::spawn(async move { broker.handle(Request::Materialize { handle }).await })
+        tokio::spawn(async move {
+            broker
+                .handle(Request::Materialize {
+                    handle,
+                    range: None,
+                })
+                .await
+        })
     };
     storage.wait_until_read_started().await;
 
@@ -631,7 +956,13 @@ async fn broker_does_not_publish_an_unchanged_writable_snapshot() {
     let file = std::fs::File::from(reply.descriptor.unwrap());
     storage.replace(0, "shared.txt", b"outside change");
 
-    let response = broker.handle(Request::Close { handle }).await.response;
+    let response = broker
+        .handle(Request::Close {
+            handle,
+            ranges: Vec::new(),
+        })
+        .await
+        .response;
 
     assert_eq!(response, Response::Success);
     assert_eq!(storage.data(0, "shared.txt").unwrap(), b"outside change");
@@ -653,7 +984,13 @@ async fn broker_publishes_an_empty_file_created_with_read_only_access() {
     let handle = open_handle(&reply.response);
     drop(reply.descriptor.unwrap());
 
-    let response = broker.handle(Request::Close { handle }).await.response;
+    let response = broker
+        .handle(Request::Close {
+            handle,
+            ranges: Vec::new(),
+        })
+        .await
+        .response;
 
     assert_eq!(response, Response::Success);
     assert_eq!(storage.data(0, "empty.txt"), Some(Vec::new()));
@@ -918,6 +1255,7 @@ async fn replaced_target_handle_cannot_recreate_or_overwrite_the_new_target() {
         broker
             .handle(Request::Sync {
                 handle: handle.clone(),
+                ranges: Vec::new()
             })
             .await
             .response,
@@ -925,7 +1263,13 @@ async fn replaced_target_handle_cannot_recreate_or_overwrite_the_new_target() {
     );
     assert_eq!(storage.flush_operations(), flushes_before_sync + 1);
     assert_eq!(
-        broker.handle(Request::Close { handle }).await.response,
+        broker
+            .handle(Request::Close {
+                handle,
+                ranges: Vec::new()
+            })
+            .await
+            .response,
         Response::Success
     );
     assert_eq!(storage.data(0, "target.txt"), Some(b"source".to_vec()));
@@ -1007,6 +1351,7 @@ async fn broker_retargets_open_descendants_when_a_directory_is_renamed() {
         broker
             .handle(Request::Sync {
                 handle: handle.clone(),
+                ranges: Vec::new()
             })
             .await
             .response,
@@ -1028,7 +1373,13 @@ async fn broker_retargets_open_descendants_when_a_directory_is_renamed() {
         Response::Success
     );
     assert_eq!(
-        broker.handle(Request::Close { handle }).await.response,
+        broker
+            .handle(Request::Close {
+                handle,
+                ranges: Vec::new()
+            })
+            .await
+            .response,
         Response::Success
     );
     assert_eq!(storage.data(0, "renamed/open.txt"), Some(b"new".to_vec()));
@@ -1054,6 +1405,7 @@ async fn broker_discards_an_open_snapshot_after_the_path_is_removed() {
         broker
             .handle(Request::Sync {
                 handle: handle.clone(),
+                ranges: Vec::new()
             })
             .await
             .response,
@@ -1075,13 +1427,20 @@ async fn broker_discards_an_open_snapshot_after_the_path_is_removed() {
         broker
             .handle(Request::Sync {
                 handle: handle.clone(),
+                ranges: Vec::new()
             })
             .await
             .response,
         Response::Synced { metadata: None }
     );
     assert_eq!(
-        broker.handle(Request::Close { handle }).await.response,
+        broker
+            .handle(Request::Close {
+                handle,
+                ranges: Vec::new()
+            })
+            .await
+            .response,
         Response::Success
     );
     assert!(!storage.exists(0, "open.txt"));
@@ -1125,7 +1484,13 @@ async fn broker_validates_open_access_directory_and_sync_semantics() {
     assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
     assert_ne!(flags & libc::O_APPEND, 0);
     assert_eq!(
-        broker.handle(Request::Close { handle }).await.response,
+        broker
+            .handle(Request::Close {
+                handle,
+                ranges: Vec::new()
+            })
+            .await
+            .response,
         Response::Success
     );
     assert_errno(
@@ -1188,7 +1553,13 @@ async fn broker_validates_open_access_directory_and_sync_semantics() {
             .is_dir()
     );
     assert_eq!(
-        broker.handle(Request::Close { handle }).await.response,
+        broker
+            .handle(Request::Close {
+                handle,
+                ranges: Vec::new()
+            })
+            .await
+            .response,
         Response::Success
     );
 
@@ -1226,6 +1597,7 @@ async fn broker_validates_open_access_directory_and_sync_semantics() {
         broker
             .handle(Request::Sync {
                 handle: "missing".to_string(),
+                ranges: Vec::new(),
             })
             .await
             .response,
@@ -1244,6 +1616,7 @@ async fn broker_validates_open_access_directory_and_sync_semantics() {
         broker
             .handle(Request::Close {
                 handle: "missing".to_string(),
+                ranges: Vec::new(),
             })
             .await
             .response,

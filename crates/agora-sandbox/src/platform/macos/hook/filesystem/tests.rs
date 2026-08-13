@@ -3,9 +3,9 @@ use super::data::{
     agora_sandbox_guarded_pwrite as sandbox_guarded_pwrite,
     agora_sandbox_guarded_writev as sandbox_guarded_writev,
     agora_sandbox_lio_listio as sandbox_lio_listio, agora_sandbox_lseek as sandbox_lseek,
-    agora_sandbox_pwrite as sandbox_pwrite, agora_sandbox_pwritev as sandbox_pwritev,
-    agora_sandbox_read as sandbox_read, agora_sandbox_write as sandbox_write,
-    agora_sandbox_writev as sandbox_writev,
+    agora_sandbox_pread as sandbox_pread, agora_sandbox_pwrite as sandbox_pwrite,
+    agora_sandbox_pwritev as sandbox_pwritev, agora_sandbox_read as sandbox_read,
+    agora_sandbox_write as sandbox_write, agora_sandbox_writev as sandbox_writev,
 };
 use super::directory::{
     fts_bulk_entry_names_for_test, fts_directory_descent_path_for_test,
@@ -479,6 +479,110 @@ fn nfs_shared_mmap_writes_back_while_private_mmap_stays_private() {
     assert_eq!(
         nfs.storage.data(0, "private-map.bin"),
         Some(b"original".to_vec())
+    );
+}
+
+#[test]
+fn nfs_private_mmap_materializes_only_its_file_range() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+    let mut contents = vec![b'a'; page * 3];
+    contents[page..page * 2].fill(b'b');
+    contents[page * 2..].fill(b'c');
+    nfs.storage.insert_file(0, "large-map.bin", &contents);
+    let path = Fixture::c_path(&nfs.logical_root.join("large-map.bin"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
+        assert!(descriptor >= 0);
+        let mapping = sandbox_mmap(
+            std::ptr::null_mut(),
+            page,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            descriptor,
+            page as libc::off_t,
+        );
+        assert_ne!(mapping, libc::MAP_FAILED);
+        assert_eq!(*mapping.cast::<u8>(), b'b');
+        assert_eq!(sandbox_munmap(mapping, page), 0);
+        let mut beginning = [0_u8; 4];
+        assert_eq!(
+            sandbox_pread(
+                descriptor,
+                beginning.as_mut_ptr().cast(),
+                beginning.len(),
+                0
+            ),
+            beginning.len() as libc::ssize_t
+        );
+        assert_eq!(&beginning, b"aaaa");
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+
+    let mapped = crate::filesystem::ByteRange {
+        start: page as u64,
+        end: (page * 2) as u64,
+    };
+    let mut resident = ByteRangeSet::default();
+    resident.insert(mapped);
+    let read_ahead = crate::filesystem::ByteRange {
+        start: 0,
+        end: (16 * 1024_u64).min((page * 3) as u64),
+    };
+    let mut expected_ranges = vec![mapped];
+    expected_ranges.extend(resident.missing(read_ahead));
+    assert_eq!(nfs.storage.read_ranges(), expected_ranges);
+}
+
+#[test]
+fn nfs_snapshot_write_preserves_unmaterialized_remote_ranges() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+    let contents = vec![b'a'; page * 3];
+    nfs.storage.insert_file(0, "partial-write.bin", &contents);
+    let path = Fixture::c_path(&nfs.logical_root.join("partial-write.bin"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR, 0);
+        assert!(descriptor >= 0);
+        let mapping = sandbox_mmap(
+            std::ptr::null_mut(),
+            page,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            descriptor,
+            page as libc::off_t,
+        );
+        assert_ne!(mapping, libc::MAP_FAILED);
+        assert_eq!(*mapping.cast::<u8>(), b'a');
+        assert_eq!(sandbox_munmap(mapping, page), 0);
+        assert_eq!(sandbox_pwrite(descriptor, b"z".as_ptr().cast(), 1, 0), 1);
+        assert_eq!(sandbox_fsync(descriptor), 0);
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+
+    let mut expected = contents;
+    expected[0] = b'z';
+    assert_eq!(nfs.storage.data(0, "partial-write.bin"), Some(expected));
+    assert_eq!(
+        nfs.storage.read_ranges(),
+        vec![
+            crate::filesystem::ByteRange {
+                start: page as u64,
+                end: (page * 2) as u64,
+            },
+            crate::filesystem::ByteRange {
+                start: 1,
+                end: page as u64,
+            },
+            crate::filesystem::ByteRange {
+                start: (page * 2) as u64,
+                end: (page * 3) as u64,
+            },
+        ]
     );
 }
 
@@ -977,7 +1081,10 @@ fn nfs_fclose_keeps_the_stream_open_when_writeback_conflicts() {
         let descriptor = libc::fileno(stream);
         assert!(descriptor >= 0);
         materialize_remote_snapshot(descriptor);
-        assert_eq!(libc::fwrite(b"sandbox".as_ptr().cast(), 1, 7, stream), 7);
+        assert_eq!(
+            sandbox_pwrite(descriptor, b"sandbox".as_ptr().cast(), 7, 0),
+            7
+        );
         nfs.storage.replace(0, "shared.txt", b"outside");
 
         assert_eq!(sandbox_fclose(stream), -1);
@@ -1003,7 +1110,7 @@ fn nfs_sync_close_and_dup2_preserve_descriptors_after_writeback_conflicts() {
         assert!(descriptor >= 0);
         materialize_remote_snapshot(descriptor);
         assert_eq!(
-            libc::pwrite(descriptor, b"sandbox".as_ptr().cast(), 7, 0),
+            sandbox_pwrite(descriptor, b"sandbox".as_ptr().cast(), 7, 0),
             7
         );
         nfs.storage.replace(0, "conflict.txt", b"outside");
@@ -1066,7 +1173,7 @@ fn nfs_dup2_closes_the_replaced_remote_handle() {
             .remote
             .as_ref()
             .unwrap()
-            .close(&old_handle)
+            .close(&old_handle, Vec::new())
             .unwrap();
 
         assert_eq!(sandbox_close(destination), 0);

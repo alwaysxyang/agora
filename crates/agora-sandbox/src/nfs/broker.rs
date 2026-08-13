@@ -1,3 +1,4 @@
+use crate::filesystem::{ByteRange, ByteRangeSet};
 use crate::nfs::backend::{RemoteStorage, StorageError, StorageResult};
 use crate::nfs::protocol::{
     MAX_REMOTE_DIRECTORY_ENTRIES, MAX_REMOTE_DIRECTORY_PAYLOAD_BYTES, MAX_REMOTE_FILE_BYTES,
@@ -10,6 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -70,10 +72,12 @@ struct RemoteHandle<H> {
     application: File,
     created: bool,
     pending_truncate: bool,
+    backend_dirty: bool,
     writable: bool,
     snapshot: bool,
     unlinked: bool,
-    checksum: [u8; 16],
+    checksum: Option<[u8; 16]>,
+    materialized: ByteRangeSet,
     baseline: Option<RemoteMetadata>,
 }
 
@@ -247,9 +251,9 @@ where
             Request::Read { handle, .. }
             | Request::Write { handle, .. }
             | Request::SetLength { handle, .. }
-            | Request::Materialize { handle }
-            | Request::Sync { handle }
-            | Request::Close { handle } => {
+            | Request::Materialize { handle, .. }
+            | Request::Sync { handle, .. }
+            | Request::Close { handle, .. } => {
                 let handle = self.handles.lock().await.get(handle).cloned()?;
                 Some(handle.lock().await.path.root())
             }
@@ -316,16 +320,23 @@ where
                 .await
             }
             Request::SetLength { handle, length } => self.set_length(&handle, length).await,
-            Request::Materialize { handle } => self.materialize(&handle, deadline).await,
-            Request::Sync { handle } => {
-                let metadata = self.sync(&handle, deadline).await?;
+            Request::Materialize { handle, range } => {
+                if let Some(range) = range {
+                    validate_byte_range(range)?;
+                }
+                self.materialize(&handle, range, deadline).await
+            }
+            Request::Sync { handle, ranges } => {
+                validate_byte_ranges(&ranges)?;
+                let metadata = self.sync(&handle, ranges, deadline).await?;
                 Ok(BrokerReply {
                     response: Response::Synced { metadata },
                     descriptor: None,
                 })
             }
-            Request::Close { handle } => {
-                self.close(&handle, deadline).await?;
+            Request::Close { handle, ranges } => {
+                validate_byte_ranges(&ranges)?;
+                self.close(&handle, ranges, deadline).await?;
                 Ok(success())
             }
             Request::Abort { handle } => {
@@ -624,10 +635,12 @@ where
                 application: replay,
                 created,
                 pending_truncate: flags & libc::O_TRUNC != 0 && !created,
+                backend_dirty: false,
                 writable,
                 snapshot: false,
                 unlinked: false,
-                checksum: Md5::digest([]).into(),
+                checksum: None,
+                materialized: ByteRangeSet::default(),
                 baseline: Some(metadata.clone()),
             })),
         );
@@ -662,10 +675,12 @@ where
                 application: replay,
                 created: false,
                 pending_truncate: false,
+                backend_dirty: false,
                 writable: false,
                 snapshot: false,
                 unlinked: false,
-                checksum: Md5::digest([]).into(),
+                checksum: None,
+                materialized: ByteRangeSet::default(),
                 baseline: Some(metadata.clone()),
             })),
         );
@@ -888,6 +903,7 @@ where
             .storage
             .write_at(backend, offset, &mut source, length)
             .await?;
+        handle.backend_dirty = true;
         if let Some(metadata) = handle.baseline.as_mut() {
             metadata.size = size;
         }
@@ -915,6 +931,7 @@ where
             .as_mut()
             .ok_or_else(|| StorageError::new(libc::EISDIR, "remote handle is a directory"))?;
         let size = self.storage.set_length(backend, length).await?;
+        handle.backend_dirty = true;
         if let Some(metadata) = handle.baseline.as_mut() {
             metadata.size = size;
         }
@@ -924,54 +941,181 @@ where
         })
     }
 
-    async fn materialize(&self, id: &str, deadline: Instant) -> StorageResult<BrokerReply> {
+    async fn materialize(
+        &self,
+        id: &str,
+        range: Option<ByteRange>,
+        deadline: Instant,
+    ) -> StorageResult<BrokerReply> {
         let handle = self.open_handle(id).await?;
         let root = handle.lock().await.path.root();
         let _mutation = self.lock_root(root).await;
         let mut handle = handle.lock().await;
-        if handle.snapshot {
-            let metadata = handle
-                .baseline
-                .clone()
-                .ok_or_else(|| StorageError::new(libc::EBADF, "remote metadata is unavailable"))?;
+        if !handle.snapshot && handle.backend_dirty {
+            let metadata = {
+                let backend = handle.backend.as_mut().ok_or_else(|| {
+                    StorageError::new(libc::EBADF, "remote file handle is closed")
+                })?;
+                self.storage.flush_file(backend).await?
+            };
+            handle.baseline = Some(metadata);
+            handle.backend_dirty = false;
+        }
+        let baseline = handle
+            .baseline
+            .clone()
+            .ok_or_else(|| StorageError::new(libc::EBADF, "remote metadata is unavailable"))?;
+        if range.is_none() && !handle.snapshot && handle.materialized.is_empty() {
+            let (metadata, checksum) = {
+                let RemoteHandle { backend, file, .. } = &mut *handle;
+                let backend = backend.as_mut().ok_or_else(|| {
+                    StorageError::new(libc::EISDIR, "remote handle is a directory")
+                })?;
+                let file = file.as_mut().ok_or_else(|| {
+                    StorageError::new(libc::EBADF, "remote placeholder is unavailable")
+                })?;
+                let metadata = self
+                    .storage
+                    .read_into(backend, file, self.limits.max_file_bytes)
+                    .await?;
+                file.flush()
+                    .map_err(|error| storage_io("failed to flush remote mmap snapshot", error))?;
+                let checksum = checksum_file(
+                    file.try_clone().map_err(|error| {
+                        storage_io("failed to clone remote mmap snapshot", error)
+                    })?,
+                    deadline,
+                )
+                .await?;
+                (metadata, checksum)
+            };
+            self.close_snapshot_backend(&mut handle).await?;
+            if metadata.size != 0 {
+                handle.materialized.insert(ByteRange {
+                    start: 0,
+                    end: metadata.size,
+                });
+            }
+            handle.snapshot = true;
+            handle.checksum = Some(checksum);
+            handle.baseline = Some(metadata.clone());
             return Ok(BrokerReply {
                 response: Response::Materialized { metadata },
                 descriptor: None,
             });
         }
-        let (metadata, checksum) = {
-            let RemoteHandle { backend, file, .. } = &mut *handle;
-            let backend = backend
-                .as_mut()
-                .ok_or_else(|| StorageError::new(libc::EISDIR, "remote handle is a directory"))?;
-            let file = file.as_mut().ok_or_else(|| {
-                StorageError::new(libc::EBADF, "remote placeholder is unavailable")
-            })?;
-            let metadata = self
-                .storage
-                .read_into(backend, file, self.limits.max_file_bytes)
-                .await?;
-            file.flush()
-                .map_err(|error| storage_io("failed to flush remote mmap snapshot", error))?;
-            let checksum = checksum_file(
-                file.try_clone()
-                    .map_err(|error| storage_io("failed to clone remote mmap snapshot", error))?,
-                deadline,
-            )
-            .await?;
-            (metadata, checksum)
-        };
-        if let Some(backend) = handle.backend.as_mut() {
-            self.storage.close_file(backend).await?;
+
+        let end = range.map_or(baseline.size, |range| range.end.min(baseline.size));
+        let start = range.map_or(0, |range| range.start.min(end));
+        if end - start > self.limits.max_file_bytes {
+            return Err(file_too_large());
         }
-        handle.backend = None;
+        if start < end {
+            self.materialize_snapshot_range(&mut handle, ByteRange { start, end })
+                .await?;
+        }
         handle.snapshot = true;
-        handle.checksum = checksum;
-        handle.baseline = Some(metadata.clone());
+        if range.is_none() {
+            self.close_snapshot_backend(&mut handle).await?;
+        }
         Ok(BrokerReply {
-            response: Response::Materialized { metadata },
+            response: Response::Materialized { metadata: baseline },
             descriptor: None,
         })
+    }
+
+    async fn materialize_snapshot_range(
+        &self,
+        handle: &mut RemoteHandle<S::FileHandle>,
+        requested: ByteRange,
+    ) -> StorageResult<()> {
+        let missing = handle.materialized.missing(requested);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let baseline = handle
+            .baseline
+            .clone()
+            .ok_or_else(|| StorageError::new(libc::EBADF, "remote metadata is unavailable"))?;
+        let current = self.snapshot_backend_metadata(handle).await?;
+        ensure_same_snapshot(&baseline, &current)?;
+
+        let mut payload = tempfile::tempfile_in(&self.staging)
+            .map_err(|error| storage_io("failed to create remote snapshot payload", error))?;
+        for range in &missing {
+            let mut offset = range.start;
+            while offset < range.end {
+                let length = u32::try_from(
+                    (range.end - offset).min(u64::from(crate::nfs::protocol::MAX_REMOTE_IO_BYTES)),
+                )
+                .expect("remote snapshot chunks are protocol bounded");
+                let actual = {
+                    let backend = handle.backend.as_mut().ok_or_else(|| {
+                        StorageError::new(libc::EBADF, "remote file handle is closed")
+                    })?;
+                    self.storage
+                        .read_at(backend, offset, length, &mut payload)
+                        .await?
+                };
+                if actual != length {
+                    return Err(StorageError::new(
+                        libc::ESTALE,
+                        "remote file changed while creating a snapshot",
+                    ));
+                }
+                let file = handle.file.as_ref().ok_or_else(|| {
+                    StorageError::new(libc::EBADF, "remote placeholder is unavailable")
+                })?;
+                copy_file_range_at(&payload, file, offset, actual)?;
+                let end = offset + u64::from(actual);
+                offset = end;
+            }
+        }
+
+        let current = self.snapshot_backend_metadata(handle).await?;
+        ensure_same_snapshot(&baseline, &current)?;
+        for range in missing {
+            handle.materialized.insert(range);
+        }
+        Ok(())
+    }
+
+    async fn snapshot_backend_metadata(
+        &self,
+        handle: &mut RemoteHandle<S::FileHandle>,
+    ) -> StorageResult<RemoteMetadata> {
+        let backend = handle
+            .backend
+            .as_mut()
+            .ok_or_else(|| StorageError::new(libc::EBADF, "remote file handle is closed"))?;
+        self.storage.file_metadata(backend).await
+    }
+
+    async fn close_snapshot_backend(
+        &self,
+        handle: &mut RemoteHandle<S::FileHandle>,
+    ) -> StorageResult<()> {
+        if let Some(mut backend) = handle.backend.take()
+            && let Err(error) = self.storage.close_file(&mut backend).await
+        {
+            handle.backend = Some(backend);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn materialize_whole_snapshot_baseline(
+        &self,
+        handle: &mut RemoteHandle<S::FileHandle>,
+        length: u64,
+    ) -> StorageResult<()> {
+        let baseline_size = handle.baseline.as_ref().map_or(0, |metadata| metadata.size);
+        let end = length.min(baseline_size);
+        if end != 0 {
+            self.materialize_snapshot_range(handle, ByteRange { start: 0, end })
+                .await?;
+        }
+        self.close_snapshot_backend(handle).await
     }
 
     async fn open_handle(&self, id: &str) -> StorageResult<SharedRemoteHandle<S::FileHandle>> {
@@ -983,7 +1127,12 @@ where
             .ok_or_else(|| StorageError::new(libc::EBADF, "unknown remote handle"))
     }
 
-    async fn sync(&self, id: &str, deadline: Instant) -> StorageResult<Option<RemoteMetadata>> {
+    async fn sync(
+        &self,
+        id: &str,
+        ranges: Vec<ByteRange>,
+        deadline: Instant,
+    ) -> StorageResult<Option<RemoteMetadata>> {
         let handle = self
             .handles
             .lock()
@@ -991,23 +1140,30 @@ where
             .get(id)
             .cloned()
             .ok_or_else(|| StorageError::new(libc::EBADF, "unknown remote handle"))?;
-        self.sync_handle(&handle, deadline).await
+        self.sync_handle(&handle, ranges, deadline).await
     }
 
     async fn sync_handle(
         &self,
         handle: &SharedRemoteHandle<S::FileHandle>,
+        ranges: Vec<ByteRange>,
         deadline: Instant,
     ) -> StorageResult<Option<RemoteMetadata>> {
         let root = handle.lock().await.path.root();
         let _mutation = self.lock_root(root).await;
         let mut handle = handle.lock().await;
-        self.sync_locked(&mut handle, deadline).await
+        let explicitly_dirty = !ranges.is_empty();
+        for range in ranges {
+            handle.materialized.insert(range);
+        }
+        self.sync_locked(&mut handle, explicitly_dirty, deadline)
+            .await
     }
 
     async fn sync_locked(
         &self,
         handle: &mut RemoteHandle<S::FileHandle>,
+        explicitly_dirty: bool,
         deadline: Instant,
     ) -> StorageResult<Option<RemoteMetadata>> {
         if !handle.snapshot {
@@ -1028,6 +1184,7 @@ where
                     metadata.size = 0;
                 }
                 handle.pending_truncate = false;
+                handle.backend_dirty = false;
             }
             if !handle.writable {
                 return Ok((!handle.unlinked)
@@ -1040,6 +1197,7 @@ where
                 .ok_or_else(|| StorageError::new(libc::EBADF, "remote file handle is closed"))?;
             let metadata = self.storage.flush_file(backend).await?;
             handle.baseline = Some(metadata.clone());
+            handle.backend_dirty = false;
             return Ok((!handle.unlinked).then_some(metadata));
         }
         if handle.unlinked {
@@ -1052,19 +1210,41 @@ where
             .file
             .as_ref()
             .ok_or_else(|| StorageError::new(libc::EBADF, "remote file handle is closed"))?;
-        let mut snapshot = file
-            .try_clone()
-            .map_err(|error| storage_io("failed to clone anonymous remote file", error))?;
-        snapshot
-            .seek(SeekFrom::Start(0))
-            .map_err(|error| storage_io("failed to rewind anonymous remote file", error))?;
-        let length = snapshot
+        let length = file
             .metadata()
             .map_err(|error| storage_io("failed to inspect anonymous remote file", error))?
             .len();
         if length > self.limits.max_file_bytes {
             return Err(file_too_large());
         }
+        let baseline_length = handle.baseline.as_ref().map_or(0, |metadata| metadata.size);
+        let mut changed = explicitly_dirty || length != baseline_length;
+        if !changed && let Some(expected) = handle.checksum {
+            let current = checksum_file(
+                file.try_clone().map_err(|error| {
+                    storage_io("failed to clone remote snapshot for checksum", error)
+                })?,
+                deadline,
+            )
+            .await?;
+            changed = current != expected;
+        }
+        if !changed {
+            return Ok(handle.baseline.clone());
+        }
+
+        self.materialize_whole_snapshot_baseline(handle, length)
+            .await?;
+        let file = handle
+            .file
+            .as_ref()
+            .ok_or_else(|| StorageError::new(libc::EBADF, "remote file handle is closed"))?;
+        let mut snapshot = file
+            .try_clone()
+            .map_err(|error| storage_io("failed to clone anonymous remote file", error))?;
+        snapshot
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| storage_io("failed to rewind anonymous remote file", error))?;
         let checksum = checksum_file(
             snapshot.try_clone().map_err(|error| {
                 storage_io("failed to clone remote snapshot for checksum", error)
@@ -1072,7 +1252,7 @@ where
             deadline,
         )
         .await?;
-        if checksum == handle.checksum {
+        if handle.checksum == Some(checksum) {
             return Ok(handle.baseline.clone());
         }
         let metadata = self
@@ -1085,22 +1265,32 @@ where
             )
             .await?;
         handle.baseline = Some(metadata.clone());
-        handle.checksum = checksum;
+        handle.checksum = Some(checksum);
+        handle.materialized.clear();
+        if length != 0 {
+            handle.materialized.insert(ByteRange {
+                start: 0,
+                end: length,
+            });
+        }
         Ok(Some(metadata))
     }
 
-    async fn close(&self, id: &str, deadline: Instant) -> StorageResult<()> {
+    async fn close(
+        &self,
+        id: &str,
+        ranges: Vec<ByteRange>,
+        deadline: Instant,
+    ) -> StorageResult<()> {
         let handle = match self.handles.lock().await.get(id).cloned() {
             Some(handle) => handle,
             None if self.closed_handles.lock().await.contains(id) => return Ok(()),
             None => return Err(StorageError::new(libc::EBADF, "unknown remote handle")),
         };
-        self.sync_handle(&handle, deadline).await?;
+        self.sync_handle(&handle, ranges, deadline).await?;
         {
             let mut handle = handle.lock().await;
-            if let Some(backend) = handle.backend.as_mut() {
-                self.storage.close_file(backend).await?;
-            }
+            self.close_snapshot_backend(&mut handle).await?;
         }
         let mut handles = self.handles.lock().await;
         if handles
@@ -1506,6 +1696,77 @@ fn directory_too_large() -> StorageError {
 
 fn operation_timed_out() -> StorageError {
     StorageError::new(libc::ETIMEDOUT, "remote filesystem operation timed out")
+}
+
+fn ensure_same_snapshot(expected: &RemoteMetadata, current: &RemoteMetadata) -> StorageResult<()> {
+    if expected.identity != current.identity
+        || expected.size != current.size
+        || expected.file_type != current.file_type
+    {
+        return Err(StorageError::new(
+            libc::ESTALE,
+            "remote file changed while creating a snapshot",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_byte_range(range: ByteRange) -> StorageResult<()> {
+    if range.start >= range.end {
+        return Err(StorageError::new(
+            libc::EINVAL,
+            "invalid remote filesystem byte range",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_byte_ranges(ranges: &[ByteRange]) -> StorageResult<()> {
+    for range in ranges {
+        validate_byte_range(*range)?;
+    }
+    Ok(())
+}
+
+fn copy_file_range_at(
+    source: &File,
+    destination: &File,
+    offset: u64,
+    length: u32,
+) -> StorageResult<()> {
+    let length = u64::from(length);
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    while copied < length {
+        let requested = usize::try_from((length - copied).min(buffer.len() as u64))
+            .expect("snapshot copy chunks fit usize");
+        let read = FileExt::read_at(source, &mut buffer[..requested], copied)
+            .map_err(|error| storage_io("failed to read remote snapshot payload", error))?;
+        if read == 0 {
+            return Err(StorageError::new(
+                libc::EIO,
+                "remote snapshot payload ended before its declared length",
+            ));
+        }
+        let mut written = 0;
+        while written < read {
+            let actual = FileExt::write_at(
+                destination,
+                &buffer[written..read],
+                offset + copied + written as u64,
+            )
+            .map_err(|error| storage_io("failed to write remote snapshot range", error))?;
+            if actual == 0 {
+                return Err(StorageError::new(
+                    libc::EIO,
+                    "remote snapshot range write made no progress",
+                ));
+            }
+            written += actual;
+        }
+        copied += read as u64;
+    }
+    Ok(())
 }
 
 fn remaining_until(deadline: Instant) -> StorageResult<Duration> {

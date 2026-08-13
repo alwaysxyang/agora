@@ -1,4 +1,4 @@
-use crate::filesystem::FileAttributes;
+use crate::filesystem::{ByteRange, FileAttributes};
 use crate::nfs::client::{RemoteClient, RemoteClientError, decode_json_descriptor};
 use crate::nfs::protocol::{
     MAX_REMOTE_DIRECTORY_ENTRIES, MAX_REMOTE_DIRECTORY_PAYLOAD_BYTES, RemoteEntry, RemoteFileType,
@@ -281,8 +281,12 @@ impl RemoteFilesystem {
         })
     }
 
-    pub(super) fn sync(&self, handle: &str) -> Result<Option<RemoteMetadata>> {
-        request_sync(&self.client, handle)
+    pub(super) fn sync(
+        &self,
+        handle: &str,
+        ranges: Vec<ByteRange>,
+    ) -> Result<Option<RemoteMetadata>> {
+        request_sync(&self.client, handle, ranges)
     }
 
     pub(super) fn read(&self, handle: &str, offset: u64, length: u32) -> Result<(OwnedFd, u32)> {
@@ -341,9 +345,14 @@ impl RemoteFilesystem {
         request_set_length(&self.client, handle, length)
     }
 
-    pub(super) fn materialize(&self, handle: &str) -> Result<RemoteMetadata> {
+    pub(super) fn materialize(
+        &self,
+        handle: &str,
+        range: Option<ByteRange>,
+    ) -> Result<RemoteMetadata> {
         let reply = self.request(Request::Materialize {
             handle: handle.to_string(),
+            range,
         })?;
         match reply.response {
             Response::Materialized { metadata } => Ok(metadata),
@@ -353,9 +362,10 @@ impl RemoteFilesystem {
         }
     }
 
-    pub(super) fn close(&self, handle: &str) -> Result<()> {
+    pub(super) fn close(&self, handle: &str, ranges: Vec<ByteRange>) -> Result<()> {
         self.expect_success(Request::Close {
             handle: handle.to_string(),
+            ranges,
         })
     }
 
@@ -490,10 +500,15 @@ fn checksum_payload(file: &File, length: u32) -> Result<[u8; 16]> {
     Ok(digest.finalize().into())
 }
 
-fn request_sync(client: &RemoteClient, handle: &str) -> Result<Option<RemoteMetadata>> {
+fn request_sync(
+    client: &RemoteClient,
+    handle: &str,
+    ranges: Vec<ByteRange>,
+) -> Result<Option<RemoteMetadata>> {
     let reply = client
         .request(Request::Sync {
             handle: handle.to_string(),
+            ranges,
         })
         .map_err(client_error)?;
     match reply.response {
@@ -552,7 +567,7 @@ impl RemoteOpen {
         if !self.truncate {
             return Ok(());
         }
-        let metadata = request_sync(&self.client, handle)?;
+        let metadata = request_sync(&self.client, handle, Vec::new())?;
         if let Some(metadata) = metadata {
             self.metadata = metadata;
         }
