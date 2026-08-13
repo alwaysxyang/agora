@@ -162,7 +162,7 @@ unsafe fn sandbox_open_with_operation(
                         OpenTarget::Descriptor(file) => file.as_raw_fd(),
                         OpenTarget::Path(_) => unreachable!("open target kind changed"),
                     };
-                    let local = prepared.local.is_some();
+                    let local = prepared.has_encrypted_broker();
                     if let Err(error) =
                         configure_descriptor(descriptor, flags, local).and_then(|()| {
                             unsafe { operation.configure_anonymous(descriptor) }.map_err(Into::into)
@@ -325,7 +325,7 @@ unsafe fn sandbox_openat_with_mode(
                         OpenTarget::Path(_) => unreachable!("open target kind changed"),
                     };
                     if let Err(error) =
-                        configure_descriptor(descriptor, flags, prepared.local.is_some())
+                        configure_descriptor(descriptor, flags, prepared.has_encrypted_broker())
                     {
                         let (target, open) = prepared.into_parts();
                         let _ = runtime.finish_open_file(descriptor, &open);
@@ -418,9 +418,11 @@ unsafe fn sandbox_fopen(path: *const libc::c_char, mode: *const libc::c_char) ->
                     OpenTarget::Path(_) => path_stream.expect("path target was opened"),
                     OpenTarget::Descriptor(file) => {
                         let descriptor = file.as_raw_fd();
-                        if let Err(error) =
-                            configure_descriptor(descriptor, flags, open.local.is_some())
-                        {
+                        if let Err(error) = configure_descriptor(
+                            descriptor,
+                            flags,
+                            open.supports_exec_inheritance(),
+                        ) {
                             let _ = runtime.finish_open_file(descriptor, &open);
                             return unsafe { fail(&error, std::ptr::null_mut()) };
                         }

@@ -79,7 +79,7 @@ unsafe fn sandbox_fchmod(descriptor: libc::c_int, mode: libc::mode_t) -> libc::c
             unsafe { set_errno(libc::EPERM) };
             return -1;
         };
-        if open.remote.is_some() {
+        if open.manages_metadata() {
             unsafe { set_errno(libc::ENOTSUP) };
             return -1;
         }
@@ -359,24 +359,16 @@ unsafe fn sandbox_fstat(descriptor: libc::c_int, status: *mut libc::stat) -> lib
             && !status.is_null()
             && let Some(open) = runtime.tracked_open(descriptor)
         {
-            let attributes = if let Some(remote) = &open.remote {
-                let metadata = lock(&remote.metadata);
-                let remote = match runtime.remote.as_ref() {
-                    Some(remote) => remote,
-                    None => {
-                        unsafe { set_errno(libc::EIO) };
-                        return -1;
-                    }
-                };
-                Some(remote.attributes(&metadata))
-            } else {
-                match runtime.filesystem.attributes(&open.logical()) {
+            let attributes = match open.managed_attributes(runtime) {
+                Ok(Some(attributes)) => Some(attributes),
+                Ok(None) => match runtime.filesystem.attributes(&open.logical()) {
                     Ok(attributes) => attributes,
                     Err(error) => return unsafe { fail(&error, -1) },
-                }
+                },
+                Err(error) => return unsafe { fail(&error, -1) },
             };
             unsafe { patch_stat(&mut *status, None, attributes.as_ref()) };
-            if let Some(local) = &open.local {
+            if let Some(local) = open.local_inheritance() {
                 unsafe {
                     (*status).st_dev = local.identity.device as _;
                     (*status).st_ino = local.identity.inode;

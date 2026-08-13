@@ -438,7 +438,7 @@ impl LocalBroker {
                 Self::reject_descriptor(descriptor)?;
                 Self::validate_ranges(&ranges)?;
                 self.activate(&handle)?;
-                self.sync_handle(&handle, ranges, durable, false, false, SyncAcquire::Try)?;
+                self.sync_handle(&handle, ranges, durable, true, false, SyncAcquire::Try)?;
                 Ok(Response::Success)
             }
             Request::PotentiallyDirty { handle, range } => {
@@ -950,7 +950,7 @@ impl LocalBroker {
             SyncAcquire::Try => shared.try_begin_sync().ok_or_else(BrokerError::busy)?,
         };
         let mut shared = lock(&shared.inner);
-        let mut handle = lock(&handle);
+        let handle = lock(&handle);
         let metadata = shared
             .plaintext
             .metadata()
@@ -980,7 +980,7 @@ impl LocalBroker {
             shared.pending_since.get_or_insert_with(Instant::now);
         }
         let mut candidates = shared.pending_writes.clone();
-        if include_potential {
+        if include_potential && current != shared.baseline {
             for range in handle.potentially_dirty.iter() {
                 candidates.insert(*range);
             }
@@ -1045,9 +1045,6 @@ impl LocalBroker {
         }
         shared.pending_writes.clear();
         shared.pending_since = None;
-        if include_potential {
-            handle.potentially_dirty.clear();
-        }
         shared.baseline = current;
         Ok(())
     }

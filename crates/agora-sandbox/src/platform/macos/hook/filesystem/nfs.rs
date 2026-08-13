@@ -362,6 +362,13 @@ impl RemoteFilesystem {
         }
     }
 
+    pub(super) fn potentially_dirty(&self, handle: &str, range: ByteRange) -> Result<()> {
+        self.expect_success(Request::PotentiallyDirty {
+            handle: handle.to_string(),
+            range,
+        })
+    }
+
     pub(super) fn close(&self, handle: &str, ranges: Vec<ByteRange>) -> Result<()> {
         self.expect_success(Request::Close {
             handle: handle.to_string(),

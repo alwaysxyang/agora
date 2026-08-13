@@ -276,25 +276,6 @@ fn sequential_write_ranges_cover_concurrent_shared_offset_progress() {
     );
 }
 
-#[test]
-fn sequential_writes_reserve_the_full_file_for_shared_offset_progress() {
-    assert_eq!(
-        sequential_write_reservation(4),
-        LocalByteRange::new(0, u64::MAX).ok()
-    );
-    assert_eq!(sequential_write_reservation(0), None);
-}
-
-#[test]
-fn positional_write_reservations_remain_conservative_on_length_overflow() {
-    assert_eq!(
-        positional_write_reservation(8, usize::MAX),
-        LocalByteRange::new(8, u64::MAX).ok()
-    );
-    assert_eq!(positional_write_reservation(-1, 1), None);
-    assert_eq!(positional_write_reservation(8, 0), None);
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn broker_managed_descriptors_preserve_complete_posix_io_semantics() {
     let directory = tempfile::tempdir().unwrap();
@@ -469,7 +450,7 @@ async fn broker_managed_descriptors_preserve_complete_posix_io_semantics() {
         assert_ne!(logical_flags & libc::O_NONBLOCK, 0);
         assert_eq!(agora_sandbox_lseek(descriptor, 0, libc::SEEK_SET), 0);
         assert_eq!(agora_sandbox_write(descriptor, b"Z".as_ptr().cast(), 1), 1);
-        assert_eq!(local_sequential_write(descriptor, Some(0), |_| 0), Some(0));
+        assert_eq!(agora_sandbox_write(descriptor, b"".as_ptr().cast(), 0), 0);
 
         let duplicate = super::super::agora_sandbox_dup(descriptor);
         assert!(duplicate >= 0);
@@ -579,8 +560,7 @@ async fn lazy_broker_reads_materialize_ranges_before_native_io() {
             runtime
                 .tracked_open(reader)
                 .unwrap()
-                .local
-                .as_ref()
+                .local_inheritance()
                 .unwrap()
                 .lazy
         );
@@ -601,7 +581,7 @@ async fn lazy_broker_reads_materialize_ranges_before_native_io() {
             &contents[first_offset as usize..first_offset as usize + first.len()]
         );
         let open = runtime.tracked_open(reader).unwrap();
-        let cached = lock(&open.local.as_ref().unwrap().materialized);
+        let cached = lock(&open.managed().state.materialized);
         assert!(cached.iter().any(|range| {
             range.start <= first_offset as u64
                 && range.end >= first_offset as u64 + 16 * 1024
@@ -947,8 +927,7 @@ async fn lazy_writable_open_preserves_partial_blocks_and_append_data() {
             runtime
                 .tracked_open(writer)
                 .unwrap()
-                .local
-                .as_ref()
+                .local_inheritance()
                 .unwrap()
                 .lazy
         );
@@ -994,8 +973,7 @@ async fn lazy_writable_open_preserves_partial_blocks_and_append_data() {
             runtime
                 .tracked_open(appender)
                 .unwrap()
-                .local
-                .as_ref()
+                .local_inheritance()
                 .unwrap()
                 .lazy
         );
@@ -1119,41 +1097,84 @@ async fn broker_managed_io_failures_preserve_errno_and_recoverable_state() {
         );
         assert_eq!(*libc::__error(), libc::ENOSYS);
 
-        let reservation = LocalByteRange::new(0, 1).unwrap();
         assert_eq!(
-            tracked_write(
+            managed_write_io(
                 descriptor,
-                Some(reservation),
+                ContentIoOffset::Positioned(0),
+                Some(1),
+                || Ok(1),
+                |_, _| unreachable!(),
+                |_| {
+                    set_errno(libc::EAGAIN);
+                    -1
+                },
                 || {
                     set_errno(libc::EAGAIN);
                     -1
                 },
-                |_| None,
             ),
-            -1
+            Some(-1)
         );
         assert_eq!(*libc::__error(), libc::EAGAIN);
         assert_eq!(
-            tracked_write(descriptor, Some(reservation), || 1, |_| Some((9, 10)),),
-            1
+            managed_write_io(
+                descriptor,
+                ContentIoOffset::Positioned(8),
+                Some(1),
+                || Ok(1),
+                |_, _| unreachable!(),
+                |_| 2,
+                || unreachable!(),
+            ),
+            Some(2)
         );
 
         let open = runtime.tracked_open(descriptor).unwrap();
-        let registration = open.local.as_ref().unwrap();
+        let content = open.managed();
+        let registration = open.local_inheritance().unwrap();
         assert_eq!(
-            lock(&registration.dirty).as_slice(),
-            &[LocalByteRange::new(9, 10).unwrap()]
+            lock(&content.state.dirty).as_slice(),
+            &[LocalByteRange::new(8, 10).unwrap()]
         );
         {
             let state = registration.state.lock().unwrap();
             state.set_offset(-1).unwrap();
         }
         assert_eq!(
-            local_read_io(descriptor, LocalReadOffset::Sequential, || Ok(0), |_| 0),
+            managed_read_io(
+                descriptor,
+                ContentIoOffset::Sequential,
+                || Ok(0),
+                |_, _| unreachable!(),
+                |_| 0,
+                || unreachable!(),
+            ),
             Some(-1)
         );
-        assert_eq!(local_sequential_write(descriptor, Some(0), |_| 0), Some(-1));
-        assert_eq!(local_sequential_write(descriptor, Some(1), |_| 0), Some(-1));
+        assert_eq!(
+            managed_write_io(
+                descriptor,
+                ContentIoOffset::Sequential,
+                Some(0),
+                || Ok(0),
+                |_, _| unreachable!(),
+                |_| 0,
+                || unreachable!(),
+            ),
+            Some(-1)
+        );
+        assert_eq!(
+            managed_write_io(
+                descriptor,
+                ContentIoOffset::Sequential,
+                Some(1),
+                || Ok(1),
+                |_, _| unreachable!(),
+                |_| 0,
+                || unreachable!(),
+            ),
+            Some(-1)
+        );
         assert_eq!(agora_sandbox_lseek(descriptor, 0, libc::SEEK_CUR), -1);
         assert_eq!(*libc::__error(), libc::EINVAL);
         {
@@ -1161,7 +1182,14 @@ async fn broker_managed_io_failures_preserve_errno_and_recoverable_state() {
             state.set_offset(libc::off_t::MAX).unwrap();
         }
         assert_eq!(
-            local_read_io(descriptor, LocalReadOffset::Sequential, || Ok(0), |_| 1),
+            managed_read_io(
+                descriptor,
+                ContentIoOffset::Sequential,
+                || Ok(0),
+                |_, _| unreachable!(),
+                |_| 1,
+                || unreachable!(),
+            ),
             Some(-1)
         );
         assert_eq!(*libc::__error(), libc::EOVERFLOW);
@@ -1194,10 +1222,28 @@ async fn broker_managed_io_failures_preserve_errno_and_recoverable_state() {
 
         assert_eq!(libc::ftruncate(registration.state.as_raw_fd(), 0), 0);
         assert_eq!(
-            local_read_io(descriptor, LocalReadOffset::Sequential, || Ok(0), |_| 0),
+            managed_read_io(
+                descriptor,
+                ContentIoOffset::Sequential,
+                || Ok(0),
+                |_, _| unreachable!(),
+                |_| 0,
+                || unreachable!(),
+            ),
             Some(-1)
         );
-        assert_eq!(local_sequential_write(descriptor, Some(1), |_| 0), Some(-1));
+        assert_eq!(
+            managed_write_io(
+                descriptor,
+                ContentIoOffset::Sequential,
+                Some(1),
+                || Ok(1),
+                |_, _| unreachable!(),
+                |_| 0,
+                || unreachable!(),
+            ),
+            Some(-1)
+        );
         assert_eq!(agora_sandbox_lseek(descriptor, 0, libc::SEEK_CUR), -1);
         assert_eq!(super::super::agora_sandbox_close(descriptor), 0);
     });

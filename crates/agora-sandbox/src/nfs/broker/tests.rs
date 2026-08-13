@@ -347,6 +347,56 @@ async fn broker_closes_a_clean_partial_snapshot_without_downloading_the_remainde
 }
 
 #[tokio::test]
+async fn broker_closes_a_changed_writable_mapping_without_explicit_dirty_ranges() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    storage.insert_file(0, "mapped.bin", b"0123456789abcdef");
+    let broker = Broker::new(Arc::clone(&storage), root.path()).unwrap();
+    let opened = broker
+        .handle(Request::Open {
+            path: path("mapped.bin"),
+            flags: libc::O_RDWR,
+            mode: 0,
+        })
+        .await;
+    let handle = open_handle(&opened.response);
+    let snapshot = File::from(opened.descriptor.unwrap());
+    let mapped = ByteRange::new(4, 8).unwrap();
+    assert!(matches!(
+        broker
+            .handle(Request::Materialize {
+                handle: handle.clone(),
+                range: Some(mapped),
+            })
+            .await
+            .response,
+        Response::Materialized { .. }
+    ));
+    assert_eq!(
+        broker
+            .handle(Request::PotentiallyDirty {
+                handle: handle.clone(),
+                range: mapped,
+            })
+            .await
+            .response,
+        Response::Success
+    );
+    snapshot.write_all_at(b"XX", 5).unwrap();
+
+    let response = broker
+        .handle(Request::Close {
+            handle,
+            ranges: Vec::new(),
+        })
+        .await
+        .response;
+
+    assert_eq!(response, Response::Success);
+    assert_eq!(storage.data(0, "mapped.bin").unwrap(), b"01234XX789abcdef");
+}
+
+#[tokio::test]
 async fn checksum_honors_its_cpu_time_budget() {
     let mut file = tempfile::tempfile().unwrap();
     file.write_all(b"data").unwrap();

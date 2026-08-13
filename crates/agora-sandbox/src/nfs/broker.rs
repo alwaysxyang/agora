@@ -78,7 +78,15 @@ struct RemoteHandle<H> {
     unlinked: bool,
     checksum: Option<[u8; 16]>,
     materialized: ByteRangeSet,
+    potentially_dirty: ByteRangeSet,
+    mapping_fingerprints: Vec<RangeFingerprint>,
     baseline: Option<RemoteMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RangeFingerprint {
+    range: ByteRange,
+    checksum: [u8; 16],
 }
 
 type SharedRemoteHandle<H> = Arc<Mutex<RemoteHandle<H>>>;
@@ -252,6 +260,7 @@ where
             | Request::Write { handle, .. }
             | Request::SetLength { handle, .. }
             | Request::Materialize { handle, .. }
+            | Request::PotentiallyDirty { handle, .. }
             | Request::Sync { handle, .. }
             | Request::Close { handle, .. } => {
                 let handle = self.handles.lock().await.get(handle).cloned()?;
@@ -325,6 +334,12 @@ where
                     validate_byte_range(range)?;
                 }
                 self.materialize(&handle, range, deadline).await
+            }
+            Request::PotentiallyDirty { handle, range } => {
+                validate_byte_range(range)?;
+                self.register_potentially_dirty(&handle, range, deadline)
+                    .await?;
+                Ok(success())
             }
             Request::Sync { handle, ranges } => {
                 validate_byte_ranges(&ranges)?;
@@ -641,6 +656,8 @@ where
                 unlinked: false,
                 checksum: None,
                 materialized: ByteRangeSet::default(),
+                potentially_dirty: ByteRangeSet::default(),
+                mapping_fingerprints: Vec::new(),
                 baseline: Some(metadata.clone()),
             })),
         );
@@ -681,6 +698,8 @@ where
                 unlinked: false,
                 checksum: None,
                 materialized: ByteRangeSet::default(),
+                potentially_dirty: ByteRangeSet::default(),
+                mapping_fingerprints: Vec::new(),
                 baseline: Some(metadata.clone()),
             })),
         );
@@ -1118,6 +1137,57 @@ where
         self.close_snapshot_backend(handle).await
     }
 
+    async fn register_potentially_dirty(
+        &self,
+        id: &str,
+        range: ByteRange,
+        deadline: Instant,
+    ) -> StorageResult<()> {
+        let handle = self.open_handle(id).await?;
+        let mut handle = handle.lock().await;
+        if !handle.writable {
+            return Err(StorageError::new(
+                libc::EBADF,
+                "remote filesystem handle is not writable",
+            ));
+        }
+        if !handle.snapshot {
+            return Err(StorageError::new(
+                libc::EBUSY,
+                "remote handle is not using a local mmap snapshot",
+            ));
+        }
+        let file = handle
+            .file
+            .as_ref()
+            .ok_or_else(|| StorageError::new(libc::EBADF, "remote file handle is closed"))?;
+        let length = file
+            .metadata()
+            .map_err(|error| storage_io("failed to inspect anonymous remote file", error))?
+            .len();
+        let missing = handle.potentially_dirty.missing(range);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let fingerprints = fingerprint_file_ranges(
+            file.try_clone()
+                .map_err(|error| storage_io("failed to clone anonymous remote file", error))?,
+            missing.clone(),
+            length,
+            deadline,
+        )
+        .await?;
+        for range in missing {
+            handle.materialized.insert(range);
+            handle.potentially_dirty.insert(range);
+        }
+        handle.mapping_fingerprints.extend(fingerprints);
+        handle
+            .mapping_fingerprints
+            .sort_unstable_by_key(|fingerprint| fingerprint.range.start);
+        Ok(())
+    }
+
     async fn open_handle(&self, id: &str) -> StorageResult<SharedRemoteHandle<S::FileHandle>> {
         self.handles
             .lock()
@@ -1219,6 +1289,33 @@ where
         }
         let baseline_length = handle.baseline.as_ref().map_or(0, |metadata| metadata.size);
         let mut changed = explicitly_dirty || length != baseline_length;
+        let current_mapping_fingerprints = if handle.mapping_fingerprints.is_empty() {
+            None
+        } else {
+            let ranges = handle
+                .mapping_fingerprints
+                .iter()
+                .map(|fingerprint| fingerprint.range)
+                .collect();
+            Some(
+                fingerprint_file_ranges(
+                    file.try_clone().map_err(|error| {
+                        storage_io("failed to clone remote mmap snapshot", error)
+                    })?,
+                    ranges,
+                    length,
+                    deadline,
+                )
+                .await?,
+            )
+        };
+        if !changed
+            && current_mapping_fingerprints
+                .as_ref()
+                .is_some_and(|current| current != &handle.mapping_fingerprints)
+        {
+            changed = true;
+        }
         if !changed && let Some(expected) = handle.checksum {
             let current = checksum_file(
                 file.try_clone().map_err(|error| {
@@ -1253,6 +1350,9 @@ where
         )
         .await?;
         if handle.checksum == Some(checksum) {
+            if let Some(fingerprints) = current_mapping_fingerprints {
+                handle.mapping_fingerprints = fingerprints;
+            }
             return Ok(handle.baseline.clone());
         }
         let metadata = self
@@ -1266,6 +1366,9 @@ where
             .await?;
         handle.baseline = Some(metadata.clone());
         handle.checksum = Some(checksum);
+        if let Some(fingerprints) = current_mapping_fingerprints {
+            handle.mapping_fingerprints = fingerprints;
+        }
         handle.materialized.clear();
         if length != 0 {
             handle.materialized.insert(ByteRange {
@@ -1401,6 +1504,57 @@ fn list_payload_error(error: std::io::Error, exceeded: bool) -> StorageError {
         directory_too_large()
     } else {
         storage_io("failed to serialize remote list", error)
+    }
+}
+
+async fn fingerprint_file_ranges(
+    file: File,
+    ranges: Vec<ByteRange>,
+    length: u64,
+    deadline: Instant,
+) -> StorageResult<Vec<RangeFingerprint>> {
+    let maximum_duration = remaining_until(deadline)?;
+    let worker = tokio::task::spawn_blocking(move || {
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut fingerprints = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let mut digest = Md5::new();
+            let mut offset = range.start.min(length);
+            let end = range.end.min(length);
+            while offset < end {
+                if Instant::now() >= deadline {
+                    return Err(operation_timed_out());
+                }
+                let requested = usize::try_from((end - offset).min(buffer.len() as u64))
+                    .expect("remote fingerprint chunks fit usize");
+                let read = file
+                    .read_at(&mut buffer[..requested], offset)
+                    .map_err(|error| {
+                        storage_io("failed to fingerprint remote mmap snapshot", error)
+                    })?;
+                if read == 0 {
+                    return Err(StorageError::new(
+                        libc::EIO,
+                        "remote mmap snapshot ended while fingerprinting a mapped range",
+                    ));
+                }
+                digest.update(&buffer[..read]);
+                offset += read as u64;
+            }
+            fingerprints.push(RangeFingerprint {
+                range,
+                checksum: digest.finalize().into(),
+            });
+        }
+        Ok(fingerprints)
+    });
+    match tokio::time::timeout(maximum_duration, worker).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(StorageError::new(
+            libc::EIO,
+            format!("remote fingerprint worker failed: {error}"),
+        )),
+        Err(_) => Err(operation_timed_out()),
     }
 }
 

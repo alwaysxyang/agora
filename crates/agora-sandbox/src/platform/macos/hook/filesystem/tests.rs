@@ -483,6 +483,74 @@ fn nfs_shared_mmap_writes_back_while_private_mmap_stays_private() {
 }
 
 #[test]
+fn nfs_shared_mapping_changed_after_native_mprotect_is_flushed_on_normal_exit() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_file(0, "protected-map.bin", b"original");
+    let path = Fixture::c_path(&nfs.logical_root.join("protected-map.bin"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR, 0);
+        assert!(descriptor >= 0);
+        let mapping = sandbox_mmap(
+            std::ptr::null_mut(),
+            8,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            descriptor,
+            0,
+        );
+        assert_ne!(mapping, libc::MAP_FAILED);
+        assert_eq!(
+            libc::mprotect(mapping, 8, libc::PROT_READ | libc::PROT_WRITE),
+            0
+        );
+        std::ptr::copy_nonoverlapping(b"sandbox!".as_ptr(), mapping.cast(), 8);
+
+        flush_at_exit();
+
+        assert_eq!(
+            nfs.storage.data(0, "protected-map.bin"),
+            Some(b"sandbox!".to_vec())
+        );
+        assert_eq!(libc::close(descriptor), 0);
+        assert_eq!(libc::munmap(mapping, 8), 0);
+    });
+}
+
+#[test]
+fn nfs_clean_shared_mapping_does_not_conflict_with_an_external_change() {
+    let mut fixture = Fixture::new();
+    let nfs = fixture.attach_nfs();
+    nfs.storage.insert_file(0, "clean-map.bin", b"original");
+    let path = Fixture::c_path(&nfs.logical_root.join("clean-map.bin"));
+
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let descriptor = sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR, 0);
+        assert!(descriptor >= 0);
+        let mapping = sandbox_mmap(
+            std::ptr::null_mut(),
+            8,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            descriptor,
+            0,
+        );
+        assert_ne!(mapping, libc::MAP_FAILED);
+        assert_eq!(*mapping.cast::<u8>(), b'o');
+        nfs.storage.replace(0, "clean-map.bin", b"external");
+
+        assert_eq!(sandbox_munmap(mapping, 8), 0);
+        assert_eq!(sandbox_close(descriptor), 0);
+    });
+
+    assert_eq!(
+        nfs.storage.data(0, "clean-map.bin"),
+        Some(b"external".to_vec())
+    );
+}
+
+#[test]
 fn nfs_private_mmap_materializes_only_its_file_range() {
     let mut fixture = Fixture::new();
     let nfs = fixture.attach_nfs();
@@ -1155,11 +1223,9 @@ fn nfs_dup2_closes_the_replaced_remote_handle() {
             .runtime
             .tracked_open(destination)
             .unwrap()
-            .remote
-            .as_ref()
+            .managed_handle()
             .unwrap()
-            .handle
-            .clone();
+            .to_owned();
         let source = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
         assert!(source >= 0);
 
@@ -2897,26 +2963,27 @@ fn content_mutating_fcntl_is_rejected_for_managed_descriptors() {
         );
         assert!(descriptor >= 0);
         assert_eq!(libc::write(descriptor, b"contents".as_ptr().cast(), 8), 8);
-        {
+        let original_content = {
             let mut files = super::lock(&runtime.open_files);
-            Arc::get_mut(files.get_mut(&descriptor).unwrap())
-                .unwrap()
-                .local = Some(super::LocalRegistration {
-                handle: "local-handle".to_string(),
-                writable: true,
-                lazy: false,
-                state: super::LocalOpenState::create(libc::O_RDWR).unwrap(),
-                lock: tempfile::tempfile().unwrap(),
-                identity: super::LocalFileIdentity {
-                    device: 1,
-                    inode: 2,
-                    links: 1,
-                },
-                dirty: std::sync::Mutex::new(ByteRangeSet::default()),
-                materialized: std::sync::Mutex::new(ByteRangeSet::default()),
-                mutation: std::sync::Mutex::new(()),
-            });
-        }
+            let open = Arc::get_mut(files.get_mut(&descriptor).unwrap()).unwrap();
+            std::mem::replace(
+                &mut open.content,
+                super::ManagedContent::encrypted(
+                    super::EncryptedContent {
+                        handle: "local-handle".to_string(),
+                        lazy: false,
+                        state: super::LocalOpenState::create(libc::O_RDWR).unwrap(),
+                        lock: tempfile::tempfile().unwrap(),
+                        identity: super::LocalFileIdentity {
+                            device: 1,
+                            inode: 2,
+                            links: 1,
+                        },
+                    },
+                    true,
+                ),
+            )
+        };
         assert_eq!(
             super::agora_sandbox_fcntl_shim(descriptor, F_SETSIZE, 2_i64),
             -1
@@ -2928,7 +2995,7 @@ fn content_mutating_fcntl_is_rejected_for_managed_descriptors() {
                 .unwrap(),
         )
         .unwrap()
-        .local = None;
+        .content = original_content;
         assert_eq!(sandbox_close(descriptor), 0);
 
         let reopened = super::agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDONLY, 0);
@@ -2941,7 +3008,7 @@ fn content_mutating_fcntl_is_rejected_for_managed_descriptors() {
 }
 
 #[test]
-fn content_mutating_fcntl_validation_allows_plain_descriptors() {
+fn plain_regular_files_use_managed_content_without_changing_native_io() {
     let fixture = Fixture::new();
     let logical = fixture.lower.join("fcntl-plain.txt");
     let path = Fixture::c_path(&logical);
@@ -2953,6 +3020,17 @@ fn content_mutating_fcntl_validation_allows_plain_descriptors() {
             0o600,
         );
         assert!(descriptor >= 0);
+        let open = fixture.runtime.tracked_open(descriptor).unwrap();
+        let content = open.managed();
+        assert!(!content.is_broker_managed());
+        assert!(!content.publishes_writes());
+        assert!(content.accepts_opaque_copy());
+
+        assert_eq!(sandbox_write(descriptor, b"plain".as_ptr().cast(), 5), 5);
+        assert_eq!(sandbox_lseek(descriptor, 0, libc::SEEK_SET), 0);
+        let mut contents = [0_u8; 5];
+        assert_eq!(sandbox_read(descriptor, contents.as_mut_ptr().cast(), 5), 5);
+        assert_eq!(&contents, b"plain");
         assert_eq!(super::agora_sandbox_validate_content_fcntl(descriptor), 0);
         assert_eq!(sandbox_close(descriptor), 0);
     });

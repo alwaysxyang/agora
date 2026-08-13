@@ -1124,6 +1124,44 @@ fn final_flush_persists_ranges_registered_by_writable_mappings() {
 }
 
 #[test]
+fn explicit_sync_persists_changes_from_registered_writable_mappings() {
+    let fixture = Fixture::new();
+    let path = fixture.encrypted("mapped-sync", b"abcdef");
+    let (handle, plaintext) = fixture.open(&path, true);
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::PotentiallyDirty {
+                    handle: handle.clone(),
+                    range: ByteRange::new(0, 6).unwrap(),
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+    write_all_at(&plaintext, b"mapped", 0).unwrap();
+
+    assert_eq!(
+        fixture
+            .broker
+            .handle(
+                Request::Sync {
+                    handle,
+                    ranges: Vec::new(),
+                    durable: true,
+                },
+                None,
+            )
+            .response,
+        Response::Success
+    );
+
+    assert_eq!(fixture.decrypt(&path), b"mapped");
+}
+
+#[test]
 fn final_flush_abandons_all_peer_writes_before_synchronizing() {
     let fixture = Fixture::new();
     let path = fixture.encrypted("peer-active-final-flush", b"abcdefgh");

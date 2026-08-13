@@ -90,7 +90,7 @@ pub unsafe extern "C" fn agora_sandbox_truncate(
 #[cfg(test)]
 pub(super) unsafe fn sandbox_descriptor_mutation(
     descriptor: libc::c_int,
-    operation: impl FnOnce(libc::c_int) -> libc::c_int,
+    operation: impl FnMut(libc::c_int) -> libc::c_int,
 ) -> libc::c_int {
     unsafe { sandbox_descriptor_mutation_with_truncate(descriptor, None, operation) }
 }
@@ -98,7 +98,7 @@ pub(super) unsafe fn sandbox_descriptor_mutation(
 unsafe fn sandbox_descriptor_mutation_with_truncate(
     descriptor: libc::c_int,
     truncate: Option<libc::off_t>,
-    operation: impl FnOnce(libc::c_int) -> libc::c_int,
+    mut operation: impl FnMut(libc::c_int) -> libc::c_int,
 ) -> libc::c_int {
     let Some(_guard) = FilesystemHookGuard::enter() else {
         return operation(descriptor);
@@ -122,94 +122,28 @@ unsafe fn sandbox_descriptor_mutation_with_truncate(
             unsafe { set_errno(libc::ENOTSUP) };
             return -1;
         }
-        if let (Some(_), Some(registration)) = (truncate, &open.local)
-            && !registration.writable
-        {
-            unsafe { set_errno(libc::EBADF) };
-            return -1;
-        }
-        if let (Some(length), Some(registration)) = (truncate, &open.local) {
-            let reservation = u64::try_from(status.st_size)
-                .ok()
-                .and_then(|current| truncate_reservation(current, length));
-            let _mutation = lock(&registration.mutation);
-            let local = match runtime.local.as_ref() {
-                Some(local) => local,
-                None => {
-                    unsafe { set_errno(libc::EIO) };
-                    return -1;
-                }
-            };
-            let active = match reservation {
-                Some(range) => match local.begin_write(&registration.handle, range) {
-                    Ok(active) => Some(active),
-                    Err(error) => {
-                        unsafe { set_errno(error.errno()) };
-                        return -1;
-                    }
-                },
-                None => None,
-            };
-            let result = operation(descriptor);
-            if result != 0 {
-                let errno = unsafe { *libc::__error() };
-                if let Some(active) = &active {
-                    let _ = local.cancel_write(&registration.handle, active);
-                }
-                unsafe { set_errno(errno) };
-                return result;
-            }
-            let logical = open.logical();
-            let attributes =
-                runtime.refresh_attributes(descriptor, logical.to_string_lossy().as_ref());
-            if let Some(range) = reservation
-                && active.as_ref().is_none_or(|active| {
-                    if local
-                        .finish_write(&registration.handle, active, range)
-                        .is_ok()
-                    {
-                        false
-                    } else {
-                        let _ = local.cancel_write(&registration.handle, active);
-                        true
-                    }
-                })
-            {
-                lock(&registration.dirty).insert(range);
-            }
-            if let Err(error) = attributes {
-                return unsafe { fail(&error, -1) };
-            }
-            return result;
-        }
-        if let (Some(length), Some(registration)) = (truncate, &open.remote) {
-            if !registration.writable {
-                unsafe { set_errno(libc::EBADF) };
-                return -1;
-            }
-            let Ok(length) = u64::try_from(length) else {
+        if let Some(length) = truncate {
+            let content = open.managed();
+            let Ok(requested_length) = u64::try_from(length) else {
                 unsafe { set_errno(libc::EINVAL) };
                 return -1;
             };
-            let _mutation = lock(&registration.mutation);
-            if !registration.snapshot.load(Ordering::Acquire) {
-                let remote = match runtime.remote.as_ref() {
-                    Some(remote) => remote,
-                    None => {
-                        unsafe { set_errno(libc::EIO) };
-                        return -1;
-                    }
-                };
-                let size = match remote.set_length(&registration.handle, length) {
-                    Ok(size) => size,
-                    Err(error) => return unsafe { fail(&error, -1) },
-                };
-                let result = operation(descriptor);
-                if result == 0 {
-                    lock(&registration.metadata).size = size;
-                }
-                return result;
-            }
+            let reservation = u64::try_from(status.st_size)
+                .ok()
+                .and_then(|current| truncate_reservation(current, length));
+            return match unsafe {
+                content.truncate(
+                    runtime,
+                    descriptor,
+                    &open,
+                    requested_length,
+                    reservation,
+                    || operation(descriptor),
+                )
+            } {
+                Ok(result) => result,
+                Err(error) => unsafe { fail(&error, -1) },
+            };
         }
         let result = operation(descriptor);
         if result == 0 {
@@ -502,7 +436,7 @@ pub unsafe extern "C" fn agora_sandbox_dup2(
                 release_local_close_locks(open, *last_alias);
             }
             if let Some((open, true)) = replaced
-                && (open.remote.is_some() || open.local.is_some())
+                && open.managed().is_broker_managed()
                 && !runtime.has_mapping(&open)
             {
                 let _ = runtime.finish_open_file(-1, &open);
@@ -535,7 +469,7 @@ pub extern "C" fn agora_sandbox_fcntl_setfd_argument(
         };
         if runtime
             .tracked_open(descriptor)
-            .is_some_and(|open| open.close_on_exec && open.local.is_none())
+            .is_some_and(|open| open.close_on_exec && !open.managed().supports_exec_inheritance())
         {
             flags | libc::FD_CLOEXEC
         } else {
@@ -561,19 +495,10 @@ pub extern "C" fn agora_sandbox_fcntl_getfl(
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return Ok(native_flags);
         };
-        let Some(open) = runtime.tracked_open(descriptor) else {
-            return Ok(native_flags);
-        };
-        let Some(registration) = &open.local else {
-            return Ok(native_flags);
-        };
-        let _mutation = lock(&registration.mutation);
-        let state = registration.state.lock()?;
-        let logical = state.flags()?;
-        Ok(
-            (native_flags & !(libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK))
-                | (logical & (libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK)),
-        )
+        runtime
+            .tracked_open(descriptor)
+            .map(|open| open.managed().merge_status_flags(native_flags))
+            .unwrap_or(Ok(native_flags))
     })) {
         Ok(Ok(flags)) => flags,
         Ok(Err(error)) => unsafe { fail(&error, -1) },
@@ -590,14 +515,10 @@ pub extern "C" fn agora_sandbox_fcntl_setfl_argument(
     flags: libc::c_int,
 ) -> libc::c_int {
     catch_unwind(AssertUnwindSafe(|| {
-        let local = FilesystemHookRuntime::global()
+        FilesystemHookRuntime::global()
             .and_then(|runtime| runtime.tracked_open(descriptor))
-            .is_some_and(|open| open.local.is_some());
-        if local {
-            flags & !(libc::O_APPEND | libc::O_NONBLOCK)
-        } else {
-            flags
-        }
+            .map(|open| open.managed().native_status_flags(flags))
+            .unwrap_or(flags)
     }))
     .unwrap_or(flags)
 }
@@ -611,21 +532,10 @@ pub extern "C" fn agora_sandbox_fcntl_commit_setfl(
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return Ok(());
         };
-        let Some(open) = runtime.tracked_open(descriptor) else {
-            return Ok(());
-        };
-        let Some(registration) = &open.local else {
-            return Ok(());
-        };
-        let _mutation = lock(&registration.mutation);
-        let state = registration.state.lock()?;
-        let current = state.flags()?;
-        state
-            .set_flags(
-                (current & !(libc::O_APPEND | libc::O_NONBLOCK))
-                    | (flags & (libc::O_APPEND | libc::O_NONBLOCK)),
-            )
-            .map_err(Into::into)
+        runtime
+            .tracked_open(descriptor)
+            .map(|open| open.managed().commit_status_flags(flags))
+            .unwrap_or(Ok(()))
     })) {
         Ok(Ok(())) => 0,
         Ok(Err(error)) => unsafe { fail(&error, -1) },
@@ -644,7 +554,8 @@ pub extern "C" fn agora_sandbox_validate_content_fcntl(descriptor: libc::c_int) 
         };
         if runtime
             .tracked_open(descriptor)
-            .is_some_and(|open| open.local.is_some() || open.remote.is_some())
+            .map(|open| open.managed().is_broker_managed())
+            .unwrap_or(false)
         {
             unsafe { set_errno(libc::ENOTSUP) };
             -1
@@ -663,7 +574,7 @@ pub extern "C" fn agora_sandbox_lock_descriptor(descriptor: libc::c_int) -> libc
     catch_unwind(AssertUnwindSafe(|| {
         FilesystemHookRuntime::global()
             .and_then(|runtime| runtime.tracked_open(descriptor))
-            .and_then(|open| open.local.as_ref().map(|local| local.lock.as_raw_fd()))
+            .map(|open| open.managed().lock_descriptor(descriptor))
             .unwrap_or(descriptor)
     }))
     .unwrap_or(descriptor)
@@ -705,25 +616,7 @@ fn original_flock() -> Option<FlockFn> {
 }
 
 pub(super) fn release_local_close_locks(open: &OpenFile, last_alias: bool) {
-    let Some(local) = &open.local else {
-        return;
-    };
-    let errno = unsafe { *libc::__error() };
-    let mut unlock = libc::flock {
-        l_start: 0,
-        l_len: 0,
-        l_pid: 0,
-        l_type: libc::F_UNLCK,
-        l_whence: libc::SEEK_SET as libc::c_short,
-    };
-    unsafe {
-        libc::fcntl(local.lock.as_raw_fd(), libc::F_SETLK, &raw mut unlock);
-        if last_alias {
-            libc::fcntl(local.lock.as_raw_fd(), libc::F_OFD_SETLK, &raw mut unlock);
-            libc::flock(local.lock.as_raw_fd(), libc::LOCK_UN);
-        }
-        set_errno(errno);
-    }
+    open.managed().release_close_locks(last_alias);
 }
 
 pub(super) fn original_close() -> Option<CloseFn> {

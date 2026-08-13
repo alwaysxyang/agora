@@ -80,37 +80,10 @@ fn mapping_ranges_split_and_reject_address_and_file_overflow() {
         drop(mappings);
 
         lock(&fixture.runtime.mappings).clear();
-        lock(&fixture.runtime.mappings).push(MemoryMapping {
-            start: 100,
-            end: 200,
-            file_offset: 10,
-            writable: false,
-            open: Arc::clone(&open),
-        });
-        fixture.runtime.set_mapping_writable(125, 175, true);
-        assert_eq!(
-            lock(&fixture.runtime.mappings)
-                .iter()
-                .map(|mapping| (
-                    mapping.start,
-                    mapping.end,
-                    mapping.file_offset,
-                    mapping.writable,
-                ))
-                .collect::<Vec<_>>(),
-            [
-                (100, 125, 10, false),
-                (125, 175, 35, true),
-                (175, 200, 85, false),
-            ]
-        );
-        lock(&fixture.runtime.mappings).clear();
 
         let invalid = MappingSlice {
             address: 1,
             length: 1,
-            file_start: 0,
-            file_end: 1,
             open,
         };
         assert!(
@@ -159,49 +132,11 @@ fn mapping_hooks_report_overflow_before_touching_native_memory() {
         assert_eq!(*libc::__error(), libc::EOVERFLOW);
         assert_eq!(agora_sandbox_munmap(address, 2), -1);
         assert_eq!(*libc::__error(), libc::EOVERFLOW);
-        assert_eq!(agora_sandbox_mprotect(address, 2, libc::PROT_READ), -1);
-        assert_eq!(*libc::__error(), libc::EOVERFLOW);
 
         let dangling = std::ptr::dangling_mut::<libc::c_void>();
         assert_eq!(agora_sandbox_msync(dangling, 4096, libc::MS_SYNC), -1);
         assert_eq!(agora_sandbox_munmap(dangling, 4096), -1);
-        assert_eq!(agora_sandbox_mprotect(dangling, 4096, libc::PROT_READ), -1);
     });
-}
-
-#[test]
-fn untracked_mprotect_does_not_depend_on_the_mapping_state_lock() {
-    let fixture = Fixture::new();
-    let mapped = unsafe {
-        original_mmap().unwrap()(
-            std::ptr::null_mut(),
-            4096,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
-        )
-    };
-    assert_ne!(mapped, libc::MAP_FAILED);
-
-    std::thread::scope(|scope| {
-        let runtime = &fixture.runtime;
-        let mappings = lock(&runtime.mappings);
-        let (finished, result) = mpsc::sync_channel(1);
-        let address = mapped as usize;
-        scope.spawn(move || {
-            let outcome = with_test_runtime(runtime, || unsafe {
-                agora_sandbox_mprotect(address as *mut libc::c_void, 4096, libc::PROT_READ)
-            });
-            let _ = finished.send(outcome);
-        });
-
-        let outcome = result.recv_timeout(Duration::from_millis(250));
-        drop(mappings);
-        assert_eq!(outcome.unwrap(), 0);
-    });
-
-    assert_eq!(unsafe { original_munmap().unwrap()(mapped, 4096) }, 0);
 }
 
 #[test]
@@ -391,64 +326,7 @@ fn tracked_mapping_classification_does_not_depend_on_the_mapping_state_lock() {
 }
 
 #[test]
-fn untracked_mprotect_does_not_depend_on_the_mapping_operation_lock() {
-    let fixture = Fixture::new();
-    let mapped = unsafe {
-        original_mmap().unwrap()(
-            std::ptr::null_mut(),
-            4096,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
-        )
-    };
-    assert_ne!(mapped, libc::MAP_FAILED);
-
-    let operation = lock(&fixture.runtime.mapping_operations);
-    assert_eq!(
-        with_test_runtime(&fixture.runtime, || unsafe {
-            agora_sandbox_mprotect(mapped, 4096, libc::PROT_READ)
-        }),
-        0
-    );
-    drop(operation);
-
-    assert_eq!(unsafe { original_munmap().unwrap()(mapped, 4096) }, 0);
-}
-
-#[test]
-fn tracked_mprotect_fails_closed_when_another_mapping_operation_is_active() {
-    let fixture = Fixture::new();
-    let logical = fixture.lower.join("serialized.bin");
-    std::fs::write(&logical, vec![0_u8; 4096]).unwrap();
-    let path = Fixture::c_path(&logical);
-
-    with_test_runtime(&fixture.runtime, || unsafe {
-        let descriptor = agora_sandbox_open_with_mode(path.as_ptr(), libc::O_RDWR, 0);
-        assert!(descriptor >= 0);
-        let mapped = agora_sandbox_mmap(
-            std::ptr::null_mut(),
-            4096,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            descriptor,
-            0,
-        );
-        assert_ne!(mapped, libc::MAP_FAILED);
-
-        let operation = lock(&fixture.runtime.mapping_operations);
-        assert_eq!(agora_sandbox_mprotect(mapped, 4096, libc::PROT_READ), -1);
-        assert_eq!(*libc::__error(), libc::EAGAIN);
-        drop(operation);
-
-        assert_eq!(agora_sandbox_munmap(mapped, 4096), 0);
-        assert_eq!(agora_sandbox_close(descriptor), 0);
-    });
-}
-
-#[test]
-fn shared_mapping_hooks_flush_protection_changes_and_unmap_cleanly() {
+fn shared_mapping_flushes_after_native_protection_changes() {
     let fixture = Fixture::new();
     let logical = fixture.lower.join("shared.bin");
     std::fs::write(&logical, vec![b'.'; 4096]).unwrap();
@@ -460,19 +338,23 @@ fn shared_mapping_hooks_flush_protection_changes_and_unmap_cleanly() {
         let mapped = agora_sandbox_mmap(
             std::ptr::null_mut(),
             4096,
-            libc::PROT_READ | libc::PROT_WRITE,
+            libc::PROT_READ,
             libc::MAP_SHARED,
             descriptor,
             0,
         );
         assert_ne!(mapped, libc::MAP_FAILED);
+        assert_eq!(
+            libc::mprotect(mapped, 4096, libc::PROT_READ | libc::PROT_WRITE),
+            0
+        );
         std::ptr::copy_nonoverlapping(b"mapped".as_ptr(), mapped.cast::<u8>(), 6);
 
         fixture.runtime.flush_memory_mappings().unwrap();
         assert_eq!(agora_sandbox_msync(mapped, 4096, libc::MS_SYNC), 0);
-        assert_eq!(agora_sandbox_mprotect(mapped, 4096, libc::PROT_READ), 0);
+        assert_eq!(libc::mprotect(mapped, 4096, libc::PROT_READ), 0);
         assert_eq!(
-            agora_sandbox_mprotect(mapped, 4096, libc::PROT_READ | libc::PROT_WRITE),
+            libc::mprotect(mapped, 4096, libc::PROT_READ | libc::PROT_WRITE),
             0
         );
         assert_eq!(agora_sandbox_munmap(mapped, 4096), 0);

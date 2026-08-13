@@ -309,16 +309,13 @@ unsafe fn sandbox_fchdir(descriptor: libc::c_int) -> libc::c_int {
             .get(&descriptor)
             .cloned();
         let managed_descriptor = tracked_open.is_some() || directory_registration.is_some();
-        let remote_descriptor = tracked_open.is_some_and(|open| open.remote.is_some())
+        let remote_descriptor = tracked_open.is_some_and(|open| open.manages_metadata())
             || directory_registration.is_some_and(|registration| registration.remote);
         if remote_descriptor {
             let is_directory = lock(&runtime.directory_descriptors).contains_key(&descriptor)
-                || runtime.tracked_open(descriptor).is_some_and(|open| {
-                    open.remote.as_ref().is_some_and(|remote| {
-                        lock(&remote.metadata).file_type
-                            == crate::nfs::protocol::RemoteFileType::Directory
-                    })
-                });
+                || runtime
+                    .tracked_open(descriptor)
+                    .is_some_and(|open| open.managed_is_directory());
             if !is_directory {
                 unsafe { set_errno(libc::ENOTDIR) };
                 return -1;

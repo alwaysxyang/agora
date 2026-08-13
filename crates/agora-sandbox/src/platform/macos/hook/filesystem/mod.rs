@@ -5,11 +5,13 @@ use super::dyld::{dyld_interpose, function_from_interpose};
 use super::set_errno;
 use crate::audit::{AuditClient, AuditError, AuditEventRequest, FileOperation};
 use crate::callback::{FileAccessMode, FileContext, FileOpenMode, ProcessContext};
+#[cfg(test)]
+use crate::filesystem::ByteRangeSet;
 use crate::filesystem::broker::{LocalClient, LocalClientError, LocalFileIdentity, LocalOpenState};
 use crate::filesystem::{
-    AccessPlan, AccessRequest, ByteRange as LocalByteRange, ByteRangeSet, Credentials,
-    DirectoryView, FileAttributes, FileLayer, MetadataPlan, NativeDirectorySnapshot, OpenIntent,
-    OpenTarget, PreparedFile, StagedWrite, VirtualFilesystem, Writeback, normalize_path,
+    AccessPlan, AccessRequest, ByteRange as LocalByteRange, Credentials, DirectoryView,
+    FileAttributes, FileLayer, MetadataPlan, NativeDirectorySnapshot, OpenIntent, OpenTarget,
+    PreparedFile, StagedWrite, VirtualFilesystem, normalize_path,
 };
 use crate::trace::TraceContext;
 use anyhow::{Context, Result};
@@ -30,6 +32,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+use content::{EncryptedContent, LocalContentInheritance, ManagedContent, NfsContent};
 
 const NATIVE_PASSTHROUGH_ROOTS: &[&str] = &["/dev"];
 type GuardId = u64;
@@ -236,20 +240,56 @@ struct PreparedOpen {
     prepared: PreparedOpenFile,
     file: FileContext,
     logical: PathBuf,
-    local: Option<LocalRegistration>,
+    content: Option<ManagedContent>,
     identity: Option<LogicalFileIdentity>,
 }
 
 struct OpenFile {
     file: FileContext,
     logical: Mutex<PathBuf>,
-    writeback: Option<Writeback>,
-    local: Option<LocalRegistration>,
-    remote: Option<RemoteRegistration>,
+    content: ManagedContent,
     identity: Option<LogicalFileIdentity>,
     layer: FileLayer,
     close_on_exec: bool,
     finished: AtomicBool,
+}
+
+impl OpenFile {
+    fn managed(&self) -> &ManagedContent {
+        &self.content
+    }
+
+    fn local_inheritance(&self) -> Option<LocalContentInheritance<'_>> {
+        self.managed().local_inheritance()
+    }
+
+    fn supports_exec_inheritance(&self) -> bool {
+        self.managed().supports_exec_inheritance()
+    }
+
+    fn manages_metadata(&self) -> bool {
+        self.managed().manages_metadata()
+    }
+
+    fn managed_attributes(
+        &self,
+        runtime: &FilesystemHookRuntime,
+    ) -> Result<Option<FileAttributes>> {
+        self.managed().file_attributes(runtime)
+    }
+
+    fn managed_is_directory(&self) -> bool {
+        self.managed().is_directory()
+    }
+
+    #[cfg(test)]
+    fn managed_handle(&self) -> Option<&str> {
+        self.managed().handle()
+    }
+
+    fn publishes_writes(&self) -> bool {
+        self.managed().publishes_writes()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -291,28 +331,6 @@ enum PreparedOpenFile {
     Remote(RemoteOpen),
 }
 
-struct RemoteRegistration {
-    handle: String,
-    metadata: Mutex<crate::nfs::protocol::RemoteMetadata>,
-    writable: bool,
-    snapshot: AtomicBool,
-    dirty: Mutex<ByteRangeSet>,
-    materialized: Mutex<ByteRangeSet>,
-    mutation: Mutex<()>,
-}
-
-struct LocalRegistration {
-    handle: String,
-    writable: bool,
-    lazy: bool,
-    state: LocalOpenState,
-    lock: File,
-    identity: LocalFileIdentity,
-    dirty: Mutex<ByteRangeSet>,
-    materialized: Mutex<ByteRangeSet>,
-    mutation: Mutex<()>,
-}
-
 #[derive(Clone, Copy)]
 struct LogicalFileIdentity {
     device: u64,
@@ -329,17 +347,29 @@ type MetadataMapping = (
 static FILESYSTEM_RUNTIME: OnceLock<Option<FilesystemHookRuntime>> = OnceLock::new();
 
 impl PreparedOpen {
+    fn has_encrypted_broker(&self) -> bool {
+        self.content
+            .as_ref()
+            .is_some_and(ManagedContent::supports_exec_inheritance)
+    }
+
     fn into_parts(self) -> (OpenTarget, OpenFile) {
-        let (target, writeback, remote, layer) = self.prepared.into_parts();
+        let (target, prepared_content, layer) = self.prepared.into_parts();
+        // Broker-managed encrypted opens may still carry the eager fallback
+        // produced by the overlay plan. The Broker has always been the
+        // authoritative writeback owner in that case.
+        let writable = self.file.mode.access != FileAccessMode::Read;
+        let content = self
+            .content
+            .or(prepared_content)
+            .unwrap_or_else(|| ManagedContent::plain(writable));
         let close_on_exec = matches!(target, OpenTarget::Descriptor(_));
         (
             target,
             OpenFile {
                 file: self.file,
                 logical: Mutex::new(self.logical),
-                writeback,
-                local: self.local,
-                remote,
+                content,
                 identity: self.identity,
                 layer,
                 close_on_exec,
@@ -364,33 +394,28 @@ impl PreparedOpenFile {
         }
     }
 
-    fn into_parts(
-        self,
-    ) -> (
-        OpenTarget,
-        Option<Writeback>,
-        Option<RemoteRegistration>,
-        FileLayer,
-    ) {
+    fn into_parts(self) -> (OpenTarget, Option<ManagedContent>, FileLayer) {
         match self {
             Self::Local(prepared) => {
                 let (target, writeback, layer) = prepared.into_parts();
-                (target, writeback, None, layer)
+                (
+                    target,
+                    writeback.map(ManagedContent::eager_encrypted),
+                    layer,
+                )
             }
             Self::Remote(prepared) => {
                 let (target, handle, metadata, writable) = prepared.into_parts();
                 (
                     target,
-                    None,
-                    Some(RemoteRegistration {
-                        handle,
-                        metadata: Mutex::new(metadata),
+                    Some(ManagedContent::nfs(
+                        NfsContent {
+                            handle,
+                            metadata: Mutex::new(metadata),
+                            snapshot: AtomicBool::new(false),
+                        },
                         writable,
-                        snapshot: AtomicBool::new(false),
-                        dirty: Mutex::new(ByteRangeSet::default()),
-                        materialized: Mutex::new(ByteRangeSet::default()),
-                        mutation: Mutex::new(()),
-                    }),
+                    )),
                     FileLayer::Upper,
                 )
             }
@@ -421,7 +446,7 @@ impl OpenRequest {
             prepared: self.prepared,
             file: self.file,
             logical: self.logical,
-            local: None,
+            content: None,
             identity: None,
         }
     }
@@ -1017,17 +1042,16 @@ impl FilesystemHookRuntime {
                     let opened = client.open(&path, flags)?;
                     let writable = flags & libc::O_ACCMODE != libc::O_RDONLY;
                     *local.target_mut() = OpenTarget::Descriptor(opened.descriptor);
-                    prepared.local = Some(LocalRegistration {
-                        handle: opened.handle,
+                    prepared.content = Some(ManagedContent::encrypted(
+                        EncryptedContent {
+                            handle: opened.handle,
+                            lazy: opened.lazy,
+                            state: opened.state,
+                            lock: opened.lock,
+                            identity: opened.identity,
+                        },
                         writable,
-                        lazy: opened.lazy,
-                        state: opened.state,
-                        lock: opened.lock,
-                        identity: opened.identity,
-                        dirty: Mutex::new(ByteRangeSet::default()),
-                        materialized: Mutex::new(ByteRangeSet::default()),
-                        mutation: Mutex::new(()),
-                    });
+                    ));
                 }
                 Ok(())
             }
@@ -1036,12 +1060,9 @@ impl FilesystemHookRuntime {
     }
 
     fn has_open_writer(&self, logical: &Path) -> bool {
-        lock(&self.open_files).values().any(|open| {
-            (open.writeback.is_some()
-                || open.local.as_ref().is_some_and(|local| local.writable)
-                || open.remote.as_ref().is_some_and(|remote| remote.writable))
-                && open.logical() == logical
-        })
+        lock(&self.open_files)
+            .values()
+            .any(|open| open.publishes_writes() && open.logical() == logical)
     }
 
     fn publish_open_writers(&self, logical: &Path) -> Result<()> {
@@ -1052,9 +1073,7 @@ impl FilesystemHookRuntime {
             .collect::<Vec<_>>();
         let mut seen = HashSet::new();
         for (descriptor, open) in files {
-            if (open.writeback.is_some()
-                || open.local.as_ref().is_some_and(|local| local.writable)
-                || open.remote.as_ref().is_some_and(|remote| remote.writable))
+            if open.publishes_writes()
                 && open.logical() == logical
                 && seen.insert(Arc::as_ptr(&open))
             {
@@ -1121,14 +1140,16 @@ impl FilesystemHookRuntime {
         };
         let mut handles = lock(&self.open_files)
             .values()
-            .filter_map(|open| open.local.as_ref().map(|local| local.handle.clone()))
+            .filter_map(|open| {
+                open.local_inheritance()
+                    .map(|local| local.handle.to_owned())
+            })
             .collect::<Vec<_>>();
         handles.extend(lock(&self.mappings).iter().filter_map(|mapping| {
             mapping
                 .open
-                .local
-                .as_ref()
-                .map(|local| local.handle.clone())
+                .local_inheritance()
+                .map(|local| local.handle.to_owned())
         }));
         handles.sort_unstable();
         handles.dedup();
@@ -1149,7 +1170,7 @@ impl FilesystemHookRuntime {
         let mut files = lock(&self.open_files);
         let close_on_exec = files
             .get(&source)
-            .is_some_and(|open| open.close_on_exec && open.local.is_none());
+            .is_some_and(|open| open.close_on_exec && !open.supports_exec_inheritance());
         let duplicated = match files.get(&source).cloned() {
             Some(open) => {
                 files.insert(destination, Arc::clone(&open));
@@ -1190,7 +1211,7 @@ impl FilesystemHookRuntime {
         let files = lock(&self.open_files);
         let mut descriptors = Vec::new();
         for (&descriptor, open) in files.iter() {
-            let Some(local) = &open.local else {
+            let Some(local) = open.local_inheritance() else {
                 continue;
             };
             let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
@@ -1218,8 +1239,8 @@ impl FilesystemHookRuntime {
                 logical_links: local.identity.links,
                 file: open.file.clone(),
                 logical: open.logical().into_os_string().into_vec(),
-                handle: local.handle.clone(),
-                writable: local.writable,
+                handle: local.handle.to_owned(),
+                writable: open.managed().writable(),
                 lazy: local.lazy,
             });
         }
@@ -1332,23 +1353,20 @@ impl FilesystemHookRuntime {
                 let open = Arc::new(OpenFile {
                     file: inherited.file,
                     logical: Mutex::new(PathBuf::from(OsString::from_vec(inherited.logical))),
-                    writeback: None,
-                    local: Some(LocalRegistration {
-                        handle: inherited.handle,
-                        writable: inherited.writable,
-                        lazy: inherited.lazy,
-                        state,
-                        lock: lock_descriptor,
-                        identity: LocalFileIdentity {
-                            device: inherited.logical_device,
-                            inode: inherited.logical_inode,
-                            links: inherited.logical_links,
+                    content: ManagedContent::encrypted(
+                        EncryptedContent {
+                            handle: inherited.handle,
+                            lazy: inherited.lazy,
+                            state,
+                            lock: lock_descriptor,
+                            identity: LocalFileIdentity {
+                                device: inherited.logical_device,
+                                inode: inherited.logical_inode,
+                                links: inherited.logical_links,
+                            },
                         },
-                        dirty: Mutex::new(ByteRangeSet::default()),
-                        materialized: Mutex::new(ByteRangeSet::default()),
-                        mutation: Mutex::new(()),
-                    }),
-                    remote: None,
+                        inherited.writable,
+                    ),
                     identity: Some(LogicalFileIdentity {
                         device: inherited.logical_device,
                         inode: inherited.logical_inode,
@@ -1397,7 +1415,7 @@ impl FilesystemHookRuntime {
     }
 
     fn refresh_local_state_inheritance(&self, open: &Arc<OpenFile>) {
-        let Some(local) = &open.local else {
+        let Some(local) = open.local_inheritance() else {
             return;
         };
         let inheritable = lock(&self.open_files)
@@ -1418,7 +1436,7 @@ impl FilesystemHookRuntime {
         let mut descriptors = Vec::new();
         let mut states = HashSet::new();
         for (&descriptor, open) in files.iter() {
-            let Some(local) = &open.local else {
+            let Some(local) = open.local_inheritance() else {
                 continue;
             };
             let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
@@ -1445,153 +1463,20 @@ impl FilesystemHookRuntime {
         Ok(())
     }
 
-    fn record_local_write_locked(&self, registration: &LocalRegistration, start: u64, end: u64) {
-        if !registration.writable || start >= end {
-            return;
-        }
-        let Ok(range) = LocalByteRange::new(start, end) else {
-            return;
-        };
-        lock(&registration.dirty).insert(range);
-    }
-
-    fn record_remote_write_locked(&self, registration: &RemoteRegistration, start: u64, end: u64) {
-        if !registration.writable || start >= end {
-            return;
-        }
-        let Ok(range) = LocalByteRange::new(start, end) else {
-            return;
-        };
-        lock(&registration.materialized).insert(range);
-        lock(&registration.dirty).insert(range);
-    }
-
-    fn materialize_local(
-        &self,
-        registration: &LocalRegistration,
-        range: Option<LocalByteRange>,
-    ) -> Result<()> {
-        if !registration.lazy {
-            return Ok(());
-        }
-        let requested = range.unwrap_or(LocalByteRange {
-            start: 0,
-            end: u64::MAX,
-        });
-        let mut materialized = lock(&registration.materialized);
-        if materialized.covers(requested) {
-            return Ok(());
-        }
-        self.local
-            .as_ref()
-            .context("local filesystem runtime is unavailable")?
-            .materialize(&registration.handle, range)?;
-        materialized.insert(requested);
-        Ok(())
-    }
-
-    fn materialize_remote_locked(
-        &self,
-        registration: &RemoteRegistration,
-        range: Option<LocalByteRange>,
-    ) -> Result<()> {
-        if let Some(range) = range
-            && lock(&registration.materialized).covers(range)
-        {
-            return Ok(());
-        }
-        let metadata = self
-            .remote
-            .as_ref()
-            .context("remote filesystem runtime is unavailable")?
-            .materialize(&registration.handle, range)?;
-        let materialized = range.unwrap_or(LocalByteRange {
-            start: 0,
-            end: metadata.size,
-        });
-        if materialized.start < metadata.size {
-            lock(&registration.materialized).insert(LocalByteRange {
-                start: materialized.start,
-                end: materialized.end.min(metadata.size),
-            });
-        }
-        *lock(&registration.metadata) = metadata;
-        registration.snapshot.store(true, Ordering::Release);
-        Ok(())
-    }
-
     fn commit_open_file(
         &self,
         descriptor: libc::c_int,
         open: &OpenFile,
         durable: bool,
     ) -> Result<()> {
-        if let Some(registration) = &open.local {
-            let _mutation = lock(&registration.mutation);
-            return self.commit_local_open_file_locked(descriptor, open, registration, durable);
-        }
-        if let Some(registration) = &open.remote {
-            let _mutation = lock(&registration.mutation);
-            let remote = self
-                .remote
-                .as_ref()
-                .context("remote filesystem runtime is unavailable")?;
-            let mut dirty = lock(&registration.dirty);
-            if let Some(metadata) = remote.sync(&registration.handle, dirty.to_vec())? {
-                *lock(&registration.metadata) = metadata;
-            }
-            dirty.clear();
-            return Ok(());
-        }
-        let Some(writeback) = &open.writeback else {
-            return Ok(());
-        };
-        let Some(logical) = self.filesystem.commit_writeback(writeback)? else {
-            return Ok(());
-        };
-        if descriptor < 0 {
-            return Ok(());
-        }
-        let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
-        if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        self.filesystem.refresh_timestamps(&logical, &status)
+        open.managed().sync(self, descriptor, open, durable)
     }
 
     fn finish_open_file(&self, descriptor: libc::c_int, open: &OpenFile) -> Result<()> {
         if open.finished.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let result = (|| {
-            if let Some(registration) = &open.local {
-                let _mutation = lock(&registration.mutation);
-                if descriptor >= 0 {
-                    self.refresh_open_attributes(descriptor, open)?;
-                }
-                let mut dirty = lock(&registration.dirty);
-                self.local
-                    .as_ref()
-                    .context("local filesystem runtime is unavailable")?
-                    .close(&registration.handle, dirty.to_vec())?;
-                dirty.clear();
-                return Ok(());
-            }
-            if let Some(registration) = &open.remote {
-                let _mutation = lock(&registration.mutation);
-                let mut dirty = lock(&registration.dirty);
-                let result = self
-                    .remote
-                    .as_ref()
-                    .context("remote filesystem runtime is unavailable")?
-                    .close(&registration.handle, dirty.to_vec());
-                if result.is_ok() {
-                    dirty.clear();
-                }
-                return result;
-            }
-            self.commit_open_file(descriptor, open, true)
-        })();
+        let result = open.managed().finish(self, descriptor, open);
         if result.is_err() {
             open.finished.store(false, Ordering::Release);
         }
@@ -1669,31 +1554,10 @@ impl FilesystemHookRuntime {
         }
     }
 
-    fn commit_local_open_file_locked(
-        &self,
-        descriptor: libc::c_int,
-        open: &OpenFile,
-        registration: &LocalRegistration,
-        durable: bool,
-    ) -> Result<()> {
-        let local = self
-            .local
-            .as_ref()
-            .context("local filesystem runtime is unavailable")?;
-        let mut dirty = lock(&registration.dirty);
-        local.sync(&registration.handle, dirty.to_vec(), durable)?;
-        dirty.clear();
-        if descriptor >= 0 {
-            self.refresh_open_attributes(descriptor, open)
-        } else {
-            Ok(())
-        }
-    }
-
     fn refresh_attributes(&self, descriptor: libc::c_int, path: &str) -> Result<()> {
         if self
             .tracked_open(descriptor)
-            .is_some_and(|open| open.remote.is_some())
+            .is_some_and(|open| open.manages_metadata())
         {
             return Ok(());
         }
@@ -1966,11 +1830,10 @@ impl FilesystemHookRuntime {
         let Some(open) = self.tracked_open(descriptor) else {
             return Ok(None);
         };
-        let Some(registration) = &open.remote else {
+        if !open.manages_metadata() {
             return Ok(None);
-        };
-        if lock(&registration.metadata).file_type != crate::nfs::protocol::RemoteFileType::Directory
-        {
+        }
+        if !open.managed_is_directory() {
             return Err(io::Error::from_raw_os_error(libc::ENOTDIR).into());
         }
         let remote = self
@@ -2374,6 +2237,7 @@ fn configure_descriptor(
     Ok(())
 }
 
+mod content;
 mod data;
 mod descriptor;
 mod directory;
