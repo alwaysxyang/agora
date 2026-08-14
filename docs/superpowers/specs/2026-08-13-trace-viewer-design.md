@@ -157,6 +157,12 @@ The page keeps the demonstrated two-column layout:
 - The header shows sandbox status, terminal state, active root trace, and elapsed time.
 - Event filters, free-text search, and a “show close events” toggle control noisy traces without
   deleting or rewriting source records.
+- The timeline follows the newest visible event while it is already at, or within 24 pixels of, the
+  bottom.
+  Scrolling upward pauses that follow behavior so incoming records do not interrupt inspection of
+  older activity. Returning within the same 24-pixel threshold resumes following automatically.
+  Initial snapshots start at the newest visible event, and timeline re-renders preserve the user's
+  paused `scrollTop` position.
 - Selecting an event opens a structured detail panel. Raw JSON is available as an explicit secondary
   view for technical diagnosis.
 - Network rows prefer `domain:port` and fall back to `IP:port`. They never imply that the full URL or
@@ -234,7 +240,10 @@ Clippy, test, and coverage requirements.
 - A sandbox smoke test uses a real `agora-sandbox` binary to start Bash, execute a descendant command,
   open a fixture file, make a local TCP request, and confirm the three corresponding timeline types.
 - Browser verification checks xterm rendering, keyboard input, terminal resize, event filtering,
-  detail expansion, process exit, and reconnect behavior at the supported desktop viewport.
+  detail expansion, smart timeline following, paused historical inspection, process exit, and
+  reconnect behavior at the supported desktop viewport.
+- A focused browser-logic test covers bottom detection and verifies that follow mode selects the
+  newest scroll position while paused mode retains the previous position.
 - Dependency licenses and the absence of runtime CDN references are checked before delivery.
 
 Adding the workspace crate changes the documented project module inventory. The implementation must
@@ -250,7 +259,9 @@ The first version is complete when all of the following are true:
 2. The page provides a functional interactive Bash terminal inside `agora-sandbox` and can run
    terminal-oriented programs such as `codex`.
 3. Descendant execution, logical file access, and network destinations appear live in one timeline
-   using only fields present in the existing sandbox log.
+   using only fields present in the existing sandbox log. The timeline follows new events until the
+   user scrolls upward, preserves that historical reading position while paused, and resumes
+   following when the user returns to the bottom.
 4. Ctrl-C, terminal resize, shell exit, restart, viewer shutdown, and browser refresh have defined and
    verified behavior.
 5. Requests without the startup token or with an invalid Host or Origin cannot read or control the

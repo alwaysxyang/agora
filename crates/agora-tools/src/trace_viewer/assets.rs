@@ -6,6 +6,7 @@ use axum::routing::get;
 const INDEX: &str = include_str!("../../web/index.html");
 const APP_CSS: &str = include_str!("../../web/app.css");
 const APP_JS: &str = include_str!("../../web/app.js");
+const TIMELINE_FOLLOW_JS: &str = include_str!("../../web/timeline-follow.js");
 const XTERM_JS: &str = include_str!("../../third-party/xterm/xterm.js");
 const XTERM_CSS: &str = include_str!("../../third-party/xterm/xterm.css");
 const FIT_JS: &str = include_str!("../../third-party/xterm-addon-fit/addon-fit.js");
@@ -28,6 +29,10 @@ where
         .route(
             "/app.js",
             get(|| async { asset(APP_JS, "text/javascript; charset=utf-8") }),
+        )
+        .route(
+            "/timeline-follow.js",
+            get(|| async { asset(TIMELINE_FOLLOW_JS, "text/javascript; charset=utf-8") }),
         )
         .route(
             "/vendor/xterm.js",
@@ -84,6 +89,7 @@ mod tests {
             ("/", "text/html"),
             ("/app.css", "text/css"),
             ("/app.js", "text/javascript"),
+            ("/timeline-follow.js", "text/javascript"),
             ("/vendor/xterm.js", "text/javascript"),
             ("/vendor/xterm.css", "text/css"),
             ("/vendor/addon-fit.js", "text/javascript"),
@@ -129,6 +135,7 @@ mod tests {
     fn application_assets_are_local_only_and_vendor_licenses_are_retained() {
         let application = concat!(
             include_str!("../../web/index.html"),
+            include_str!("../../web/timeline-follow.js"),
             include_str!("../../web/app.js")
         );
         assert!(!application.contains("http://"));
@@ -144,5 +151,18 @@ mod tests {
             include_str!("../../third-party/xterm-addon-fit/LICENSE")
                 .contains("Permission is hereby granted")
         );
+    }
+
+    #[test]
+    fn timeline_follow_helper_loads_before_the_application_and_is_wired() {
+        let index = include_str!("../../web/index.html");
+        let helper = r#"<script defer src="/timeline-follow.js"></script>"#;
+        let application = r#"<script defer src="/app.js"></script>"#;
+        assert!(index.find(helper).unwrap() < index.find(application).unwrap());
+
+        let app = include_str!("../../web/app.js");
+        assert!(app.contains("timelineFollowing: true"));
+        assert!(app.contains("timelineFollow.isAtBottom(elements.timeline)"));
+        assert!(app.contains("timelineFollow.restoreAfterRender("));
     }
 }

@@ -29,6 +29,7 @@
     detailRaw: document.querySelector("#detail-raw"),
     closeDetail: document.querySelector("#close-detail"),
   };
+  const timelineFollow = window.AgoraTimelineFollow;
 
   const fragment = new URLSearchParams(window.location.hash.slice(1));
   const fragmentToken = fragment.get("token");
@@ -95,6 +96,7 @@
     terminalTruncated: false,
     selectedKey: null,
     filters: new Set(["exec", "file", "network"]),
+    timelineFollowing: true,
     startedAt: null,
   };
 
@@ -310,6 +312,7 @@
   }
 
   function renderTimeline() {
+    const previousScrollTop = elements.timeline.scrollTop;
     const events = visibleEvents();
     const fragmentNode = document.createDocumentFragment();
     if (events.length === 0) {
@@ -330,6 +333,7 @@
       }
     }
     elements.timeline.replaceChildren(fragmentNode);
+    timelineFollow.restoreAfterRender(elements.timeline, state.timelineFollowing, previousScrollTop);
   }
 
   function createRootDivider(rootTraceId) {
@@ -468,6 +472,10 @@
 
   const resizeObserver = new ResizeObserver(() => window.requestAnimationFrame(fitTerminal));
   resizeObserver.observe(elements.terminalHost);
+
+  elements.timeline.addEventListener("scroll", () => {
+    state.timelineFollowing = timelineFollow.isAtBottom(elements.timeline);
+  });
 
   document.querySelectorAll(".filter-chip").forEach((button) => {
     button.addEventListener("click", () => {
