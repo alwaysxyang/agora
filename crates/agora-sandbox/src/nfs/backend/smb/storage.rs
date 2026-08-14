@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -39,13 +40,15 @@ const FILE_RENAME_INFORMATION: u8 = 10;
 const FILE_DISPOSITION_INFORMATION: u8 = 13;
 const TRANSFER_CHUNK_SIZE: usize = 64 * 1024;
 const WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const SMB_SESSION_POOL_SIZE: usize = 4;
 
 struct SmbStorage {
-    roots: Vec<Mutex<SmbRoot>>,
+    roots: Vec<SmbRoot>,
 }
 
 pub(super) struct SmbFileHandle {
     root: u32,
+    slot: usize,
     generation: u64,
     file_id: FileId,
     size: u64,
@@ -60,42 +63,34 @@ pub(in crate::nfs) fn configured_storage(
 impl SmbStorage {
     fn new(remotes: &[SmbRemoteConfig]) -> Self {
         Self {
-            roots: remotes
-                .iter()
-                .cloned()
-                .map(SmbRoot::new)
-                .map(Mutex::new)
-                .collect(),
+            roots: remotes.iter().cloned().map(SmbRoot::new).collect(),
         }
     }
 
-    async fn root_by_index(
-        &self,
-        root: u32,
-    ) -> StorageResult<tokio::sync::MutexGuard<'_, SmbRoot>> {
-        let root = self
-            .roots
+    fn root_by_index(&self, root: u32) -> StorageResult<&SmbRoot> {
+        self.roots
             .get(root as usize)
-            .ok_or_else(|| StorageError::new(libc::EINVAL, "unknown SMB root"))?;
-        Ok(root.lock().await)
+            .ok_or_else(|| StorageError::new(libc::EINVAL, "unknown SMB root"))
     }
 
-    async fn root(&self, path: &RemotePath) -> StorageResult<tokio::sync::MutexGuard<'_, SmbRoot>> {
-        self.root_by_index(path.root()).await
+    fn root(&self, path: &RemotePath) -> StorageResult<&SmbRoot> {
+        self.root_by_index(path.root())
     }
 
-    async fn file_root(
+    async fn file_slot(
         &self,
         handle: &SmbFileHandle,
-    ) -> StorageResult<tokio::sync::MutexGuard<'_, SmbRoot>> {
-        let root = self.root_by_index(handle.root).await?;
-        if root.generation != handle.generation || root.session.is_none() {
+    ) -> StorageResult<tokio::sync::OwnedMutexGuard<SmbSlot>> {
+        let root = self.root_by_index(handle.root)?;
+        let slot = root.slot(handle.slot)?;
+        let slot = slot.lock_owned().await;
+        if slot.generation != handle.generation || slot.session.is_none() {
             return Err(StorageError::new(
                 libc::ESTALE,
                 "SMB file handle belongs to an expired session",
             ));
         }
-        Ok(root)
+        Ok(slot)
     }
 }
 
@@ -104,14 +99,17 @@ impl RemoteStorage for SmbStorage {
 
     async fn reset(&self, root: u32) {
         if let Some(root) = self.roots.get(root as usize) {
-            root.lock().await.invalidate_session();
+            for slot in &root.slots {
+                slot.lock().await.invalidate_session();
+            }
         }
     }
 
     async fn connect(&self, root: u32) -> StorageResult<()> {
-        let mut root = self.root_by_index(root).await?;
+        let root = self.root_by_index(root)?;
         let remote_path = root.config.remote_path().to_string();
-        let session = root.session().await?;
+        let mut slot = root.slot(0)?.lock_owned().await;
+        let session = slot.session(&root.config).await?;
         if remote_path.is_empty() {
             return Ok(());
         }
@@ -121,17 +119,19 @@ impl RemoteStorage for SmbStorage {
 
     async fn stat(&self, path: &RemotePath) -> StorageResult<RemoteMetadata> {
         ensure_public_path(path)?;
-        let mut root = self.root(path).await?;
+        let root = self.root(path)?;
         let remote = root.path(path);
+        let (_, slot) = root.next_slot();
+        let mut slot = slot.lock_owned().await;
         for attempt in 0..2 {
             let result = {
-                let session = root.session().await?;
+                let session = slot.session(&root.config).await?;
                 stat_locked_path(session, &remote)
                     .await
                     .map_err(storage_error)
             };
             if attempt == 0 && result.as_ref().is_err_and(is_connection_failure) {
-                root.invalidate_session();
+                slot.invalidate_session();
                 continue;
             }
             return result;
@@ -178,11 +178,13 @@ impl RemoteStorage for SmbStorage {
             desired |= FileAccessMask::FILE_WRITE_ATTRIBUTES;
             desired |= FileAccessMask::FILE_WRITE_DATA;
         }
-        let mut root = self.root(path).await?;
+        let root = self.root(path)?;
         let remote = root.path(path);
+        let (slot_index, slot) = root.next_slot();
+        let mut slot = slot.lock_owned().await;
         for attempt in 0..2 {
             let result = {
-                let session = root.session().await?;
+                let session = slot.session(&root.config).await?;
                 open_direct_handle(session, &remote, disposition, FileAccessMask::new(desired))
                     .await
                     .map_err(storage_error)
@@ -194,7 +196,8 @@ impl RemoteStorage for SmbStorage {
                     return Ok((
                         SmbFileHandle {
                             root: path.root(),
-                            generation: root.generation,
+                            slot: slot_index,
+                            generation: slot.generation,
                             file_id: opened.file_id,
                             size: metadata.size,
                         },
@@ -203,7 +206,7 @@ impl RemoteStorage for SmbStorage {
                     ));
                 }
                 Err(error) if attempt == 0 && is_connection_failure(&error) => {
-                    root.invalidate_session();
+                    slot.invalidate_session();
                 }
                 Err(error) => return Err(error),
             }
@@ -218,9 +221,9 @@ impl RemoteStorage for SmbStorage {
         length: u32,
         destination: &mut File,
     ) -> StorageResult<u32> {
-        let mut root = self.file_root(handle).await?;
+        let mut slot = self.file_slot(handle).await?;
         let result = read_handle_at(
-            root.session
+            slot.session
                 .as_mut()
                 .expect("validated SMB handle has an active session"),
             handle.file_id,
@@ -229,7 +232,7 @@ impl RemoteStorage for SmbStorage {
             destination,
         )
         .await;
-        root.finish_file_operation(result.map_err(storage_error))
+        slot.finish_file_operation(result.map_err(storage_error))
     }
 
     async fn write_at(
@@ -242,9 +245,9 @@ impl RemoteStorage for SmbStorage {
         source
             .seek(SeekFrom::Start(0))
             .map_err(|error| storage_error(error.into()))?;
-        let mut root = self.file_root(handle).await?;
+        let mut slot = self.file_slot(handle).await?;
         let result = write_handle_at(
-            root.session
+            slot.session
                 .as_mut()
                 .expect("validated SMB handle has an active session"),
             handle.file_id,
@@ -254,15 +257,15 @@ impl RemoteStorage for SmbStorage {
         )
         .await
         .map_err(storage_error);
-        let written = root.finish_file_operation(result)?;
+        let written = slot.finish_file_operation(result)?;
         handle.size = handle.size.max(offset.saturating_add(u64::from(written)));
         Ok((written, handle.size))
     }
 
     async fn set_length(&self, handle: &mut Self::FileHandle, length: u64) -> StorageResult<u64> {
-        let mut root = self.file_root(handle).await?;
+        let mut slot = self.file_slot(handle).await?;
         let result = set_handle_length(
-            root.session
+            slot.session
                 .as_mut()
                 .expect("validated SMB handle has an active session"),
             handle.file_id,
@@ -270,14 +273,14 @@ impl RemoteStorage for SmbStorage {
         )
         .await
         .map_err(storage_error);
-        root.finish_file_operation(result)?;
+        slot.finish_file_operation(result)?;
         handle.size = length;
         Ok(length)
     }
 
     async fn flush_file(&self, handle: &mut Self::FileHandle) -> StorageResult<RemoteMetadata> {
-        let mut root = self.file_root(handle).await?;
-        let session = root
+        let mut slot = self.file_slot(handle).await?;
+        let session = slot
             .session
             .as_mut()
             .expect("validated SMB handle has an active session");
@@ -287,30 +290,30 @@ impl RemoteStorage for SmbStorage {
         }
         .await
         .map_err(storage_error);
-        let metadata = root.finish_file_operation(result)?;
+        let metadata = slot.finish_file_operation(result)?;
         handle.size = metadata.size;
         Ok(metadata)
     }
 
     async fn file_metadata(&self, handle: &mut Self::FileHandle) -> StorageResult<RemoteMetadata> {
-        let mut root = self.file_root(handle).await?;
+        let mut slot = self.file_slot(handle).await?;
         let result = query_handle_metadata(
-            root.session
+            slot.session
                 .as_mut()
                 .expect("validated SMB handle has an active session"),
             handle.file_id,
         )
         .await
         .map_err(storage_error);
-        let metadata = root.finish_file_operation(result)?;
+        let metadata = slot.finish_file_operation(result)?;
         handle.size = metadata.size;
         Ok(metadata)
     }
 
     async fn close_file(&self, handle: &mut Self::FileHandle) -> StorageResult<()> {
-        let mut root = self.file_root(handle).await?;
+        let mut slot = self.file_slot(handle).await?;
         let result = close_handle(
-            root.session
+            slot.session
                 .as_mut()
                 .expect("validated SMB handle has an active session"),
             handle.file_id,
@@ -319,7 +322,7 @@ impl RemoteStorage for SmbStorage {
         .await
         .map(|_| ())
         .map_err(storage_error);
-        match root.finish_file_operation(result) {
+        match slot.finish_file_operation(result) {
             Err(error) if is_connection_failure(&error) => {
                 // Dropping the failed session releases all of its server-side
                 // handles. A lost CLOSE response is therefore locally complete
@@ -336,8 +339,8 @@ impl RemoteStorage for SmbStorage {
         destination: &mut File,
         max_length: u64,
     ) -> StorageResult<RemoteMetadata> {
-        let mut root = self.file_root(handle).await?;
-        let session = root
+        let mut slot = self.file_slot(handle).await?;
+        let session = slot
             .session
             .as_mut()
             .expect("validated SMB handle has an active session");
@@ -355,7 +358,7 @@ impl RemoteStorage for SmbStorage {
         }
         .await
         .map_err(storage_error);
-        let metadata = root.finish_file_operation(result)?;
+        let metadata = slot.finish_file_operation(result)?;
         handle.size = metadata.size;
         Ok(metadata)
     }
@@ -368,16 +371,18 @@ impl RemoteStorage for SmbStorage {
         length: u64,
     ) -> StorageResult<RemoteMetadata> {
         ensure_public_path(path)?;
-        let mut root = self.root(path).await?;
+        let root = self.root(path)?;
         let remote = root.path(path);
+        let (_, slot) = root.next_slot();
+        let mut slot = slot.lock_owned().await;
         let mut operation = WriteOperation::new(&remote);
         for attempt in 0..2 {
             let result = {
-                let session = root.session().await?;
+                let session = slot.session(&root.config).await?;
                 write_locked_file(session, &remote, expected, source, length, &mut operation).await
             };
             if attempt == 0 && result.as_ref().is_err_and(is_connection_failure) {
-                root.invalidate_session();
+                slot.invalidate_session();
                 continue;
             }
             return result;
@@ -391,8 +396,10 @@ impl RemoteStorage for SmbStorage {
         emit: &mut (impl FnMut(RemoteEntry) -> StorageResult<()> + Send),
     ) -> StorageResult<()> {
         ensure_public_path(path)?;
-        let mut root = self.root(path).await?;
+        let root = self.root(path)?;
         let remote = root.path(path);
+        let (_, slot) = root.next_slot();
+        let mut slot = slot.lock_owned().await;
         for attempt in 0..2 {
             let mut emitted = 0_usize;
             let result = {
@@ -401,15 +408,15 @@ impl RemoteStorage for SmbStorage {
                     emitted += 1;
                     Ok(())
                 };
-                let session = root.session().await?;
+                let session = slot.session(&root.config).await?;
                 list_directory_stream(session, &remote, &mut counting_emit).await
             };
             if attempt == 0 && emitted == 0 && result.as_ref().is_err_and(is_connection_failure) {
-                root.invalidate_session();
+                slot.invalidate_session();
                 continue;
             }
             if result.as_ref().is_err_and(is_connection_failure) {
-                root.invalidate_session();
+                slot.invalidate_session();
             }
             return result;
         }
@@ -418,28 +425,35 @@ impl RemoteStorage for SmbStorage {
 
     async fn create_directory(&self, path: &RemotePath) -> StorageResult<()> {
         ensure_public_path(path)?;
-        let mut root = self.root(path).await?;
+        let root = self.root(path)?;
         let remote = root.path(path);
-        let session = root.session().await?;
-        session
+        let (_, slot) = root.next_slot();
+        let mut slot = slot.lock_owned().await;
+        let result = slot
+            .session(&root.config)
+            .await?
             .create_directory(&remote)
             .await
-            .map_err(storage_error)
+            .map_err(storage_error);
+        slot.finish_file_operation(result)
     }
 
     async fn remove(&self, path: &RemotePath, directory: bool) -> StorageResult<()> {
         ensure_public_path(path)?;
-        let mut root = self.root(path).await?;
+        let root = self.root(path)?;
         let remote = root.path(path);
-        let session = root.session().await?;
-        if directory {
+        let (_, slot) = root.next_slot();
+        let mut slot = slot.lock_owned().await;
+        let session = slot.session(&root.config).await?;
+        let result = if directory {
             session
                 .delete_directory(&remote)
                 .await
                 .map_err(storage_error)
         } else {
             session.delete_file(&remote).await.map_err(storage_error)
-        }
+        };
+        slot.finish_file_operation(result)
     }
 
     async fn rename(&self, from: &RemotePath, to: &RemotePath) -> StorageResult<()> {
@@ -448,19 +462,21 @@ impl RemoteStorage for SmbStorage {
         }
         ensure_public_path(from)?;
         ensure_public_path(to)?;
-        let mut root = self.root(from).await?;
+        let root = self.root(from)?;
         let from = root.path(from);
         let to = root.path(to);
+        let (_, slot) = root.next_slot();
+        let mut slot = slot.lock_owned().await;
         let mut source_attempt = 0;
         let source = loop {
             let result = {
-                let session = root.session().await?;
+                let session = slot.session(&root.config).await?;
                 stat_locked_path(session, &from)
                     .await
                     .map_err(storage_error)
             };
             if source_attempt == 0 && result.as_ref().is_err_and(is_connection_failure) {
-                root.invalidate_session();
+                slot.invalidate_session();
                 source_attempt += 1;
                 continue;
             }
@@ -468,15 +484,15 @@ impl RemoteStorage for SmbStorage {
         };
         for attempt in 0..2 {
             let result = {
-                let session = root.session().await?;
+                let session = slot.session(&root.config).await?;
                 rename_replacing(session, &from, &to)
                     .await
                     .map_err(storage_error)
             };
             if attempt == 0 && result.as_ref().is_err_and(is_connection_failure) {
-                root.invalidate_session();
+                slot.invalidate_session();
                 let resolved = {
-                    let session = root.session().await?;
+                    let session = slot.session(&root.config).await?;
                     resolve_ambiguous_rename(session, &from, &to, &source).await
                 };
                 match resolved {
@@ -1557,6 +1573,11 @@ fn stale_file() -> StorageError {
 
 struct SmbRoot {
     config: SmbRemoteConfig,
+    slots: Vec<Arc<Mutex<SmbSlot>>>,
+    next_slot: AtomicUsize,
+}
+
+struct SmbSlot {
     session: Option<SmbSession>,
     generation: u64,
 }
@@ -1565,23 +1586,59 @@ impl SmbRoot {
     fn new(config: SmbRemoteConfig) -> Self {
         Self {
             config,
-            session: None,
-            generation: 0,
+            slots: (0..SMB_SESSION_POOL_SIZE)
+                .map(|_| Arc::new(Mutex::new(SmbSlot::new())))
+                .collect(),
+            next_slot: AtomicUsize::new(0),
         }
+    }
+
+    #[cfg(test)]
+    fn with_slots(config: SmbRemoteConfig, slots: Vec<SmbSlot>) -> Self {
+        assert!(!slots.is_empty());
+        Self {
+            config,
+            slots: slots
+                .into_iter()
+                .map(|slot| Arc::new(Mutex::new(slot)))
+                .collect(),
+            next_slot: AtomicUsize::new(0),
+        }
+    }
+
+    fn slot(&self, index: usize) -> StorageResult<Arc<Mutex<SmbSlot>>> {
+        self.slots
+            .get(index)
+            .cloned()
+            .ok_or_else(|| StorageError::new(libc::EINVAL, "unknown SMB session slot"))
+    }
+
+    fn next_slot(&self) -> (usize, Arc<Mutex<SmbSlot>>) {
+        let index = self.next_slot.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        (index, Arc::clone(&self.slots[index]))
     }
 
     fn path(&self, path: &RemotePath) -> String {
         remote_path(self.config.remote_path(), path)
     }
+}
 
-    async fn session(&mut self) -> StorageResult<&mut SmbSession> {
+impl SmbSlot {
+    fn new() -> Self {
+        Self {
+            session: None,
+            generation: 0,
+        }
+    }
+
+    async fn session(&mut self, config: &SmbRemoteConfig) -> StorageResult<&mut SmbSession> {
         if self.session.is_none() {
             let mut client = SmbClient::connect(ClientConfig {
-                addr: self.config.server().to_string(),
+                addr: config.server().to_string(),
                 timeout: Duration::from_secs(5),
-                username: self.config.username().to_string(),
-                password: self.config.password().to_string(),
-                domain: self.config.domain().to_string(),
+                username: config.username().to_string(),
+                password: config.password().to_string(),
+                domain: config.domain().to_string(),
                 auto_reconnect: true,
                 compression: true,
                 dfs_enabled: true,
@@ -1590,7 +1647,7 @@ impl SmbRoot {
             .await
             .map_err(storage_error)?;
             let tree = client
-                .connect_share(self.config.share())
+                .connect_share(config.share())
                 .await
                 .map_err(storage_error)?;
             self.generation = self.generation.wrapping_add(1);

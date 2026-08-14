@@ -1,4 +1,4 @@
-use super::super::{SmbRoot, SmbSession, SmbStorage, open_direct_handle};
+use super::super::{SmbRoot, SmbSession, SmbSlot, SmbStorage, open_direct_handle};
 use crate::nfs::SmbRemoteConfig;
 use crate::nfs::backend::RemoteStorage;
 use crate::nfs::protocol::{RemoteFileType, RemotePath};
@@ -22,7 +22,7 @@ use smb2::types::{Command, FileId, OplockLevel, TreeId};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::time::Duration;
 
 fn response(command: Command, body: &dyn Pack) -> Vec<u8> {
     response_with_status(command, NtStatus::SUCCESS, body)
@@ -170,13 +170,40 @@ async fn storage(remote_path: &str) -> (SmbStorage, Arc<MockTransport>) {
     };
     (
         SmbStorage {
-            roots: vec![Mutex::new(SmbRoot {
+            roots: vec![SmbRoot::with_slots(
                 config,
-                session: Some(session),
-                generation: 1,
-            })],
+                vec![SmbSlot {
+                    session: Some(session),
+                    generation: 1,
+                }],
+            )],
         },
         mock,
+    )
+}
+
+async fn storage_with_two_slots() -> (SmbStorage, Arc<MockTransport>, Arc<MockTransport>) {
+    let (first_session, first_mock) = session().await;
+    let (second_session, second_mock) = session().await;
+    let config = SmbRemoteConfig::new("/remote", "test-server", "share").unwrap();
+    (
+        SmbStorage {
+            roots: vec![SmbRoot::with_slots(
+                config,
+                vec![
+                    SmbSlot {
+                        session: Some(first_session),
+                        generation: 1,
+                    },
+                    SmbSlot {
+                        session: Some(second_session),
+                        generation: 1,
+                    },
+                ],
+            )],
+        },
+        first_mock,
+        second_mock,
     )
 }
 
@@ -372,6 +399,179 @@ async fn directory_listing_streams_multiple_pages_and_closes_the_handle() {
     assert_eq!(entries[1].name, "nested");
     assert_eq!(entries[1].metadata.file_type, RemoteFileType::Directory);
     mock.assert_fully_consumed();
+}
+
+#[tokio::test]
+async fn independent_path_operation_does_not_wait_for_a_busy_smb_session() {
+    let (storage, first_mock, second_mock) = storage_with_two_slots().await;
+    let storage = Arc::new(storage);
+    second_mock.queue_responses(vec![
+        create_response(file_id(55), 4, CreateAction::FileOpened),
+        query_info_response(550_u64.to_le_bytes().to_vec()),
+        close_response(4),
+    ]);
+    let busy_slot = storage.roots[0].slot(0).unwrap();
+    let busy_session = busy_slot.lock_owned().await;
+    let blocked_storage = Arc::clone(&storage);
+    let blocked = tokio::spawn(async move {
+        blocked_storage
+            .stat(&RemotePath::new(0, "blocked.txt").unwrap())
+            .await
+    });
+    while storage.roots[0]
+        .next_slot
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == 0
+    {
+        tokio::task::yield_now().await;
+    }
+
+    let metadata = tokio::time::timeout(
+        Duration::from_millis(500),
+        storage.stat(&RemotePath::new(0, "independent.txt").unwrap()),
+    )
+    .await
+    .expect("an independent SMB path operation waited for the busy session")
+    .unwrap();
+
+    assert_eq!(metadata.size, 4);
+    blocked.abort();
+    drop(busy_session);
+    first_mock.assert_fully_consumed();
+    second_mock.assert_fully_consumed();
+}
+
+#[tokio::test]
+async fn open_file_handles_remain_pinned_to_their_smb_session_slot() {
+    let (storage, first_mock, second_mock) = storage_with_two_slots().await;
+    let first_path = RemotePath::new(0, "first.txt").unwrap();
+    let second_path = RemotePath::new(0, "second.txt").unwrap();
+    first_mock.queue_responses(vec![
+        create_response(file_id(56), 1, CreateAction::FileOpened),
+        query_info_response(560_u64.to_le_bytes().to_vec()),
+    ]);
+    second_mock.queue_responses(vec![
+        create_response(file_id(57), 1, CreateAction::FileOpened),
+        query_info_response(570_u64.to_le_bytes().to_vec()),
+    ]);
+    let (_first, _, _) = storage
+        .open_file(&first_path, libc::O_RDONLY, 0)
+        .await
+        .unwrap();
+    let (mut second, _, _) = storage
+        .open_file(&second_path, libc::O_RDONLY, 0)
+        .await
+        .unwrap();
+    second_mock.queue_response(response(
+        Command::Read,
+        &ReadResponse {
+            data_offset: 0x50,
+            data_remaining: 0,
+            flags: 0,
+            data: b"x".to_vec(),
+        },
+    ));
+    let busy_slot = storage.roots[0].slot(0).unwrap();
+    let busy_session = busy_slot.lock_owned().await;
+    let mut destination = tempfile::tempfile().unwrap();
+
+    let read = tokio::time::timeout(
+        Duration::from_millis(500),
+        storage.read_at(&mut second, 0, 1, &mut destination),
+    )
+    .await
+    .expect("the second handle used the busy first session slot")
+    .unwrap();
+
+    assert_eq!(read, 1);
+    drop(busy_session);
+    first_mock.assert_fully_consumed();
+    second_mock.assert_fully_consumed();
+}
+
+#[tokio::test]
+async fn resetting_an_smb_root_expires_handles_from_every_session_slot() {
+    let (storage, first_mock, second_mock) = storage_with_two_slots().await;
+    let first_path = RemotePath::new(0, "first.txt").unwrap();
+    let second_path = RemotePath::new(0, "second.txt").unwrap();
+    first_mock.queue_responses(vec![
+        create_response(file_id(58), 1, CreateAction::FileOpened),
+        query_info_response(580_u64.to_le_bytes().to_vec()),
+    ]);
+    second_mock.queue_responses(vec![
+        create_response(file_id(59), 1, CreateAction::FileOpened),
+        query_info_response(590_u64.to_le_bytes().to_vec()),
+    ]);
+    let (mut first, _, _) = storage
+        .open_file(&first_path, libc::O_RDONLY, 0)
+        .await
+        .unwrap();
+    let (mut second, _, _) = storage
+        .open_file(&second_path, libc::O_RDONLY, 0)
+        .await
+        .unwrap();
+
+    storage.reset(0).await;
+
+    let mut destination = tempfile::tempfile().unwrap();
+    super::assert_errno(
+        storage.read_at(&mut first, 0, 1, &mut destination).await,
+        libc::ESTALE,
+    );
+    super::assert_errno(
+        storage.read_at(&mut second, 0, 1, &mut destination).await,
+        libc::ESTALE,
+    );
+    first_mock.assert_fully_consumed();
+    second_mock.assert_fully_consumed();
+}
+
+#[tokio::test]
+async fn reconnecting_one_smb_slot_does_not_expire_another_slots_handle() {
+    let (storage, first_mock, second_mock) = storage_with_two_slots().await;
+    let first_path = RemotePath::new(0, "first.txt").unwrap();
+    let second_path = RemotePath::new(0, "second.txt").unwrap();
+    first_mock.queue_responses(vec![
+        create_response(file_id(60), 1, CreateAction::FileOpened),
+        query_info_response(600_u64.to_le_bytes().to_vec()),
+    ]);
+    second_mock.queue_responses(vec![
+        create_response(file_id(61), 1, CreateAction::FileOpened),
+        query_info_response(610_u64.to_le_bytes().to_vec()),
+    ]);
+    let (mut first, _, _) = storage
+        .open_file(&first_path, libc::O_RDONLY, 0)
+        .await
+        .unwrap();
+    let (mut second, _, _) = storage
+        .open_file(&second_path, libc::O_RDONLY, 0)
+        .await
+        .unwrap();
+    storage.roots[0].slots[0].lock().await.invalidate_session();
+    second_mock.queue_response(response(
+        Command::Read,
+        &ReadResponse {
+            data_offset: 0x50,
+            data_remaining: 0,
+            flags: 0,
+            data: b"y".to_vec(),
+        },
+    ));
+    let mut destination = tempfile::tempfile().unwrap();
+
+    super::assert_errno(
+        storage.read_at(&mut first, 0, 1, &mut destination).await,
+        libc::ESTALE,
+    );
+    assert_eq!(
+        storage
+            .read_at(&mut second, 0, 1, &mut destination)
+            .await
+            .unwrap(),
+        1
+    );
+    first_mock.assert_fully_consumed();
+    second_mock.assert_fully_consumed();
 }
 
 #[tokio::test]

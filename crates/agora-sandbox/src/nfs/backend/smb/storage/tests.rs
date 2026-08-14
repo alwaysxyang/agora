@@ -387,7 +387,7 @@ fn smb_root_and_wire_paths_keep_backend_details_inside_the_backend() {
         .with_remote_path("base/team")
         .unwrap();
     let root = SmbRoot::new(config);
-    assert!(root.session.is_none());
+    assert_eq!(root.slots.len(), super::SMB_SESSION_POOL_SIZE);
     assert_eq!(
         root.path(&RemotePath::new(0, "child.txt").unwrap()),
         "base/team/child.txt"
