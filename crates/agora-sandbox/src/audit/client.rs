@@ -140,6 +140,9 @@ impl AuditClient {
     }
 
     fn publish_regular(&self, request: &[u8]) -> Result<(), AuditError> {
+        #[cfg(target_os = "macos")]
+        let _signals =
+            crate::platform::hook::SignalMaskGuard::block().map_err(AuditError::from_io)?;
         CONNECTIONS
             .try_with(|connections| {
                 let mut connections = connections.borrow_mut();

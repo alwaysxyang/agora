@@ -56,7 +56,9 @@ thread_local! {
     static TEST_PROCESS_RUNTIME: Cell<*const ProcessHookRuntime> = const { Cell::new(std::ptr::null()) };
 }
 
-struct ProcessHookGuard;
+struct ProcessHookGuard {
+    _signals: super::SignalMaskGuard,
+}
 
 struct SpawnFileActions {
     borrowed: *const libc::posix_spawn_file_actions_t,
@@ -164,11 +166,12 @@ impl ProcessHookGuard {
     // while libSystem is still bootstrapping thread-local storage.
     #[inline(never)]
     fn enter_initialized() -> Option<Self> {
+        let signals = super::SignalMaskGuard::block_or_abort();
         INSIDE_PROCESS_HOOK.with(|inside| {
             if inside.replace(true) {
                 None
             } else {
-                Some(Self)
+                Some(Self { _signals: signals })
             }
         })
     }
@@ -738,7 +741,7 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
     let Some(original) = original_posix_spawn() else {
         return libc::ENOSYS;
     };
-    let Some(_guard) = ProcessHookGuard::enter() else {
+    let Some(guard) = ProcessHookGuard::enter() else {
         return libc::EACCES;
     };
     let remote_current_directory = match super::filesystem::prepare_child_current_directory() {
@@ -778,6 +781,7 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawn(
         Ok(file_actions) => file_actions,
         Err(error) => return error,
     };
+    drop(guard);
     unsafe {
         original(
             pid,
@@ -802,7 +806,7 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
     let Some(original) = original_posix_spawn() else {
         return libc::ENOSYS;
     };
-    let Some(_guard) = ProcessHookGuard::enter() else {
+    let Some(guard) = ProcessHookGuard::enter() else {
         return libc::EACCES;
     };
     let remote_current_directory = match super::filesystem::prepare_child_current_directory() {
@@ -842,6 +846,7 @@ pub unsafe extern "C" fn agora_sandbox_posix_spawnp(
         Ok(file_actions) => file_actions,
         Err(error) => return error,
     };
+    drop(guard);
     unsafe {
         original(
             pid,
@@ -914,7 +919,7 @@ unsafe fn execute(
         unsafe { set_errno(libc::ENOSYS) };
         return -1;
     };
-    let Some(_guard) = ProcessHookGuard::enter() else {
+    let Some(guard) = ProcessHookGuard::enter() else {
         unsafe { set_errno(libc::EACCES) };
         return -1;
     };
@@ -958,6 +963,7 @@ unsafe fn execute(
         unsafe { set_errno(error.errno) };
         return -1;
     }
+    drop(guard);
     let result = unsafe {
         original(
             prepared.program.as_ptr(),
@@ -968,6 +974,10 @@ unsafe fn execute(
     if !search_path || result != -1 || unsafe { *libc::__error() } != libc::ENOEXEC {
         return result;
     }
+    let Some(fallback_guard) = ProcessHookGuard::enter() else {
+        unsafe { set_errno(libc::EACCES) };
+        return -1;
+    };
     let shell = match runtime.prepare_executable(Path::new("/bin/sh")) {
         Ok(shell) => shell,
         Err(error) => {
@@ -981,6 +991,7 @@ unsafe fn execute(
         unsafe { set_errno(libc::EACCES) };
         return -1;
     };
+    drop(fallback_guard);
     unsafe {
         original(
             shell.program.as_ptr(),

@@ -52,15 +52,18 @@ thread_local! {
     static INSIDE_HOOK: Cell<bool> = const { Cell::new(false) };
 }
 
-struct HookGuard;
+struct HookGuard {
+    _signals: super::SignalMaskGuard,
+}
 
 impl HookGuard {
     fn enter() -> Option<Self> {
+        let signals = super::SignalMaskGuard::block_or_abort();
         INSIDE_HOOK.with(|inside| {
             if inside.replace(true) {
                 None
             } else {
-                Some(Self)
+                Some(Self { _signals: signals })
             }
         })
     }
@@ -75,6 +78,11 @@ impl Drop for HookGuard {
 struct HookRuntime {
     config: config::HookConfig,
     process: ProcessContext,
+}
+
+struct PreparedConnect {
+    request: Vec<u8>,
+    proxy: RawSocketAddress,
 }
 
 pub(super) struct ProcessContext {
@@ -124,13 +132,11 @@ impl HookRuntime {
             .as_ref()
     }
 
-    unsafe fn intercept_connect(
+    fn prepare_connect(
         &self,
-        socket: libc::c_int,
         destination: SocketAddr,
         operation: HookOperation,
-        original_connectx: ConnectxFn,
-    ) -> libc::c_int {
+    ) -> Result<PreparedConnect, ()> {
         let (connection_id, process) = self.process.snapshot();
         let request = ConnectRequest {
             protocol_version: PROTOCOL_VERSION,
@@ -141,42 +147,15 @@ impl HookRuntime {
             trace_id: self.config.trace().encode(),
             operation,
         };
-        let request = match encode_connect_request(&request) {
-            Ok(request) => request,
-            Err(_) => return unsafe { Self::deny() },
-        };
+        Ok(PreparedConnect {
+            request: encode_connect_request(&request).map_err(|_| ())?,
+            proxy: RawSocketAddress::new(self.config.proxy_for(destination)),
+        })
+    }
 
-        let proxy = RawSocketAddress::new(self.config.proxy_for(destination));
-        let endpoints = SocketEndpoints {
-            source_interface: 0,
-            source_address: std::ptr::null(),
-            source_address_length: 0,
-            destination_address: proxy.as_ptr(),
-            destination_address_length: proxy.len(),
-        };
-        let vector = libc::iovec {
-            iov_base: request.as_ptr().cast_mut().cast(),
-            iov_len: request.len(),
-        };
-        let mut bytes_written = 0;
-        let result = unsafe {
-            original_connectx(
-                socket,
-                std::ptr::addr_of!(endpoints),
-                0,
-                0,
-                std::ptr::addr_of!(vector),
-                1,
-                std::ptr::addr_of_mut!(bytes_written),
-                std::ptr::null_mut(),
-            )
-        };
-        if result == 0 && bytes_written != request.len() {
-            unsafe { libc::shutdown(socket, libc::SHUT_RDWR) };
-            unsafe { set_errno(libc::EPROTO) };
-            return -1;
-        }
-        result
+    unsafe fn deny() -> libc::c_int {
+        unsafe { set_errno(libc::EACCES) };
+        -1
     }
 
     unsafe fn intercepted_destination(
@@ -203,10 +182,40 @@ impl HookRuntime {
         }
         Ok((socket_type == libc::SOCK_STREAM).then_some(destination))
     }
+}
 
-    unsafe fn deny() -> libc::c_int {
-        unsafe { set_errno(libc::EACCES) };
-        -1
+impl PreparedConnect {
+    unsafe fn connect(self, socket: libc::c_int, original_connectx: ConnectxFn) -> libc::c_int {
+        let endpoints = SocketEndpoints {
+            source_interface: 0,
+            source_address: std::ptr::null(),
+            source_address_length: 0,
+            destination_address: self.proxy.as_ptr(),
+            destination_address_length: self.proxy.len(),
+        };
+        let vector = libc::iovec {
+            iov_base: self.request.as_ptr().cast_mut().cast(),
+            iov_len: self.request.len(),
+        };
+        let mut bytes_written = 0;
+        let result = unsafe {
+            original_connectx(
+                socket,
+                std::ptr::addr_of!(endpoints),
+                0,
+                0,
+                std::ptr::addr_of!(vector),
+                1,
+                std::ptr::addr_of_mut!(bytes_written),
+                std::ptr::null_mut(),
+            )
+        };
+        if result == 0 && bytes_written != self.request.len() {
+            unsafe { libc::shutdown(socket, libc::SHUT_RDWR) };
+            unsafe { set_errno(libc::EPROTO) };
+            return -1;
+        }
+        result
     }
 }
 
@@ -232,17 +241,25 @@ pub unsafe extern "C" fn agora_sandbox_connect(
     if !initialized() {
         return unsafe { HookRuntime::deny() };
     }
+    let Some(guard) = HookGuard::enter() else {
+        return unsafe { HookRuntime::deny() };
+    };
     let Some(runtime) = HookRuntime::global() else {
         return unsafe { HookRuntime::deny() };
     };
     let Some(connectx) = original_connectx() else {
         return unsafe { HookRuntime::deny() };
     };
-    let Some(_guard) = HookGuard::enter() else {
+    let prepared = catch_unwind(AssertUnwindSafe(|| {
+        runtime.prepare_connect(destination, HookOperation::Connect)
+    }))
+    .unwrap_or(Err(()));
+    let Ok(prepared) = prepared else {
         return unsafe { HookRuntime::deny() };
     };
+    drop(guard);
     catch_unwind(AssertUnwindSafe(|| unsafe {
-        runtime.intercept_connect(socket, destination, HookOperation::Connect, connectx)
+        prepared.connect(socket, connectx)
     }))
     .unwrap_or_else(|_| {
         unsafe { set_errno(libc::EIO) };
@@ -311,9 +328,6 @@ pub unsafe extern "C" fn agora_sandbox_connectx(
     if !initialized() {
         return unsafe { HookRuntime::deny() };
     }
-    let Some(runtime) = HookRuntime::global() else {
-        return unsafe { HookRuntime::deny() };
-    };
     let simple = association_id == 0
         && flags == 0
         && vector_count == 0
@@ -329,11 +343,22 @@ pub unsafe extern "C" fn agora_sandbox_connectx(
     if !connection_id.is_null() {
         unsafe { *connection_id = 0 };
     }
-    let Some(_guard) = HookGuard::enter() else {
+    let Some(guard) = HookGuard::enter() else {
         return unsafe { HookRuntime::deny() };
     };
+    let Some(runtime) = HookRuntime::global() else {
+        return unsafe { HookRuntime::deny() };
+    };
+    let prepared = catch_unwind(AssertUnwindSafe(|| {
+        runtime.prepare_connect(destination, HookOperation::Connectx)
+    }))
+    .unwrap_or(Err(()));
+    let Ok(prepared) = prepared else {
+        return unsafe { HookRuntime::deny() };
+    };
+    drop(guard);
     catch_unwind(AssertUnwindSafe(|| unsafe {
-        runtime.intercept_connect(socket, destination, HookOperation::Connectx, original)
+        prepared.connect(socket, original)
     }))
     .unwrap_or_else(|_| {
         unsafe { set_errno(libc::EIO) };

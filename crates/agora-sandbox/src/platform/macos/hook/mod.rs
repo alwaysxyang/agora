@@ -5,6 +5,9 @@ mod dyld;
 mod filesystem;
 mod network;
 mod process;
+mod signal;
+
+pub(crate) use signal::SignalMaskGuard;
 
 #[cfg(any(agora_sandbox_hook_build, test, coverage))]
 use std::sync::Once;
@@ -78,4 +81,4 @@ unsafe fn set_errno(value: libc::c_int) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

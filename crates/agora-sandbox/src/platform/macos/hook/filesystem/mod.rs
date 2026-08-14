@@ -156,7 +156,9 @@ unsafe fn restore_filesystem_guard_after_fork() {
     set_filesystem_barrier_read_held(true);
 }
 
-struct FilesystemHookGuard;
+struct FilesystemHookGuard {
+    _signals: super::SignalMaskGuard,
+}
 
 impl FilesystemHookGuard {
     fn enter() -> Option<Self> {
@@ -172,6 +174,7 @@ impl FilesystemHookGuard {
     // while libSystem is still bootstrapping thread-local storage.
     #[inline(never)]
     fn enter_initialized() -> Option<Self> {
+        let signals = super::SignalMaskGuard::block_or_abort();
         if FORK_IN_PROGRESS.with(|forking| forking.get()) {
             return None;
         }
@@ -184,7 +187,7 @@ impl FilesystemHookGuard {
             return None;
         }
         set_filesystem_barrier_read_held(true);
-        Some(Self)
+        Some(Self { _signals: signals })
     }
 }
 

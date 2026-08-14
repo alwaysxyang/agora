@@ -619,6 +619,57 @@ fn hook_guard_blocks_recursion_and_reopens_after_drop() {
 }
 
 #[test]
+fn network_hook_guard_blocks_catchable_signals_while_state_is_active() {
+    let signal = super::super::tests::SignalMaskProbe::unblocked(libc::SIGUSR2);
+    let guard = HookGuard::enter().unwrap();
+
+    assert!(signal.is_blocked());
+    drop(guard);
+    assert!(!signal.is_blocked());
+}
+
+unsafe extern "C" fn connectx_requiring_unblocked_signals(
+    _socket: libc::c_int,
+    _endpoints: *const SocketEndpoints,
+    _association_id: AssociationId,
+    _flags: libc::c_uint,
+    vectors: *const libc::iovec,
+    vector_count: libc::c_uint,
+    bytes_written: *mut libc::size_t,
+    _connection_id: *mut ConnectionId,
+) -> libc::c_int {
+    if super::super::tests::SignalMaskProbe::signal_is_blocked(libc::SIGUSR2) {
+        unsafe { set_errno(libc::EBUSY) };
+        return -1;
+    }
+    if vector_count == 1 && !bytes_written.is_null() {
+        unsafe { *bytes_written = (*vectors).iov_len };
+    }
+    0
+}
+
+#[test]
+fn native_connect_runs_after_network_hook_state_is_released() {
+    let signal = super::super::tests::SignalMaskProbe::unblocked(libc::SIGUSR2);
+    let runtime = runtime();
+    let destination = "203.0.113.10:443".parse().unwrap();
+    let socket = socket(libc::SOCK_STREAM);
+    let guard = HookGuard::enter().unwrap();
+    let prepared = runtime
+        .prepare_connect(destination, HookOperation::Connect)
+        .unwrap();
+
+    assert!(signal.is_blocked());
+    drop(guard);
+    assert_eq!(
+        unsafe { prepared.connect(socket, connectx_requiring_unblocked_signals) },
+        0
+    );
+    assert!(!signal.is_blocked());
+    unsafe { libc::close(socket) };
+}
+
+#[test]
 fn intercepted_destination_accepts_only_valid_stream_sockets() {
     let address = RawSocketAddress::new("203.0.113.10:443".parse().unwrap());
     let stream = socket(libc::SOCK_STREAM);
@@ -656,12 +707,10 @@ fn runtime_encodes_connect_metadata_and_rejects_short_proxy_writes() {
     SHORT_WRITE.store(false, Ordering::Relaxed);
     assert_eq!(
         unsafe {
-            runtime.intercept_connect(
-                socket,
-                destination,
-                HookOperation::Connectx,
-                recording_connectx,
-            )
+            runtime
+                .prepare_connect(destination, HookOperation::Connectx)
+                .unwrap()
+                .connect(socket, recording_connectx)
         },
         0
     );
@@ -675,12 +724,10 @@ fn runtime_encodes_connect_metadata_and_rejects_short_proxy_writes() {
     SHORT_WRITE.store(true, Ordering::Relaxed);
     assert_eq!(
         unsafe {
-            runtime.intercept_connect(
-                socket,
-                destination,
-                HookOperation::Connect,
-                recording_connectx,
-            )
+            runtime
+                .prepare_connect(destination, HookOperation::Connect)
+                .unwrap()
+                .connect(socket, recording_connectx)
         },
         -1
     );

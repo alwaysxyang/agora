@@ -116,6 +116,7 @@ where
     }
 
     pub(crate) fn transact<T>(&self, operation: impl FnOnce(&mut S) -> T) -> io::Result<T> {
+        let _signals = crate::platform::hook::SignalMaskGuard::block()?;
         let _mutex = RawMutexGuard::lock(self.mutex.get())?;
         let _process = self.lock.lock(self.slot)?;
         Ok(operation(unsafe { &mut *self.stream.get() }))

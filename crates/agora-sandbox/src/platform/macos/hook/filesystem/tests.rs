@@ -12,6 +12,7 @@ use super::directory::{
     fts_getattrlistbulk_for_test as sandbox_getattrlistbulk,
     fts_read_returns_virtual_entry_for_test,
 };
+use super::lifecycle::sandbox_fork_with;
 use super::mapping::{
     agora_sandbox_mmap as sandbox_mmap, agora_sandbox_msync as sandbox_msync,
     agora_sandbox_munmap as sandbox_munmap,
@@ -59,8 +60,8 @@ use super::{
     agora_sandbox_unlink as sandbox_unlink, agora_sandbox_unlinkat as sandbox_unlinkat,
     agora_sandbox_utimensat as sandbox_utimensat, agora_sandbox_utimes as sandbox_utimes,
     catch_filesystem_panic, configure_descriptor, error_errno, flush_at_exit, flush_before_exec,
-    intent_from_fopen_mode, sandbox_descriptor_mutation, sandbox_unsupported_path_mutation,
-    truncate_reservation, with_test_runtime,
+    intent_from_fopen_mode, sandbox_descriptor_mutation, sandbox_flock_with,
+    sandbox_unsupported_path_mutation, truncate_reservation, with_test_runtime,
 };
 use crate::audit::AuditClient;
 use crate::filesystem::{EntryState, FileAttributes, FileLayer};
@@ -2529,11 +2530,13 @@ fn full_sync_discards_stale_descriptor_aliases() {
         assert_eq!(libc::write(descriptor, b"persisted".as_ptr().cast(), 9), 9);
         let duplicate = sandbox_dup(descriptor);
         assert!(duplicate >= 0);
-
-        assert_eq!(libc::close(descriptor), 0);
-        assert!(runtime.tracked_open(descriptor).is_some());
+        let stale = libc::c_int::MAX;
+        let stale_open = runtime.tracked_open(descriptor).unwrap();
+        runtime.open_files.lock().unwrap().insert(stale, stale_open);
+        assert_eq!(sandbox_close(descriptor), 0);
+        assert!(runtime.tracked_open(stale).is_some());
         runtime.commit_all_open_files().unwrap();
-        assert!(runtime.tracked_open(descriptor).is_none());
+        assert!(runtime.tracked_open(stale).is_none());
         assert!(runtime.tracked_open(duplicate).is_some());
         assert_eq!(sandbox_close(duplicate), 0);
     });
@@ -3769,6 +3772,62 @@ fn fork_does_not_deadlock_when_the_current_thread_owns_the_filesystem_guard() {
             "fork deadlocked while the current thread held the filesystem guard"
         );
         assert_eq!(libc::WEXITSTATUS(status), 0);
+    });
+}
+
+#[test]
+fn filesystem_hook_guard_blocks_catchable_signals_while_state_is_active() {
+    let fixture = Fixture::new();
+    with_test_runtime(&fixture.runtime, || {
+        let signal = super::super::tests::SignalMaskProbe::unblocked(libc::SIGUSR2);
+        let guard = FilesystemHookGuard::enter().unwrap();
+
+        assert!(signal.is_blocked());
+        drop(guard);
+        assert!(!signal.is_blocked());
+    });
+}
+
+unsafe extern "C" fn flock_requiring_unblocked_signals(
+    _descriptor: libc::c_int,
+    _operation: libc::c_int,
+) -> libc::c_int {
+    if super::super::tests::SignalMaskProbe::signal_is_blocked(libc::SIGUSR2) {
+        -1
+    } else {
+        0
+    }
+}
+
+#[test]
+fn native_blocking_flock_runs_after_filesystem_hook_state_is_released() {
+    let fixture = Fixture::new();
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let signal = super::super::tests::SignalMaskProbe::unblocked(libc::SIGUSR2);
+
+        assert_eq!(
+            sandbox_flock_with(-1, libc::LOCK_EX, flock_requiring_unblocked_signals),
+            0
+        );
+        assert!(!signal.is_blocked());
+    });
+}
+
+unsafe extern "C" fn fork_requiring_blocked_signals() -> libc::pid_t {
+    let blocked = super::super::tests::SignalMaskProbe::signal_is_blocked(libc::SIGUSR2);
+    unsafe { *libc::__error() = if blocked { libc::EAGAIN } else { libc::EIO } };
+    -1
+}
+
+#[test]
+fn native_fork_defers_signals_until_atfork_state_is_released() {
+    let fixture = Fixture::new();
+    with_test_runtime(&fixture.runtime, || unsafe {
+        let signal = super::super::tests::SignalMaskProbe::unblocked(libc::SIGUSR2);
+
+        assert_eq!(sandbox_fork_with(fork_requiring_blocked_signals), -1);
+        assert_eq!(*libc::__error(), libc::EAGAIN);
+        assert!(!signal.is_blocked());
     });
 }
 

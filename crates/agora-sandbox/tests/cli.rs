@@ -9,6 +9,40 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+fn byte_occurrences(bytes: &[u8], needle: &[u8]) -> usize {
+    bytes
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_pty_output(
+    output: &mut std::process::ChildStdout,
+    transcript: &mut Vec<u8>,
+    needle: &[u8],
+    occurrences: usize,
+    deadline: Instant,
+) -> std::io::Result<bool> {
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match output.read(&mut chunk) {
+            Ok(0) => return Ok(byte_occurrences(transcript, needle) >= occurrences),
+            Ok(length) => transcript.extend_from_slice(&chunk[..length]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        if byte_occurrences(transcript, needle) >= occurrences {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn cli_workdir() -> PathBuf {
     std::env::temp_dir().join(format!(
         "agora-sandbox-cli-workdir-{}",
@@ -745,6 +779,120 @@ fn sandbox_cli_prompts_for_migration_keys_in_a_terminal() {
     assert!(stdout.contains("New filesystem key"), "{stdout}");
     assert!(stdout.contains("Migration progress"), "{stdout}");
     assert!(stdout.contains("5%"), "{stdout}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_cli_shell_can_execute_after_ctrl_c_interrupts_the_prompt() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().join("workdir");
+    let data = directory.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let config = write_cli_config(directory.path(), &workdir, "off", "plain", None, None);
+    let prompt = b"__AGORA_PROMPT__ ";
+    let status_prefix = b"__AGORA_TRUE_STATUS__=";
+    let logical = data.join("after-sigint.txt");
+
+    let mut process = Command::new("/usr/bin/script");
+    process
+        .arg("-q")
+        .arg("/dev/null")
+        .arg(env!("CARGO_BIN_EXE_agora-sandbox"))
+        .arg("run")
+        .arg("-c")
+        .arg(&config)
+        .arg("-e")
+        .arg("/bin/bash --noprofile --norc -i")
+        .env("PS1", std::str::from_utf8(prompt).unwrap())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = process.spawn().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
+    let flags = unsafe { libc::fcntl(output.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(output.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut transcript = Vec::new();
+    let mut wait_for = |needle: &[u8], occurrences: usize| {
+        let found =
+            wait_for_pty_output(&mut output, &mut transcript, needle, occurrences, deadline)
+                .unwrap();
+        if !found {
+            child.kill().ok();
+            child.wait().ok();
+            panic!(
+                "PTY output did not contain {:?}; transcript={}",
+                String::from_utf8_lossy(needle),
+                String::from_utf8_lossy(&transcript)
+            );
+        }
+    };
+
+    wait_for(prompt, 1);
+    input.write_all(b"stty -echo\n").unwrap();
+    wait_for(prompt, 2);
+    input.write_all(b"\x03").unwrap();
+    wait_for(prompt, 3);
+    let logical_argument = logical.to_string_lossy().into_owned();
+    let quoted_logical = shell_words::quote(&logical_argument);
+    let command = format!(
+        "printf sandboxed > {quoted_logical}; /bin/cat {quoted_logical}; /usr/bin/true; printf '__AGORA_TRUE_STATUS__=%s\\n' \"$?\"; exit\n"
+    );
+    input.write_all(command.as_bytes()).unwrap();
+    wait_for(status_prefix, 1);
+
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            panic!(
+                "interactive sandbox shell did not exit; transcript={}",
+                String::from_utf8_lossy(&transcript)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    output.read_to_end(&mut transcript).unwrap();
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+
+    assert!(
+        status.success(),
+        "status={status}; transcript={}; stderr={}",
+        String::from_utf8_lossy(&transcript),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        transcript
+            .windows(b"__AGORA_TRUE_STATUS__=0".len())
+            .any(|window| window == b"__AGORA_TRUE_STATUS__=0"),
+        "transcript={}; stderr={}",
+        String::from_utf8_lossy(&transcript),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        transcript
+            .windows(b"sandboxed".len())
+            .any(|window| window == b"sandboxed"),
+        "transcript={}; stderr={}",
+        String::from_utf8_lossy(&transcript),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(!logical.exists(), "post-SIGINT write bypassed the overlay");
 }
 
 #[cfg(target_os = "macos")]

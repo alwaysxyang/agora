@@ -139,7 +139,7 @@ impl MemoryStateIndex {
         })
     }
 
-    fn descriptor_state(&self, descriptor: libc::c_int) -> Option<bool> {
+    pub(super) fn descriptor_state(&self, descriptor: libc::c_int) -> Option<bool> {
         let Ok(descriptor) = usize::try_from(descriptor) else {
             return Some(false);
         };
@@ -486,7 +486,11 @@ unsafe fn sandbox_mmap(
         unsafe { set_errno(libc::EOVERFLOW) };
         return libc::MAP_FAILED;
     }
-    let runtime = match mmap_route(address, length, flags, descriptor) {
+    let route = {
+        let _signals = super::super::SignalMaskGuard::block_or_abort();
+        mmap_route(address, length, flags, descriptor)
+    };
+    let runtime = match route {
         MemoryRoute::Native => {
             return unsafe { original(address, length, protection, flags, descriptor, offset) };
         }
@@ -573,7 +577,11 @@ unsafe fn sandbox_msync(
         unsafe { set_errno(libc::EOVERFLOW) };
         return -1;
     };
-    let runtime = match mapping_range_route(address as usize, end) {
+    let route = {
+        let _signals = super::super::SignalMaskGuard::block_or_abort();
+        mapping_range_route(address as usize, end)
+    };
+    let runtime = match route {
         MemoryRoute::Native => return unsafe { original(address, length, flags) },
         MemoryRoute::Managed(runtime) => runtime,
         MemoryRoute::Busy => return unsafe { fail_closed_memory(-1) },
@@ -621,7 +629,11 @@ unsafe fn sandbox_munmap(address: *mut libc::c_void, length: usize) -> libc::c_i
         unsafe { set_errno(libc::EOVERFLOW) };
         return -1;
     };
-    let runtime = match mapping_range_route(address as usize, end) {
+    let route = {
+        let _signals = super::super::SignalMaskGuard::block_or_abort();
+        mapping_range_route(address as usize, end)
+    };
+    let runtime = match route {
         MemoryRoute::Native => return unsafe { original(address, length) },
         MemoryRoute::Managed(runtime) => runtime,
         MemoryRoute::Busy => return unsafe { fail_closed_memory(-1) },

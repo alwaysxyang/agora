@@ -4,6 +4,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 
 typedef uint64_t guardid_t;
 
@@ -35,6 +36,91 @@ extern int agora_sandbox_fcntl_setfl_argument(int descriptor, int flags);
 extern int agora_sandbox_fcntl_commit_setfl(int descriptor, int flags);
 extern int agora_sandbox_validate_content_fcntl(int descriptor);
 extern int agora_sandbox_lock_descriptor(int descriptor);
+extern int agora_sandbox_data_descriptor_requires_hook(int descriptor);
+extern const void *agora_sandbox_original_read(void);
+extern const void *agora_sandbox_original_pread(void);
+extern const void *agora_sandbox_original_readv(void);
+extern const void *agora_sandbox_original_preadv(void);
+extern const void *agora_sandbox_original_write(void);
+extern const void *agora_sandbox_original_pwrite(void);
+extern const void *agora_sandbox_original_writev(void);
+extern const void *agora_sandbox_original_pwritev(void);
+extern const void *agora_sandbox_original_read_nocancel(void);
+extern const void *agora_sandbox_original_pread_nocancel(void);
+extern const void *agora_sandbox_original_readv_nocancel(void);
+extern const void *agora_sandbox_original_preadv_nocancel(void);
+extern const void *agora_sandbox_original_write_nocancel(void);
+extern const void *agora_sandbox_original_pwrite_nocancel(void);
+extern const void *agora_sandbox_original_writev_nocancel(void);
+extern const void *agora_sandbox_original_pwritev_nocancel(void);
+extern ssize_t agora_sandbox_read(int descriptor, void *buffer, size_t length);
+extern ssize_t agora_sandbox_pread(
+    int descriptor,
+    void *buffer,
+    size_t length,
+    off_t offset
+);
+extern ssize_t agora_sandbox_readv(int descriptor, const struct iovec *vectors, int count);
+extern ssize_t agora_sandbox_preadv(
+    int descriptor,
+    const struct iovec *vectors,
+    int count,
+    off_t offset
+);
+extern ssize_t agora_sandbox_write(int descriptor, const void *buffer, size_t length);
+extern ssize_t agora_sandbox_pwrite(
+    int descriptor,
+    const void *buffer,
+    size_t length,
+    off_t offset
+);
+extern ssize_t agora_sandbox_writev(int descriptor, const struct iovec *vectors, int count);
+extern ssize_t agora_sandbox_pwritev(
+    int descriptor,
+    const struct iovec *vectors,
+    int count,
+    off_t offset
+);
+extern ssize_t agora_sandbox_read_nocancel(int descriptor, void *buffer, size_t length);
+extern ssize_t agora_sandbox_pread_nocancel(
+    int descriptor,
+    void *buffer,
+    size_t length,
+    off_t offset
+);
+extern ssize_t agora_sandbox_readv_nocancel(
+    int descriptor,
+    const struct iovec *vectors,
+    int count
+);
+extern ssize_t agora_sandbox_preadv_nocancel(
+    int descriptor,
+    const struct iovec *vectors,
+    int count,
+    off_t offset
+);
+extern ssize_t agora_sandbox_write_nocancel(
+    int descriptor,
+    const void *buffer,
+    size_t length
+);
+extern ssize_t agora_sandbox_pwrite_nocancel(
+    int descriptor,
+    const void *buffer,
+    size_t length,
+    off_t offset
+);
+extern ssize_t agora_sandbox_writev_nocancel(
+    int descriptor,
+    const struct iovec *vectors,
+    int count
+);
+extern ssize_t agora_sandbox_pwritev_nocancel(
+    int descriptor,
+    const struct iovec *vectors,
+    int count,
+    off_t offset
+);
 
 typedef int (*open_fn)(const char *, int, ...);
 typedef int (*openat_fn)(int, const char *, int, ...);
@@ -49,6 +135,382 @@ typedef int (*guarded_open_dprotected_fn)(
     ...
 );
 typedef int (*fcntl_fn)(int, int, ...);
+typedef ssize_t (*read_fn)(int, void *, size_t);
+typedef ssize_t (*pread_fn)(int, void *, size_t, off_t);
+typedef ssize_t (*readv_fn)(int, const struct iovec *, int);
+typedef ssize_t (*preadv_fn)(int, const struct iovec *, int, off_t);
+typedef ssize_t (*write_fn)(int, const void *, size_t);
+typedef ssize_t (*pwrite_fn)(int, const void *, size_t, off_t);
+typedef ssize_t (*writev_fn)(int, const struct iovec *, int);
+typedef ssize_t (*pwritev_fn)(int, const struct iovec *, int, off_t);
+
+static ssize_t agora_sandbox_call_native_read(
+    const void *function,
+    int descriptor,
+    void *buffer,
+    size_t length
+) {
+    if (function == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return ((read_fn)function)(descriptor, buffer, length);
+}
+
+static ssize_t agora_sandbox_call_native_readv(
+    const void *function,
+    int descriptor,
+    const struct iovec *vectors,
+    int count
+) {
+    if (function == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return ((readv_fn)function)(descriptor, vectors, count);
+}
+
+static ssize_t agora_sandbox_call_native_pread(
+    const void *function,
+    int descriptor,
+    void *buffer,
+    size_t length,
+    off_t offset
+) {
+    if (function == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return ((pread_fn)function)(descriptor, buffer, length, offset);
+}
+
+static ssize_t agora_sandbox_call_native_preadv(
+    const void *function,
+    int descriptor,
+    const struct iovec *vectors,
+    int count,
+    off_t offset
+) {
+    if (function == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return ((preadv_fn)function)(descriptor, vectors, count, offset);
+}
+
+static ssize_t agora_sandbox_call_native_write(
+    const void *function,
+    int descriptor,
+    const void *buffer,
+    size_t length
+) {
+    if (function == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return ((write_fn)function)(descriptor, buffer, length);
+}
+
+static ssize_t agora_sandbox_call_native_pwrite(
+    const void *function,
+    int descriptor,
+    const void *buffer,
+    size_t length,
+    off_t offset
+) {
+    if (function == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return ((pwrite_fn)function)(descriptor, buffer, length, offset);
+}
+
+static ssize_t agora_sandbox_call_native_writev(
+    const void *function,
+    int descriptor,
+    const struct iovec *vectors,
+    int count
+) {
+    if (function == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return ((writev_fn)function)(descriptor, vectors, count);
+}
+
+static ssize_t agora_sandbox_call_native_pwritev(
+    const void *function,
+    int descriptor,
+    const struct iovec *vectors,
+    int count,
+    off_t offset
+) {
+    if (function == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return ((pwritev_fn)function)(descriptor, vectors, count, offset);
+}
+
+ssize_t agora_sandbox_read_shim(int descriptor, void *buffer, size_t length) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_read(descriptor, buffer, length);
+    }
+    return agora_sandbox_call_native_read(
+        agora_sandbox_original_read(),
+        descriptor,
+        buffer,
+        length
+    );
+}
+
+ssize_t agora_sandbox_readv_shim(
+    int descriptor,
+    const struct iovec *vectors,
+    int count
+) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_readv(descriptor, vectors, count);
+    }
+    return agora_sandbox_call_native_readv(
+        agora_sandbox_original_readv(),
+        descriptor,
+        vectors,
+        count
+    );
+}
+
+ssize_t agora_sandbox_pread_shim(
+    int descriptor,
+    void *buffer,
+    size_t length,
+    off_t offset
+) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_pread(descriptor, buffer, length, offset);
+    }
+    return agora_sandbox_call_native_pread(
+        agora_sandbox_original_pread(),
+        descriptor,
+        buffer,
+        length,
+        offset
+    );
+}
+
+ssize_t agora_sandbox_preadv_shim(
+    int descriptor,
+    const struct iovec *vectors,
+    int count,
+    off_t offset
+) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_preadv(descriptor, vectors, count, offset);
+    }
+    return agora_sandbox_call_native_preadv(
+        agora_sandbox_original_preadv(),
+        descriptor,
+        vectors,
+        count,
+        offset
+    );
+}
+
+ssize_t agora_sandbox_write_shim(int descriptor, const void *buffer, size_t length) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_write(descriptor, buffer, length);
+    }
+    return agora_sandbox_call_native_write(
+        agora_sandbox_original_write(),
+        descriptor,
+        buffer,
+        length
+    );
+}
+
+ssize_t agora_sandbox_pwrite_shim(
+    int descriptor,
+    const void *buffer,
+    size_t length,
+    off_t offset
+) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_pwrite(descriptor, buffer, length, offset);
+    }
+    return agora_sandbox_call_native_pwrite(
+        agora_sandbox_original_pwrite(),
+        descriptor,
+        buffer,
+        length,
+        offset
+    );
+}
+
+ssize_t agora_sandbox_writev_shim(
+    int descriptor,
+    const struct iovec *vectors,
+    int count
+) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_writev(descriptor, vectors, count);
+    }
+    return agora_sandbox_call_native_writev(
+        agora_sandbox_original_writev(),
+        descriptor,
+        vectors,
+        count
+    );
+}
+
+ssize_t agora_sandbox_pwritev_shim(
+    int descriptor,
+    const struct iovec *vectors,
+    int count,
+    off_t offset
+) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_pwritev(descriptor, vectors, count, offset);
+    }
+    return agora_sandbox_call_native_pwritev(
+        agora_sandbox_original_pwritev(),
+        descriptor,
+        vectors,
+        count,
+        offset
+    );
+}
+
+ssize_t agora_sandbox_read_nocancel_shim(int descriptor, void *buffer, size_t length) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_read_nocancel(descriptor, buffer, length);
+    }
+    return agora_sandbox_call_native_read(
+        agora_sandbox_original_read_nocancel(),
+        descriptor,
+        buffer,
+        length
+    );
+}
+
+ssize_t agora_sandbox_readv_nocancel_shim(
+    int descriptor,
+    const struct iovec *vectors,
+    int count
+) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_readv_nocancel(descriptor, vectors, count);
+    }
+    return agora_sandbox_call_native_readv(
+        agora_sandbox_original_readv_nocancel(),
+        descriptor,
+        vectors,
+        count
+    );
+}
+
+ssize_t agora_sandbox_pread_nocancel_shim(
+    int descriptor,
+    void *buffer,
+    size_t length,
+    off_t offset
+) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_pread_nocancel(descriptor, buffer, length, offset);
+    }
+    return agora_sandbox_call_native_pread(
+        agora_sandbox_original_pread_nocancel(),
+        descriptor,
+        buffer,
+        length,
+        offset
+    );
+}
+
+ssize_t agora_sandbox_preadv_nocancel_shim(
+    int descriptor,
+    const struct iovec *vectors,
+    int count,
+    off_t offset
+) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_preadv_nocancel(descriptor, vectors, count, offset);
+    }
+    return agora_sandbox_call_native_preadv(
+        agora_sandbox_original_preadv_nocancel(),
+        descriptor,
+        vectors,
+        count,
+        offset
+    );
+}
+
+ssize_t agora_sandbox_write_nocancel_shim(
+    int descriptor,
+    const void *buffer,
+    size_t length
+) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_write_nocancel(descriptor, buffer, length);
+    }
+    return agora_sandbox_call_native_write(
+        agora_sandbox_original_write_nocancel(),
+        descriptor,
+        buffer,
+        length
+    );
+}
+
+ssize_t agora_sandbox_pwrite_nocancel_shim(
+    int descriptor,
+    const void *buffer,
+    size_t length,
+    off_t offset
+) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_pwrite_nocancel(descriptor, buffer, length, offset);
+    }
+    return agora_sandbox_call_native_pwrite(
+        agora_sandbox_original_pwrite_nocancel(),
+        descriptor,
+        buffer,
+        length,
+        offset
+    );
+}
+
+ssize_t agora_sandbox_writev_nocancel_shim(
+    int descriptor,
+    const struct iovec *vectors,
+    int count
+) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_writev_nocancel(descriptor, vectors, count);
+    }
+    return agora_sandbox_call_native_writev(
+        agora_sandbox_original_writev_nocancel(),
+        descriptor,
+        vectors,
+        count
+    );
+}
+
+ssize_t agora_sandbox_pwritev_nocancel_shim(
+    int descriptor,
+    const struct iovec *vectors,
+    int count,
+    off_t offset
+) {
+    if (agora_sandbox_data_descriptor_requires_hook(descriptor)) {
+        return agora_sandbox_pwritev_nocancel(descriptor, vectors, count, offset);
+    }
+    return agora_sandbox_call_native_pwritev(
+        agora_sandbox_original_pwritev_nocancel(),
+        descriptor,
+        vectors,
+        count,
+        offset
+    );
+}
 
 int agora_sandbox_call_open(const void *function, const char *path, int flags, mode_t mode) {
     open_fn original = (open_fn)function;

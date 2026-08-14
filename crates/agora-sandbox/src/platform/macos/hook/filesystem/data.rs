@@ -6,6 +6,22 @@ use super::*;
 
 const MAX_VECTOR_COUNT: usize = 1024;
 
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_data_descriptor_requires_hook(
+    descriptor: libc::c_int,
+) -> libc::c_int {
+    let _signals = super::super::SignalMaskGuard::block_or_abort();
+    let Some(runtime) = FilesystemHookRuntime::global() else {
+        return 0;
+    };
+    libc::c_int::from(
+        runtime
+            .memory_index
+            .descriptor_state(descriptor)
+            .unwrap_or(true),
+    )
+}
+
 type ReadFn = unsafe extern "C" fn(libc::c_int, *mut libc::c_void, usize) -> libc::ssize_t;
 type PreadFn =
     unsafe extern "C" fn(libc::c_int, *mut libc::c_void, usize, libc::off_t) -> libc::ssize_t;
@@ -760,16 +776,19 @@ pub unsafe extern "C" fn agora_sandbox_sendfile(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(descriptor, socket, offset, length, headers, flags) };
         };
         let Some(runtime) = FilesystemHookRuntime::global() else {
+            drop(guard);
             return unsafe { original(descriptor, socket, offset, length, headers, flags) };
         };
         let Some(open) = runtime.tracked_open(descriptor) else {
+            drop(guard);
             return unsafe { original(descriptor, socket, offset, length, headers, flags) };
         };
         if offset < 0 {
+            drop(guard);
             return unsafe { original(descriptor, socket, offset, length, headers, flags) };
         }
         let range = match unsafe { sendfile_materialization_range(offset, length, headers) } {
@@ -782,6 +801,7 @@ pub unsafe extern "C" fn agora_sandbox_sendfile(
         if let Err(error) = open.managed().materialize(runtime, range) {
             return unsafe { fail(&error, -1) };
         }
+        drop(guard);
         unsafe { original(descriptor, socket, offset, length, headers, flags) }
     })
 }
@@ -798,10 +818,11 @@ pub unsafe extern "C" fn agora_sandbox_fcopyfile(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(source, destination, state, flags) };
         };
         let Some(runtime) = FilesystemHookRuntime::global() else {
+            drop(guard);
             return unsafe { original(source, destination, state, flags) };
         };
         if let Err(error) = prepare_native_snapshot_descriptor(runtime, destination) {
@@ -820,15 +841,16 @@ pub unsafe extern "C" fn agora_sandbox_fcopyfile(
         {
             return unsafe { fail(&error, -1) };
         }
-        let result = unsafe { original(source, destination, state, flags) };
-        if result == 0 {
-            record_snapshot_write_descriptor(
-                runtime,
-                destination,
-                descriptor_file_range(destination),
-            );
-        }
-        result
+        // Record a conservative full-file candidate before the native call.
+        // A signal handler may leave the call through `siglongjmp`, so there is
+        // no reliable post-call point at which to observe the resulting size.
+        record_snapshot_write_descriptor(
+            runtime,
+            destination,
+            LocalByteRange::new(0, u64::MAX).ok(),
+        );
+        drop(guard);
+        unsafe { original(source, destination, state, flags) }
     })
 }
 
@@ -839,10 +861,11 @@ pub unsafe extern "C" fn agora_sandbox_aio_read(control: *mut libc::aiocb) -> li
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(control) };
         };
         let Some(runtime) = FilesystemHookRuntime::global() else {
+            drop(guard);
             return unsafe { original(control) };
         };
         let copied = match unsafe { copy_process_value(control.cast_const()) } {
@@ -857,6 +880,7 @@ pub unsafe extern "C" fn agora_sandbox_aio_read(control: *mut libc::aiocb) -> li
         {
             return unsafe { fail(&error, -1) };
         }
+        drop(guard);
         unsafe { original(control) }
     })
 }
@@ -868,10 +892,11 @@ pub unsafe extern "C" fn agora_sandbox_aio_write(control: *mut libc::aiocb) -> l
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(control) };
         };
         let Some(runtime) = FilesystemHookRuntime::global() else {
+            drop(guard);
             return unsafe { original(control) };
         };
         let copied = match unsafe { copy_process_value(control.cast_const()) } {
@@ -885,6 +910,7 @@ pub unsafe extern "C" fn agora_sandbox_aio_write(control: *mut libc::aiocb) -> l
             return unsafe { fail(&error, -1) };
         }
         record_snapshot_write_descriptor(runtime, copied.aio_fildes, aio_read_range(&copied));
+        drop(guard);
         unsafe { original(control) }
     })
 }
@@ -901,10 +927,11 @@ pub unsafe extern "C" fn agora_sandbox_lio_listio(
             unsafe { set_errno(libc::ENOSYS) };
             return -1;
         };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
+        let Some(guard) = FilesystemHookGuard::enter() else {
             return unsafe { original(mode, controls, count, event) };
         };
         let Some(runtime) = FilesystemHookRuntime::global() else {
+            drop(guard);
             return unsafe { original(mode, controls, count, event) };
         };
         let copied = match usize::try_from(count) {
@@ -950,6 +977,7 @@ pub unsafe extern "C" fn agora_sandbox_lio_listio(
                 return unsafe { fail(&error, -1) };
             }
         }
+        drop(guard);
         unsafe { original(mode, controls, count, event) }
     })
 }
@@ -984,15 +1012,6 @@ fn record_snapshot_write_descriptor(
         return;
     };
     open.managed().record_snapshot_write(range);
-}
-
-fn descriptor_file_range(descriptor: libc::c_int) -> Option<LocalByteRange> {
-    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(descriptor, &mut status) } != 0 {
-        return None;
-    }
-    let end = u64::try_from(status.st_size).ok()?;
-    LocalByteRange::new(0, end).ok()
 }
 
 fn aio_read_range(control: &libc::aiocb) -> Option<LocalByteRange> {
@@ -1121,32 +1140,72 @@ fn original_read() -> Option<ReadFn> {
     function_from_interpose(&INTERPOSE_READ)
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_read() -> *const libc::c_void {
+    INTERPOSE_READ.replacee
+}
+
 fn original_pread() -> Option<PreadFn> {
     function_from_interpose(&INTERPOSE_PREAD)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_pread() -> *const libc::c_void {
+    INTERPOSE_PREAD.replacee
 }
 
 fn original_readv() -> Option<ReadvFn> {
     function_from_interpose(&INTERPOSE_READV)
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_readv() -> *const libc::c_void {
+    INTERPOSE_READV.replacee
+}
+
 fn original_preadv() -> Option<PreadvFn> {
     function_from_interpose(&INTERPOSE_PREADV)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_preadv() -> *const libc::c_void {
+    INTERPOSE_PREADV.replacee
 }
 
 fn original_write() -> Option<WriteFn> {
     function_from_interpose(&INTERPOSE_WRITE)
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_write() -> *const libc::c_void {
+    INTERPOSE_WRITE.replacee
+}
+
 fn original_pwrite() -> Option<PwriteFn> {
     function_from_interpose(&INTERPOSE_PWRITE)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_pwrite() -> *const libc::c_void {
+    INTERPOSE_PWRITE.replacee
 }
 
 fn original_writev() -> Option<WritevFn> {
     function_from_interpose(&INTERPOSE_WRITEV)
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_writev() -> *const libc::c_void {
+    INTERPOSE_WRITEV.replacee
+}
+
 fn original_pwritev() -> Option<PwritevFn> {
     function_from_interpose(&INTERPOSE_PWRITEV)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_pwritev() -> *const libc::c_void {
+    INTERPOSE_PWRITEV.replacee
 }
 
 fn original_lseek() -> Option<LseekFn> {
@@ -1177,32 +1236,72 @@ fn original_read_nocancel() -> Option<ReadFn> {
     function_from_interpose(&INTERPOSE_READ_NOCANCEL)
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_read_nocancel() -> *const libc::c_void {
+    INTERPOSE_READ_NOCANCEL.replacee
+}
+
 fn original_pread_nocancel() -> Option<PreadFn> {
     function_from_interpose(&INTERPOSE_PREAD_NOCANCEL)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_pread_nocancel() -> *const libc::c_void {
+    INTERPOSE_PREAD_NOCANCEL.replacee
 }
 
 fn original_readv_nocancel() -> Option<ReadvFn> {
     function_from_interpose(&INTERPOSE_READV_NOCANCEL)
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_readv_nocancel() -> *const libc::c_void {
+    INTERPOSE_READV_NOCANCEL.replacee
+}
+
 fn original_preadv_nocancel() -> Option<PreadvFn> {
     function_from_interpose(&INTERPOSE_PREADV_NOCANCEL)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_preadv_nocancel() -> *const libc::c_void {
+    INTERPOSE_PREADV_NOCANCEL.replacee
 }
 
 fn original_write_nocancel() -> Option<WriteFn> {
     function_from_interpose(&INTERPOSE_WRITE_NOCANCEL)
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_write_nocancel() -> *const libc::c_void {
+    INTERPOSE_WRITE_NOCANCEL.replacee
+}
+
 fn original_pwrite_nocancel() -> Option<PwriteFn> {
     function_from_interpose(&INTERPOSE_PWRITE_NOCANCEL)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_pwrite_nocancel() -> *const libc::c_void {
+    INTERPOSE_PWRITE_NOCANCEL.replacee
 }
 
 fn original_writev_nocancel() -> Option<WritevFn> {
     function_from_interpose(&INTERPOSE_WRITEV_NOCANCEL)
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_writev_nocancel() -> *const libc::c_void {
+    INTERPOSE_WRITEV_NOCANCEL.replacee
+}
+
 fn original_pwritev_nocancel() -> Option<PwritevFn> {
     function_from_interpose(&INTERPOSE_PWRITEV_NOCANCEL)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn agora_sandbox_original_pwritev_nocancel() -> *const libc::c_void {
+    INTERPOSE_PWRITEV_NOCANCEL.replacee
 }
 
 fn original_guarded_write() -> Option<GuardedWriteFn> {
@@ -1217,14 +1316,120 @@ fn original_guarded_writev() -> Option<GuardedWritevFn> {
     function_from_interpose(&INTERPOSE_GUARDED_WRITEV)
 }
 
-dyld_interpose!(INTERPOSE_READ, agora_sandbox_read, libc::read);
-dyld_interpose!(INTERPOSE_PREAD, agora_sandbox_pread, libc::pread);
-dyld_interpose!(INTERPOSE_READV, agora_sandbox_readv, libc::readv);
-dyld_interpose!(INTERPOSE_PREADV, agora_sandbox_preadv, libc::preadv);
-dyld_interpose!(INTERPOSE_WRITE, agora_sandbox_write, libc::write);
-dyld_interpose!(INTERPOSE_PWRITE, agora_sandbox_pwrite, libc::pwrite);
-dyld_interpose!(INTERPOSE_WRITEV, agora_sandbox_writev, libc::writev);
-dyld_interpose!(INTERPOSE_PWRITEV, agora_sandbox_pwritev, libc::pwritev);
+unsafe extern "C" {
+    fn agora_sandbox_read_shim(
+        descriptor: libc::c_int,
+        buffer: *mut libc::c_void,
+        length: usize,
+    ) -> libc::ssize_t;
+
+    fn agora_sandbox_readv_shim(
+        descriptor: libc::c_int,
+        vectors: *const libc::iovec,
+        count: libc::c_int,
+    ) -> libc::ssize_t;
+
+    fn agora_sandbox_pread_shim(
+        descriptor: libc::c_int,
+        buffer: *mut libc::c_void,
+        length: usize,
+        offset: libc::off_t,
+    ) -> libc::ssize_t;
+
+    fn agora_sandbox_preadv_shim(
+        descriptor: libc::c_int,
+        vectors: *const libc::iovec,
+        count: libc::c_int,
+        offset: libc::off_t,
+    ) -> libc::ssize_t;
+
+    fn agora_sandbox_write_shim(
+        descriptor: libc::c_int,
+        buffer: *const libc::c_void,
+        length: usize,
+    ) -> libc::ssize_t;
+
+    fn agora_sandbox_pwrite_shim(
+        descriptor: libc::c_int,
+        buffer: *const libc::c_void,
+        length: usize,
+        offset: libc::off_t,
+    ) -> libc::ssize_t;
+
+    fn agora_sandbox_writev_shim(
+        descriptor: libc::c_int,
+        vectors: *const libc::iovec,
+        count: libc::c_int,
+    ) -> libc::ssize_t;
+
+    fn agora_sandbox_pwritev_shim(
+        descriptor: libc::c_int,
+        vectors: *const libc::iovec,
+        count: libc::c_int,
+        offset: libc::off_t,
+    ) -> libc::ssize_t;
+
+    fn agora_sandbox_read_nocancel_shim(
+        descriptor: libc::c_int,
+        buffer: *mut libc::c_void,
+        length: usize,
+    ) -> libc::ssize_t;
+
+    fn agora_sandbox_readv_nocancel_shim(
+        descriptor: libc::c_int,
+        vectors: *const libc::iovec,
+        count: libc::c_int,
+    ) -> libc::ssize_t;
+
+    fn agora_sandbox_pread_nocancel_shim(
+        descriptor: libc::c_int,
+        buffer: *mut libc::c_void,
+        length: usize,
+        offset: libc::off_t,
+    ) -> libc::ssize_t;
+
+    fn agora_sandbox_preadv_nocancel_shim(
+        descriptor: libc::c_int,
+        vectors: *const libc::iovec,
+        count: libc::c_int,
+        offset: libc::off_t,
+    ) -> libc::ssize_t;
+
+    fn agora_sandbox_write_nocancel_shim(
+        descriptor: libc::c_int,
+        buffer: *const libc::c_void,
+        length: usize,
+    ) -> libc::ssize_t;
+
+    fn agora_sandbox_pwrite_nocancel_shim(
+        descriptor: libc::c_int,
+        buffer: *const libc::c_void,
+        length: usize,
+        offset: libc::off_t,
+    ) -> libc::ssize_t;
+
+    fn agora_sandbox_writev_nocancel_shim(
+        descriptor: libc::c_int,
+        vectors: *const libc::iovec,
+        count: libc::c_int,
+    ) -> libc::ssize_t;
+
+    fn agora_sandbox_pwritev_nocancel_shim(
+        descriptor: libc::c_int,
+        vectors: *const libc::iovec,
+        count: libc::c_int,
+        offset: libc::off_t,
+    ) -> libc::ssize_t;
+}
+
+dyld_interpose!(INTERPOSE_READ, agora_sandbox_read_shim, libc::read);
+dyld_interpose!(INTERPOSE_PREAD, agora_sandbox_pread_shim, libc::pread);
+dyld_interpose!(INTERPOSE_READV, agora_sandbox_readv_shim, libc::readv);
+dyld_interpose!(INTERPOSE_PREADV, agora_sandbox_preadv_shim, libc::preadv);
+dyld_interpose!(INTERPOSE_WRITE, agora_sandbox_write_shim, libc::write);
+dyld_interpose!(INTERPOSE_PWRITE, agora_sandbox_pwrite_shim, libc::pwrite);
+dyld_interpose!(INTERPOSE_WRITEV, agora_sandbox_writev_shim, libc::writev);
+dyld_interpose!(INTERPOSE_PWRITEV, agora_sandbox_pwritev_shim, libc::pwritev);
 dyld_interpose!(INTERPOSE_LSEEK, agora_sandbox_lseek, libc::lseek);
 dyld_interpose!(INTERPOSE_SENDFILE, agora_sandbox_sendfile, libc::sendfile);
 dyld_interpose!(
@@ -1344,7 +1549,8 @@ unsafe extern "C" {
     ) -> libc::ssize_t;
 }
 
-unsafe extern "C" fn agora_sandbox_read_nocancel(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_read_nocancel(
     descriptor: libc::c_int,
     buffer: *mut libc::c_void,
     length: usize,
@@ -1360,7 +1566,8 @@ unsafe extern "C" fn agora_sandbox_read_nocancel(
     }
 }
 
-unsafe extern "C" fn agora_sandbox_pread_nocancel(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_pread_nocancel(
     descriptor: libc::c_int,
     buffer: *mut libc::c_void,
     length: usize,
@@ -1377,7 +1584,8 @@ unsafe extern "C" fn agora_sandbox_pread_nocancel(
     }
 }
 
-unsafe extern "C" fn agora_sandbox_readv_nocancel(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_readv_nocancel(
     descriptor: libc::c_int,
     vectors: *const libc::iovec,
     count: libc::c_int,
@@ -1393,7 +1601,8 @@ unsafe extern "C" fn agora_sandbox_readv_nocancel(
     }
 }
 
-unsafe extern "C" fn agora_sandbox_preadv_nocancel(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_preadv_nocancel(
     descriptor: libc::c_int,
     vectors: *const libc::iovec,
     count: libc::c_int,
@@ -1410,7 +1619,8 @@ unsafe extern "C" fn agora_sandbox_preadv_nocancel(
     }
 }
 
-unsafe extern "C" fn agora_sandbox_write_nocancel(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_write_nocancel(
     descriptor: libc::c_int,
     buffer: *const libc::c_void,
     length: usize,
@@ -1426,7 +1636,8 @@ unsafe extern "C" fn agora_sandbox_write_nocancel(
     }
 }
 
-unsafe extern "C" fn agora_sandbox_pwrite_nocancel(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_pwrite_nocancel(
     descriptor: libc::c_int,
     buffer: *const libc::c_void,
     length: usize,
@@ -1443,7 +1654,8 @@ unsafe extern "C" fn agora_sandbox_pwrite_nocancel(
     }
 }
 
-unsafe extern "C" fn agora_sandbox_writev_nocancel(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_writev_nocancel(
     descriptor: libc::c_int,
     vectors: *const libc::iovec,
     count: libc::c_int,
@@ -1459,7 +1671,8 @@ unsafe extern "C" fn agora_sandbox_writev_nocancel(
     }
 }
 
-unsafe extern "C" fn agora_sandbox_pwritev_nocancel(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agora_sandbox_pwritev_nocancel(
     descriptor: libc::c_int,
     vectors: *const libc::iovec,
     count: libc::c_int,
@@ -1478,43 +1691,43 @@ unsafe extern "C" fn agora_sandbox_pwritev_nocancel(
 
 dyld_interpose!(
     INTERPOSE_READ_NOCANCEL,
-    agora_sandbox_read_nocancel,
+    agora_sandbox_read_nocancel_shim,
     read_nocancel
 );
 dyld_interpose!(
     INTERPOSE_PREAD_NOCANCEL,
-    agora_sandbox_pread_nocancel,
+    agora_sandbox_pread_nocancel_shim,
     pread_nocancel
 );
 dyld_interpose!(
     INTERPOSE_READV_NOCANCEL,
-    agora_sandbox_readv_nocancel,
+    agora_sandbox_readv_nocancel_shim,
     readv_nocancel
 );
 dyld_interpose!(
     INTERPOSE_PREADV_NOCANCEL,
-    agora_sandbox_preadv_nocancel,
+    agora_sandbox_preadv_nocancel_shim,
     preadv_nocancel
 );
 
 dyld_interpose!(
     INTERPOSE_WRITE_NOCANCEL,
-    agora_sandbox_write_nocancel,
+    agora_sandbox_write_nocancel_shim,
     write_nocancel
 );
 dyld_interpose!(
     INTERPOSE_PWRITE_NOCANCEL,
-    agora_sandbox_pwrite_nocancel,
+    agora_sandbox_pwrite_nocancel_shim,
     pwrite_nocancel
 );
 dyld_interpose!(
     INTERPOSE_WRITEV_NOCANCEL,
-    agora_sandbox_writev_nocancel,
+    agora_sandbox_writev_nocancel_shim,
     writev_nocancel
 );
 dyld_interpose!(
     INTERPOSE_PWRITEV_NOCANCEL,
-    agora_sandbox_pwritev_nocancel,
+    agora_sandbox_pwritev_nocancel_shim,
     pwritev_nocancel
 );
 

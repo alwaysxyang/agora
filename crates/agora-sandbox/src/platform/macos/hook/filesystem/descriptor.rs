@@ -8,7 +8,7 @@ type DescriptorFn = unsafe extern "C" fn(libc::c_int) -> libc::c_int;
 type Dup2Fn = unsafe extern "C" fn(libc::c_int, libc::c_int) -> libc::c_int;
 type TruncateFn = unsafe extern "C" fn(*const libc::c_char, libc::off_t) -> libc::c_int;
 type FtruncateFn = unsafe extern "C" fn(libc::c_int, libc::off_t) -> libc::c_int;
-type FlockFn = unsafe extern "C" fn(libc::c_int, libc::c_int) -> libc::c_int;
+pub(super) type FlockFn = unsafe extern "C" fn(libc::c_int, libc::c_int) -> libc::c_int;
 
 unsafe fn sandbox_truncate(path: *const libc::c_char, length: libc::off_t) -> libc::c_int {
     catch_filesystem_panic(-1, || {
@@ -451,6 +451,9 @@ pub extern "C" fn agora_sandbox_track_fcntl_duplicate(
     source: libc::c_int,
     destination: libc::c_int,
 ) {
+    let Some(_guard) = FilesystemHookGuard::enter() else {
+        return;
+    };
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if let Some(runtime) = FilesystemHookRuntime::global() {
             runtime.duplicate_descriptor(source, destination);
@@ -463,6 +466,9 @@ pub extern "C" fn agora_sandbox_fcntl_setfd_argument(
     descriptor: libc::c_int,
     flags: libc::c_int,
 ) -> libc::c_int {
+    let Some(_guard) = FilesystemHookGuard::enter() else {
+        return flags;
+    };
     catch_unwind(AssertUnwindSafe(|| {
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return flags;
@@ -481,6 +487,9 @@ pub extern "C" fn agora_sandbox_fcntl_setfd_argument(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn agora_sandbox_fcntl_commit_setfd(descriptor: libc::c_int) {
+    let Some(_guard) = FilesystemHookGuard::enter() else {
+        return;
+    };
     let _ = catch_unwind(AssertUnwindSafe(|| {
         refresh_descriptor_inheritance(descriptor);
     }));
@@ -491,6 +500,9 @@ pub extern "C" fn agora_sandbox_fcntl_getfl(
     descriptor: libc::c_int,
     native_flags: libc::c_int,
 ) -> libc::c_int {
+    let Some(_guard) = FilesystemHookGuard::enter() else {
+        return native_flags;
+    };
     match catch_unwind(AssertUnwindSafe(|| -> Result<libc::c_int> {
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return Ok(native_flags);
@@ -514,6 +526,9 @@ pub extern "C" fn agora_sandbox_fcntl_setfl_argument(
     descriptor: libc::c_int,
     flags: libc::c_int,
 ) -> libc::c_int {
+    let Some(_guard) = FilesystemHookGuard::enter() else {
+        return flags;
+    };
     catch_unwind(AssertUnwindSafe(|| {
         FilesystemHookRuntime::global()
             .and_then(|runtime| runtime.tracked_open(descriptor))
@@ -528,6 +543,9 @@ pub extern "C" fn agora_sandbox_fcntl_commit_setfl(
     descriptor: libc::c_int,
     flags: libc::c_int,
 ) -> libc::c_int {
+    let Some(_guard) = FilesystemHookGuard::enter() else {
+        return 0;
+    };
     match catch_unwind(AssertUnwindSafe(|| -> Result<()> {
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return Ok(());
@@ -548,6 +566,9 @@ pub extern "C" fn agora_sandbox_fcntl_commit_setfl(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn agora_sandbox_validate_content_fcntl(descriptor: libc::c_int) -> libc::c_int {
+    let Some(_guard) = FilesystemHookGuard::enter() else {
+        return 0;
+    };
     catch_unwind(AssertUnwindSafe(|| {
         let Some(runtime) = FilesystemHookRuntime::global() else {
             return 0;
@@ -571,6 +592,9 @@ pub extern "C" fn agora_sandbox_validate_content_fcntl(descriptor: libc::c_int) 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn agora_sandbox_lock_descriptor(descriptor: libc::c_int) -> libc::c_int {
+    let Some(_guard) = FilesystemHookGuard::enter() else {
+        return descriptor;
+    };
     catch_unwind(AssertUnwindSafe(|| {
         FilesystemHookRuntime::global()
             .and_then(|runtime| runtime.tracked_open(descriptor))
@@ -580,22 +604,34 @@ pub extern "C" fn agora_sandbox_lock_descriptor(descriptor: libc::c_int) -> libc
     .unwrap_or(descriptor)
 }
 
+pub(super) unsafe fn sandbox_flock_with(
+    descriptor: libc::c_int,
+    operation: libc::c_int,
+    original: FlockFn,
+) -> libc::c_int {
+    catch_filesystem_panic(-1, || {
+        let Some(guard) = FilesystemHookGuard::enter() else {
+            return unsafe { original(descriptor, operation) };
+        };
+        let descriptor = FilesystemHookRuntime::global()
+            .and_then(|runtime| runtime.tracked_open(descriptor))
+            .map(|open| open.managed().lock_descriptor(descriptor))
+            .unwrap_or(descriptor);
+        drop(guard);
+        unsafe { original(descriptor, operation) }
+    })
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn agora_sandbox_flock(
     descriptor: libc::c_int,
     operation: libc::c_int,
 ) -> libc::c_int {
-    catch_filesystem_panic(-1, || {
-        let Some(original) = original_flock() else {
-            unsafe { set_errno(libc::ENOSYS) };
-            return -1;
-        };
-        let Some(_guard) = FilesystemHookGuard::enter() else {
-            return unsafe { original(descriptor, operation) };
-        };
-        let descriptor = agora_sandbox_lock_descriptor(descriptor);
-        unsafe { original(descriptor, operation) }
-    })
+    let Some(original) = original_flock() else {
+        unsafe { set_errno(libc::ENOSYS) };
+        return -1;
+    };
+    unsafe { sandbox_flock_with(descriptor, operation, original) }
 }
 
 #[unsafe(no_mangle)]

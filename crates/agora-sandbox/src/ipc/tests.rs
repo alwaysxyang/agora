@@ -99,6 +99,18 @@ fn inherited_control_streams_are_inheritable_and_serialize_threads() {
     assert_eq!(adopted_flags & libc::FD_CLOEXEC, 0);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn inherited_control_transaction_blocks_catchable_signals_while_locked() {
+    let signal = crate::platform::hook::tests::SignalMaskProbe::unblocked(libc::SIGUSR2);
+    let lock = InheritedControlLock::anonymous().unwrap();
+    let (stream, _peer) = UnixStream::pair().unwrap();
+    let shared = InheritedControlStream::new(stream, lock, 0).unwrap();
+
+    shared.transact(|_| assert!(signal.is_blocked())).unwrap();
+    assert!(!signal.is_blocked());
+}
+
 #[test]
 fn framed_transport_passes_one_close_on_exec_descriptor() {
     let root = tempfile::tempdir().unwrap();

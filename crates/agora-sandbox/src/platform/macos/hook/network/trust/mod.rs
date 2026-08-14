@@ -228,6 +228,7 @@ unsafe fn policy_is_ssl(policy: CfType) -> bool {
 }
 
 fn prepare(trust: SecTrust) -> bool {
+    let _signals = super::super::SignalMaskGuard::block_or_abort();
     catch_unwind(AssertUnwindSafe(|| unsafe {
         TrustRuntime::global().prepare(trust)
     }))

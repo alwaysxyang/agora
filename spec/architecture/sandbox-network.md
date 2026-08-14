@@ -256,13 +256,16 @@ intercepted child open/openat/fopen and close/fclose
 intercepted child SecTrust TLS evaluation
   -> detect whether the trust object uses an SSL policy
   -> preserve non-SSL trust objects and application-provided custom anchors
-  -> add all configured CAs alongside built-in anchors for otherwise-default SSL trust
+  -> defer asynchronous signals while preparing the trust object and add all configured CAs
+     alongside built-in anchors for otherwise-default SSL trust
+  -> restore the caller's signal mask after preparation
   -> invoke the original synchronous or asynchronous SecTrust evaluator
 
 intercepted child connect/connectx
   -> identify original destination and process
-  -> encode the original destination, process identity, and trace chain in an authenticated HTTP
-     CONNECT preface
+  -> defer asynchronous signals while recursion state is active and encode the original
+     destination, process identity, and trace chain in an authenticated HTTP CONNECT preface
+  -> release recursion state and restore the caller's signal mask
   -> invoke the original macOS connectx with the preface as initial data
   -> kernel connects the original socket to the matching loopback proxy and orders the preface
      before later application writes
@@ -369,9 +372,12 @@ returning. This lets an interactive command such as `/bin/bash` receive terminal
 control signals instead of being suspended by the kernel.
 
 Non-stream and non-IP sockets bypass the hook. Calls to the run's own proxy addresses bypass it to
-avoid recursion. A thread-local guard rejects unexpected recursive covered calls. The hook does not
-use flat namespace mode; original functions are obtained from the interposition table's replacee
-pointers.
+avoid recursion. A thread-local guard rejects unexpected recursive covered calls. Catchable
+asynchronous signals are deferred while that guard and CONNECT-preface preparation state are live,
+then restored before the original potentially blocking `connectx`; a signal-driven non-local
+transfer therefore cannot poison later network calls, and native blocking behavior remains
+interruptible. The hook does not use flat namespace mode; original functions are obtained from the
+interposition table's replacee pointers.
 
 Covered interception is fail-closed. Missing or invalid run configuration, unavailable internal
 `connectx`, CONNECT-preface encoding failure, unexpected hook recursion, and complex `connectx`

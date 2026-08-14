@@ -406,6 +406,19 @@ fn process_hook_guard_blocks_recursion_until_dropped() {
 }
 
 #[test]
+fn process_hook_guard_blocks_catchable_signals_while_state_is_active() {
+    let signal = super::super::tests::SignalMaskProbe::unblocked(libc::SIGUSR2);
+    let guard = ProcessHookGuard::enter_when_ready(true).unwrap();
+
+    assert!(signal.is_blocked());
+    assert!(!super::super::tests::SignalMaskProbe::signal_is_blocked(
+        libc::SIGSEGV
+    ));
+    drop(guard);
+    assert!(!signal.is_blocked());
+}
+
+#[test]
 fn process_hook_guard_does_not_touch_tls_before_initialization() {
     INSIDE_PROCESS_HOOK.with(|inside| inside.set(false));
     assert!(ProcessHookGuard::enter_when_ready(false).is_none());
@@ -908,6 +921,44 @@ fn process_spawn_interposers_prepare_and_launch_native_children() {
         let request = decode_prepare_request(&server.join().unwrap()).unwrap();
         assert_eq!(request.executable, Path::new("/usr/bin/true"));
     }
+}
+
+#[test]
+fn spawned_child_inherits_the_callers_signal_mask() {
+    let signal = super::super::tests::SignalMaskProbe::unblocked(libc::SIGUSR2);
+    let executable = CString::new("/usr/bin/python3").unwrap();
+    let option = CString::new("-c").unwrap();
+    let program = CString::new(
+        "import signal,sys; sys.exit(9 if signal.SIGUSR2 in signal.pthread_sigmask(signal.SIG_BLOCK, []) else 0)",
+    )
+    .unwrap();
+    let (runtime, server) = runtime_with_response(response(1, b"/usr/bin/python3"));
+    let mut arguments = [
+        executable.as_ptr().cast_mut(),
+        option.as_ptr().cast_mut(),
+        program.as_ptr().cast_mut(),
+        std::ptr::null_mut(),
+    ];
+    let mut pid = 0;
+
+    let result = with_test_runtime(&runtime, || unsafe {
+        agora_sandbox_posix_spawn(
+            &mut pid,
+            executable.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            arguments.as_mut_ptr(),
+            std::ptr::null(),
+        )
+    });
+
+    assert_eq!(result, 0);
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 0);
+    assert!(!signal.is_blocked());
+    server.join().unwrap();
 }
 
 #[test]

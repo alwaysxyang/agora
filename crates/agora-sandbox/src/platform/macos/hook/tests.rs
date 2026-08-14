@@ -4,6 +4,57 @@ use crate::filesystem::FileCipher;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
+pub(crate) struct SignalMaskProbe {
+    previous: libc::sigset_t,
+    signal: libc::c_int,
+}
+
+impl SignalMaskProbe {
+    pub(crate) fn unblocked(signal: libc::c_int) -> Self {
+        let mut selected = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        unsafe {
+            libc::sigemptyset(selected.as_mut_ptr());
+            libc::sigaddset(selected.as_mut_ptr(), signal);
+            let selected = selected.assume_init();
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &selected, previous.as_mut_ptr()),
+                0
+            );
+            Self {
+                previous: previous.assume_init(),
+                signal,
+            }
+        }
+    }
+
+    pub(crate) fn is_blocked(&self) -> bool {
+        Self::signal_is_blocked(self.signal)
+    }
+
+    pub(crate) fn signal_is_blocked(signal: libc::c_int) -> bool {
+        let mut current = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        unsafe {
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), current.as_mut_ptr(),),
+                0
+            );
+            libc::sigismember(&current.assume_init(), signal) == 1
+        }
+    }
+}
+
+impl Drop for SignalMaskProbe {
+    fn drop(&mut self) {
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut())
+            },
+            0
+        );
+    }
+}
+
 #[test]
 fn ipv4_socket_address_round_trips_through_raw_storage() {
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 443);
