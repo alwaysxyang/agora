@@ -1,6 +1,6 @@
 # Project Modules
 
-Agora is a Rust workspace with four top-level crates.
+Agora is a Rust workspace with five top-level crates.
 
 ## `agora-core`
 
@@ -228,6 +228,50 @@ Rules:
   at the async runner boundary instead of marking blocking filesystem operations `async`.
 - Build the `agora-sandbox` library as both `rlib` for SDK callers and `cdylib` for macOS injection.
 
+## `agora-tools`
+
+Type: binary crate.
+
+Responsibility:
+
+- Local developer tooling that is useful when operating or diagnosing Agora but is not part of a
+  production daemon or sandbox runtime.
+- The `trace-viewer` command, which starts one fixed
+  `agora-sandbox run -c <validated-config> -e /bin/bash` child on a pseudoterminal and exposes its
+  interactive terminal through a local browser page.
+- The embedded Runtime Trace page, authenticated WebSocket transport, bounded terminal replay, and
+  normalized presentation of process, file-open/file-close, and network records appended to the
+  sandbox's configured compact JSON Lines log.
+
+Current constraints:
+
+- The HTTP listener uses an operating-system-selected IPv4 loopback port only. A high-entropy
+  per-process token, exact `Host`, same-origin `Origin`, and one-controller lease protect terminal
+  input from ordinary cross-origin access. This is a local same-user boundary, not protection from
+  another process already running as the same operating-system user.
+- The config path, log path, sandbox executable, and `/bin/bash` root shell are fixed before the
+  listener starts. Browser messages carry only PTY bytes, bounded terminal dimensions, Stop/Start,
+  and presentation reset requests; they cannot select or launch a host command outside that fixed
+  sandbox process chain.
+- The compact sandbox log remains the durable audit source. The viewer starts at the current log
+  end for each terminal session, buffers incomplete JSON Lines records, follows truncation or file
+  replacement, and bounds only its in-memory replay and presentation history.
+- Network presentation is limited to the domain when present plus destination IP and port. It does
+  not claim a full URL, HTTP body, file content, or execution result that the compact audit record
+  does not contain.
+- Browser assets, including the pinned xterm.js runtime and its licenses, are embedded in the Rust
+  binary. Running the viewer requires neither a CDN nor a Node.js runtime.
+
+Rules:
+
+- Keep `agora-tools` outside the production dependency graph. It may launch the public
+  `agora-sandbox` CLI as a child process, but it must not make production crates depend on tooling or
+  import private sandbox implementation modules.
+- Keep terminal execution behind the fixed sandbox CLI boundary. Do not add a browser API that
+  accepts a shell, executable, config, log path, or arbitrary host launch vector.
+- Treat terminal output and audit records as potentially sensitive. Do not persist them or the
+  session token in cookies, local storage, or a second viewer-owned log.
+
 ## Dependency Direction
 
 Expected dependency direction:
@@ -236,7 +280,9 @@ Expected dependency direction:
 agora-node    -> agora-core
 agora-server  -> agora-core
 agora-sandbox -> agora-core
+agora-tools   -> external crates only
 agora-core    -> external crates only
 ```
 
-Do not introduce reverse dependencies.
+`agora-tools` launches `agora-sandbox` only through its CLI process boundary; this is not a Cargo
+dependency. Do not introduce reverse dependencies.
