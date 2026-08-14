@@ -89,6 +89,7 @@ pub(crate) enum ServerMessage {
     Prepared { launch: WirePreparedLaunch },
     Released,
     RuntimeFailed { message: String },
+    Retiring { message: String },
     Rejected { message: String },
 }
 

@@ -1,8 +1,13 @@
-use super::protocol::{ClientMessage, WireOsString, read_frame, write_frame};
+use super::protocol::{
+    ClientMessage, ServerMessage, WireOsString, WirePreparedLaunch, read_frame, write_frame,
+};
+use crate::runner::{PreparedLaunch, ProtectedEnvironment};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
+use std::time::Duration;
 
 #[test]
 fn wire_os_string_round_trips_non_utf8_bytes() {
@@ -41,6 +46,111 @@ async fn session_frame_rejects_a_payload_over_the_control_limit() {
     let error = write_frame(&mut writer, &oversized).await.unwrap_err();
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[tokio::test]
+async fn session_client_times_out_when_the_daemon_stops_after_join() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workspace");
+    std::fs::create_dir(&workdir).unwrap();
+    let paths = super::startup::SessionPaths::resolve(&workdir).unwrap();
+    let listener = tokio::net::UnixListener::bind(paths.socket()).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _: ClientMessage = read_frame(&mut stream).await.unwrap();
+        std::future::pending::<()>().await;
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        super::client::run(
+            &root.path().join("sandbox.json"),
+            &workdir,
+            "config-a",
+            crate::runner::SandboxCommand::new("/usr/bin/true"),
+        ),
+    )
+    .await;
+    server.abort();
+
+    let error = result
+        .expect("the session client did not enforce its control deadline")
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("sandbox session join response timed out"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn session_client_retries_an_idle_daemon_retirement() {
+    let root = tempfile::tempdir().unwrap();
+    let workdir = root.path().join("workspace");
+    std::fs::create_dir(&workdir).unwrap();
+    let paths = super::startup::SessionPaths::resolve(&workdir).unwrap();
+    let listener = tokio::net::UnixListener::bind(paths.socket()).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stale, _) = listener.accept().await.unwrap();
+        let _: ClientMessage = read_frame(&mut stale).await.unwrap();
+        write_frame(
+            &mut stale,
+            &ServerMessage::Retiring {
+                message: "sandbox session build mismatch".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        drop(stale);
+
+        let (mut current, _) = listener.accept().await.unwrap();
+        let _: ClientMessage = read_frame(&mut current).await.unwrap();
+        write_frame(
+            &mut current,
+            &ServerMessage::Joined {
+                sandbox_id: "sandbox-a".to_string(),
+                run_id: "run-a".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame::<_, ClientMessage>(&mut current).await.unwrap(),
+            ClientMessage::Prepare { .. }
+        ));
+        let launch = PreparedLaunch::new(
+            "/usr/bin/true".into(),
+            Vec::new(),
+            ProtectedEnvironment::from_parts(BTreeMap::new(), Vec::new()),
+            "launch-a".to_string(),
+        );
+        write_frame(
+            &mut current,
+            &ServerMessage::Prepared {
+                launch: WirePreparedLaunch::from(&launch),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame::<_, ClientMessage>(&mut current).await.unwrap(),
+            ClientMessage::Finished { .. }
+        ));
+        write_frame(&mut current, &ServerMessage::Released)
+            .await
+            .unwrap();
+    });
+
+    let outcome = super::client::run(
+        &root.path().join("sandbox.json"),
+        &workdir,
+        "config-a",
+        crate::runner::SandboxCommand::new("/usr/bin/true"),
+    )
+    .await
+    .unwrap();
+
+    assert!(outcome.status().success());
+    server.await.unwrap();
 }
 
 #[test]

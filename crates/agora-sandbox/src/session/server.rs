@@ -37,6 +37,9 @@ struct ConnectionContext {
 
 enum SessionEvent {
     Joined,
+    BuildMismatch {
+        response: oneshot::Sender<bool>,
+    },
     Releasing {
         response: Option<oneshot::Sender<std::result::Result<(), String>>>,
     },
@@ -172,6 +175,13 @@ where
                 saw_client = true;
                 active_leases = active_leases.saturating_add(1);
             }
+            Completion::Event(Some(SessionEvent::BuildMismatch { response })) => {
+                let retiring = !saw_client && active_leases == 0;
+                let _ = response.send(retiring);
+                if retiring {
+                    break;
+                }
+            }
             Completion::Event(Some(SessionEvent::Releasing { response })) => {
                 if active_leases == 0 {
                     runtime_failure = Some(anyhow!("sandbox session released an inactive lease"));
@@ -294,11 +304,26 @@ async fn handle_connection(mut stream: UnixStream, context: ConnectionContext) -
         return reject(&mut stream, "sandbox session protocol mismatch").await;
     }
     if build != build_identity.as_ref() {
+        let (response, retiring) = oneshot::channel();
+        events
+            .send(SessionEvent::BuildMismatch { response })
+            .await
+            .context("sandbox session owner stopped before build mismatch decision")?;
+        if retiring
+            .await
+            .context("sandbox session build mismatch decision was cancelled")?
+        {
+            return retire(&mut stream, "sandbox session build mismatch").await;
+        }
         return reject(&mut stream, "sandbox session build mismatch").await;
     }
     if config != config_identity.as_ref() {
         return reject(&mut stream, "sandbox session configuration mismatch").await;
     }
+    events
+        .send(SessionEvent::Joined)
+        .await
+        .context("sandbox session owner stopped")?;
     write_frame(
         &mut stream,
         &ServerMessage::Joined {
@@ -307,10 +332,6 @@ async fn handle_connection(mut stream: UnixStream, context: ConnectionContext) -
         },
     )
     .await?;
-    events
-        .send(SessionEvent::Joined)
-        .await
-        .context("sandbox session owner stopped")?;
 
     let result = handle_joined_connection(&mut stream, &prepare, &events, &mut failure).await;
     match result {
@@ -453,6 +474,17 @@ async fn reject(stream: &mut UnixStream, message: &str) -> Result<()> {
     Ok(())
 }
 
+async fn retire(stream: &mut UnixStream, message: &str) -> Result<()> {
+    write_frame(
+        stream,
+        &ServerMessage::Retiring {
+            message: message.to_owned(),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 fn peer_effective_uid(stream: &UnixStream) -> Result<libc::uid_t> {
     let mut uid = 0;
     let mut gid = 0;
@@ -472,5 +504,106 @@ struct SocketGuard(PathBuf);
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[tokio::test]
+    async fn incompatible_build_is_retryable_when_the_idle_owner_retires() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (prepare, _prepare_receiver) = mpsc::channel(MAX_CONNECTIONS);
+        let (events, mut event_receiver) = mpsc::channel(MAX_CONNECTIONS);
+        let (_failure_sender, failure) = watch::channel(None);
+        let context = ConnectionContext {
+            build_identity: Arc::from("current-build"),
+            config_identity: Arc::from("config-a"),
+            sandbox_id: Arc::from("sandbox-a"),
+            run_id: Arc::from("run-a"),
+            prepare,
+            events,
+            failure,
+        };
+        let handler = tokio::spawn(handle_connection(server, context));
+        write_frame(
+            &mut client,
+            &ClientMessage::Join {
+                protocol: PROTOCOL_VERSION,
+                build: "old-build".to_string(),
+                config: "config-a".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        match event_receiver.recv().await {
+            Some(SessionEvent::BuildMismatch { response }) => response.send(true).unwrap(),
+            _ => panic!("missing build mismatch decision request"),
+        }
+
+        let response: Value = read_frame(&mut client).await.unwrap();
+
+        assert_eq!(response["type"], "retiring");
+        handler.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn incompatible_build_is_rejected_while_a_compatible_lease_is_active() {
+        let (prepare, _prepare_receiver) = mpsc::channel(MAX_CONNECTIONS);
+        let (events, mut event_receiver) = mpsc::channel(MAX_CONNECTIONS);
+        let (_failure_sender, failure) = watch::channel(None);
+        let context = ConnectionContext {
+            build_identity: Arc::from("current-build"),
+            config_identity: Arc::from("config-a"),
+            sandbox_id: Arc::from("sandbox-a"),
+            run_id: Arc::from("run-a"),
+            prepare,
+            events,
+            failure,
+        };
+        let (mut compatible, compatible_server) = UnixStream::pair().unwrap();
+        let compatible_handler =
+            tokio::spawn(handle_connection(compatible_server, context.clone()));
+        write_frame(
+            &mut compatible,
+            &ClientMessage::Join {
+                protocol: PROTOCOL_VERSION,
+                build: "current-build".to_string(),
+                config: "config-a".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let joined: Value = read_frame(&mut compatible).await.unwrap();
+        assert_eq!(joined["type"], "joined");
+        assert!(matches!(
+            event_receiver.recv().await,
+            Some(SessionEvent::Joined)
+        ));
+
+        let (mut incompatible, incompatible_server) = UnixStream::pair().unwrap();
+        let incompatible_handler = tokio::spawn(handle_connection(incompatible_server, context));
+        write_frame(
+            &mut incompatible,
+            &ClientMessage::Join {
+                protocol: PROTOCOL_VERSION,
+                build: "old-build".to_string(),
+                config: "config-a".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        match event_receiver.recv().await {
+            Some(SessionEvent::BuildMismatch { response }) => response.send(false).unwrap(),
+            _ => panic!("missing build mismatch decision request"),
+        }
+
+        let response: Value = read_frame(&mut incompatible).await.unwrap();
+
+        assert_eq!(response["type"], "rejected");
+        compatible_handler.abort();
+        incompatible_handler.await.unwrap().unwrap();
     }
 }
