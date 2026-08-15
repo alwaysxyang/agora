@@ -66,6 +66,8 @@ enum CompactAudit {
         destination_ip: IpAddr,
         destination_port: u16,
         domain: Option<String>,
+        target_host: Option<String>,
+        target_port: Option<u16>,
     },
 }
 
@@ -122,12 +124,17 @@ pub(super) fn normalize_line(id: u64, line: &[u8]) -> Result<Option<TraceEvent>,
             destination_ip,
             destination_port,
             domain,
+            target_host,
+            target_port,
         } => {
-            let title = match domain.filter(|domain| !domain.is_empty()) {
-                Some(domain) => format!("{domain}:{destination_port}"),
-                None => match destination_ip {
-                    IpAddr::V4(address) => format!("{address}:{destination_port}"),
-                    IpAddr::V6(address) => format!("[{address}]:{destination_port}"),
+            let title = match (target_host.filter(|host| !host.is_empty()), target_port) {
+                (Some(host), Some(port)) => format!("{host}:{port}"),
+                _ => match domain.filter(|domain| !domain.is_empty()) {
+                    Some(domain) => format!("{domain}:{destination_port}"),
+                    None => match destination_ip {
+                        IpAddr::V4(address) => format!("{address}:{destination_port}"),
+                        IpAddr::V6(address) => format!("[{address}]:{destination_port}"),
+                    },
                 },
             };
             (
@@ -362,6 +369,19 @@ mod tests {
         assert_eq!(network.title, "api.example.com:443");
         assert_eq!(network.detail.get("url"), None);
         assert_eq!(ip_only.title, "[2001:db8::1]:8443");
+    }
+
+    #[test]
+    fn http_connect_target_titles_do_not_reuse_the_proxy_port() {
+        let line = br#"{"audit":{"type":"network","access_time":"t","trace_id":"root","pid":3,"destination_ip":"127.0.0.1","destination_port":1087,"domain":"chatgpt.com","target_host":"chatgpt.com","target_port":443}}"#;
+
+        let event = normalize_line(1, line).unwrap().unwrap();
+
+        assert_eq!(event.title, "chatgpt.com:443");
+        assert_eq!(event.detail["destination_ip"], "127.0.0.1");
+        assert_eq!(event.detail["destination_port"], 1087);
+        assert_eq!(event.detail["target_host"], "chatgpt.com");
+        assert_eq!(event.detail["target_port"], 443);
     }
 
     #[test]

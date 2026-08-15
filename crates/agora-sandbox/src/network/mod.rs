@@ -19,8 +19,8 @@ pub(crate) fn validate_tls_ca(certificate_pem: &[u8], private_key_pem: &[u8]) ->
 
 use crate::callback::{
     Callback, Decision, DomainSource, EVENT_SCHEMA_VERSION, Event, EventMetrics, EventResult,
-    EventStatus, EventType, NetworkContext, NetworkEvent, NetworkProtocol, ProcessContext, Proxy,
-    Subsystem, TlsContext,
+    EventStatus, EventType, NetworkContext, NetworkEvent, NetworkProtocol, NetworkTarget,
+    ProcessContext, Proxy, Subsystem, TlsContext,
 };
 use crate::protocol::{ConnectRequest, PROTOCOL_VERSION, ProtocolError, RouteRegistration};
 use anyhow::{Context, Result};
@@ -548,6 +548,14 @@ where
             protocol: NetworkProtocol::Tcp,
             destination_ip: registration.destination.ip(),
             destination_port: registration.destination.port(),
+            target: observation.and_then(|value| {
+                value.target_port.map(|port| {
+                    Box::new(NetworkTarget {
+                        host: value.domain.clone(),
+                        port,
+                    })
+                })
+            }),
             http_host: observation
                 .filter(|value| value.source == DomainSource::HttpHost)
                 .map(|value| value.domain.clone()),

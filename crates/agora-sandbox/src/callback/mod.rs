@@ -4,7 +4,7 @@ use std::fmt;
 use std::future::Future;
 use std::net::IpAddr;
 
-pub const EVENT_SCHEMA_VERSION: u16 = 8;
+pub const EVENT_SCHEMA_VERSION: u16 = 9;
 
 pub trait Callback: Send + Sync + 'static {
     fn on_event(&self, event: Event) -> impl Future<Output = Decision> + Send;
@@ -341,10 +341,20 @@ pub struct NetworkContext {
     pub protocol: NetworkProtocol,
     pub destination_ip: IpAddr,
     pub destination_port: u16,
+    #[serde(flatten)]
+    pub target: Option<Box<NetworkTarget>>,
     pub http_host: Option<String>,
     pub tls_sni: Option<String>,
     pub domain: Option<String>,
     pub domain_source: Option<DomainSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkTarget {
+    #[serde(rename = "target_host")]
+    pub host: String,
+    #[serde(rename = "target_port")]
+    pub port: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

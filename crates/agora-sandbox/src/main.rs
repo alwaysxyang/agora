@@ -98,6 +98,8 @@ fn audit_record(event: &Event) -> Option<AuditRecord> {
                 pid: event.process.pid,
                 destination_ip: network.destination_ip,
                 destination_port: network.destination_port,
+                target_host: network.target.as_deref().map(|target| target.host.clone()),
+                target_port: network.target.as_deref().map(|target| target.port),
                 domain: network.domain.clone(),
             })
         }
@@ -162,6 +164,10 @@ enum AuditRecord {
         pid: u32,
         destination_ip: std::net::IpAddr,
         destination_port: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_host: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_port: Option<u16>,
         domain: Option<String>,
     },
     Process {

@@ -261,6 +261,7 @@ fn tls_sni_populates_only_the_tls_domain_fields() {
     let observation = DomainObservation {
         domain: "secure.example.com".to_string(),
         source: DomainSource::TlsSni,
+        target_port: None,
     };
 
     let context = NetworkState::<NoopCallback>::network_context(&registration, Some(&observation));
@@ -269,4 +270,27 @@ fn tls_sni_populates_only_the_tls_domain_fields() {
     assert_eq!(context.tls_sni.as_deref(), Some("secure.example.com"));
     assert_eq!(context.domain.as_deref(), Some("secure.example.com"));
     assert_eq!(context.domain_source, Some(DomainSource::TlsSni));
+    assert_eq!(context.target, None);
+}
+
+#[test]
+fn http_connect_target_is_separate_from_the_tcp_destination() {
+    let mut registration = registration();
+    registration.destination = "127.0.0.1:1087".parse().unwrap();
+    let observation = DomainObservation {
+        domain: "chatgpt.com".to_string(),
+        source: DomainSource::HttpHost,
+        target_port: Some(443),
+    };
+
+    let context = NetworkState::<NoopCallback>::network_context(&registration, Some(&observation));
+
+    assert_eq!(
+        context.destination_ip,
+        "127.0.0.1".parse::<IpAddr>().unwrap()
+    );
+    assert_eq!(context.destination_port, 1087);
+    let target = context.target.as_deref().unwrap();
+    assert_eq!(target.host, "chatgpt.com");
+    assert_eq!(target.port, 443);
 }

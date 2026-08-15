@@ -152,8 +152,10 @@ operators require an explicit shell command. The CLI audit adapter writes one st
 field through the JSON logger for each validated network connection attempt, intercepted descendant
 process execution attempt, and intercepted file open or close attempt. The logger appends JSON Lines
 to `log.file`, defaulting to `<workdir>/runtime/logs/sandbox.log`, and creates missing parent
-directories. The same file contains the unified audit, NFS-status, and lifecycle log stream. Network records contain `access_time`, `trace_id`,
-`pid`, destination IP and port, and the observed domain. Process records contain `access_time`,
+directories. The same file contains the unified audit, NFS-status, and lifecycle log stream. Network
+records contain `access_time`, `trace_id`, `pid`, the actual intercepted TCP destination IP and port,
+the observed domain, and optional `target_host` and `target_port` fields when an HTTP CONNECT
+authority supplies a logical target. Process records contain `access_time`,
 `trace_id`, PID, PPID, current and requested executables, arguments, current directory, and launch
 operation. The root command is started directly by the runner and therefore does not emit a
 `process.exec.attempt` record. File records contain `access_time`, `trace_id`, PID, operation,
@@ -444,7 +446,7 @@ require a future host-native boundary that derives identity independently of chi
 ## Callback Contract
 
 `Callback::on_event` receives an owned, versioned `Event` and asynchronously returns `Decision`.
-Event schema version 8 contains `Event::Network(NetworkEvent)`, `Event::Process(ProcessEvent)`, and
+Event schema version 9 contains `Event::Network(NetworkEvent)`, `Event::Process(ProcessEvent)`, and
 `Event::File(FileEvent)`.
 For `network.connect.attempt`, `Decision::Allow` routes directly, `Decision::Deny` blocks the
 connection, and `Decision::Proxy` selects a typed proxy route. The only implemented route is
@@ -467,9 +469,13 @@ the decision. A denied event contains that result; successful connection events 
 `Allow` or `Proxy` decision.
 The loopback peer of the local proxy is intentionally not exposed as the original connection source.
 The event schema records `http_host`, `tls_sni`, normalized `domain`, and a `domain_source` of
-either `http_host` or `tls_sni`. Established, failed, and closed events for observed TLS include
-the TLS policy, an outcome of `terminated`, `passthrough`, or `failed`, and the negotiated ALPN
-when known.
+either `http_host` or `tls_sni`. `destination_ip` and `destination_port` always describe the actual
+intercepted TCP endpoint. When a valid HTTP CONNECT request contains a DNS authority with an explicit
+port matching its normalized Host observation, `target_host` and `target_port` separately describe
+that logical target. Other HTTP requests and TLS SNI observations leave both target fields empty;
+the controller never infers port 443 from a hostname. Established, failed, and closed events for
+observed TLS include the TLS policy, an outcome of `terminated`, `passthrough`, or `failed`, and the
+negotiated ALPN when known.
 
 The process path currently publishes `process.exec.attempt` for intercepted descendant `posix_spawn`,
 `posix_spawnp`, `execve`, `execv`, and `execvp` operations. A process event contains sandbox and run

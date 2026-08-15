@@ -21,6 +21,24 @@ fn http_host_is_detected_and_normalized() {
             domain: Some(DomainObservation {
                 domain: "example.com".to_string(),
                 source: DomainSource::HttpHost,
+                target_port: None,
+            }),
+            tls: None,
+        })
+    );
+}
+
+#[test]
+fn http_connect_target_preserves_its_explicit_port() {
+    let mut inspector = ProtocolInspector::new();
+
+    assert_eq!(
+        inspector.inspect(b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\n"),
+        InspectionState::Complete(InspectionObservation {
+            domain: Some(DomainObservation {
+                domain: "chatgpt.com".to_string(),
+                source: DomainSource::HttpHost,
+                target_port: Some(443),
             }),
             tls: None,
         })
@@ -40,6 +58,7 @@ fn fragmented_tls_client_hello_sni_is_detected() {
             domain: Some(DomainObservation {
                 domain: "secure.example.com".to_string(),
                 source: DomainSource::TlsSni,
+                target_port: None,
             }),
             tls: Some(TlsClientHello {
                 server_name: Some("secure.example.com".to_string()),
@@ -102,6 +121,7 @@ fn http_host_normalization_handles_brackets_and_non_port_colons() {
             domain: Some(DomainObservation {
                 domain: "example.com".to_string(),
                 source: DomainSource::HttpHost,
+                target_port: None,
             }),
             tls: None,
         })
@@ -114,6 +134,7 @@ fn http_host_normalization_handles_brackets_and_non_port_colons() {
             domain: Some(DomainObservation {
                 domain: "example.com:not-a-port".to_string(),
                 source: DomainSource::HttpHost,
+                target_port: None,
             }),
             tls: None,
         })

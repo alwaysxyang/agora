@@ -6,7 +6,7 @@ use agora_core::lifecycle::shutdown::ShutdownGuard;
 use agora_sandbox::callback::{
     Callback, CommandContext, Decision, EVENT_SCHEMA_VERSION, Event, EventResult, EventStatus,
     EventType, FileAccessMode, FileContext, FileEvent, FileOpenMode, NetworkContext, NetworkEvent,
-    NetworkProtocol, ProcessContext, ProcessEvent, ProcessOperation, Subsystem,
+    NetworkProtocol, NetworkTarget, ProcessContext, ProcessEvent, ProcessOperation, Subsystem,
 };
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::fs::PermissionsExt;
@@ -34,6 +34,7 @@ fn event(event_type: EventType, connection_id: Option<&str>, network: bool) -> N
             protocol: NetworkProtocol::Tcp,
             destination_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
             destination_port: 443,
+            target: None,
             http_host: None,
             tls_sni: None,
             domain: Some("example.com".to_string()),
@@ -163,6 +164,25 @@ fn audit_records_only_network_attempts_with_destination_details() {
     assert_eq!(record["type"], "network");
     assert_eq!(record["domain"], "example.com");
     assert_eq!(record["destination_ip"], "203.0.113.10");
+}
+
+#[test]
+fn audit_record_keeps_http_connect_target_separate_from_proxy_destination() {
+    let mut event = event(EventType::NetworkConnectAttempt, Some("connection"), true);
+    let network = event.network.as_mut().unwrap();
+    network.destination_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    network.destination_port = 1087;
+    network.target = Some(Box::new(NetworkTarget {
+        host: "chatgpt.com".to_string(),
+        port: 443,
+    }));
+
+    let record = serde_json::to_value(audit_record(&Event::Network(event)).unwrap()).unwrap();
+
+    assert_eq!(record["destination_ip"], "127.0.0.1");
+    assert_eq!(record["destination_port"], 1087);
+    assert_eq!(record["target_host"], "chatgpt.com");
+    assert_eq!(record["target_port"], 443);
 }
 
 #[test]

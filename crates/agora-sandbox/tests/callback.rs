@@ -1,8 +1,8 @@
 use agora_sandbox::callback::{
     BasicAuth, Callback, CommandContext, Decision, DomainSource, EVENT_SCHEMA_VERSION, Event,
     EventMetrics, EventResult, EventStatus, EventType, FileAccessMode, FileContext, FileEvent,
-    FileOpenMode, HttpProxy, NetworkContext, NetworkEvent, NetworkProtocol, NoopCallback,
-    ProcessContext, ProcessEvent, ProcessOperation, Proxy, Redact, Subsystem,
+    FileOpenMode, HttpProxy, NetworkContext, NetworkEvent, NetworkProtocol, NetworkTarget,
+    NoopCallback, ProcessContext, ProcessEvent, ProcessOperation, Proxy, Redact, Subsystem,
 };
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
@@ -28,6 +28,10 @@ fn network_event() -> NetworkEvent {
             protocol: NetworkProtocol::Tcp,
             destination_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
             destination_port: 443,
+            target: Some(Box::new(NetworkTarget {
+                host: "example.com".to_string(),
+                port: 443,
+            })),
             http_host: Some("example.com".to_string()),
             tls_sni: None,
             domain: Some("example.com".to_string()),
@@ -120,6 +124,8 @@ fn callback_event_uses_stable_versioned_json_fields() {
     assert_eq!(value["event_type"], "network.connect.attempt");
     assert_eq!(value["network"]["protocol"], "tcp");
     assert_eq!(value["network"]["destination_ip"], "203.0.113.10");
+    assert_eq!(value["network"]["target_host"], "example.com");
+    assert_eq!(value["network"]["target_port"], 443);
     assert!(value["network"].get("source_ip").is_none());
     assert!(value["network"].get("source_port").is_none());
     assert_eq!(value["network"]["domain_source"], "http_host");

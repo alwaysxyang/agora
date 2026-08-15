@@ -10,6 +10,7 @@ const MAX_HTTP_HEADERS: usize = 64;
 pub(super) struct DomainObservation {
     pub(super) domain: String,
     pub(super) source: DomainSource,
+    pub(super) target_port: Option<u16>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -84,15 +85,24 @@ impl ProtocolInspector {
         match request.parse(bytes) {
             Ok(httparse::Status::Partial) => InspectionResult::Pending,
             Ok(httparse::Status::Complete(_)) => {
-                let observation = request
+                let domain = request
                     .headers
                     .iter()
                     .find(|header| header.name.eq_ignore_ascii_case("host"))
-                    .and_then(|header| Self::normalize_domain(header.value))
-                    .map(|domain| DomainObservation {
-                        domain,
-                        source: DomainSource::HttpHost,
-                    });
+                    .and_then(|header| Self::normalize_domain(header.value));
+                let target_port = match (request.method, request.path, domain.as_deref()) {
+                    (Some("CONNECT"), Some(target), Some(domain)) => {
+                        Self::parse_connect_target(target)
+                            .filter(|(target_domain, _)| target_domain == domain)
+                            .map(|(_, port)| port)
+                    }
+                    _ => None,
+                };
+                let observation = domain.map(|domain| DomainObservation {
+                    domain,
+                    source: DomainSource::HttpHost,
+                    target_port,
+                });
                 InspectionResult::Complete(InspectionObservation {
                     domain: observation,
                     tls: None,
@@ -118,6 +128,7 @@ impl ProtocolInspector {
                 let domain = server_name.as_ref().map(|value| DomainObservation {
                     domain: value.clone(),
                     source: DomainSource::TlsSni,
+                    target_port: None,
                 });
                 let alpn = hello
                     .alpn()
@@ -151,6 +162,13 @@ impl ProtocolInspector {
         } else {
             Some(host)
         }
+    }
+
+    fn parse_connect_target(value: &str) -> Option<(String, u16)> {
+        let (host, port) = value.rsplit_once(':')?;
+        let port = port.parse::<u16>().ok()?;
+        let domain = Self::normalize_domain(host.as_bytes())?;
+        Some((domain, port))
     }
 
     fn finish(&mut self) {
