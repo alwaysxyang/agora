@@ -2218,6 +2218,125 @@ fn lower_read_paths_remain_directly_addressable_by_the_sandbox() {
 }
 
 #[test]
+fn direct_filesystem_backing_paths_reenter_the_logical_view() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join("Relocated.app/Contents/Info.plist");
+    let backing = fixture
+        .runtime
+        .filesystem
+        .root()
+        .join(logical.strip_prefix(Path::new("/")).unwrap());
+    let backing = Fixture::c_path(&backing);
+
+    let resolved = unsafe {
+        fixture
+            .runtime
+            .logical_path(backing.as_ptr(), libc::AT_FDCWD)
+    }
+    .unwrap();
+
+    assert_eq!(resolved, logical);
+}
+
+#[test]
+fn direct_filesystem_root_represents_the_logical_root() {
+    let fixture = Fixture::new();
+    let backing = Fixture::c_path(fixture.runtime.filesystem.root());
+
+    let resolved = unsafe {
+        fixture
+            .runtime
+            .logical_path(backing.as_ptr(), libc::AT_FDCWD)
+    }
+    .unwrap();
+
+    assert_eq!(resolved, Path::new("/"));
+}
+
+#[test]
+fn canonical_filesystem_backing_paths_reenter_the_logical_view() {
+    let directory = PathBuf::from(format!(
+        "/tmp/agora-filesystem-hook-canonical-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let root = directory.join("workdir/fs");
+    let runtime = FilesystemHookRuntime::new(&root).unwrap();
+    let canonical_root = root.canonicalize().unwrap();
+    let logical = Path::new("/Applications/Relocated.app/Contents/Info.plist");
+    let backing = canonical_root.join(logical.strip_prefix(Path::new("/")).unwrap());
+    let backing = Fixture::c_path(&backing);
+
+    let resolved = unsafe { runtime.logical_path(backing.as_ptr(), libc::AT_FDCWD) }.unwrap();
+
+    assert_eq!(resolved, logical);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn decoded_backing_aliases_cannot_target_private_workspace_paths() {
+    let fixture = Fixture::new();
+    let private = fixture.directory.join("workdir/runtime/control");
+    let backing = fixture
+        .runtime
+        .filesystem
+        .root()
+        .join(private.strip_prefix(Path::new("/")).unwrap());
+    let backing = Fixture::c_path(&backing);
+
+    let error = unsafe {
+        fixture
+            .runtime
+            .logical_path(backing.as_ptr(), libc::AT_FDCWD)
+    }
+    .unwrap_err();
+
+    assert_eq!(error_errno(&error), libc::EACCES);
+}
+
+#[test]
+fn raw_backing_controls_resolve_only_as_logical_business_names() {
+    let fixture = Fixture::new();
+    let logical = fixture.lower.join(".metadata");
+    let logical_backing = fixture
+        .runtime
+        .filesystem
+        .prepare_write(&logical, true)
+        .unwrap();
+    std::fs::write(&logical_backing, b"business metadata").unwrap();
+    let raw_control = logical_backing.parent().unwrap().join(".metadata");
+    let raw_control = Fixture::c_path(&raw_control);
+
+    let mapped = fixture
+        .runtime
+        .map(raw_control.as_ptr(), libc::AT_FDCWD)
+        .unwrap();
+
+    assert_eq!(Path::new(mapped.to_str().unwrap()), logical_backing);
+    assert_ne!(
+        Path::new(mapped.to_str().unwrap()),
+        Path::new(raw_control.to_str().unwrap())
+    );
+}
+
+#[test]
+fn loader_backing_aliases_do_not_fall_through_a_remote_route() {
+    let mut fixture = Fixture::new();
+    let server = fixture.attach_nfs();
+    let logical = server.logical_root.join("libfixture.dylib");
+    std::fs::create_dir_all(logical.parent().unwrap()).unwrap();
+    std::fs::write(&logical, b"local lower").unwrap();
+    let backing = fixture
+        .runtime
+        .filesystem
+        .root()
+        .join(logical.strip_prefix(Path::new("/")).unwrap());
+
+    let error = fixture.runtime.prepare_loader_path(&backing).unwrap_err();
+
+    assert_eq!(error_errno(&error), libc::ENOTSUP);
+}
+
+#[test]
 fn external_symlink_aliases_cannot_address_private_workspace_paths() {
     let fixture = Fixture::new();
     let private = fixture.directory.join("workdir/private");
@@ -3310,7 +3429,7 @@ fn stat_follows_overlay_symlinks_while_lstat_reports_the_link() {
 }
 
 #[test]
-fn encrypted_control_paths_are_denied_but_logical_control_names_are_isolated() {
+fn encrypted_control_paths_resolve_as_isolated_logical_business_names() {
     let fixture = Fixture::new();
     let runtime = FilesystemHookRuntime::new_encrypted(
         fixture.directory.join("encrypted-workdir/fs"),
@@ -3327,7 +3446,7 @@ fn encrypted_control_paths_are_denied_but_logical_control_names_are_isolated() {
             super::agora_sandbox_open_with_mode(physical.as_ptr(), libc::O_RDONLY, 0),
             -1
         );
-        assert_eq!(*libc::__error(), libc::EACCES);
+        assert_eq!(*libc::__error(), libc::ENOENT);
 
         let descriptor = super::agora_sandbox_open_with_mode(
             logical.as_ptr(),

@@ -217,7 +217,6 @@ struct FilesystemHookRuntime {
     remote: Option<RemoteFilesystem>,
     audit: Option<AuditClient>,
     trace: TraceContext,
-    prepared_executable: Option<PathBuf>,
     current_directory: Mutex<CurrentDirectory>,
     open_files: Mutex<HashMap<libc::c_int, Arc<OpenFile>>>,
     mappings: Mutex<Vec<MemoryMapping>>,
@@ -521,7 +520,6 @@ impl FilesystemHookRuntime {
                         None => VirtualFilesystem::plain(config.filesystem_root()),
                     };
                     filesystem.ok().and_then(|filesystem| {
-                        let prepared_executable = Self::prepared_executable(&filesystem);
                         let remote = config
                             .remote_filesystem()
                             .map(|(control, token, routes)| {
@@ -560,7 +558,6 @@ impl FilesystemHookRuntime {
                                 },
                             )),
                             trace: config.trace().clone(),
-                            prepared_executable,
                             current_directory: Mutex::new(current_directory),
                             open_files: Mutex::new(HashMap::new()),
                             mappings: Mutex::new(Vec::new()),
@@ -588,7 +585,6 @@ impl FilesystemHookRuntime {
             remote: None,
             audit: None,
             trace: TraceContext::parse("test-trace").map_err(anyhow::Error::msg)?,
-            prepared_executable: None,
             current_directory: Mutex::new(CurrentDirectory {
                 logical: current_directory,
                 remote: false,
@@ -613,7 +609,6 @@ impl FilesystemHookRuntime {
             remote: None,
             audit: None,
             trace: TraceContext::parse("test-trace").map_err(anyhow::Error::msg)?,
-            prepared_executable: None,
             current_directory: Mutex::new(CurrentDirectory {
                 logical: current_directory,
                 remote: false,
@@ -666,12 +661,6 @@ impl FilesystemHookRuntime {
         })
     }
 
-    fn prepared_executable(filesystem: &VirtualFilesystem) -> Option<PathBuf> {
-        std::env::current_exe()
-            .ok()
-            .filter(|executable| filesystem.is_internal(executable))
-    }
-
     fn native_passthrough_path(&self, path: &Path) -> Result<Option<PathBuf>> {
         let normalized = normalize_path(path)?;
         Ok(NATIVE_PASSTHROUGH_ROOTS
@@ -717,6 +706,46 @@ impl FilesystemHookRuntime {
             .ok()
             .and_then(|path| self.native_passthrough_path(&path).ok().flatten())
             .is_some()
+    }
+
+    fn prepare_loader_path(&self, requested: &Path) -> Result<Option<CString>> {
+        if !requested.is_absolute() {
+            return Ok(None);
+        }
+        if !self.filesystem.is_internal(requested) {
+            if self.filesystem.is_private(requested)? {
+                return Err(io::Error::from_raw_os_error(libc::EACCES).into());
+            }
+            return Ok(None);
+        }
+
+        let logical = self.logical_or_host(requested)?;
+        if let Some(native) = self.native_passthrough_path(&logical)? {
+            return CString::new(native.as_os_str().as_bytes())
+                .context("native loader path contains NUL")
+                .map(Some);
+        }
+        if let Some(remote) = &self.remote
+            && remote.route_result(&logical)?.is_some()
+        {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into());
+        }
+        self.publish_open_writers(&logical)?;
+        let intent = OpenIntent::new(libc::O_RDONLY, 0)?;
+        let plan = self.filesystem.prepare_authorized_broker_open(
+            &logical,
+            intent,
+            &Credentials::effective(),
+        )?;
+        let (resolved, prepared) = plan.into_parts();
+        self.logical_or_host(&resolved)?;
+        let OpenTarget::Path(mapped) = prepared.target() else {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into());
+        };
+        mapped.metadata()?;
+        CString::new(mapped.as_os_str().as_bytes())
+            .context("resolved loader path contains NUL")
+            .map(Some)
     }
 
     #[cfg(test)]
@@ -839,15 +868,14 @@ impl FilesystemHookRuntime {
     }
 
     fn logical_or_host(&self, path: &Path) -> Result<PathBuf> {
-        if self.filesystem.is_private(path)? {
-            if let Some(executable) = &self.prepared_executable
-                && executable.starts_with(path)
-            {
-                let logical = self.filesystem.logical_path(path)?;
-                if logical != Path::new("/") {
-                    return Ok(logical);
-                }
+        if self.filesystem.is_internal(path) {
+            let logical = self.filesystem.logical_path(path)?;
+            if self.filesystem.is_private(&logical)? {
+                return Err(io::Error::from_raw_os_error(libc::EACCES).into());
             }
+            return Ok(logical);
+        }
+        if self.filesystem.is_private(path)? {
             return Err(io::Error::from_raw_os_error(libc::EACCES).into());
         }
         Ok(path.to_path_buf())
@@ -2245,6 +2273,7 @@ mod data;
 mod descriptor;
 mod directory;
 mod lifecycle;
+mod loader;
 mod mapping;
 mod metadata;
 mod namespace;

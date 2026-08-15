@@ -406,12 +406,15 @@ executable exists and its directory metadata entry matches the source device, in
 timestamps, and mode. Executable preparation does not hash the complete source. The original
 executable is never modified.
 
-Remaining coverage gaps exist outside code that successfully enters the hook:
+After Hook initialization, filesystem APIs and explicit runtime `dlopen` or `dlopen_preflight`
+calls derived from a relocated executable path re-enter the logical VFS. Runtime loading supports
+lower and plain-upper native files; encrypted-upper and NFS inputs remain unsupported because dyld
+requires a stable native plaintext path. Remaining coverage gaps exist outside that boundary:
 
 - statically linked code or direct system calls that bypass interposed APIs;
 - process launch APIs outside the covered spawn and exec family;
 - executables that cannot run correctly after copying or ad-hoc signing because they depend on
-  their original code identity, entitlements, resources, or path;
+  their original code identity, entitlements, or dependencies loaded before Hook initialization;
 - executables without a slice compatible with the sandbox build target;
 - processes that do not load the hook successfully;
 - TLS clients that use neither the interposed `SecTrust` APIs nor the injected trust-bundle

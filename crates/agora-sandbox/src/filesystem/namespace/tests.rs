@@ -64,3 +64,11 @@ fn namespace_rejects_relative_or_external_backing_paths() {
             .contains("not inside")
     );
 }
+
+#[test]
+fn namespace_rejects_escaped_names_that_decode_to_path_structure() {
+    let root = Path::new("/work/fs");
+
+    assert!(logical_path(root, &root.join(".agora-entry-L3ByaXZhdGUvdG1w")).is_err());
+    assert!(logical_path(root, &root.join(".agora-entry-Li4")).is_err());
+}

@@ -283,6 +283,9 @@ fn materialized_hook_is_signed_and_exports_interpose_symbols() {
     let symbols = String::from_utf8(symbols.stdout).unwrap();
     for symbol in [
         "_agora_sandbox_open",
+        "_agora_sandbox_dlopen",
+        "_agora_sandbox_dlopen_preflight",
+        "_agora_sandbox_dlerror",
         "_agora_sandbox_connect",
         "_agora_sandbox_posix_spawn",
     ] {

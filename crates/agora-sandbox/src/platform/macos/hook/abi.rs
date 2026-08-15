@@ -44,6 +44,9 @@ unsafe extern "C" {
     #[link_name = "close$NOCANCEL"]
     pub(super) fn darwin_close_nocancel(descriptor: libc::c_int) -> libc::c_int;
 
+    #[link_name = "dlopen_preflight"]
+    pub(super) fn darwin_dlopen_preflight(path: *const libc::c_char) -> bool;
+
     #[cfg_attr(target_arch = "x86_64", link_name = "fts_children$INODE64")]
     #[cfg_attr(not(target_arch = "x86_64"), link_name = "fts_children")]
     pub(super) fn darwin_fts_children(

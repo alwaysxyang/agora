@@ -33,7 +33,15 @@ pub(super) fn logical_path(root: &Path, backing: &Path) -> Result<PathBuf> {
         let Component::Normal(name) = component else {
             bail!("invalid filesystem backing path: {}", backing.display());
         };
-        logical.push(decode_name(name)?);
+        let decoded = decode_name(name)?;
+        let mut decoded_components = Path::new(&decoded).components();
+        if decoded.as_bytes().contains(&0)
+            || !matches!(decoded_components.next(), Some(Component::Normal(_)))
+            || decoded_components.next().is_some()
+        {
+            bail!("invalid filesystem backing path: {}", backing.display());
+        }
+        logical.push(decoded);
     }
     Ok(logical)
 }
