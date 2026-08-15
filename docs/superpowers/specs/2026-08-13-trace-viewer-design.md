@@ -163,6 +163,9 @@ The page keeps the demonstrated two-column layout:
   older activity. Returning within the same 24-pixel threshold resumes following automatically.
   Initial snapshots start at the newest visible event, and timeline re-renders preserve the user's
   paused `scrollTop` position.
+- Live audit events update bounded browser state immediately, but timeline DOM work is coalesced into
+  at most one render per second. Terminal input and output bypass this presentation timer and remain
+  immediate.
 - Selecting an event opens a structured detail panel. Raw JSON is available as an explicit secondary
   view for technical diagnosis.
 - Network rows prefer `domain:port` and fall back to `IP:port`. They never imply that the full URL or
@@ -220,7 +223,8 @@ a privilege boundary against another process already running as the same operati
 ## Resource Bounds
 
 The backend uses explicit caps for terminal replay bytes, normalized trace events, maximum JSON line
-length, WebSocket message size, and diagnostic history. Reaching a presentation cap drops only the
+length, WebSocket message size, and diagnostic history. Both backend and browser presentation state
+retain at most the newest 5,000 normalized trace events. Reaching a presentation cap drops only the
 oldest in-memory viewer data and shows a truncation indicator; it does not alter the durable log.
 Terminal input and resize messages are processed with bounded queues so a stalled browser cannot
 create unbounded backend memory use.
@@ -244,6 +248,9 @@ Clippy, test, and coverage requirements.
   reconnect behavior at the supported desktop viewport.
 - A focused browser-logic test covers bottom detection and verifies that follow mode selects the
   newest scroll position while paused mode retains the previous position.
+- A focused browser-logic test verifies that trace bursts schedule one one-second refresh, duplicate
+  events retain their chronological position, immediate user actions cancel redundant refreshes, and
+  the browser keeps only the newest 5,000 events.
 - Dependency licenses and the absence of runtime CDN references are checked before delivery.
 
 Adding the workspace crate changes the documented project module inventory. The implementation must

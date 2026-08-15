@@ -7,6 +7,7 @@ const INDEX: &str = include_str!("../../web/index.html");
 const APP_CSS: &str = include_str!("../../web/app.css");
 const APP_JS: &str = include_str!("../../web/app.js");
 const TIMELINE_FOLLOW_JS: &str = include_str!("../../web/timeline-follow.js");
+const TRACE_BATCH_JS: &str = include_str!("../../web/trace-batch.js");
 const XTERM_JS: &str = include_str!("../../third-party/xterm/xterm.js");
 const XTERM_CSS: &str = include_str!("../../third-party/xterm/xterm.css");
 const FIT_JS: &str = include_str!("../../third-party/xterm-addon-fit/addon-fit.js");
@@ -33,6 +34,10 @@ where
         .route(
             "/timeline-follow.js",
             get(|| async { asset(TIMELINE_FOLLOW_JS, "text/javascript; charset=utf-8") }),
+        )
+        .route(
+            "/trace-batch.js",
+            get(|| async { asset(TRACE_BATCH_JS, "text/javascript; charset=utf-8") }),
         )
         .route(
             "/vendor/xterm.js",
@@ -90,6 +95,7 @@ mod tests {
             ("/app.css", "text/css"),
             ("/app.js", "text/javascript"),
             ("/timeline-follow.js", "text/javascript"),
+            ("/trace-batch.js", "text/javascript"),
             ("/vendor/xterm.js", "text/javascript"),
             ("/vendor/xterm.css", "text/css"),
             ("/vendor/addon-fit.js", "text/javascript"),
@@ -136,6 +142,7 @@ mod tests {
         let application = concat!(
             include_str!("../../web/index.html"),
             include_str!("../../web/timeline-follow.js"),
+            include_str!("../../web/trace-batch.js"),
             include_str!("../../web/app.js")
         );
         assert!(!application.contains("http://"));
@@ -154,11 +161,13 @@ mod tests {
     }
 
     #[test]
-    fn timeline_follow_helper_loads_before_the_application_and_is_wired() {
+    fn frontend_helpers_load_before_the_application_and_are_wired() {
         let index = include_str!("../../web/index.html");
-        let helper = r#"<script defer src="/timeline-follow.js"></script>"#;
+        let follow_helper = r#"<script defer src="/timeline-follow.js"></script>"#;
+        let batch_helper = r#"<script defer src="/trace-batch.js"></script>"#;
         let application = r#"<script defer src="/app.js"></script>"#;
-        assert!(index.find(helper).unwrap() < index.find(application).unwrap());
+        assert!(index.find(follow_helper).unwrap() < index.find(batch_helper).unwrap());
+        assert!(index.find(batch_helper).unwrap() < index.find(application).unwrap());
 
         let app = include_str!("../../web/app.js");
         assert!(app.contains("timelineFollowing: true"));

@@ -87,7 +87,6 @@
     reconnectAttempt: 0,
     reconnectTimer: null,
     replaying: false,
-    events: [],
     diagnostics: [],
     activeRootTraceId: null,
     status: "idle",
@@ -99,6 +98,16 @@
     timelineFollowing: true,
     startedAt: null,
   };
+  const traceBatch = window.AgoraTraceBatch.create({
+    keyOf: eventKey,
+    onFlush: () => {
+      renderTimeline();
+      renderHeader();
+      renderTruncationNotice();
+    },
+    delayMs: 1000,
+    maxEvents: 5000,
+  });
 
   const textEncoder = new TextEncoder();
 
@@ -195,7 +204,7 @@
         terminal.focus();
         break;
       case "snapshot":
-        state.events = Array.isArray(message.traces) ? message.traces : [];
+        traceBatch.replace(Array.isArray(message.traces) ? message.traces : []);
         state.diagnostics = Array.isArray(message.diagnostics) ? message.diagnostics : [];
         state.activeRootTraceId = message.active_root_trace_id || null;
         state.traceTruncated = Boolean(message.trace_truncated);
@@ -208,6 +217,7 @@
         break;
       case "status":
         setSessionStatus(message.status, message.exit_code, message.message);
+        if (message.status === "exited" || message.status === "error") traceBatch.flush();
         break;
       case "diagnostic":
         if (message.message) {
@@ -217,7 +227,7 @@
         }
         break;
       case "trace_cleared":
-        state.events = [];
+        traceBatch.clear();
         state.diagnostics = [];
         state.activeRootTraceId = null;
         state.traceTruncated = false;
@@ -258,13 +268,8 @@
   }
 
   function appendTrace(event) {
-    const key = eventKey(event);
-    const index = state.events.findIndex((candidate) => eventKey(candidate) === key);
-    if (index >= 0) state.events[index] = event;
-    else state.events.push(event);
+    if (traceBatch.append(event)) state.traceTruncated = true;
     if (!state.activeRootTraceId) state.activeRootTraceId = event.root_trace_id;
-    renderTimeline();
-    renderHeader();
   }
 
   function eventKey(event) {
@@ -279,7 +284,7 @@
   }
 
   function renderHeader() {
-    elements.eventCount.textContent = String(state.events.length);
+    elements.eventCount.textContent = String(traceBatch.size);
     elements.activeTrace.textContent = state.activeRootTraceId || "Waiting for events";
     elements.activeTrace.title = state.activeRootTraceId || "";
   }
@@ -300,7 +305,7 @@
 
   function visibleEvents() {
     const query = elements.traceSearch.value.trim().toLocaleLowerCase();
-    return state.events.filter((event) => {
+    return traceBatch.values().filter((event) => {
       const category = event.kind === "network" ? "network" : event.kind === "exec" ? "exec" : "file";
       if (!state.filters.has(category)) return false;
       if (event.kind === "file_close" && !elements.showCloses.checked) return false;
@@ -316,7 +321,7 @@
     const events = visibleEvents();
     const fragmentNode = document.createDocumentFragment();
     if (events.length === 0) {
-      const hasSourceEvents = state.events.length > 0;
+      const hasSourceEvents = traceBatch.size > 0;
       elements.emptyState.querySelector("strong").textContent = hasSourceEvents ? "No events match these filters" : "Waiting for runtime activity";
       elements.emptyState.querySelector("p").textContent = hasSourceEvents
         ? "Adjust the event types, search text, or close-event toggle to reveal more activity."
@@ -430,7 +435,7 @@
       elements.detailFields.append(term, definition);
     }
     elements.detailRaw.textContent = JSON.stringify(event.detail, null, 2);
-    renderTimeline();
+    traceBatch.flush();
   }
 
   function displayValue(value) {
@@ -442,7 +447,7 @@
   function closeDetail() {
     state.selectedKey = null;
     elements.detailPanel.classList.add("hidden");
-    renderTimeline();
+    traceBatch.flush();
   }
 
   function fitTerminal() {
@@ -483,12 +488,12 @@
       if (state.filters.has(filter)) state.filters.delete(filter);
       else state.filters.add(filter);
       button.classList.toggle("active", state.filters.has(filter));
-      renderTimeline();
+      traceBatch.flush();
     });
   });
 
-  elements.traceSearch.addEventListener("input", renderTimeline);
-  elements.showCloses.addEventListener("change", renderTimeline);
+  elements.traceSearch.addEventListener("input", () => traceBatch.flush());
+  elements.showCloses.addEventListener("change", () => traceBatch.flush());
   elements.closeDetail.addEventListener("click", closeDetail);
   elements.stopSession.addEventListener("click", () => sendControl({ type: "stop" }));
   elements.startSession.addEventListener("click", () => sendControl({ type: "start" }));
